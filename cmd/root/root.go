@@ -65,12 +65,11 @@ func NewApp() usecase.Application {
 	var imageDiscovery usecase.ImageDiscovery
 	var imageRequester usecase.ImageRequester
 
+	ghClient := github.NewClient(os.Getenv("GITHUB_TOKEN"))
+	imageDiscovery = infra.NewGitHubImageDiscovery(ghClient)
 	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
-		ghClient := github.NewClient(token)
-		imageDiscovery = infra.NewGitHubImageDiscovery(ghClient)
 		imageRequester = infra.NewGitHubImageRequester(ghClient)
 	} else {
-		imageDiscovery = infra.NewGitHubImageDiscovery(nil)
 		imageRequester = infra.NewBrowserImageRequester()
 	}
 

@@ -62,6 +62,11 @@ generate:
 images-sha:
 	cd internal/embedded/images && go run update_manifest.go
 
+update-manifest-gh:
+	@command -v gh >/dev/null 2>&1 || { echo "gh CLI is required (https://cli.github.com)"; exit 1; }
+	@command -v yq >/dev/null 2>&1 || { echo "yq is required (https://github.com/mikefarah/yq)"; exit 1; }
+	sh scripts/update-manifest-gh.sh
+
 print-binary-name:
 	@echo $(OUT_DIR)/$(OUT_BIN)
 
