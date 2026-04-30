@@ -11,7 +11,22 @@ class Anvil < Formula
   depends_on "qemu"
 
   def install
-    system "go", "build", *std_go_args(ldflags: "-s -w"), "./cmd/anvil"
+    ldflags = %W[
+      -s -w
+      -X anvil/internal/usecase.appVersion=#{version}
+    ]
+
+    if build.head?
+      ldflags << "-X anvil/internal/usecase.revision=#{Utils.git_short_head}"
+    else
+      ldflags << "-X anvil/internal/usecase.revision=PLACEHOLDER_REVISION"
+    end
+
+    system "go", "build", *std_go_args(ldflags:), "./cmd/anvil"
+
+    if OS.mac?
+      system "codesign", "-s", "-", "--force", bin/"anvil"
+    end
   end
 
   test do
