@@ -108,7 +108,7 @@ jobs:
   release:
     needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
