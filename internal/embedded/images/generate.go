@@ -93,5 +93,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	gofmtCmd := exec.Command("gofmt", "-w", outputFile)
+	gofmtCmd.Stdout = os.Stdout
+	gofmtCmd.Stderr = os.Stderr
+	if err := gofmtCmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "gofmt failed: %v\n", err)
+		os.Exit(1)
+	}
+
 	fmt.Printf("Generated %s successfully.\n", outputFile)
 }
