@@ -1,0 +1,63 @@
+version: "2"
+linters:
+  enable:
+    - gocritic
+    - errcheck
+    - staticcheck
+    - ineffassign
+    - gosec
+  disable:
+    - unused
+  exclusions:
+    rules:
+      - path: internal/store/store\.go
+        linters:
+          - gosec
+      - path: internal/util/yamlutil/yaml\.go
+        linters:
+          - gosec
+      - path: internal/environment/host/host\.go
+        linters:
+          - gosec
+      - path: internal/infra/ssh_config_manager\.go
+        linters:
+          - gosec
+      - path: cmd/anvil/commands_other\.go
+        linters:
+          - gosec
+      - path: internal/environment/vm/lima/network\.go
+        linters:
+          - gosec
+      - path: internal/util/util\.go
+        linters:
+          - gosec
+      - path: internal/cli/command\.go
+        linters:
+          - gosec
+      - path: cmd/daemon/daemon_test\.go
+        linters:
+          - gosec
+      - path: internal/environment/vm/lima/limautil/limautil\.go
+        linters:
+          - gosec
+      - path: internal/infra/config_file_store\.go
+        linters:
+          - gosec
+      - path: internal/util/github/client\.go
+        linters:
+          - gosec
+      - path: internal/util/terminal/output\.go
+        linters:
+          - gosec
+      - path: internal/daemon/process/vmnet/vmnet\.go
+        linters:
+          - gosec
+      - path: cmd/anvil/commands_compose\.go
+        linters:
+          - gosec
+      - path: cmd/anvil/commands_start\.go
+        linters:
+          - gosec
+      - path: internal/infra/browser_image_requester\.go
+        linters:
+          - gosec

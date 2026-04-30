@@ -1,0 +1,51 @@
+name: Update Homebrew Formula
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  homebrew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout anvil repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Checkout tap repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          repository: olegshirko/homebrew-tap
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: homebrew-tap
+
+      - name: Download release archive and compute SHA256
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          URL="https://github.com/olegshirko/anvil/archive/refs/tags/${VERSION}.tar.gz"
+          curl -sL "${URL}" -o anvil.tar.gz
+          SHA256=$(sha256sum anvil.tar.gz | cut -d' ' -f1)
+          echo "URL=${URL}" >> "$GITHUB_ENV"
+          echo "SHA256=${SHA256}" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Update formula
+        run: |
+          cp packaging/homebrew/anvil.rb homebrew-tap/anvil.rb
+          sed -i "s|https://github.com/olegshirko/anvil/archive/refs/tags/v0.1.0.tar.gz|${URL}|g" homebrew-tap/anvil.rb
+          sed -i "s|PLACEHOLDER_SHA256|${SHA256}|g" homebrew-tap/anvil.rb
+
+      - name: Commit and push
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add anvil.rb
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "anvil ${VERSION}"
+          git push
