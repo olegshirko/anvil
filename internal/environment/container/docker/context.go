@@ -87,5 +87,15 @@ func (d dockerEngine) teardownContext() error {
 		return nil
 	}
 
-	return d.host.Run("docker", "context", "rm", "--force", d.profileID)
+	if err := d.host.Run("docker", "context", "rm", "--force", d.profileID); err != nil {
+		return err
+	}
+
+	homeDir, err := util.UserHome()
+	if err == nil {
+		symlinkPath := filepath.Join(homeDir, ".anvil", "docker.sock")
+		_ = d.host.RunQuiet("rm", "-f", symlinkPath)
+	}
+
+	return nil
 }

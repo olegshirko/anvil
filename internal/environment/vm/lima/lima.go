@@ -138,6 +138,8 @@ func (l *limaVM) Start(ctx context.Context, conf domain.Config) error {
 
 	a.Add(func() error { return l.writeNetworkFile(conf) })
 
+	a.Add(l.removeStaleSockets)
+
 	a.Add(func() error {
 		return l.host.Run(limactl, "start", "--tty=false", confFile)
 	})
@@ -200,6 +202,8 @@ func (l *limaVM) resume(ctx context.Context, conf domain.Config) error {
 	})
 
 	a.Add(func() error { return l.writeNetworkFile(conf) })
+
+	a.Add(l.removeStaleSockets)
 
 	a.Stage("starting")
 	a.Add(func() error {
@@ -267,7 +271,26 @@ func (l limaVM) Teardown(ctx context.Context) error {
 		return l.host.Run(limactl, "delete", "--force", l.configService.Profile().ID)
 	})
 
+	a.Add(l.removeStaleSockets)
+
 	return a.Exec()
+}
+
+func (l limaVM) removeStaleSockets() error {
+	profileDir := l.configService.ProfileConfigDir(l.configService.Profile())
+	sockets := []string{
+		filepath.Join(profileDir, "docker.sock"),
+		filepath.Join(profileDir, "containerd.sock"),
+		filepath.Join(profileDir, "buildkitd.sock"),
+		filepath.Join(profileDir, "incus.sock"),
+	}
+	for _, sock := range sockets {
+		_ = l.host.RunQuiet("rm", "-f", sock)
+	}
+	if l.configService.Profile().ShortName == "default" {
+		_ = l.host.RunQuiet("rm", "-f", filepath.Join(filepath.Dir(profileDir), "docker.sock"))
+	}
+	return nil
 }
 
 func (l limaVM) Restart(ctx context.Context) error {

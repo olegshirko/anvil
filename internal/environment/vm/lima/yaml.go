@@ -345,13 +345,7 @@ done`,
 				Proto:       limaconfig.TCP,
 			},
 		)
-		if profile.ShortName == "default" {
-			out.PortForwards = append(out.PortForwards, limaconfig.PortForward{
-				GuestSocket: "/var/run/docker.sock",
-				HostSocket:  docker.LegacyDefaultHostSocketFile(profileConfigDir),
-				Proto:       limaconfig.TCP,
-			})
-		}
+
 	}
 
 	if conf.Runtime == containerd.Name {

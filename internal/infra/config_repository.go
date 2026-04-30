@@ -70,7 +70,7 @@ func NewConfigRepository(configDataStore usecase.ConfigDataStore, profileMan use
 			if isWSL() {
 				return filepath.Join(home, ".config", domain.AppName)
 			}
-			return filepath.Join(home, ".config", domain.AppName)
+			return filepath.Join(home, "."+domain.AppName)
 		},
 		storeDirFunc: func() string {
 			home := getUserHomeDir()
