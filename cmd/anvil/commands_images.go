@@ -309,8 +309,9 @@ func (c *imagesLoadCmd) Run(g *Globals) error {
 		return fmt.Errorf("error creating cache dir: %w", err)
 	}
 
-	tarZstPath := filepath.Join(cacheDir, fmt.Sprintf("%s-%s-%s.tar.zst", image, tag, goArch))
-	tarPath := filepath.Join(cacheDir, fmt.Sprintf("%s-%s-%s.tar", image, tag, goArch))
+	safeImage := strings.ReplaceAll(image, "/", "_")
+	tarZstPath := filepath.Join(cacheDir, fmt.Sprintf("%s-%s-%s.tar.zst", safeImage, tag, goArch))
+	tarPath := filepath.Join(cacheDir, fmt.Sprintf("%s-%s-%s.tar", safeImage, tag, goArch))
 
 	// Check if already cached
 	if _, err := os.Stat(tarPath); err == nil && !c.Force {
