@@ -16,35 +16,35 @@ type Version struct {
 
 // Manifest is the embedded registry of VM base images.
 var Manifest = map[string]Version{
+	"26.04": {
+		Tag: "master",
+		Artifacts: map[string]map[string]Artifact{
+			"arm64": {
+				"none":       {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-26.04-minimal-cloudimg-arm64-none.qcow2", Digest: "sha512:22f756d1b6afb1d06e071b3d5d86dd212313785280653111b38358dfd683e326f412b668ea05142cb8dbcb145c57056f0959188f799d69a8eaf0c51ef85a20e2"},
+				"docker":     {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-26.04-minimal-cloudimg-arm64-docker.qcow2", Digest: "sha512:b71393037e83695b2bd611fcaeee3ac11c9a741e9d7cb3a4ad4196ce31c0895bfe0a013dc47210102c06c410aa97525025b213116a444caa8c3cca47cd4de606"},
+				"containerd": {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-26.04-minimal-cloudimg-arm64-containerd.qcow2", Digest: "sha512:5cb130fd8ad32e77d3c9d8c520f0817151d3642c7240462256cc4e5cd4ece09885a4431c816614b14d57668206ba275e7860fdf8d5c2a0235829ab37cbece185"},
+			},
+			"amd64": {
+				"none":       {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-26.04-minimal-cloudimg-amd64-none.qcow2", Digest: "sha512:423f648fe4d87f4fa758e4ace1f04530b99b31068dff1fec165d5aa1563358d6da35425c6a125a579e9dd0a9e1896383ba7a862dff1591af7c163842eb40750b"},
+				"docker":     {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-26.04-minimal-cloudimg-amd64-docker.qcow2", Digest: "sha512:b9ebedbd61c6541900f5e390c7ee3644b86ea67b44581608217e9c93be28591d78a1885a7bd3fbaab6e60bc9d9c2fb4ca767f244b5ced9bcd4c9499fd1d36274"},
+				"containerd": {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-26.04-minimal-cloudimg-amd64-containerd.qcow2", Digest: "sha512:576d85762333014b66c1f7d8fab5ea981da433e7b59948953eb724570fd58e19ee6dc59660311ef4fbe036012d17cdf00ff5d739704df2a62f4560fdceb325d3"},
+			},
+		},
+	},
 	"24.04": {
 		Tag: "master",
 		Artifacts: map[string]map[string]Artifact{
 			"arm64": {
-				"containerd": {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-arm64-containerd.qcow2", Digest: "sha512:e7992594f816a5d3dcc2ae91fc45cc67fc32f6cfa497a04c1fb77ac8d55787c44bdcdbbd218d469cd01e13ac80aac16c0d99aea77b4766d4b952d019025cc522"},
-				"incus":      {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-arm64-incus.qcow2", Digest: "sha512:427c16cb901e0688137be01fd3d694d208092766e86e3423179560f47d8425eff5fa1017ebeb17125b42acfc45d41b40c1c7cc36eb5d5f33550bde897110c000"},
-				"none":       {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-arm64-none.qcow2", Digest: "sha512:d67b16d16eba5d7f3df2e806b3a9963d538ead52e0c0c2d1a2692808083bbcbcff7da33e89880dd0a385ae8589f21ee96abd048807e4a99e3916282ae0534812"},
-				"docker":     {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-arm64-docker.qcow2", Digest: "sha512:287267ed14f280c5db6e7685239ea650b01fb95c62df902886db87eb33a87ef38021fb78122ccb37b3c756eb7794017eb7cf12055db7dbd3064f595f27e91af9"},
+				"docker":     {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-arm64-docker.qcow2", Digest: "sha512:b30346ec0a2b7b6923706d03bce8441d2c2307cf888a3883b2ba8f324f271a901e98d1c739ef8629283090a13f951e234a8b772387029188d07813878c00b259"},
+				"containerd": {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-arm64-containerd.qcow2", Digest: "sha512:c73b15f7680f1e8084349025fc367b0bb7cba082fef6b6eed668720fb202b84c46ec7dfbe3480bb31ff886f8afa21ab0c71088c5ab59e1d8c778c5a3e25cef14"},
+				"incus":      {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-arm64-incus.qcow2", Digest: "sha512:367fa95b28e5cf9cc34f03bfdaee864bd92e32843d3191c9200bbd5693ae2be596b16d38612c2abfed56c22c740512ab31ffe99cd66f8c00302602cecb3aca88"},
+				"none":       {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-arm64-none.qcow2", Digest: "sha512:3786e9290e973104ea34f7e538a362dc031bd729d73b194e7e509e17bef92efd312b68de7d3daa47f380da9cdb4e97a36ffde34d67dd726a2387ce21f4b72850"},
 			},
 			"amd64": {
-				"none":       {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-amd64-none.qcow2", Digest: "sha512:bdf069d96e577d4ace4b4848e4757d67884a902cccc60a9481d30820c8da701cc37cd0983fd92fc3ad135f3b4bb47930ffb84423c91afa595aa2fc4490741ee4"},
-				"docker":     {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-amd64-docker.qcow2", Digest: "sha512:d7d88dc3564bc464122ea2d18592a5129b1e7fff2e724ccbc631e105856836fdfdc3d0164162667304c7f0a5644df30468b275fb470b0ded973213bb83d4f756"},
-				"containerd": {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-amd64-containerd.qcow2", Digest: "sha512:23eabf0ce29b8cfb1e17154130727b495d4613c60c924750bac11b8536721b7b3f189824e93a2fdd7d7d0b3839f210aba8c31b880132a9cb31601f1e81270fb3"},
-				"incus":      {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-amd64-incus.qcow2", Digest: "sha512:954f6b40fd1bf7cb9fa878f9b62fec9afacba775566a793ecc1ead46363896e8d97203ac91f5214cbc651fc6e691538675eba00e79525f8132383ce36e727059"},
-			},
-		},
-	},
-	"26.04": {
-		Tag: "master",
-		Artifacts: map[string]map[string]Artifact{
-			"amd64": {
-				"none":       {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-26.04-minimal-cloudimg-amd64-none.qcow2", Digest: "sha512:e9e2451cecd76c6e71759175a584902e5e1d6f0ad22117f5f591e58c2c9c74a8169b64c5789561a7a6cbda116886ea39862501fb8e5a3c231cd7128e61aef2cd"},
-				"docker":     {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-26.04-minimal-cloudimg-amd64-docker.qcow2", Digest: "sha512:12c21cbfac6c8b8d7b50f698045548f78a6c7abe2f3dc274924770b91f1bd3984cc2fa2a0a752904503bf213e338c0b104bcb033ab05c4dda63bb547c86a483b"},
-				"containerd": {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-26.04-minimal-cloudimg-amd64-containerd.qcow2", Digest: "sha512:068be390012b17fcaffc42c29f287298a5b57bff887bb6cfcc59d8a157713157904872dc78e5d5ce635d4fa5916a2642c3d8c59fee28d9017c8f562052028d8d"},
-			},
-			"arm64": {
-				"containerd": {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-26.04-minimal-cloudimg-arm64-containerd.qcow2", Digest: "sha512:f4f3c343227dec8a8a8a87c7c8ac3d308fd2f2950db892271c8014fdf9b526c2d96deb24550cbefbdc4cceae9d8abc7e44bd439c114577322781da0e95bbee8a"},
-				"none":       {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-26.04-minimal-cloudimg-arm64-none.qcow2", Digest: "sha512:af422d7568e611ecb7cd24e8bcaae971c7e44b79dd6cd4933aa9308d68c32178884ddce501d62486547269b1e9a41ad4bb1f9646f8ad38b0f369c70e19592de5"},
-				"docker":     {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-26.04-minimal-cloudimg-arm64-docker.qcow2", Digest: "sha512:e9eedddcc8b8c5b520b14260f0bb812da4efd03e3cbf412547f3f95032c05444971bddc3a804729578d7b7123ea78929d5a665d025b08ba31c73a7974957e087"},
+				"none":       {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-amd64-none.qcow2", Digest: "sha512:e31a7e62b766a218686b24926dfda733a83ea60d7a6ad6af90db1d098f7512ab18e752a83240d09ba2ba76d22e8f0631fd3df33efde9106113615b2660a679d2"},
+				"docker":     {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-amd64-docker.qcow2", Digest: "sha512:b5902d4f7f5e8c3d5bfce8b85837f42781e1652d5fb710a05d2f5fb5e2464a122a06d270df33eecee7295f38b18213aba2b437fbfeb062d4adaf7835b6d528fe"},
+				"containerd": {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-amd64-containerd.qcow2", Digest: "sha512:a6020511950ef49bdf98ef47740c82c9c27fc52eaf8da899f4f5a77d58f884ca59c0d4574030b4b3d261162c131446cb76fb6ad3a01336f5e0cae45e40a4acea"},
+				"incus":      {URL: "https://github.com/olegshirko/docker-mirror/releases/download/master/ubuntu-24.04-minimal-cloudimg-amd64-incus.qcow2", Digest: "sha512:33d36f518d57d9439df7568a6d19d3b7cb27a043e09b122de7d13ef667f84e1b0dc5501397e9f01cf35f9c77b58882d9d66ad48344a838004b9384a3b17809ad"},
 			},
 		},
 	},

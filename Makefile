@@ -21,12 +21,19 @@ OUT_BIN  = anvil-$(OS)-$(ARCH)
 INSTALL  = /usr/local/bin
 NAME     = anvil
 
-.PHONY: all build clean fmt test lint install vmnet integration generate images-sha print-binary-name nix-shell
+.PHONY: all build clean clean-cache fmt test lint install vmnet integration generate images-sha print-binary-name nix-shell update-manifest-gh
 
 all: build
 
 clean:
 	rm -rf _output _build
+
+clean-cache:
+ifeq ($(GOOS),darwin)
+	rm -rf $(HOME)/Library/Caches/anvil/caches/*
+else
+	rm -rf $(HOME)/.cache/anvil/caches/*
+endif
 
 fmt:
 	go fmt ./...

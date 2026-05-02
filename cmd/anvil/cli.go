@@ -3,16 +3,18 @@ package main
 import (
 	"anvil/cmd/root"
 	"anvil/internal/usecase"
+	"anvil/internal/util/downloader"
 
 	"github.com/sirupsen/logrus"
 )
 
 // Globals are flags available on all commands.
 type Globals struct {
-	Profile     string              `short:"p" env:"ANVIL_PROFILE" default:"default" help:"Profile name, for multiple instances"`
-	Verbose     bool                `short:"v" help:"Enable verbose log"`
-	VeryVerbose bool                `long:"very-verbose" help:"Enable more verbose log"`
-	app         usecase.Application `kong:"-"`
+	Profile          string              `short:"p" env:"ANVIL_PROFILE" default:"default" help:"Profile name, for multiple instances"`
+	Verbose          bool                `short:"v" help:"Enable verbose log"`
+	VeryVerbose      bool                `long:"very-verbose" help:"Enable more verbose log"`
+	ParallelDownload bool                `long:"parallel-download" help:"Enable parallel multi-threaded downloads"`
+	app              usecase.Application `kong:"-"`
 }
 
 // BeforeApply initializes profile and logging before any command runs.
@@ -23,6 +25,7 @@ func (g *Globals) BeforeApply() error {
 	if g.VeryVerbose {
 		logrus.SetLevel(logrus.TraceLevel)
 	}
+	downloader.EnableParallel = g.ParallelDownload
 	return nil
 }
 

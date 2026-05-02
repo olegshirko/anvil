@@ -27,6 +27,10 @@ type (
 	guestActions = environment.GuestActions
 )
 
+// EnableParallel toggles multi-threaded (parallel) downloading.
+// When false (default), all downloads use a single thread.
+var EnableParallel bool
+
 // Request is download request
 type Request struct {
 	URL string // request URL
@@ -138,14 +142,16 @@ func (d downloader) downloadFileAttempt(r Request, basename string) (err error) 
 		return d.downloadSingleThreaded(r, basename, cacheDownloadingFilename, fi.Size())
 	}
 
-	// Try parallel download first
-	if err := d.downloadParallel(r, basename, cacheDownloadingFilename); err == nil {
-		return d.finalizeDownload(r, basename, cacheDownloadingFilename)
-	} else {
+	// Try parallel download only when explicitly enabled.
+	if EnableParallel {
+		if err := d.downloadParallel(r, basename, cacheDownloadingFilename); err == nil {
+			return d.finalizeDownload(r, basename, cacheDownloadingFilename)
+		}
 		d.log.Warnf("parallel download failed, falling back to single-threaded: %v", err)
+		_ = os.Remove(cacheDownloadingFilename)
 	}
 
-	// Fallback to single-threaded download
+	// Single-threaded download (default)
 	if err := d.downloadSingleThreaded(r, basename, cacheDownloadingFilename, 0); err != nil {
 		return err
 	}
@@ -316,7 +322,11 @@ func (d downloader) downloadChunk(url string, destFile *os.File, start, end int6
 }
 
 func (d downloader) downloadSingleThreaded(r Request, basename, filename string, resumeFrom int64) error {
-	destFile, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0600) //nolint:gosec
+	flags := os.O_CREATE | os.O_WRONLY
+	if resumeFrom == 0 {
+		flags |= os.O_TRUNC
+	}
+	destFile, err := os.OpenFile(filename, flags, 0600) //nolint:gosec
 	if err != nil {
 		return fmt.Errorf("error creating destination file: %w", err)
 	}
