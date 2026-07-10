@@ -118,12 +118,16 @@ enum DaemonCommand {
         let manager: VMLifecycleManager
         let idleSeconds: TimeInterval
         private var server: ControlServer?
+        private var dockerProxyServer: DockerProxyServer?
+        private var portForwarder: PortForwarder?
         private var idleTimer: Timer?
         private var isShuttingDown = false
+        private let cacheManager: ContainerdCacheManager?
 
         init(manager: VMLifecycleManager, idleSeconds: TimeInterval) {
             self.manager = manager
             self.idleSeconds = idleSeconds
+            self.cacheManager = ContainerdCacheManager(sharePath: manager.args.sharePath)
             manager.delegate = self
         }
 
@@ -136,7 +140,11 @@ enum DaemonCommand {
             guard !isShuttingDown else { return }
             isShuttingDown = true
             idleTimer?.invalidate()
+            // Sync containerd cache while the control socket is still available.
+            cacheManager?.sync()
             server?.stop()
+            dockerProxyServer?.stop()
+            portForwarder?.stop()
             manager.stopAndSave {
                 releaseDaemonLock()
                 exit(0)
@@ -158,6 +166,17 @@ enum DaemonCommand {
             server.start()
             self.server = server
             print("[vz-runner] daemon ready, control socket: \(controlSocketPath)")
+
+            let dockerProxy = DockerProxyServer(socketPath: dockerSocketPath) { [weak manager] in
+                manager?.socketDevice
+            }
+            dockerProxy.start()
+            self.dockerProxyServer = dockerProxy
+            print("[vz-runner] docker proxy socket: \(dockerSocketPath)")
+
+            let forwarder = PortForwarder { [weak manager] in manager?.socketDevice }
+            forwarder.start()
+            self.portForwarder = forwarder
 
             // Start the idle timer if no client connected while the VM was starting.
             if server.clientsCount == 0 {
@@ -212,7 +231,9 @@ enum DaemonCommand {
 
         private func idleTimeoutFired() {
             guard !isShuttingDown, (server?.clientsCount ?? 0) == 0 else { return }
-            print("[vz-runner] idle timeout reached, pausing VM...")
+            print("[vz-runner] idle timeout reached, syncing containerd cache...")
+            cacheManager?.sync()
+            print("[vz-runner] pausing VM...")
             manager.pause { [weak self] result in
                 guard let self = self else { return }
                 switch result {

@@ -13,6 +13,7 @@ final class VMLifecycleManager: NSObject {
     let args: BootArgs
     private let snapshot: SnapshotManager
     private var vm: VZVirtualMachine?
+    private var coldBootStart: Date?
 
     weak var delegate: VMLifecycleManagerDelegate?
 
@@ -139,13 +140,15 @@ final class VMLifecycleManager: NSObject {
         }
         print("[vz-runner] saving VM snapshot...")
         snapshot.removeSnapshotStatePreservingSidecars()
+        let start = Date()
         vm.saveMachineStateTo(url: snapshot.snapshotURL) { [weak self] error in
             guard let self = self else {
                 completion?(error)
                 return
             }
+            let duration = Date().timeIntervalSince(start)
             if let error = error {
-                print("[vz-runner] snapshot save failed: \(error)")
+                print("[vz-runner] snapshot save failed after \(String(format: "%.3f", duration))s: \(error)")
                 completion?(error)
                 return
             }
@@ -155,7 +158,7 @@ final class VMLifecycleManager: NSObject {
                 cpus: self.args.cpuCount,
                 memory: self.args.memoryGiB
             )
-            print("[vz-runner] snapshot saved")
+            print("[vz-runner] snapshot saved in \(String(format: "%.3f", duration))s")
             completion?(nil)
         }
     }
@@ -228,21 +231,25 @@ final class VMLifecycleManager: NSObject {
 
         if canRestore {
             print("[vz-runner] restoring VM from snapshot...")
+            let restoreStart = Date()
             vm.restoreMachineStateFrom(url: snapshot.snapshotURL) { [weak self] error in
                 guard let self = self else { return }
+                let restoreDuration = Date().timeIntervalSince(restoreStart)
                 if let error = error {
-                    print("[vz-runner] restore failed: \(error)")
+                    print("[vz-runner] restore failed after \(String(format: "%.3f", restoreDuration))s: \(error)")
                     print("[vz-runner] falling back to cold boot")
                     self.snapshot.removeSnapshot()
                     self.coldBoot(vm: vm)
                 } else {
-                    print("[vz-runner] VM restored, resuming...")
+                    print("[vz-runner] VM restored in \(String(format: "%.3f", restoreDuration))s, resuming...")
+                    let resumeStart = Date()
                     vm.resume { result in
                         DispatchQueue.main.async { [weak self] in
                             guard let self = self else { return }
+                            let resumeDuration = Date().timeIntervalSince(resumeStart)
                             switch result {
                             case .success:
-                                print("[vz-runner] VM resumed, streaming console:\n---")
+                                print("[vz-runner] VM resumed in \(String(format: "%.3f", resumeDuration))s, streaming console:\n---")
                                 self.delegate?.vmLifecycleManagerDidBecomeReady(self)
                             case .failure(let error):
                                 self.delegate?.vmLifecycleManager(self, didFailWithError: error)
@@ -258,12 +265,17 @@ final class VMLifecycleManager: NSObject {
     }
 
     private func coldBoot(vm: VZVirtualMachine) {
+        coldBootStart = Date()
         vm.start { [weak self] result in
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 switch result {
                 case .success:
-                    print("[vz-runner] VM started, streaming console:\n---")
+                    if let start = self.coldBootStart {
+                        print("[vz-runner] VM started in \(String(format: "%.3f", Date().timeIntervalSince(start)))s, streaming console:\n---")
+                    } else {
+                        print("[vz-runner] VM started, streaming console:\n---")
+                    }
                     if self.args.useAgent {
                         self.waitForGuestAgent(vm: vm)
                     }
@@ -293,7 +305,11 @@ final class VMLifecycleManager: NSObject {
                 switch result {
                 case .success(let conn):
                     conn.close()
-                    print("[vz-runner] guest agent ready")
+                    if let start = self.coldBootStart {
+                        print("[vz-runner] guest agent ready \(String(format: "%.3f", Date().timeIntervalSince(start)))s after VM start")
+                    } else {
+                        print("[vz-runner] guest agent ready")
+                    }
                     self.pause { pauseResult in
                         switch pauseResult {
                         case .success:

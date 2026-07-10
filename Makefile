@@ -4,7 +4,7 @@
     download-alpine extract-alpine-kernel \
     download-ubuntu ubuntu-modules \
     guest-agent initramfs-agent initramfs-ubuntu initramfs-containerd \
-    container-tools
+    container-tools time-boot time-service validate
 
 BINARY := .build/release/vz-runner
 ENTITLEMENTS := entitlements.plist
@@ -33,6 +33,15 @@ clean:
 
 test: sign
 	$(BINARY) --help || true
+
+time-boot: sign
+	python3 scripts/time_boot.py
+
+time-service: sign
+	python3 scripts/time_service.py
+
+validate: sign
+	python3 scripts/validate_robustness.py
 
 # -----------------------------------------------------------------------------
 # Alpine (M0 bare boot)
@@ -104,6 +113,8 @@ CONTAINER_TOOLS_DIR := .download/container-tools
 CONTAINERD_URL := https://github.com/containerd/containerd/releases/download/v2.0.0/containerd-static-2.0.0-linux-arm64.tar.gz
 NERDCTL_URL := https://github.com/containerd/nerdctl/releases/download/v2.0.0/nerdctl-2.0.0-linux-arm64.tar.gz
 RUNC_URL := https://github.com/opencontainers/runc/releases/download/v1.2.0/runc.arm64
+CNI_PLUGINS_URL := https://github.com/containernetworking/plugins/releases/download/v1.6.0/cni-plugins-linux-arm64-v1.6.0.tgz
+DOCKER_URL := https://download.docker.com/linux/static/stable/aarch64/docker-29.6.1.tgz
 
 $(CONTAINER_TOOLS_DIR):
 	mkdir -p $(CONTAINER_TOOLS_DIR)
@@ -119,8 +130,35 @@ container-tools: $(CONTAINER_TOOLS_DIR)
 	    curl -L -o $(CONTAINER_TOOLS_DIR)/runc $(RUNC_URL); \
 	    chmod +x $(CONTAINER_TOOLS_DIR)/runc; \
 	fi
+	if [ ! -f $(CONTAINER_TOOLS_DIR)/cni-plugins.tgz ]; then \
+	    curl -L -o $(CONTAINER_TOOLS_DIR)/cni-plugins.tgz $(CNI_PLUGINS_URL); \
+	fi
 
-initramfs-containerd: extract-alpine-kernel ubuntu-modules guest-agent container-tools
+# Alpine iptables + libs needed by CNI bridge/portmap/firewall plugins.
+ALPINE_IPTABLES_DIR := .download/alpine-iptables
+ALPINE_IPTABLES_URL := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/iptables-1.8.10-r3.apk
+ALPINE_LIBMNL_URL   := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libmnl-1.0.5-r2.apk
+ALPINE_LIBNFTNL_URL := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libnftnl-1.2.6-r0.apk
+ALPINE_LIBXTABLES_URL := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libxtables-1.8.10-r3.apk
+
+$(ALPINE_IPTABLES_DIR):
+	mkdir -p $(ALPINE_IPTABLES_DIR)
+
+alpine-iptables: $(ALPINE_IPTABLES_DIR)
+	if [ ! -f $(ALPINE_IPTABLES_DIR)/iptables.apk ]; then \
+	    curl -L -o $(ALPINE_IPTABLES_DIR)/iptables.apk $(ALPINE_IPTABLES_URL); \
+	fi
+	if [ ! -f $(ALPINE_IPTABLES_DIR)/libmnl.apk ]; then \
+	    curl -L -o $(ALPINE_IPTABLES_DIR)/libmnl.apk $(ALPINE_LIBMNL_URL); \
+	fi
+	if [ ! -f $(ALPINE_IPTABLES_DIR)/libnftnl.apk ]; then \
+	    curl -L -o $(ALPINE_IPTABLES_DIR)/libnftnl.apk $(ALPINE_LIBNFTNL_URL); \
+	fi
+	if [ ! -f $(ALPINE_IPTABLES_DIR)/libxtables.apk ]; then \
+	    curl -L -o $(ALPINE_IPTABLES_DIR)/libxtables.apk $(ALPINE_LIBXTABLES_URL); \
+	fi
+
+initramfs-containerd: extract-alpine-kernel ubuntu-modules guest-agent container-tools alpine-iptables
 	scripts/build_initramfs_containerd.sh
 
 # Default boot path does NOT rebuild the initramfs so that an existing snapshot's

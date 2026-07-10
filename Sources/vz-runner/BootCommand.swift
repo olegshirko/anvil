@@ -26,6 +26,8 @@ enum BootCommand {
         private let args: BootArgs
         private let manager: VMLifecycleManager
         private var server: ControlServer?
+        private var dockerProxyServer: DockerProxyServer?
+        private var portForwarder: PortForwarder?
 
         init(args: BootArgs, manager: VMLifecycleManager) {
             self.args = args
@@ -40,6 +42,17 @@ enum BootCommand {
             server.start()
             self.server = server
             print("[vz-runner] control server ready on \(controlSocketPath)")
+
+            let dockerProxy = DockerProxyServer(socketPath: dockerSocketPath) { [weak manager] in
+                manager?.socketDevice
+            }
+            dockerProxy.start()
+            self.dockerProxyServer = dockerProxy
+            print("[vz-runner] docker proxy socket: \(dockerSocketPath)")
+
+            let forwarder = PortForwarder { [weak manager] in manager?.socketDevice }
+            forwarder.start()
+            self.portForwarder = forwarder
         }
 
         func vmLifecycleManager(_ manager: VMLifecycleManager, didFailWithError error: Error) {

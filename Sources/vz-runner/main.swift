@@ -11,6 +11,20 @@
 
 import Foundation
 
+// If this process was spawned by the daemon for a task that must not outlive
+// the daemon (e.g. containerd cache sync), exit immediately when the parent
+// disappears. This prevents orphan `vz-runner exec` processes after `kill -9`.
+if ProcessInfo.processInfo.environment["ANVIL_EXIT_ON_PARENT_DEATH"] == "1" {
+    DispatchQueue.global().async {
+        while true {
+            Thread.sleep(forTimeInterval: 1.0)
+            if getppid() == 1 {
+                exit(1)
+            }
+        }
+    }
+}
+
 func printUsage() {
     print("""
     Usage:
@@ -18,6 +32,7 @@ func printUsage() {
       vz-runner boot --kernel <path> --initrd <path> [--agent]
       vz-runner status
       vz-runner exec <command> [args...]
+      vz-runner docker-socket-path
 
     Daemon options:
       --kernel <path>   Path to the Linux kernel image (default: .download/ubuntu/vmlinuz-raw)
@@ -57,6 +72,9 @@ case "exec":
         exit(1)
     }
     ControlClient.exec(command: cmdArgs)
+case "docker-socket-path":
+    print(dockerSocketPath)
+    exit(0)
 case "--help", "-h":
     printUsage()
     exit(0)

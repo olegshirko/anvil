@@ -12,6 +12,8 @@ enum ControlClient {
     }
 
     static func exec(command: [String]) {
+        // Avoid buffering when stdout is redirected to a pipe/file.
+        setbuf(stdout, nil)
         do {
             let resp = try sendUnixWithAutoStart(request: ControlRequest(cmd: "exec", args: command))
             if let out = resp.stdout, !out.isEmpty {
@@ -41,6 +43,11 @@ enum ControlClient {
         do {
             return try sendUnix(request: request)
         } catch {
+            // Internal sync requests must never spawn a new daemon; otherwise a
+            // killed daemon's sync child can auto-start an orphan process.
+            if ProcessInfo.processInfo.environment["ANVIL_NO_DAEMON_AUTOSTART"] == "1" {
+                throw error
+            }
             print("[vz-runner] control socket unreachable, starting daemon...")
             try startDaemonAndWaitForSocket()
             return try sendUnix(request: request)
