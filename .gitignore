@@ -1,7 +1,6 @@
+.build/
+.download/
+.venv/
+.DS_Store
 .idea/
-.fleet/
-.vscode/
-_output/
-_build/
-bin/
-result
+*.log
