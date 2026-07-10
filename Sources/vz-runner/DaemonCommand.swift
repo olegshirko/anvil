@@ -18,13 +18,17 @@ enum DaemonCommand {
         globalDaemon = daemon
 
         signal(SIGINT) { _ in
-            print("\n[vz-runner] daemon received SIGINT, shutting down...")
-            globalDaemon?.shutdown()
+            DispatchQueue.main.async {
+                print("\n[vz-runner] daemon received SIGINT, shutting down...")
+                globalDaemon?.shutdown()
+            }
         }
 
         signal(SIGTERM) { _ in
-            print("\n[vz-runner] daemon received SIGTERM, shutting down...")
-            globalDaemon?.shutdown()
+            DispatchQueue.main.async {
+                print("\n[vz-runner] daemon received SIGTERM, shutting down...")
+                globalDaemon?.shutdown()
+            }
         }
 
         daemon.start()
@@ -108,7 +112,8 @@ enum DaemonCommand {
                 sharePath: sharePath ?? "/tmp/anvil-share",
                 mountTag: mountTag,
                 memoryGiB: memory,
-                cpuCount: cpus
+                cpuCount: cpus,
+                consoleOutputPath: stateDir.appendingPathComponent("console.log").path
             ),
             idleSeconds: idleSeconds
         )
@@ -140,12 +145,13 @@ enum DaemonCommand {
             guard !isShuttingDown else { return }
             isShuttingDown = true
             idleTimer?.invalidate()
-            // Sync containerd cache while the control socket is still available.
-            cacheManager?.sync()
             server?.stop()
             dockerProxyServer?.stop()
             portForwarder?.stop()
-            manager.stopAndSave {
+            // Save the VM snapshot first (this must run on the main queue),
+            // then sync the containerd cache before exiting.
+            manager.stopAndSave { [weak self] in
+                self?.cacheManager?.sync()
                 releaseDaemonLock()
                 exit(0)
             }

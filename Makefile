@@ -56,13 +56,15 @@ $(ALPINE_DIR):
 	mkdir -p $(ALPINE_DIR)
 
 download-alpine: $(ALPINE_DIR)
-	curl -L -o $(ALPINE_KERNEL_PE) $(ALPINE_URL)/vmlinuz-virt
-	curl -L -o $(ALPINE_INITRD) $(ALPINE_URL)/initramfs-virt
+	@if [ ! -f $(ALPINE_KERNEL_PE) ]; then curl -L -o $(ALPINE_KERNEL_PE) $(ALPINE_URL)/vmlinuz-virt; fi
+	@if [ ! -f $(ALPINE_INITRD) ]; then curl -L -o $(ALPINE_INITRD) $(ALPINE_URL)/initramfs-virt; fi
 
 extract-alpine-kernel: download-alpine
-	python3 scripts/extract_alpine_kernel.py $(ALPINE_KERNEL_PE) $(ALPINE_KERNEL_RAW).gz
-	-gunzip -c $(ALPINE_KERNEL_RAW).gz > $(ALPINE_KERNEL_RAW) 2>/dev/null
-	file $(ALPINE_KERNEL_RAW)
+	@if [ ! -f $(ALPINE_KERNEL_RAW) ]; then \
+	    python3 scripts/extract_alpine_kernel.py $(ALPINE_KERNEL_PE) $(ALPINE_KERNEL_RAW).gz && \
+	    gunzip -c $(ALPINE_KERNEL_RAW).gz > $(ALPINE_KERNEL_RAW) 2>/dev/null && \
+	    file $(ALPINE_KERNEL_RAW); \
+	fi
 
 boot-alpine: sign extract-alpine-kernel
 	$(BINARY) boot --kernel $(ALPINE_KERNEL_RAW) --initrd $(ALPINE_INITRD)
@@ -89,7 +91,7 @@ download-ubuntu: $(UBUNTU_DIR)
 	file $(UBUNTU_KERNEL)
 
 ubuntu-modules: $(UBUNTU_DIR)
-	curl -L -o $(UBUNTU_DEB) $(UBUNTU_MODULES_URL)
+	@if [ ! -f $(UBUNTU_DEB) ]; then curl -L -o $(UBUNTU_DEB) $(UBUNTU_MODULES_URL); fi
 
 guest-agent:
 	cd guest-agent && go mod tidy
@@ -159,7 +161,13 @@ alpine-iptables: $(ALPINE_IPTABLES_DIR)
 	fi
 
 initramfs-containerd: extract-alpine-kernel ubuntu-modules guest-agent container-tools alpine-iptables
-	scripts/build_initramfs_containerd.sh
+	@if command -v limactl >/dev/null 2>&1 && limactl list anvil --format '{{.Status}}' 2>/dev/null | grep -q Running; then \
+	    echo "Building initramfs inside Lima VM 'anvil'..."; \
+	    limactl shell anvil -- bash $(CURDIR)/scripts/build_initramfs_containerd.sh; \
+	else \
+	    echo "Lima VM 'anvil' not running; falling back to local Docker (requires Docker Desktop)."; \
+	    scripts/build_initramfs_containerd.sh; \
+	fi
 
 # Default boot path does NOT rebuild the initramfs so that an existing snapshot's
 # config hash stays valid. Build the initramfs explicitly with

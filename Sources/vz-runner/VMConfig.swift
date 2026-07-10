@@ -10,6 +10,7 @@ struct BootArgs {
     var mountTag: String = "anvil"
     var memoryGiB: UInt64 = 2
     var cpuCount: Int = 2
+    var consoleOutputPath: String?
 }
 
 func parseBootArgs(_ raw: [String]) -> BootArgs? {
@@ -19,6 +20,7 @@ func parseBootArgs(_ raw: [String]) -> BootArgs? {
     var fresh = false
     var sharePath: String?
     var mountTag: String = "anvil"
+    var consoleOutputPath: String?
     var cpus: Int = 2
     var memory: UInt64 = 2
 
@@ -37,6 +39,8 @@ func parseBootArgs(_ raw: [String]) -> BootArgs? {
             sharePath = it.next()
         case "--mount-tag":
             if let v = it.next() { mountTag = v }
+        case "--console":
+            consoleOutputPath = it.next()
         case "--cpus":
             if let v = it.next() { cpus = Int(v) ?? cpus }
         case "--memory":
@@ -59,7 +63,8 @@ func parseBootArgs(_ raw: [String]) -> BootArgs? {
         sharePath: sharePath,
         mountTag: mountTag,
         memoryGiB: memory,
-        cpuCount: cpus
+        cpuCount: cpus,
+        consoleOutputPath: consoleOutputPath
     )
 }
 
@@ -89,12 +94,23 @@ func makeConfiguration(
     config.cpuCount = args.cpuCount
     config.memorySize = args.memoryGiB * 1024 * 1024 * 1024
 
+    // Serial port: use stdio for one-shot boot, redirect to a file for daemon mode
+    // so snapshot restore isn't tied to the original process's stdin/stdout.
     let serialConfig = VZVirtioConsoleDeviceSerialPortConfiguration()
-    let stdioAttachment = VZFileHandleSerialPortAttachment(
-        fileHandleForReading: FileHandle.standardInput,
-        fileHandleForWriting: FileHandle.standardOutput
-    )
-    serialConfig.attachment = stdioAttachment
+    if let consolePath = args.consoleOutputPath {
+        FileManager.default.createFile(atPath: consolePath, contents: nil, attributes: nil)
+        let readHandle = FileHandle(forReadingAtPath: "/dev/null") ?? FileHandle.standardInput
+        let writeHandle = FileHandle(forWritingAtPath: consolePath) ?? FileHandle.standardOutput
+        serialConfig.attachment = VZFileHandleSerialPortAttachment(
+            fileHandleForReading: readHandle,
+            fileHandleForWriting: writeHandle
+        )
+    } else {
+        serialConfig.attachment = VZFileHandleSerialPortAttachment(
+            fileHandleForReading: FileHandle.standardInput,
+            fileHandleForWriting: FileHandle.standardOutput
+        )
+    }
     config.serialPorts = [serialConfig]
 
     // M1: virtio-socket control device.
@@ -122,7 +138,12 @@ func makeConfiguration(
     }
     config.networkDevices = [networkDevice]
 
-    try config.validate()
+    do {
+        try config.validate()
+    } catch {
+        print("[vz-runner] configuration validation failed: \(error)")
+        throw error
+    }
     return config
 }
 

@@ -471,6 +471,14 @@ insmod /lib/modules/br_netfilter/br_netfilter.ko 2>/dev/null || true
 # Ensure mount propagation is private so runc can pivot_root into containers.
 mount --make-rprivate /
 
+# CNI's portmap plugin DNATs host ports to container IPs. When the original
+# source is on the same L3 segment as the guest (VZ NAT on the macOS host),
+# reply packets from the container bypass the DNAT host and the host drops
+# them. Masquerade DNATed TCP traffic so replies always return through the
+# guest, making localhost:PORT forwarding from the host work.
+iptables -t nat -C POSTROUTING -p tcp -m conntrack --ctstate DNAT -j MASQUERADE -m comment --comment "anvil-dnat-masq" 2>/dev/null || \
+iptables -t nat -A POSTROUTING -p tcp -m conntrack --ctstate DNAT -j MASQUERADE -m comment --comment "anvil-dnat-masq"
+
 # Restore containerd image cache from the host share before starting containerd.
 # This makes pulled images survive cold boots while keeping runtime on tmpfs.
 if [ -f /mnt/anvil/containerd-cache.tar.zst ]; then
@@ -486,6 +494,18 @@ echo "[stage2] starting containerd"
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     if [ -S /run/containerd/containerd.sock ]; then break; fi
     sleep 0.5
+done
+
+# Cold boot only: per-container nerdctl state (/var/lib/nerdctl) is on tmpfs and
+# is not persisted across boots. Restored containerd metadata would reference
+# missing state files (resolv.conf, hostname, etc.), causing those containers to
+# fail on start. Drop all stopped containers on cold boot so the VM starts with
+# a clean slate; images and snapshots survive in the persisted cache.
+echo "[stage2] cleaning up non-running containers from restored metadata"
+for ns in default $(/opt/containerd/bin/nerdctl namespace ls -q 2>/dev/null); do
+    for id in $(/opt/containerd/bin/nerdctl -n "$ns" ps -aq 2>/dev/null); do
+        /opt/containerd/bin/nerdctl -n "$ns" rm -f "$id" >/dev/null 2>&1 || true
+    done
 done
 
 # Start guest agent in foreground.

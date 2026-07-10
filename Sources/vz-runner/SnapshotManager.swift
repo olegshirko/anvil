@@ -80,8 +80,8 @@ struct SnapshotManager {
     }
 
     /// Remove the snapshot and config hash files but keep the sidecars
-    /// (machine identifier, hardware model, network config) so a newly saved
-    /// snapshot remains restorable with the same virtual hardware.
+    /// (machine identifier, network config) so a newly saved snapshot remains
+    /// restorable with the same virtual hardware.
     func removeSnapshotStatePreservingSidecars() {
         try? FileManager.default.removeItem(at: snapshotURL)
         try? FileManager.default.removeItem(at: configHashURL)

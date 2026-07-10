@@ -1,0 +1,55 @@
+# Одинаковый workload для всех backend'ов. Образы должны быть уже
+# затянуты (docker/nerdctl pull) ДО замера, иначе меряешь скорость
+# сети, а не рантайма. Прогони scripts/prepull.sh перед бенчем.
+#
+# Состав нарочно небольшой, но реалистичный: web + api + db + cache —
+# типичный docker-compose стек, который люди реально гоняют локально.
+
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  cache:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  api:
+    image: node:20-alpine
+    command: ["node", "-e", "require('http').createServer((q,r)=>r.end('ok')).listen(3000); console.log('ready')"]
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000 || exit 1"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  web:
+    image: nginx:alpine
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "18080:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80 || exit 1"]
+      interval: 1s
+      timeout: 2s
+      retries: 30

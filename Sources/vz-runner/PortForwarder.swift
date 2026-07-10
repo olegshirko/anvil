@@ -225,7 +225,7 @@ private final class Listener {
             var addr = sockaddr_in6()
             addr.sin6_family = sa_family_t(AF_INET6)
             addr.sin6_port = in_port_t(self.mapping.hostPort).bigEndian
-            addr.sin6_addr = in6addr_loopback
+            addr.sin6_addr = in6addr_any
 
             let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
                 ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
