@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -364,6 +366,14 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 		return "", err
 	}
 
+	// nerdctl leaves stale name-to-ID files in /var/lib/nerdctl when its metadata
+	// and containerd's bolt DB drift (e.g. after cold boot or forced cleanup).
+	// Remove any existing name-store file for this name before create, otherwise
+	// `nerdctl create --name <name>` fails with "name ... is already used".
+	if name != "" {
+		removeNerdctlNameStoreByName(ns, name)
+	}
+
 	// Docker refuses duplicate names; mimic that to avoid ambiguous lookups later.
 	if name != "" {
 		if existing, err := findContainerByName(ns, name); err == nil && existing != "" {
@@ -593,6 +603,62 @@ func handleContainerWait(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 // deleteDockerContainer removes a container by Docker ID or name.
+// removeNerdctlNameStore removes stale name-to-ID mappings that nerdctl leaves
+// behind after `nerdctl rm`. Without this, `nerdctl create --name <name>` later
+// fails with "name <name> is already used by ID <id>".
+// nerdctl stores names under /var/lib/nerdctl/<datastore>/<namespace>/<name>.
+func removeNerdctlNameStore(ns, containerdID string) {
+	base := "/var/lib/nerdctl"
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		nsDir := filepath.Join(base, e.Name(), ns)
+		subs, err := os.ReadDir(nsDir)
+		if err != nil {
+			continue
+		}
+		for _, sub := range subs {
+			if sub.IsDir() {
+				continue
+			}
+			path := filepath.Join(nsDir, sub.Name())
+			data, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			if strings.TrimSpace(string(data)) == containerdID {
+				_ = os.Remove(path)
+			}
+		}
+	}
+}
+
+// removeNerdctlNameStoreByName removes any name-store file for the given
+// namespace and container name, regardless of which container ID it points to.
+// This fixes drift between containerd metadata and nerdctl's name store after
+// cold boot or snapshot resume.
+func removeNerdctlNameStoreByName(ns, name string) {
+	base := "/var/lib/nerdctl"
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		path := filepath.Join(base, e.Name(), ns, name)
+		if _, err := os.Stat(path); err == nil {
+			_ = os.Remove(path)
+		}
+	}
+}
+
 func deleteDockerContainer(id string, force bool) error {
 	ns, containerdID, _, err := resolveDockerID(id)
 	if err != nil {
@@ -608,6 +674,7 @@ func deleteDockerContainer(id string, force bool) error {
 	if err != nil || code != 0 {
 		return fmt.Errorf("nerdctl rm failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
 	}
+	removeNerdctlNameStore(ns, containerdID)
 	stopHealthCheck(did)
 	unmarkAutoRemove(did)
 	takeContainerExitCode(did)

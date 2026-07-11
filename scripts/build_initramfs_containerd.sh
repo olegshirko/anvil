@@ -573,11 +573,11 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     sleep 0.5
 done
 
-# Cold boot only: per-container nerdctl state (/var/lib/nerdctl) is on tmpfs and
-# is not persisted across boots. Restored containerd metadata would reference
-# missing state files (resolv.conf, hostname, etc.), causing those containers to
-# fail on start. Drop all containers on cold boot so the VM starts with a clean
-# slate; images and snapshots survive in the persisted cache.
+# Cold boot only: per-container nerdctl state (/var/lib/nerdctl) is persisted
+# on disk. Restored containerd metadata would reference missing or stale state
+# files, causing containers to fail on start. Drop all containers on cold boot
+# so the VM starts with a clean slate; images, snapshots and volumes survive in
+# the persisted cache.
 # Use the low-level `ctr` client instead of `nerdctl rm` so a stuck OCI hook or
 # shim cannot block the whole boot process.
 echo "[stage2] cleaning up containers from restored metadata"
@@ -594,6 +594,13 @@ for ns in $(/opt/containerd/bin/ctr namespace ls -q 2>/dev/null); do
         /opt/containerd/bin/ctr -n "$ns" t rm -f "$id" >/dev/null 2>&1 || true
         /opt/containerd/bin/ctr -n "$ns" c rm "$id" >/dev/null 2>&1 || true
     done
+done
+
+# ctr rm does not clean nerdctl's name-store files. Stale name-to-ID mappings
+# survive on the persisted disk and block docker compose from reusing names.
+# Name files live at /var/lib/nerdctl/<datastore>/<namespace>/<name>.
+find /var/lib/nerdctl -mindepth 4 -maxdepth 4 -type f 2>/dev/null | while read f; do
+    rm -f "$f"
 done
 
 # Start guest agent in foreground.
