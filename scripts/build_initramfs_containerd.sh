@@ -481,10 +481,11 @@ mountpoint -q /sys/fs/cgroup || mount -t cgroup2 cgroup2 /sys/fs/cgroup
 mkdir -p /mnt/anvil
 mountpoint -q /mnt/anvil || mount -t virtiofs anvil /mnt/anvil 2>/dev/null || true
 
-# containerd root: prefer a virtio-blk disk (full POSIX semantics, keeps the
-# memory snapshot small), fall back to a virtiofs bind-mount, then to tmpfs.
-mkdir -p /var/lib/containerd
-mountpoint -q /var/lib/containerd || {
+# Persistent state: mount the virtio-blk disk (or virtiofs share) over /var/lib
+# so both containerd root (/var/lib/containerd) and nerdctl metadata/volumes
+# (/var/lib/nerdctl) survive reboots and resume, instead of filling tmpfs root.
+mkdir -p /var/lib
+mountpoint -q /var/lib || {
     # Load ext4 modules for the optional persistent block disk.
     insmod /lib/modules/crc16/crc16.ko 2>/dev/null || true
     insmod /lib/modules/mbcache/mbcache.ko 2>/dev/null || true
@@ -493,8 +494,8 @@ mountpoint -q /var/lib/containerd || {
     # The first virtio-blk device is exposed as /dev/vda inside the VM.
     for blk in /dev/vda /dev/vdb /dev/vdc; do
         if [ -b "$blk" ]; then
-            if mount -t ext4 -o defaults "$blk" /var/lib/containerd 2>/dev/null; then
-                echo "[stage2] mounted $blk as /var/lib/containerd"
+            if mount -t ext4 -o defaults "$blk" /var/lib 2>/dev/null; then
+                echo "[stage2] mounted $blk as /var/lib"
                 break
             fi
         fi
@@ -502,19 +503,22 @@ mountpoint -q /var/lib/containerd || {
 }
 
 # If no block disk is available, persist on the virtiofs host share.
-if ! mountpoint -q /var/lib/containerd; then
-    mkdir -p /mnt/anvil/containerd-root
+if ! mountpoint -q /var/lib; then
+    mkdir -p /mnt/anvil/var-lib
 
     # One-time migration: if an old tarball cache exists and the persisted root is
     # empty, extract the tarball into the virtiofs directory.
-    if [ -f /mnt/anvil/containerd-cache.tar.zst ] && [ -z "$(ls -A /mnt/anvil/containerd-root 2>/dev/null)" ]; then
+    if [ -f /mnt/anvil/containerd-cache.tar.zst ] && [ -z "$(ls -A /mnt/anvil/var-lib 2>/dev/null)" ]; then
         echo "[stage2] migrating containerd cache from tarball to virtiofs directory"
-        /bin/zstd -dc /mnt/anvil/containerd-cache.tar.zst | tar -xf - -C /mnt/anvil/containerd-root
+        mkdir -p /mnt/anvil/var-lib/containerd
+        /bin/zstd -dc /mnt/anvil/containerd-cache.tar.zst | tar -xf - -C /mnt/anvil/var-lib/containerd
     fi
 
-    mount --bind /mnt/anvil/containerd-root /var/lib/containerd
-    echo "[stage2] containerd root bound to virtiofs share"
+    mount --bind /mnt/anvil/var-lib /var/lib
+    echo "[stage2] /var/lib bound to virtiofs share"
 fi
+
+mkdir -p /var/lib/containerd /var/lib/nerdctl /var/lib/cni
 
 # Load netfilter modules so CNI bridge/portmap/firewall and iptables-nft work.
 # Order matters: load dependencies before dependents.

@@ -152,14 +152,18 @@ func makeConfiguration(
     }
     config.networkDevices = [networkDevice]
 
-    // M8: persistent block device for /var/lib/containerd. Images and
-    // snapshots live on disk, so the VM needs less RAM and the memory-only
-    // snapshot stays small.
+    // M8: persistent block device for /var/lib. Images and snapshots live on
+    // disk, so the VM needs less RAM and the memory-only snapshot stays small.
+    // Use host writeback caching + guest-fsync synchronization: this keeps the
+    // disk safe on normal shutdown while avoiding a host flush on every guest
+    // metadata operation (the default .full mode makes nerdctl/docker ps slow).
     if let diskPath = args.containerdDiskPath {
         let diskURL = URL(fileURLWithPath: diskPath)
         let attachment = try VZDiskImageStorageDeviceAttachment(
             url: diskURL,
-            readOnly: false
+            readOnly: false,
+            cachingMode: .cached,
+            synchronizationMode: .fsync
         )
         let blockDevice = VZVirtioBlockDeviceConfiguration(attachment: attachment)
         config.storageDevices = [blockDevice]

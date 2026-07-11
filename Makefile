@@ -265,8 +265,8 @@ boot-containerd-fresh: sign initramfs-containerd
 #   make bench BENCH_BACKENDS="vz-runner lima colima"
 BENCH_BACKENDS ?= vz-runner
 
-bench harness: sign
+bench harness harness-tests: sign
 	@VZRUNNER_BIN="$(CURDIR)/$(BINARY)" bash "$(CURDIR)/bench-harness/run_bench.sh" $(BENCH_BACKENDS)
 
-bench-prepull: sign
+bench-prepull harness-prepull: sign
 	@VZRUNNER_BIN="$(CURDIR)/$(BINARY)" bash "$(CURDIR)/bench-harness/scripts/prepull.sh" vz-runner
