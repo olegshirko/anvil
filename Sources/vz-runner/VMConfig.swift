@@ -11,6 +11,12 @@ struct BootArgs {
     var memoryGiB: UInt64 = 2
     var cpuCount: Int = 2
     var consoleOutputPath: String?
+    /// Path to a host disk image that will be attached to the VM and used
+    /// for /var/lib/containerd. Keeping containerd state on a block device
+    /// removes the tmpfs memory pressure and shrinks the VM memory snapshot.
+    var containerdDiskPath: String?
+    /// Enable verbose logging for the docker proxy and related host-side paths.
+    var debug: Bool = false
 }
 
 func parseBootArgs(_ raw: [String]) -> BootArgs? {
@@ -21,8 +27,10 @@ func parseBootArgs(_ raw: [String]) -> BootArgs? {
     var sharePath: String?
     var mountTag: String = "anvil"
     var consoleOutputPath: String?
+    var containerdDiskPath: String?
     var cpus: Int = 2
     var memory: UInt64 = 2
+    var debug = false
 
     var it = raw.makeIterator()
     while let a = it.next() {
@@ -41,10 +49,14 @@ func parseBootArgs(_ raw: [String]) -> BootArgs? {
             if let v = it.next() { mountTag = v }
         case "--console":
             consoleOutputPath = it.next()
+        case "--containerd-disk":
+            containerdDiskPath = it.next()
         case "--cpus":
             if let v = it.next() { cpus = Int(v) ?? cpus }
         case "--memory":
             if let v = it.next() { memory = UInt64(v) ?? memory }
+        case "--debug":
+            debug = true
         case "--help", "-h":
             return nil
         default:
@@ -64,7 +76,9 @@ func parseBootArgs(_ raw: [String]) -> BootArgs? {
         mountTag: mountTag,
         memoryGiB: memory,
         cpuCount: cpus,
-        consoleOutputPath: consoleOutputPath
+        consoleOutputPath: consoleOutputPath,
+        containerdDiskPath: containerdDiskPath,
+        debug: debug
     )
 }
 
@@ -137,6 +151,19 @@ func makeConfiguration(
         networkDevice.macAddress = addr
     }
     config.networkDevices = [networkDevice]
+
+    // M8: persistent block device for /var/lib/containerd. Images and
+    // snapshots live on disk, so the VM needs less RAM and the memory-only
+    // snapshot stays small.
+    if let diskPath = args.containerdDiskPath {
+        let diskURL = URL(fileURLWithPath: diskPath)
+        let attachment = try VZDiskImageStorageDeviceAttachment(
+            url: diskURL,
+            readOnly: false
+        )
+        let blockDevice = VZVirtioBlockDeviceConfiguration(attachment: attachment)
+        config.storageDevices = [blockDevice]
+    }
 
     do {
         try config.validate()

@@ -31,10 +31,8 @@ services:
     image: node:20-alpine
     command: ["node", "-e", "require('http').createServer((q,r)=>r.end('ok')).listen(3000); console.log('ready')"]
     depends_on:
-      db:
-        condition: service_healthy
-      cache:
-        condition: service_healthy
+      - db
+      - cache
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:3000 || exit 1"]
       interval: 1s
@@ -44,8 +42,7 @@ services:
   web:
     image: nginx:alpine
     depends_on:
-      api:
-        condition: service_healthy
+      - api
     ports:
       - "18080:80"
     healthcheck:

@@ -18,9 +18,12 @@ final class ControlServer {
     var onClientConnect: (() -> Void)?
     var onClientDisconnect: (() -> Void)?
 
-    init(socketPath: String, deviceProvider: @escaping () -> VZVirtioSocketDevice?) {
+    private let debug: Bool
+
+    init(socketPath: String, deviceProvider: @escaping () -> VZVirtioSocketDevice?, debug: Bool = false) {
         self.socketPath = socketPath
         self.deviceProvider = deviceProvider
+        self.debug = debug
     }
 
     deinit {
@@ -146,9 +149,17 @@ final class ControlServer {
             return
         }
 
+        if debug,
+           let req = try? JSONDecoder().decode(ControlRequest.self, from: body) {
+            print("[control] command=\(req.cmd) args=\(req.args ?? [])")
+        }
+
         do {
             try writeExactlyFD(vfd, data: lengthData + body)
             let resp = try decodeLengthPrefixedFD(ControlResponse.self, fd: vfd)
+            if debug {
+                print("[control] response exit=\(resp.exitCode ?? -1) error=\(resp.error ?? "")")
+            }
             let data = try encodeLengthPrefixed(resp)
             _ = data.withUnsafeBytes { write(clientFd, $0.baseAddress, $0.count) }
         } catch {

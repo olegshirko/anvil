@@ -10,12 +10,19 @@ import Virtualization
 final class DockerProxyServer {
     private let socketPath: String
     private let deviceProvider: () -> VZVirtioSocketDevice?
+    private let resumeProvider: () -> Void
+    private let debug: Bool
     private var fd: Int32 = -1
     private let lock = NSLock()
 
-    init(socketPath: String, deviceProvider: @escaping () -> VZVirtioSocketDevice?) {
+    var onClientConnect: (() -> Void)?
+    var onClientDisconnect: (() -> Void)?
+
+    init(socketPath: String, deviceProvider: @escaping () -> VZVirtioSocketDevice?, resumeProvider: @escaping () -> Void = {}, debug: Bool = false) {
         self.socketPath = socketPath
         self.deviceProvider = deviceProvider
+        self.resumeProvider = resumeProvider
+        self.debug = debug
     }
 
     deinit {
@@ -84,7 +91,22 @@ final class DockerProxyServer {
     // MARK: - Private
 
     private func handleClient(fd clientFd: Int32) {
-        defer { close(clientFd) }
+        DispatchQueue.main.async { [weak self] in
+            self?.onClientConnect?()
+        }
+        defer {
+            close(clientFd)
+            DispatchQueue.main.async { [weak self] in
+                self?.onClientDisconnect?()
+            }
+        }
+
+        // Ask the daemon to resume the VM if it is paused. The ControlServer
+        // does this for its own clients, but docker.sock clients bypass it.
+        resumeProvider()
+        if debug {
+            print("[docker-proxy] client connected")
+        }
 
         guard let device = deviceProvider() else {
             print("[docker-proxy] vm not ready, closing client")
@@ -112,7 +134,15 @@ final class DockerProxyServer {
             print("[docker-proxy] vsock connect failed, closing client")
             return
         }
-        defer { conn.close() }
+        if debug {
+            print("[docker-proxy] vsock connected, proxying")
+        }
+        defer {
+            conn.close()
+            if debug {
+                print("[docker-proxy] client disconnected")
+            }
+        }
 
         let vfd = conn.fileDescriptor
         let group = DispatchGroup()
@@ -121,11 +151,16 @@ final class DockerProxyServer {
         group.enter()
         DispatchQueue.global().async {
             var buf = [UInt8](repeating: 0, count: 65536)
+            var total: Int = 0
             while true {
                 let n = read(clientFd, &buf, buf.count)
                 if n <= 0 { break }
+                total += n
                 let written = buf.withUnsafeBytes { write(vfd, $0.baseAddress, n) }
                 if written < 0 { break }
+            }
+            if self.debug {
+                print("[docker-proxy] host -> guest: \(total) bytes")
             }
             _ = shutdown(vfd, Int32(SHUT_WR))
             group.leave()
@@ -135,11 +170,16 @@ final class DockerProxyServer {
         group.enter()
         DispatchQueue.global().async {
             var buf = [UInt8](repeating: 0, count: 65536)
+            var total: Int = 0
             while true {
                 let n = read(vfd, &buf, buf.count)
                 if n <= 0 { break }
+                total += n
                 let written = buf.withUnsafeBytes { write(clientFd, $0.baseAddress, n) }
                 if written < 0 { break }
+            }
+            if self.debug {
+                print("[docker-proxy] guest -> host: \(total) bytes")
             }
             _ = shutdown(clientFd, Int32(SHUT_WR))
             group.leave()

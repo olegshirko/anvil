@@ -1,10 +1,14 @@
 .PHONY: all build sign clean test \
     daemon stop-daemon \
+    service-install service-uninstall service-start service-stop service-restart service-status \
+    service-debug service-debug-rebuild rebuild-all \
+    docker-context-anvil docker-context-lima \
     boot boot-alpine boot-ubuntu boot-containerd \
     download-alpine extract-alpine-kernel \
     download-ubuntu ubuntu-modules \
     guest-agent initramfs-agent initramfs-ubuntu initramfs-containerd \
-    container-tools time-boot time-service validate
+    container-tools time-boot time-service validate \
+    bench bench-prepull harness prune clean-containers
 
 BINARY := .build/release/vz-runner
 ENTITLEMENTS := entitlements.plist
@@ -27,6 +31,77 @@ stop-daemon:
 	else \
 	    echo "[vz-runner] no daemon pid file"; \
 	fi
+
+# -----------------------------------------------------------------------------
+# macOS service: LaunchAgent + shell wrapper
+# -----------------------------------------------------------------------------
+
+LAUNCHAGENT_LABEL := com.olegshirko.anvil
+LAUNCHAGENT_PLIST := scripts/$(LAUNCHAGENT_LABEL).plist
+LAUNCHAGENT_DIR := $(HOME)/Library/LaunchAgents
+LAUNCHAGENT_DST := $(LAUNCHAGENT_DIR)/$(LAUNCHAGENT_LABEL).plist
+
+service-install:
+	@mkdir -p "$(LAUNCHAGENT_DIR)"
+	cp "$(LAUNCHAGENT_PLIST)" "$(LAUNCHAGENT_DST)"
+	launchctl unload "$(LAUNCHAGENT_DST)" 2>/dev/null || true
+	launchctl load "$(LAUNCHAGENT_DST)"
+	@echo "[anvil-service] LaunchAgent installed. It will start automatically on next login."
+
+service-uninstall:
+	@launchctl unload "$(LAUNCHAGENT_DST)" 2>/dev/null || true
+	@rm -f "$(LAUNCHAGENT_DST)"
+	@echo "[anvil-service] LaunchAgent uninstalled."
+
+service-start:
+	@scripts/anvil-service.sh start
+
+service-stop:
+	@scripts/anvil-service.sh stop
+
+service-restart:
+	@scripts/anvil-service.sh restart
+
+service-status:
+	@scripts/anvil-service.sh status
+
+# Rebuild Swift binary, guest-agent and the containerd initramfs in one go.
+rebuild-all: sign initramfs-containerd
+	@echo "[anvil] rebuild complete: $(BINARY), guest-agent, initramfs"
+
+# Stop the service, invalidate the saved VM snapshot and restart in debug mode.
+# Debug logs from guest-agent are written to $(SHARE_ROOT)/guest-agent.log.
+service-debug:
+	@$(MAKE) service-stop
+	@rm -rf $(HOME)/.anvil-vz/snapshots
+	@DEBUG=1 $(MAKE) service-start
+
+# Rebuild everything (Swift binary, guest-agent, initramfs), then restart the
+# service in debug mode with a fresh VM snapshot.
+service-debug-rebuild: rebuild-all service-debug
+
+# Switch Docker CLI context. LIMA_DOCKER_CONTEXT can be overridden, e.g.
+# make docker-context-lima LIMA_DOCKER_CONTEXT=lima.
+LIMA_DOCKER_CONTEXT ?= default
+docker-context-lima:
+	@docker context use $(LIMA_DOCKER_CONTEXT)
+	@echo "[anvil] docker context: $(LIMA_DOCKER_CONTEXT)"
+
+docker-context-anvil:
+	@docker context use anvil
+	@echo "[anvil] docker context: anvil"
+
+# Prune leftover containers, volumes and images inside the anvil VM.
+# Useful because `docker run --rm` is not yet implemented; test leftovers can
+# fill the persistent containerd disk and break subsequent compose runs.
+prune clean-containers:
+	@containers=$$(docker --context anvil ps -aq 2>/dev/null); \
+	if [ -n "$$containers" ]; then \
+	    docker --context anvil rm -f $$containers >/dev/null; \
+	fi
+	@docker --context anvil volume prune -f >/dev/null 2>&1 || true
+	@docker --context anvil system prune -af --volumes >/dev/null 2>&1 || true
+	@echo "[anvil] pruned containers, volumes and images"
 
 clean:
 	rm -rf .build .download .venv
@@ -113,7 +188,7 @@ boot-ubuntu: boot
 # -----------------------------------------------------------------------------
 CONTAINER_TOOLS_DIR := .download/container-tools
 CONTAINERD_URL := https://github.com/containerd/containerd/releases/download/v2.0.0/containerd-static-2.0.0-linux-arm64.tar.gz
-NERDCTL_URL := https://github.com/containerd/nerdctl/releases/download/v2.0.0/nerdctl-2.0.0-linux-arm64.tar.gz
+NERDCTL_URL := https://github.com/containerd/nerdctl/releases/download/v2.0.4/nerdctl-2.0.4-linux-arm64.tar.gz
 RUNC_URL := https://github.com/opencontainers/runc/releases/download/v1.2.0/runc.arm64
 CNI_PLUGINS_URL := https://github.com/containernetworking/plugins/releases/download/v1.6.0/cni-plugins-linux-arm64-v1.6.0.tgz
 DOCKER_URL := https://download.docker.com/linux/static/stable/aarch64/docker-29.6.1.tgz
@@ -181,3 +256,17 @@ boot-containerd: sign
 # Explicit cold-boot target that rebuilds the initramfs first.
 boot-containerd-fresh: sign initramfs-containerd
 	$(BINARY) boot --kernel $(UBUNTU_KERNEL) --initrd $(UBUNTU_INITRD_CONTAINERD) --agent --share /tmp/anvil-share --fresh
+
+# -----------------------------------------------------------------------------
+# Bench harness
+# -----------------------------------------------------------------------------
+
+# Backends to benchmark. Override, e.g.:
+#   make bench BENCH_BACKENDS="vz-runner lima colima"
+BENCH_BACKENDS ?= vz-runner
+
+bench harness: sign
+	@VZRUNNER_BIN="$(CURDIR)/$(BINARY)" bash "$(CURDIR)/bench-harness/run_bench.sh" $(BENCH_BACKENDS)
+
+bench-prepull: sign
+	@VZRUNNER_BIN="$(CURDIR)/$(BINARY)" bash "$(CURDIR)/bench-harness/scripts/prepull.sh" vz-runner

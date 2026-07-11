@@ -29,7 +29,7 @@ TS="$(date +%Y%m%d-%H%M%S)"
 CSV="$RESULTS_DIR/$TS.csv"
 MD="$RESULTS_DIR/latest.md"
 
-ALL_BACKENDS=(vz-runner colima orbstack docker-desktop)
+ALL_BACKENDS=(vz-runner lima colima orbstack docker-desktop)
 
 if [[ $# -eq 0 ]]; then
     echo "Usage: $0 <backend...> | all"

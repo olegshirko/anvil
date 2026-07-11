@@ -21,24 +21,24 @@ struct SnapshotManager {
             && FileManager.default.fileExists(atPath: configHashURL.path)
     }
 
-    func configHashMatches(kernel: String, initrd: String, cpus: Int, memory: UInt64) -> Bool {
+    func configHashMatches(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?) -> Bool {
         guard let stored = try? String(contentsOf: configHashURL, encoding: .utf8) else {
             return false
         }
-        let components = configHashComponents(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory)
+        let components = configHashComponents(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory, containerdDiskPath: containerdDiskPath)
         let current = components.hash
         let storedClean = stored.trimmingCharacters(in: .whitespacesAndNewlines)
         print("[vz-runner] stored config hash: \(storedClean)")
         print("[vz-runner] current config hash: \(current)")
-        print("[vz-runner] hash inputs -> kernel:\(components.kernelSHA) initrd:\(components.initrdSHA) cpus:\(components.cpus) memory:\(components.memory)")
+        print("[vz-runner] hash inputs -> kernel:\(components.kernelSHA) initrd:\(components.initrdSHA) cpus:\(components.cpus) memory:\(components.memory) disk:\(components.diskToken)")
         return storedClean == current
     }
 
     @discardableResult
-    func writeConfigHash(kernel: String, initrd: String, cpus: Int, memory: UInt64) -> Bool {
-        let components = configHashComponents(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory)
+    func writeConfigHash(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?) -> Bool {
+        let components = configHashComponents(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory, containerdDiskPath: containerdDiskPath)
         print("[vz-runner] writing config hash: \(components.hash)")
-        print("[vz-runner] hash inputs -> kernel:\(components.kernelSHA) initrd:\(components.initrdSHA) cpus:\(components.cpus) memory:\(components.memory)")
+        print("[vz-runner] hash inputs -> kernel:\(components.kernelSHA) initrd:\(components.initrdSHA) cpus:\(components.cpus) memory:\(components.memory) disk:\(components.diskToken)")
         do {
             try components.hash.write(to: configHashURL, atomically: true, encoding: .utf8)
             return true
@@ -53,15 +53,29 @@ struct SnapshotManager {
         let initrdSHA: String
         let cpus: Int
         let memory: UInt64
+        let diskToken: String
         let hash: String
     }
 
-    private func configHashComponents(kernel: String, initrd: String, cpus: Int, memory: UInt64) -> HashComponents {
+    private func configHashComponents(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?) -> HashComponents {
         let kernelSHA = sha256OfFile(kernel) ?? "missing"
         let initrdSHA = sha256OfFile(initrd) ?? "missing"
-        let input = "\(kernelSHA):\(initrdSHA):\(cpus):\(memory)"
+        let diskToken = diskToken(for: containerdDiskPath)
+        let input = "\(kernelSHA):\(initrdSHA):\(cpus):\(memory):\(diskToken)"
         let hash = SHA256.hash(data: Data(input.utf8)).compactMap { String(format: "%02x", $0) }.joined()
-        return HashComponents(kernelSHA: kernelSHA, initrdSHA: initrdSHA, cpus: cpus, memory: memory, hash: hash)
+        return HashComponents(kernelSHA: kernelSHA, initrdSHA: initrdSHA, cpus: cpus, memory: memory, diskToken: diskToken, hash: hash)
+    }
+
+    private func diskToken(for path: String?) -> String {
+        guard let path = path, !path.isEmpty else {
+            return "nodisk"
+        }
+        let url = URL(fileURLWithPath: path)
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? NSNumber else {
+            return "missing:\(path)"
+        }
+        return "\(path):\(size)"
     }
 
     private func sha256OfFile(_ path: String) -> String? {

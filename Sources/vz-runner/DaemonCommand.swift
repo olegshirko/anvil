@@ -45,15 +45,16 @@ enum DaemonCommand {
         try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
 
         let pidFile = daemonPIDFile
+        let ownPid = getpid()
         if let data = try? Data(contentsOf: pidFile),
            let s = String(data: data, encoding: .utf8),
            let pid = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)),
+           pid != ownPid,
            kill(pid, 0) == 0 {
             return false
         }
 
-        let pid = getpid()
-        if let data = String(pid).data(using: .utf8) {
+        if let data = String(ownPid).data(using: .utf8) {
             try? data.write(to: pidFile, options: .atomic)
         }
         return true
@@ -67,6 +68,7 @@ enum DaemonCommand {
     private struct DaemonCLIArgs {
         var bootArgs: BootArgs
         var idleSeconds: TimeInterval
+        var debug: Bool
     }
 
     private static func parseDaemonArgs(_ raw: [String]) -> DaemonCLIArgs {
@@ -77,6 +79,8 @@ enum DaemonCommand {
         var cpus: Int = 2
         var memory: UInt64 = 2
         var idleSeconds: TimeInterval = 60
+        var containerdDiskPath: String?
+        var debug = false
 
         var it = raw.makeIterator()
         while let a = it.next() {
@@ -97,6 +101,10 @@ enum DaemonCommand {
                 if let v = it.next(), let n = TimeInterval(v) {
                     idleSeconds = n
                 }
+            case "--containerd-disk":
+                containerdDiskPath = it.next()
+            case "--debug":
+                debug = true
             default:
                 break
             }
@@ -113,9 +121,11 @@ enum DaemonCommand {
                 mountTag: mountTag,
                 memoryGiB: memory,
                 cpuCount: cpus,
-                consoleOutputPath: stateDir.appendingPathComponent("console.log").path
+                consoleOutputPath: stateDir.appendingPathComponent("console.log").path,
+                containerdDiskPath: containerdDiskPath
             ),
-            idleSeconds: idleSeconds
+            idleSeconds: idleSeconds,
+            debug: debug
         )
     }
 
@@ -128,12 +138,53 @@ enum DaemonCommand {
         private var idleTimer: Timer?
         private var isShuttingDown = false
         private let cacheManager: ContainerdCacheManager?
+        private var clientTracker: ClientTracker?
 
         init(manager: VMLifecycleManager, idleSeconds: TimeInterval) {
             self.manager = manager
             self.idleSeconds = idleSeconds
             self.cacheManager = ContainerdCacheManager(sharePath: manager.args.sharePath)
             manager.delegate = self
+        }
+
+        /// Shared counter for control-socket and docker-socket clients. Both must
+        /// keep the VM awake; previously only control clients were counted, so long
+        /// docker compose / test runs could idle-timeout in the middle of work.
+        private final class ClientTracker {
+            private let lock = NSLock()
+            private var count = 0
+            private let idleSeconds: TimeInterval
+            private let scheduleIdle: () -> Void
+            private let cancelIdle: () -> Void
+
+            init(idleSeconds: TimeInterval, scheduleIdle: @escaping () -> Void, cancelIdle: @escaping () -> Void) {
+                self.idleSeconds = idleSeconds
+                self.scheduleIdle = scheduleIdle
+                self.cancelIdle = cancelIdle
+            }
+
+            var isIdle: Bool {
+                lock.lock(); defer { lock.unlock() }
+                return count == 0
+            }
+
+            func connect() {
+                var wasZero = false
+                lock.lock()
+                count += 1
+                wasZero = count == 1
+                lock.unlock()
+                if wasZero { cancelIdle() }
+            }
+
+            func disconnect() {
+                var isZero = false
+                lock.lock()
+                count -= 1
+                isZero = count == 0
+                lock.unlock()
+                if isZero { scheduleIdle() }
+            }
         }
 
         func start() {
@@ -145,36 +196,78 @@ enum DaemonCommand {
             guard !isShuttingDown else { return }
             isShuttingDown = true
             idleTimer?.invalidate()
-            server?.stop()
-            dockerProxyServer?.stop()
-            portForwarder?.stop()
-            // Save the VM snapshot first (this must run on the main queue),
-            // then sync the containerd cache before exiting.
-            manager.stopAndSave { [weak self] in
+            // Sync the containerd cache and drop guest page caches *before*
+            // pausing/saving the VM. With containerd on a block disk the sync
+            // is a no-op, but dropping caches shrinks the memory snapshot.
+            // Run off the main queue so the run loop keeps the control server
+            // alive for the guest exec calls.
+            DispatchQueue.global().async { [weak self] in
                 self?.cacheManager?.sync()
-                releaseDaemonLock()
-                exit(0)
+                GuestCacheDropper.dropCaches()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.server?.stop()
+                    self.dockerProxyServer?.stop()
+                    self.portForwarder?.stop()
+                    self.manager.stopAndSave {
+                        releaseDaemonLock()
+                        exit(0)
+                    }
+                }
             }
         }
 
         // MARK: - VMLifecycleManagerDelegate
 
         func vmLifecycleManagerDidBecomeReady(_ manager: VMLifecycleManager) {
-            let server = ControlServer(socketPath: controlSocketPath) { [weak manager] in
+            let tracker = ClientTracker(
+                idleSeconds: idleSeconds,
+                scheduleIdle: { [weak self] in self?.scheduleIdleTimer() },
+                cancelIdle: { [weak self] in
+                    self?.idleTimer?.invalidate()
+                    self?.idleTimer = nil
+                }
+            )
+            self.clientTracker = tracker
+
+            let server = ControlServer(socketPath: controlSocketPath, deviceProvider: { [weak manager] in
                 manager?.socketDevice
-            }
+            }, debug: manager.args.debug)
             server.onClientConnect = { [weak self] in
-                self?.clientDidConnect()
+                tracker.connect()
+                self?.manager.ensureRunning { result in
+                    if case .failure(let error) = result {
+                        print("[vz-runner] resume on control client connect failed: \(error)")
+                    }
+                }
             }
             server.onClientDisconnect = { [weak self] in
-                self?.clientDidDisconnect()
+                tracker.disconnect()
             }
             server.start()
             self.server = server
             print("[vz-runner] daemon ready, control socket: \(controlSocketPath)")
 
-            let dockerProxy = DockerProxyServer(socketPath: dockerSocketPath) { [weak manager] in
-                manager?.socketDevice
+            let dockerProxy = DockerProxyServer(
+                socketPath: dockerSocketPath,
+                deviceProvider: { [weak manager] in manager?.socketDevice },
+                resumeProvider: { [weak manager] in
+                    let sem = DispatchSemaphore(value: 0)
+                    manager?.ensureRunning { result in
+                        if case .failure(let error) = result {
+                            print("[docker-proxy] resume request failed: \(error)")
+                        }
+                        sem.signal()
+                    }
+                    _ = sem.wait(timeout: .now() + .seconds(15))
+                },
+                debug: manager.args.debug
+            )
+            dockerProxy.onClientConnect = {
+                tracker.connect()
+            }
+            dockerProxy.onClientDisconnect = {
+                tracker.disconnect()
             }
             dockerProxy.start()
             self.dockerProxyServer = dockerProxy
@@ -185,7 +278,7 @@ enum DaemonCommand {
             self.portForwarder = forwarder
 
             // Start the idle timer if no client connected while the VM was starting.
-            if server.clientsCount == 0 {
+            if tracker.isIdle {
                 scheduleIdleTimer()
             }
         }
@@ -202,29 +295,6 @@ enum DaemonCommand {
 
         // MARK: - Idle handling
 
-        private func clientDidConnect() {
-            DispatchQueue.main.async { [weak self] in
-                self?.idleTimer?.invalidate()
-                self?.idleTimer = nil
-            }
-
-            // If the VM is paused because of a previous idle timeout, resume it
-            // before the request handler tries to open a vsock connection.
-            let sem = DispatchSemaphore(value: 0)
-            manager.ensureRunning { result in
-                if case .failure(let error) = result {
-                    print("[vz-runner] resume on client connect failed: \(error)")
-                }
-                sem.signal()
-            }
-            _ = sem.wait(timeout: .now() + .seconds(15))
-        }
-
-        private func clientDidDisconnect() {
-            guard !isShuttingDown else { return }
-            scheduleIdleTimer()
-        }
-
         private func scheduleIdleTimer() {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
@@ -239,6 +309,7 @@ enum DaemonCommand {
             guard !isShuttingDown, (server?.clientsCount ?? 0) == 0 else { return }
             print("[vz-runner] idle timeout reached, syncing containerd cache...")
             cacheManager?.sync()
+            GuestCacheDropper.dropCaches()
             print("[vz-runner] pausing VM...")
             manager.pause { [weak self] result in
                 guard let self = self else { return }

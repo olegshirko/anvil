@@ -156,7 +156,8 @@ final class VMLifecycleManager: NSObject {
                 kernel: self.args.kernelPath,
                 initrd: self.args.initrdPath,
                 cpus: self.args.cpuCount,
-                memory: self.args.memoryGiB
+                memory: self.args.memoryGiB,
+                containerdDiskPath: self.args.containerdDiskPath
             )
             print("[vz-runner] snapshot saved in \(String(format: "%.3f", duration))s")
             completion?(nil)
@@ -173,7 +174,8 @@ final class VMLifecycleManager: NSObject {
                 kernel: self.args.kernelPath,
                 initrd: self.args.initrdPath,
                 cpus: self.args.cpuCount,
-                memory: self.args.memoryGiB
+                memory: self.args.memoryGiB,
+                containerdDiskPath: self.args.containerdDiskPath
             )
             print("[vz-runner] snapshot exists=\(self.snapshot.hasSnapshot) hashMatches=\(hashMatches)")
 
@@ -222,7 +224,8 @@ final class VMLifecycleManager: NSObject {
             kernel: args.kernelPath,
             initrd: args.initrdPath,
             cpus: args.cpuCount,
-            memory: args.memoryGiB
+            memory: args.memoryGiB,
+            containerdDiskPath: args.containerdDiskPath
         )
         let canRestore = args.useAgent
             && !args.fresh
@@ -293,7 +296,7 @@ final class VMLifecycleManager: NSObject {
                                                                          userInfo: [NSLocalizedDescriptionKey: "virtio socket device not found"]))
             return
         }
-        let deadline = Date().addingTimeInterval(30)
+        let deadline = Date().addingTimeInterval(120)
 
         func attempt() {
             guard Date() < deadline else {

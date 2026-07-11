@@ -81,7 +81,7 @@ for applet in mount umount mkdir mknod sleep sh insmod \
               uname id cat ls ps echo printf chmod chown \
               kill killall pwd whoami hostname udhcpc ifconfig \
               ip grep ntpd switch_root cp rm mv head mountpoint \
-              tar gzip gunzip dirname sync du date awk; do
+              tar gzip gunzip dirname sync du date awk touch; do
     ln -sf busybox "bin/$applet"
 done
 
@@ -103,7 +103,9 @@ cat > bin/nerdctl <<'NERDCTLEOF'
 # Thin wrapper that ensures a per-project CNI bridge exists and is used
 # automatically for the requested namespace.
 NS="default"
+NET=""
 NEXT_IS_NS=0
+NEXT_IS_NET=0
 HAS_NET=0
 RUN_IDX=0
 i=0
@@ -114,17 +116,27 @@ for arg in "$@"; do
         NEXT_IS_NS=0
         continue
     fi
+    if [ "$NEXT_IS_NET" -eq 1 ]; then
+        NET="$arg"
+        NEXT_IS_NET=0
+        HAS_NET=1
+        continue
+    fi
     case "$arg" in
         -n|--namespace) NEXT_IS_NS=1 ;;
         -n=*|--namespace=*) NS="${arg#*=}" ;;
-        --net|--network) HAS_NET=1 ;;
-        --net=*|--network=*) HAS_NET=1 ;;
+        --net|--network) NEXT_IS_NET=1 ;;
+        --net=*|--network=*) NET="${arg#*=}"; HAS_NET=1 ;;
         run) RUN_IDX=$i ;;
     esac
 done
-# Remove the global default bridge so each namespace gets its own bridge.
+# Remove the global default bridge so each project gets its own bridge.
 rm -f /etc/cni/net.d/nerdctl-bridge.conflist /etc/cni/net.d/bridge.conflist
-/bin/guest-agent cni-gen "$NS" >/dev/null 2>&1 || true
+# Generate the CNI config for the network that will actually be used.
+if [ -z "$NET" ]; then
+    NET="$NS"
+fi
+/bin/guest-agent cni-gen "$NET" >/dev/null 2>&1 || true
 
 if [ "$HAS_NET" -eq 0 ] && [ "$RUN_IDX" -ne 0 ]; then
     shift_count=$RUN_IDX
@@ -153,13 +165,36 @@ for apk in iptables libmnl libnftnl libxtables; do
     tar -xf "$IPTABLES_DIR/$apk.apk" -C . 2>/dev/null || true
 done
 
+# GNU tar is required by nerdctl cp; busybox tar is not sufficient. The build
+# container is Alpine, so install the GNU tar package and copy it (along with
+# its libacl/libattr dependencies) into the initramfs.
+apk add --no-cache tar >/dev/null 2>&1 || true
+if /bin/tar --version 2>/dev/null | grep -q GNU; then
+    cp /bin/tar bin/tar-gnu
+    chmod +x bin/tar-gnu
+    rm -f bin/tar
+    cp bin/tar-gnu bin/tar
+    mkdir -p lib
+    for lib in /lib/libacl.so.1 /lib/libattr.so.1 /usr/lib/libacl.so.1 /usr/lib/libattr.so.1; do
+        if [ -f "$lib" ]; then
+            cp "$lib" lib/
+        fi
+    done
+fi
+
 # Helpers to persist containerd image cache across cold boots.
 cat > bin/anvil-sync-containerd <<'EOF'
 #!/bin/sh
 # Sync /var/lib/containerd to a tarball on the virtiofs share.
-set -e
+# When containerd root is on a persistent block disk this is a no-op.
 ARCHIVE="${1:-/mnt/anvil/containerd-cache.tar.zst}"
 SIZE_FILE="${ARCHIVE}.size"
+
+if ! mount | grep -q 'on /var/lib/containerd type tmpfs'; then
+    echo "[anvil-sync] containerd on persistent disk, skipping tarball sync"
+    exit 0
+fi
+
 mkdir -p "$(dirname "$ARCHIVE")"
 
 # If the cache size has not changed since the last sync, skip the expensive
@@ -234,6 +269,25 @@ if [[ -f $(echo $OVERLAY_SRC) ]]; then
 else
     echo "missing overlayfs module"
     exit 1
+fi
+
+# ext4 for the optional persistent containerd block disk.
+mkdir -p lib/modules/ext4 lib/modules/jbd2 lib/modules/mbcache lib/modules/crc16
+EXT4_SRC="$DEB_WORK/lib/modules/*/kernel/fs/ext4/ext4.ko.zst"
+if [[ -f $(echo $EXT4_SRC) ]]; then
+    zstd -d -f $(echo $EXT4_SRC) -o lib/modules/ext4/ext4.ko
+fi
+JBD2_SRC="$DEB_WORK/lib/modules/*/kernel/fs/jbd2/jbd2.ko.zst"
+if [[ -f $(echo $JBD2_SRC) ]]; then
+    zstd -d -f $(echo $JBD2_SRC) -o lib/modules/jbd2/jbd2.ko
+fi
+MBCACHE_SRC="$DEB_WORK/lib/modules/*/kernel/fs/mbcache.ko.zst"
+if [[ -f $(echo $MBCACHE_SRC) ]]; then
+    zstd -d -f $(echo $MBCACHE_SRC) -o lib/modules/mbcache/mbcache.ko
+fi
+CRC16_SRC="$DEB_WORK/lib/modules/*/kernel/lib/crc16.ko.zst"
+if [[ -f $(echo $CRC16_SRC) ]]; then
+    zstd -d -f $(echo $CRC16_SRC) -o lib/modules/crc16/crc16.ko
 fi
 
 # Networking modules for CNI bridge/veth + nftables for iptables-nft.
@@ -375,9 +429,6 @@ ntpd -nq -p pool.ntp.org >/tmp/ntpd.log 2>&1 || true
 
 # containerd needs /etc/containerd and a state dir.
 mkdir -p /etc/containerd /run/containerd /var/lib/containerd
-# Keep containerd root on tmpfs: snapshotters rely on local FS semantics
-# (xattr, hardlinks) that virtiofs does not fully provide.
-mount -t tmpfs tmpfs /var/lib/containerd
 cat > /etc/containerd/config.toml <<'CTREOF'
 version = 2
 root = "/var/lib/containerd"
@@ -426,15 +477,44 @@ mountpoint -q /dev/pts || mount -t devpts devpts /dev/pts
 mkdir -p /sys/fs/cgroup
 mountpoint -q /sys/fs/cgroup || mount -t cgroup2 cgroup2 /sys/fs/cgroup
 
-# Re-mount virtiofs share and containerd tmpfs if not already moved.
+# Re-mount virtiofs share if not already moved.
 mkdir -p /mnt/anvil
 mountpoint -q /mnt/anvil || mount -t virtiofs anvil /mnt/anvil 2>/dev/null || true
 
-# containerd root stays on tmpfs for correct runtime behaviour.
-# Persistence is handled by syncing to a tarball on the virtiofs share
-# before shutdown/idle-pause and restoring it on cold boot.
+# containerd root: prefer a virtio-blk disk (full POSIX semantics, keeps the
+# memory snapshot small), fall back to a virtiofs bind-mount, then to tmpfs.
 mkdir -p /var/lib/containerd
-mountpoint -q /var/lib/containerd || mount -t tmpfs tmpfs /var/lib/containerd 2>/dev/null || true
+mountpoint -q /var/lib/containerd || {
+    # Load ext4 modules for the optional persistent block disk.
+    insmod /lib/modules/crc16/crc16.ko 2>/dev/null || true
+    insmod /lib/modules/mbcache/mbcache.ko 2>/dev/null || true
+    insmod /lib/modules/jbd2/jbd2.ko 2>/dev/null || true
+    insmod /lib/modules/ext4/ext4.ko 2>/dev/null || true
+    # The first virtio-blk device is exposed as /dev/vda inside the VM.
+    for blk in /dev/vda /dev/vdb /dev/vdc; do
+        if [ -b "$blk" ]; then
+            if mount -t ext4 -o defaults "$blk" /var/lib/containerd 2>/dev/null; then
+                echo "[stage2] mounted $blk as /var/lib/containerd"
+                break
+            fi
+        fi
+    done
+}
+
+# If no block disk is available, persist on the virtiofs host share.
+if ! mountpoint -q /var/lib/containerd; then
+    mkdir -p /mnt/anvil/containerd-root
+
+    # One-time migration: if an old tarball cache exists and the persisted root is
+    # empty, extract the tarball into the virtiofs directory.
+    if [ -f /mnt/anvil/containerd-cache.tar.zst ] && [ -z "$(ls -A /mnt/anvil/containerd-root 2>/dev/null)" ]; then
+        echo "[stage2] migrating containerd cache from tarball to virtiofs directory"
+        /bin/zstd -dc /mnt/anvil/containerd-cache.tar.zst | tar -xf - -C /mnt/anvil/containerd-root
+    fi
+
+    mount --bind /mnt/anvil/containerd-root /var/lib/containerd
+    echo "[stage2] containerd root bound to virtiofs share"
+fi
 
 # Load netfilter modules so CNI bridge/portmap/firewall and iptables-nft work.
 # Order matters: load dependencies before dependents.
@@ -479,13 +559,6 @@ mount --make-rprivate /
 iptables -t nat -C POSTROUTING -p tcp -m conntrack --ctstate DNAT -j MASQUERADE -m comment --comment "anvil-dnat-masq" 2>/dev/null || \
 iptables -t nat -A POSTROUTING -p tcp -m conntrack --ctstate DNAT -j MASQUERADE -m comment --comment "anvil-dnat-masq"
 
-# Restore containerd image cache from the host share before starting containerd.
-# This makes pulled images survive cold boots while keeping runtime on tmpfs.
-if [ -f /mnt/anvil/containerd-cache.tar.zst ]; then
-    echo "[stage2] restoring containerd cache from host share"
-    /bin/anvil-restore-containerd /mnt/anvil/containerd-cache.tar.zst
-fi
-
 # Start containerd in background.
 echo "[stage2] starting containerd"
 /opt/containerd/bin/containerd > /tmp/containerd.log 2>&1 &
@@ -499,17 +572,35 @@ done
 # Cold boot only: per-container nerdctl state (/var/lib/nerdctl) is on tmpfs and
 # is not persisted across boots. Restored containerd metadata would reference
 # missing state files (resolv.conf, hostname, etc.), causing those containers to
-# fail on start. Drop all stopped containers on cold boot so the VM starts with
-# a clean slate; images and snapshots survive in the persisted cache.
-echo "[stage2] cleaning up non-running containers from restored metadata"
-for ns in default $(/opt/containerd/bin/nerdctl namespace ls -q 2>/dev/null); do
-    for id in $(/opt/containerd/bin/nerdctl -n "$ns" ps -aq 2>/dev/null); do
-        /opt/containerd/bin/nerdctl -n "$ns" rm -f "$id" >/dev/null 2>&1 || true
+# fail on start. Drop all containers on cold boot so the VM starts with a clean
+# slate; images and snapshots survive in the persisted cache.
+# Use the low-level `ctr` client instead of `nerdctl rm` so a stuck OCI hook or
+# shim cannot block the whole boot process.
+echo "[stage2] cleaning up containers from restored metadata"
+
+# Old shims/hooks from a crashed/hung previous session cannot be talked to;
+# trying to delete their tasks through containerd would hang. Kill them first.
+killall -9 containerd-shim-runc-v2 2>/dev/null || true
+killall -9 runc 2>/dev/null || true
+killall -9 nerdctl 2>/dev/null || true
+sleep 1
+
+for ns in $(/opt/containerd/bin/ctr namespace ls -q 2>/dev/null); do
+    for id in $(/opt/containerd/bin/ctr -n "$ns" c ls -q 2>/dev/null); do
+        /opt/containerd/bin/ctr -n "$ns" t rm -f "$id" >/dev/null 2>&1 || true
+        /opt/containerd/bin/ctr -n "$ns" c rm "$id" >/dev/null 2>&1 || true
     done
 done
 
 # Start guest agent in foreground.
 echo "[stage2] starting guest-agent"
+if [ -f /mnt/anvil/.anvil-debug ]; then
+    echo "[stage2] enabling guest-agent debug mode"
+    export ANVIL_DEBUG=1
+    # Stream guest-agent stdout/stderr to the virtiofs share so debug logs are
+    # inspectable on the host without entering the VM.
+    exec /bin/guest-agent >>/mnt/anvil/guest-agent.log 2>&1
+fi
 exec /bin/guest-agent
 STAGE2
 chmod +x /newroot/stage2.sh

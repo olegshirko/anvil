@@ -4,3 +4,14 @@
 .DS_Store
 .idea/
 *.log
+guest-agent.log
+.anvil-debug
+networks/
+containerd-root/
+guest-agent/guest-agent
+bench-harness/containerd-root/
+bench-harness/results/
+bench-harness/containerd-cache.tar.zst
+bench-harness/containerd-cache.tar.zst.size
+__pycache__/
+

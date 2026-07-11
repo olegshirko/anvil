@@ -13,7 +13,9 @@ export VZRUNNER_BIN=/path/to/.build/release/vz-runner
 
 # 2. Затянуть образы заранее на каждом backend'е, которым будешь мерить
 #    (иначе первый прогон меряет сеть, а не раннер)
-./scripts/prepull.sh   # запускать после переключения docker context / open -a X
+./scripts/prepull.sh docker        # текущий docker context (Colima, OrbStack, Docker Desktop)
+./scripts/prepull.sh lima          # Lima VM instance "anvil"
+./scripts/prepull.sh vz-runner     # внутри vz-runner VM (namespace bench)
 
 # 3. Убедиться что vz-runner расшаривает корень этой папки в VM на
 #    /mnt/anvil через virtiofs (см. M2) — иначе vzc.sh не найдёт
@@ -23,11 +25,13 @@ export VZRUNNER_BIN=/path/to/.build/release/vz-runner
 ## Запуск
 
 ```bash
-./run_bench.sh vz-runner colima orbstack docker-desktop
+./run_bench.sh vz-runner lima colima orbstack docker-desktop
 # или
 ./run_bench.sh all
 # или только свой раннер, если конкуренты не установлены
 ./run_bench.sh vz-runner
+# или сравнить с предыдущим Lima-based Anvil
+./run_bench.sh vz-runner lima
 ```
 
 Каждый backend прогоняется изолированно: полный stop → cold start →

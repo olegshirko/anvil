@@ -27,10 +27,9 @@ final class ContainerdCacheManager {
         let process = Process()
         process.executableURL = executableURL
         process.arguments = ["exec", "anvil-sync-containerd", guestArchivePath]
-        // Prevent the exec client from auto-starting a new daemon if the current
-        // daemon is being shut down; we only want to sync against the live one.
+        // Keep the sync child tied to the daemon's lifetime so it does not outlive
+        // a shutdown/snapshot cycle.
         process.environment = ProcessInfo.processInfo.environment
-        process.environment?["ANVIL_NO_DAEMON_AUTOSTART"] = "1"
         process.environment?["ANVIL_EXIT_ON_PARENT_DEATH"] = "1"
 
         do {
