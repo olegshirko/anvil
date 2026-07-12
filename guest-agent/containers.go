@@ -535,7 +535,10 @@ func startDockerContainer(id string) error {
 	return nil
 }
 
-// stopDockerContainer stops a container by Docker ID or name.
+// stopDockerContainer stops a container by Docker ID or name and waits until
+// the containerd task actually reaches the stopped state. nerdctl stop can
+// return before the task exits, which makes a subsequent `docker rm` fail with
+// "container is in running status".
 func stopDockerContainer(id string, timeout int) error {
 	ns, containerdID, _, err := resolveDockerID(id)
 	if err != nil {
@@ -551,6 +554,35 @@ func stopDockerContainer(id string, timeout int) error {
 	if err != nil || code != 0 {
 		return fmt.Errorf("nerdctl stop failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
 	}
+
+	// Poll containerd until the task stops or disappears.
+	waitDeadline := time.Now().Add(30 * time.Second)
+	for {
+		cl, err := client.New(containerdSocket)
+		if err != nil {
+			break
+		}
+		nsCtx := namespaces.WithNamespace(context.Background(), ns)
+		c, err := cl.LoadContainer(nsCtx, containerdID)
+		cl.Close()
+		if err != nil {
+			break
+		}
+		task, err := c.Task(nsCtx, nil)
+		if err != nil {
+			break
+		}
+		st, err := task.Status(nsCtx)
+		if err != nil || st.Status == "stopped" {
+			break
+		}
+		if time.Now().After(waitDeadline) {
+			log.Printf("[docker-api] stop %s: timeout waiting for task to stop", id)
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	stopHealthCheck(did)
 	return nil
 }

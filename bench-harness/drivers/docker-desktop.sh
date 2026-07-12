@@ -3,9 +3,16 @@
 
 backend_name() { echo "Docker Desktop"; }
 
+backend_is_available() {
+    [[ -d "/Applications/Docker.app" ]] || \
+        mdfind "kMDItemCFBundleIdentifier == 'com.docker.docker'" 2>/dev/null | grep -q .
+}
+
 backend_start() {
     open -a Docker
-    wait_for "docker desktop ready" 90 docker info
+    # `docker info` без сервера возвращает 0 и показывает только Client.
+    # Ждём именно ServerVersion — он появляется только когда daemon готов.
+    wait_for "docker desktop ready" 180 docker --context desktop-linux info --format '{{.ServerVersion}}'
 }
 
 backend_stop() {
@@ -22,12 +29,12 @@ backend_resume() {
 }
 
 backend_compose_cmd() {
-    echo "docker compose"
+    echo "docker --context desktop-linux compose"
 }
 
 backend_all_healthy() {
     local unhealthy
-    unhealthy=$(docker compose -f "$WORKLOAD" ps --format json 2>/dev/null \
+    unhealthy=$(docker --context desktop-linux compose -f "$WORKLOAD" ps --format json 2>/dev/null \
         | python3 -c '
 import sys, json
 n = 0

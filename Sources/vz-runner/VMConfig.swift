@@ -98,7 +98,7 @@ func makeConfiguration(
 
     let bootLoader = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: args.kernelPath))
     bootLoader.initialRamdiskURL = URL(fileURLWithPath: args.initrdPath)
-    var cmdline = "console=hvc0"
+    var cmdline = "console=hvc0 elevator=none"
     if args.useAgent {
         cmdline += " rdinit=/myinit"
     }

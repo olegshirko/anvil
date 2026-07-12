@@ -2,13 +2,13 @@
     daemon stop-daemon \
     service-install service-uninstall service-start service-stop service-restart service-status \
     service-debug service-debug-rebuild rebuild-all \
-    docker-context-anvil docker-context-lima \
+    docker-context-anvil docker-context-lima lima-restart colima-start colima-stop \
     boot boot-alpine boot-ubuntu boot-containerd \
     download-alpine extract-alpine-kernel \
     download-ubuntu ubuntu-modules \
     guest-agent initramfs-agent initramfs-ubuntu initramfs-containerd \
     container-tools time-boot time-service validate \
-    bench bench-prepull harness prune clean-containers
+    bench bench-prepull harness harness-all prune clean-containers
 
 BINARY := .build/release/vz-runner
 ENTITLEMENTS := entitlements.plist
@@ -83,6 +83,8 @@ service-debug-rebuild: rebuild-all service-debug
 # Switch Docker CLI context. LIMA_DOCKER_CONTEXT can be overridden, e.g.
 # make docker-context-lima LIMA_DOCKER_CONTEXT=lima.
 LIMA_DOCKER_CONTEXT ?= default
+LIMA_INSTANCE ?= anvil
+
 docker-context-lima:
 	@docker context use $(LIMA_DOCKER_CONTEXT)
 	@echo "[anvil] docker context: $(LIMA_DOCKER_CONTEXT)"
@@ -90,6 +92,23 @@ docker-context-lima:
 docker-context-anvil:
 	@docker context use anvil
 	@echo "[anvil] docker context: anvil"
+
+# Restart the Lima VM used for initramfs builds and as a fallback docker backend.
+lima-restart:
+	@limactl stop $(LIMA_INSTANCE) 2>/dev/null || true
+	@limactl start $(LIMA_INSTANCE)
+	@docker context use $(LIMA_DOCKER_CONTEXT)
+	@echo "[anvil] Lima VM '$(LIMA_INSTANCE)' restarted, docker context: $(LIMA_DOCKER_CONTEXT)"
+
+# Start/stop Colima with settings close to vz-runner (VZ VM + virtiofs mounts).
+colima-start:
+	@colima start --vm-type=vz --mount-type=virtiofs
+	@docker context use colima
+	@echo "[anvil] Colima started, docker context: colima"
+
+colima-stop:
+	@colima stop
+	@echo "[anvil] Colima stopped"
 
 # Prune leftover containers, volumes and images inside the anvil VM.
 # Useful because `docker run --rm` is not yet implemented; test leftovers can
@@ -265,8 +284,23 @@ boot-containerd-fresh: sign initramfs-containerd
 #   make bench BENCH_BACKENDS="vz-runner lima colima"
 BENCH_BACKENDS ?= vz-runner
 
-bench harness harness-tests: sign
+# Prepull harness workload images into the vz-runner VM. Starts the service if
+# it is not running, because prepull needs a live guest-agent/containerd.
+harness-prepull: sign
+	@$(MAKE) service-start
+	@VZRUNNER_BIN="$(CURDIR)/$(BINARY)" bash "$(CURDIR)/bench-harness/scripts/prepull.sh" vz-runner
+
+# Run harness benchmarks. Stops the service first so the harness can start its
+# own isolated daemon without control-socket/lock conflicts.
+harness harness-tests: sign
+	@$(MAKE) service-stop
 	@VZRUNNER_BIN="$(CURDIR)/$(BINARY)" bash "$(CURDIR)/bench-harness/run_bench.sh" $(BENCH_BACKENDS)
 
-bench-prepull harness-prepull: sign
-	@VZRUNNER_BIN="$(CURDIR)/$(BINARY)" bash "$(CURDIR)/bench-harness/scripts/prepull.sh" vz-runner
+# Run harness against all supported backends. Requires each backend to be
+# installed (Lima, Colima, OrbStack, Docker Desktop) and its docker context to
+# exist. Results are merged into the same CSV and latest.md as a single run.
+ALL_BENCH_BACKENDS ?= vz-runner lima colima orbstack docker-desktop
+
+bench-all harness-all: sign
+	@$(MAKE) service-stop
+	@VZRUNNER_BIN="$(CURDIR)/$(BINARY)" bash "$(CURDIR)/bench-harness/run_bench.sh" $(ALL_BENCH_BACKENDS)

@@ -24,6 +24,14 @@ DRIVERS_DIR="$SCRIPT_DIR/drivers"
 WORKLOAD="$SCRIPT_DIR/workloads/docker-compose.bench.yml"
 RESULTS_DIR="$SCRIPT_DIR/results"
 mkdir -p "$RESULTS_DIR"
+# Старые сырые CSV от предыдущих (прерванных) запусков больше не нужны —
+# aggregate results/latest.csv и latest.md уже содержат итоговые данные.
+# latest.csv не трогаем, чтобы не сбросить результаты других backend'ов.
+for f in "$RESULTS_DIR"/*.csv; do
+    [[ -f "$f" ]] || continue
+    [[ "$(basename "$f")" == "latest.csv" ]] && continue
+    rm -f "$f"
+done
 
 TS="$(date +%Y%m%d-%H%M%S)"
 CSV="$RESULTS_DIR/$TS.csv"
@@ -69,7 +77,9 @@ echo "backend,phase,metric,value_ms" > "$CSV"
 record() {
     local backend="$1" phase="$2" metric="$3" value="$4"
     echo "$backend,$phase,$metric,$value" >> "$CSV"
-    printf "  %-12s %-14s %-18s %sms\n" "$backend" "$phase" "$metric" "$value"
+    local unit="ms"
+    [[ "$metric" == "idle_rss_mb" ]] && unit="MB"
+    printf "  %-12s %-14s %-18s %s%s\n" "$backend" "$phase" "$metric" "$value" "$unit"
 }
 
 run_one_backend() {
@@ -85,6 +95,14 @@ run_one_backend() {
     # shellcheck disable=SC1090
     source "$driver"
 
+    # Skip backends that declare they are not available (e.g. app not installed
+    # or VM not running). Keeps `make harness-all` usable on machines that have
+    # only a subset of competitors installed.
+    if declare -f backend_is_available >/dev/null && ! backend_is_available; then
+        echo "!! backend '$backend' is not available, skipping"
+        return
+    fi
+
     # --- 1. Полная остановка перед тестом, чтобы cold start был честным ---
     backend_stop || true
     sleep 2
@@ -92,7 +110,10 @@ run_one_backend() {
     # --- 2. Cold start ---
     local t0 t1
     t0=$(now_ms)
-    backend_start
+    if ! backend_start; then
+        echo "!! backend '$backend' failed to start, skipping"
+        return
+    fi
     t1=$(now_ms)
     record "$backend" "cold_start" "daemon_ready" $((t1 - t0))
 
@@ -100,7 +121,11 @@ run_one_backend() {
     local compose_cmd
     compose_cmd="$(backend_compose_cmd)"
     t0=$(now_ms)
-    $compose_cmd -f "$WORKLOAD" up -d
+    if ! $compose_cmd -f "$WORKLOAD" up -d; then
+        echo "!! backend '$backend' compose up failed, skipping"
+        backend_stop || true
+        return
+    fi
     wait_for "all services healthy" 60 backend_all_healthy
     t1=$(now_ms)
     record "$backend" "cold_start" "compose_up_healthy" $((t1 - t0))
@@ -117,13 +142,21 @@ run_one_backend() {
     # --- 6. Resume (если backend не поддерживает snapshot, это будет
     #     просто второй cold start — driver сам это учитывает) ---
     t0=$(now_ms)
-    backend_resume
+    if ! backend_resume; then
+        echo "!! backend '$backend' resume failed, skipping"
+        backend_stop || true
+        return
+    fi
     t1=$(now_ms)
     record "$backend" "resume" "daemon_ready" $((t1 - t0))
 
     # --- 7. Compose up повторно на уже тёплом backend ---
     t0=$(now_ms)
-    $compose_cmd -f "$WORKLOAD" up -d
+    if ! $compose_cmd -f "$WORKLOAD" up -d; then
+        echo "!! backend '$backend' resume compose up failed, skipping"
+        backend_stop || true
+        return
+    fi
     wait_for "all services healthy" 60 backend_all_healthy
     t1=$(now_ms)
     record "$backend" "resume" "compose_up_healthy" $((t1 - t0))
@@ -140,6 +173,8 @@ done
 echo
 echo "Raw results: $CSV"
 
-python3 "$SCRIPT_DIR/report.py" "$CSV" > "$MD"
-echo "Markdown table: $MD"
+python3 "$SCRIPT_DIR/report.py" "$CSV"
+# Aggregate latest.csv обновлён, latest.md перегенерирован.
+# Сырые CSV-файлы отдельных прогонов больше не нужны — удаляем.
+rm -f "$CSV"
 cat "$MD"

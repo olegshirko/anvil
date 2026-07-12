@@ -5,6 +5,12 @@ LIMA_INSTANCE="${LIMA_INSTANCE:-anvil}"
 
 backend_name() { echo "Lima ($LIMA_INSTANCE)"; }
 
+backend_is_available() {
+    # The VM instance must exist; harness itself will start/stop it.
+    command -v limactl >/dev/null 2>&1 && \
+        limactl list "$LIMA_INSTANCE" --format '{{.Name}}' 2>/dev/null | grep -qx "$LIMA_INSTANCE"
+}
+
 # Внутренняя обёртка для docker-команд внутри Lima VM
 _lima_docker() {
     limactl shell "$LIMA_INSTANCE" docker "$@"

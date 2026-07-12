@@ -19,14 +19,15 @@ INITRD_PATH="$VZRUNNER_DIR/.download/ubuntu/initramfs-containerd"
 # Persistent block disk for /var/lib/containerd. Without it stage2 falls back
 # to a virtiofs bind-mount, which does not satisfy containerd native snapshotter
 # semantics (read-only rootfs errors on container start).
-CONTAINERD_DISK="${CONTAINERD_DISK:-$HOME/.anvil-vz/containerd-disk.dmg}"
+CONTAINERD_DISK="${CONTAINERD_DISK:-$HOME/.anvil-vz/containerd-disk.img}"
 
 backend_name() { echo "vz-runner-docker"; }
 
 VZ_PID_FILE="${TMPDIR:-/tmp}/vz-runner-bench.pid"
+VZ_VM_PID_FILE="${VZ_PID_FILE}.vm"
 
 backend_start() {
-    rm -f "$VZ_PID_FILE"
+    rm -f "$VZ_PID_FILE" "$VZ_VM_PID_FILE"
     nohup "$VZRUNNER_BIN" daemon \
         --kernel "$KERNEL_PATH" \
         --initrd "$INITRD_PATH" \
@@ -37,6 +38,17 @@ backend_start() {
         >/tmp/vz-runner-bench.log 2>&1 &
     echo $! > "$VZ_PID_FILE"
     wait_for "vz-runner daemon ready" 60 "$VZRUNNER_BIN" status
+    # Capture the VirtualMachine process spawned by this daemon. There may be
+    # leftover orphan VM processes from previous runs; pick the newest one.
+    for _ in $(seq 1 50); do
+        local vm_pid
+        vm_pid="$(pgrep -f "com.apple.Virtualization.VirtualMachine" | tail -1)"
+        if [[ -n "$vm_pid" ]]; then
+            echo "$vm_pid" > "$VZ_VM_PID_FILE"
+            break
+        fi
+        sleep 0.1
+    done
 }
 
 backend_stop() {
@@ -48,7 +60,7 @@ backend_stop() {
             kill -0 "$pid" 2>/dev/null || break
             sleep 0.3
         done
-        rm -f "$VZ_PID_FILE"
+        rm -f "$VZ_PID_FILE" "$VZ_VM_PID_FILE"
     fi
     pkill -f 'vz-runner daemon' || true
 }
@@ -93,6 +105,19 @@ print(n)
 }
 
 backend_idle_rss() {
-    ps aux | grep -E "$VZRUNNER_BIN|Virtualization\\.VirtualMachine" | grep -v grep \
-        | awk '{sum+=$6} END {printf "%.0f", sum/1024}'
+    local total_rss=0
+    local pid
+    if [[ -f "$VZ_PID_FILE" ]]; then
+        pid="$(cat "$VZ_PID_FILE" 2>/dev/null)"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            total_rss=$((total_rss + $(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')))
+        fi
+    fi
+    if [[ -f "$VZ_VM_PID_FILE" ]]; then
+        pid="$(cat "$VZ_VM_PID_FILE" 2>/dev/null)"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            total_rss=$((total_rss + $(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')))
+        fi
+    fi
+    echo $((total_rss / 1024))
 }

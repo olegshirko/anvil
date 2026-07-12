@@ -13,7 +13,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VZRUNNER_BIN="${VZRUNNER_BIN:-$PROJECT_ROOT/.build/release/vz-runner}"
 KERNEL_PATH="${KERNEL_PATH:-$PROJECT_ROOT/.download/ubuntu/vmlinuz-raw}"
 INITRD_PATH="${INITRD_PATH:-$PROJECT_ROOT/.download/ubuntu/initramfs-containerd}"
-CONTAINERD_DISK="${CONTAINERD_DISK:-$HOME/.anvil-vz/containerd-disk.dmg}"
+CONTAINERD_DISK="${CONTAINERD_DISK:-$HOME/.anvil-vz/containerd-disk.img}"
 SHARE_ROOT="${SHARE_ROOT:-$PROJECT_ROOT}"
 MEMORY_GB="${ANVIL_MEMORY:-2}"
 

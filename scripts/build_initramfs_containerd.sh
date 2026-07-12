@@ -494,7 +494,9 @@ mountpoint -q /var/lib || {
     # The first virtio-blk device is exposed as /dev/vda inside the VM.
     for blk in /dev/vda /dev/vdb /dev/vdc; do
         if [ -b "$blk" ]; then
-            if mount -t ext4 -o defaults "$blk" /var/lib 2>/dev/null; then
+            # noatime + writeback data + infrequent journal commit + no barrier flush
+            # for a dev VM where snapshot save/resume provides durability.
+            if mount -t ext4 -o noatime,nobarrier,data=writeback,commit=60 "$blk" /var/lib 2>/dev/null; then
                 echo "[stage2] mounted $blk as /var/lib"
                 break
             fi
@@ -503,6 +505,21 @@ mountpoint -q /var/lib || {
 }
 
 # If no block disk is available, persist on the virtiofs host share.
+if mountpoint -q /var/lib; then
+    # Tune the virtio-blk device for low-latency metadata-heavy workload.
+    # The host-side APFS/virtio stack already batches requests, so disable
+    # guest-level merging/scheduler overhead and keep queues short.
+    for dev in vda vdb vdc; do
+        if [ -b "/dev/$dev" ]; then
+            echo none > /sys/block/$dev/queue/scheduler 2>/dev/null || true
+            echo 256 > /sys/block/$dev/queue/read_ahead_kb 2>/dev/null || true
+            echo 256 > /sys/block/$dev/queue/nr_requests 2>/dev/null || true
+            echo 2 > /sys/block/$dev/queue/nomerges 2>/dev/null || true
+            echo "[stage2] tuned /dev/$dev"
+        fi
+    done
+fi
+
 if ! mountpoint -q /var/lib; then
     mkdir -p /mnt/anvil/var-lib
 
