@@ -140,7 +140,7 @@ func cmdStart(args: [String]) {
 
     // Launch the daemon process in the background.
     let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+    proc.executableURL = URL(fileURLWithPath: currentExecutablePath())
     proc.arguments = cmdArgs
     proc.standardOutput = FileHandle(forWritingAtPath: daemonLogFile.path)
     proc.standardError = proc.standardOutput
@@ -213,6 +213,40 @@ func cmdStatus() {
 
 // MARK: - Arg helpers
 
+func currentExecutablePath() -> String {
+    // Bundle.main.executableURL is the most reliable — resolves symlinks.
+    if let url = Bundle.main.executableURL {
+        return url.path
+    }
+    // Fallback: resolve CommandLine.arguments[0] through realpath.
+    let arg0 = CommandLine.arguments[0]
+    if !arg0.isEmpty {
+        if arg0.hasPrefix("/") {
+            if let cPath = arg0.cString(using: .utf8),
+               let resolved = realpath(cPath, nil) {
+                return String(cString: resolved)
+            }
+        } else {
+            // Relative or bare name — resolve against CWD, then try PATH.
+            let abs = URL(fileURLWithPath: arg0).path
+            if let cPath = abs.cString(using: .utf8),
+               let resolved = realpath(cPath, nil) {
+                return String(cString: resolved)
+            }
+            // Search PATH for the command name.
+            if let pathEnv = ProcessInfo.processInfo.environment["PATH"] {
+                for dir in pathEnv.split(separator: ":") {
+                    let candidate = "\(dir)/\(arg0)"
+                    if FileManager.default.isExecutableFile(atPath: candidate) {
+                        return candidate
+                    }
+                }
+            }
+        }
+    }
+    return arg0
+}
+
 func findArg(_ args: [String], _ key: String) -> String? {
     guard let idx = args.firstIndex(of: key), idx + 1 < args.count else { return nil }
     return args[idx + 1]
@@ -220,7 +254,7 @@ func findArg(_ args: [String], _ key: String) -> String? {
 
 func findProjectRoot() -> String? {
     // Walk up from the executable looking for Package.swift.
-    var url = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+    var url = URL(fileURLWithPath: currentExecutablePath()).deletingLastPathComponent()
     for _ in 0..<10 {
         if FileManager.default.fileExists(atPath: url.appendingPathComponent("Package.swift").path) {
             return url.path
