@@ -1,9 +1,9 @@
-# Одинаковый workload для всех backend'ов. Образы должны быть уже
-# затянуты (docker/nerdctl pull) ДО замера, иначе меряешь скорость
-# сети, а не рантайма. Прогони scripts/prepull.sh перед бенчем.
+# Same workload for all backends. Images must be pulled
+# (docker/nerdctl pull) BEFORE measuring, otherwise you measure
+# network speed, not runtime speed. Run scripts/prepull.sh before benchmarking.
 #
-# Состав нарочно небольшой, но реалистичный: web + api + db + cache —
-# типичный docker-compose стек, который люди реально гоняют локально.
+# Small but realistic: web + api + db + cache — a typical docker-compose
+# stack people actually run locally.
 
 version: "3.9"
 

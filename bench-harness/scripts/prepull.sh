@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Затягивает образы workload'а заранее на каждом backend, чтобы бенч
-# мерил скорость раннера, а не скорость registry/сети.
+# Pull workload images ahead of time on each backend so the benchmark measures
+# runner speed, not registry/network speed.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

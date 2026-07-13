@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Драйвер для Colima. Требует: brew install colima docker docker-compose
+# Driver for Colima. Requires: brew install colima docker docker-compose
 
 backend_name() { echo "Colima"; }
 
-# Colima docker socket + изолированный docker config без desktop credential helper,
-# чтобы `docker pull` не ломался на отсутствии docker-credential-desktop.
+# Colima docker socket + isolated docker config without desktop credential helper,
+# so `docker pull` does not fail because docker-credential-desktop is missing.
 COLIMA_SOCK="${COLIMA_SOCK:-$HOME/.colima/default/docker.sock}"
 
 _backend_colima_docker_config() {
@@ -12,8 +12,8 @@ _backend_colima_docker_config() {
         local tmp
         tmp="$(mktemp -d)"
         mkdir -p "$tmp"
-        # Копируем хостовый config, но убираем desktop credential helper —
-        # иначе `docker pull` пытается вызвать docker-credential-desktop, которого нет в PATH.
+        # Copy host config but remove desktop credential helper; otherwise
+        # `docker pull` tries to call docker-credential-desktop, which is not in PATH.
         python3 -c "
 import json, os
 src = os.path.expanduser('~/.docker/config.json')
@@ -37,8 +37,8 @@ backend_is_available() {
 }
 
 _backend_colima_dns_ready() {
-    # DNS-форвардер Colima (192.168.5.1) иногда готов позже, чем docker daemon.
-    # Проверяем, что изнутри VM резолвится auth.docker.io.
+    # Colima DNS forwarder sometimes becomes ready later than the docker daemon.
+    # Check that auth.docker.io resolves from inside the VM.
     colima ssh -- sh -c 'curl -sS -o /dev/null --connect-timeout 5 "https://auth.docker.io/token?scope=repository%3Alibrary%2Fnginx%3Apull&service=registry.docker.io"' >/dev/null 2>&1
 }
 
@@ -46,11 +46,11 @@ backend_start() {
     export DOCKER_CONFIG="$(_backend_colima_docker_config)"
     export DOCKER_HOST="unix://$COLIMA_SOCK"
     colima start --vm-type=vz --mount-type=virtiofs >/dev/null 2>&1
-    # Colima старт может занять 30-60 с на Apple Silicon.
-    # `docker info` без сервера всё равно возвращает 0, поэтому ждём именно ServerVersion.
+    # Colima start can take 30-60 s on Apple Silicon.
+    # `docker info` returns 0 even without a server, so wait for ServerVersion.
     wait_for "colima docker ready" 180 docker info --format '{{.ServerVersion}}'
-    # Дополнительно ждём, пока заработает DNS-форвардер внутри VM —
-    # без этого `compose up` падает на timeout auth.docker.io.
+    # Also wait for the DNS forwarder inside the VM; without it compose up
+    # times out on auth.docker.io.
     wait_for "colima DNS ready" 60 _backend_colima_dns_ready
 }
 
@@ -60,9 +60,9 @@ backend_stop() {
     colima stop >/dev/null 2>&1 || true
 }
 
-# Colima не умеет VM-snapshot/resume в смысле мгновенного восстановления
-# состояния — "resume" тут это обычный start после stop (диск тот же,
-# но не suspended-state). Это честно отражает реальную разницу с vz-runner.
+# Colima has no instant VM snapshot/resume. "Resume" here is a normal start
+# after stop (same disk, no suspended state). This honestly shows the gap vs
+# vz-runner.
 backend_stop_keep_snapshot() {
     return 1
 }
@@ -99,9 +99,9 @@ print(n)
 }
 
 backend_idle_rss() {
-    # Сумма RSS всех colima/limactl/Virtualization-related процессов на хосте.
-    # Colima на Apple Silicon использует limactl hostagent + usernet + VM-процесс
-    # com.apple.Virtualization.VirtualMachine.
+    # Sum RSS of all colima/limactl/Virtualization-related host processes.
+    # On Apple Silicon Colima uses limactl hostagent + usernet + the
+    # com.apple.Virtualization.VirtualMachine process.
     ps aux | grep -E 'colima|limactl|qemu-system|Virtualization' | grep -v grep \
         | awk '{sum+=$6} END {printf "%.0f", sum/1024}'
 }

@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Драйвер для vz-runner. Требует бинарник vz-runner в PATH (или VZRUNNER_BIN).
+# Driver for vz-runner. Requires the vz-runner binary in PATH (or VZRUNNER_BIN).
 #
-# Текущий CLI vz-runner:
+# Current vz-runner CLI:
 #   vz-runner daemon [--share <path>] [--idle <seconds>]
 #   vz-runner status
 #   vz-runner exec <cmd>...
 #
-# Harness запускает демон в фоне, ждёт status, останавливает через SIGTERM
-# (daemon сам делает pause + save snapshot в shutdown handler).
+# Harness starts the daemon in the background, waits for status, and stops it
+# with SIGTERM (the daemon pauses and saves a snapshot in its shutdown handler).
 
 VZRUNNER_BIN="${VZRUNNER_BIN:-vz-runner}"
-# Корень bench-harness расшариваем в VM через virtiofs на /mnt/anvil
+# Share the bench-harness root into the VM via virtiofs at /mnt/anvil.
 HOST_SHARE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GUEST_SHARE_ROOT="/mnt/anvil"
-# Пути к kernel/initrd относительно корня проекта (этот драйвер лежит в bench-harness/drivers).
+# Kernel/initrd paths are relative to the project root.
 VZRUNNER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 KERNEL_PATH="$VZRUNNER_DIR/.download/ubuntu/vmlinuz-raw"
 INITRD_PATH="$VZRUNNER_DIR/.download/ubuntu/initramfs-containerd"
@@ -22,13 +22,13 @@ CONTAINERD_DISK="${CONTAINERD_DISK:-$HOME/.anvil-vz/containerd-disk.img}"
 
 backend_name() { echo "vz-runner"; }
 
-# --- pid файла нет; запоминаем pid демона ourselves ---
+# --- no pid file; remember the daemon pid ourselves ---
 VZ_PID_FILE="${TMPDIR:-/tmp}/vz-runner-bench.pid"
 VZ_VM_PID_FILE="${VZ_PID_FILE}.vm"
 
 backend_start() {
     rm -f "$VZ_PID_FILE" "$VZ_VM_PID_FILE"
-    # Запускаем демон, detached от терминала, но с сохранением pid.
+    # Start daemon detached from terminal but keep its pid.
     # 2 GB is enough because images and snapshots live on the persistent
     # containerd block disk, not in guest RAM/tmpfs.
     nohup "$VZRUNNER_BIN" daemon \
@@ -67,18 +67,18 @@ backend_stop() {
         done
         rm -f "$VZ_PID_FILE" "$VZ_VM_PID_FILE"
     fi
-    # Fallback: убиваем любой оставшийся vz-runner daemon от этого harness'а
+    # Fallback: kill any leftover vz-runner daemon from this harness.
     pkill -f 'vz-runner daemon' || true
 }
 
-# vz-runner daemon сам сохраняет snapshot при SIGTERM, так что keep snapshot
-# — это просто graceful stop.
+# vz-runner daemon saves the snapshot on SIGTERM, so keep-snapshot is just a
+# graceful stop.
 backend_stop_keep_snapshot() {
     backend_stop
 }
 
 backend_resume() {
-    # При повторном запуске daemon восстановится из snapshot, если он валиден.
+    # On restart the daemon restores from snapshot if it is valid.
     backend_start
 }
 
@@ -115,9 +115,9 @@ print(n)
 }
 
 backend_idle_rss() {
-    # Сумма RSS vz-runner daemon + VM процесса, запущенного этим harness'ом.
-    # Гостевые процессы внутри VM не считаем — их RSS несравним напрямую
-    # с host-side процессами других backend'ов.
+    # Sum RSS of the vz-runner daemon and the VM process started by this harness.
+    # Guest processes inside the VM are not counted; their RSS is not directly
+    # comparable to host-side processes of other backends.
     local total_rss=0
     local pid
     if [[ -f "$VZ_PID_FILE" ]]; then

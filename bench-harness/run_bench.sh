@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# Anvil bench harness: сравнивает cold start / resume / compose-up
-# время между разными раннерами (vz-runner, Colima, OrbStack, Docker
-# Desktop) на одинаковом workload.
+# Anvil bench harness: compare cold start / resume / compose-up time
+# between runners (vz-runner, Colima, OrbStack, Docker Desktop) on the
+# same workload.
 #
-# Использование:
+# Usage:
 #   ./run_bench.sh vz-runner colima orbstack
 #   ./run_bench.sh all
 #
-# Каждый backend — это drivers/<name>.sh, который должен определить:
-#   backend_start        - холодный старт демона/VM, вернуть когда готов принимать docker/nerdctl команды
-#   backend_stop          - полная остановка (для cold start теста следующего прогона)
-#   backend_resume         - если backend поддерживает snapshot/resume; иначе делает то же что backend_start
-#   backend_compose_cmd     - печатает команду для docker/nerdctl compose (может отличаться: "docker compose" vs "nerdctl compose")
-#   backend_idle_rss        - RSS в МБ демона/VM процесса в состоянии idle (после compose down)
-#   backend_name             - человекочитаемое имя для отчёта
+# Each backend is a drivers/<name>.sh that must define:
+#   backend_start          - cold start daemon/VM, return when ready for commands
+#   backend_stop           - full stop (so the next cold start is honest)
+#   backend_resume         - snapshot/resume if supported, else same as backend_start
+#   backend_compose_cmd    - print the docker/nerdctl compose command
+#   backend_idle_rss       - idle RSS of daemon/VM process in MB (after compose down)
+#   backend_name           - human-readable name for the report
 #
-# Результаты пишутся в results/<timestamp>.csv и в results/latest.md
+# Results are written to results/<timestamp>.csv and merged into results/latest.md
 
 set -euo pipefail
 
@@ -24,9 +24,8 @@ DRIVERS_DIR="$SCRIPT_DIR/drivers"
 WORKLOAD="$SCRIPT_DIR/workloads/docker-compose.bench.yml"
 RESULTS_DIR="$SCRIPT_DIR/results"
 mkdir -p "$RESULTS_DIR"
-# Старые сырые CSV от предыдущих (прерванных) запусков больше не нужны —
-# aggregate results/latest.csv и latest.md уже содержат итоговые данные.
-# latest.csv не трогаем, чтобы не сбросить результаты других backend'ов.
+# Drop stale per-run CSVs; aggregate latest.csv/latest.md keep final data.
+# Keep latest.csv so other backends are not reset.
 for f in "$RESULTS_DIR"/*.csv; do
     [[ -f "$f" ]] || continue
     [[ "$(basename "$f")" == "latest.csv" ]] && continue
@@ -51,12 +50,12 @@ else
     BACKENDS=("$@")
 fi
 
-# --- таймер helper: возвращает миллисекунды ---
+# --- timer helper: returns milliseconds ---
 now_ms() {
     python3 -c 'import time; print(int(time.time()*1000))'
 }
 
-# --- ждать, пока команда не вернёт 0, с таймаутом ---
+# --- wait for a command to succeed, with timeout ---
 wait_for() {
     local desc="$1"; shift
     local timeout_s="$1"; shift
@@ -103,7 +102,7 @@ run_one_backend() {
         return
     fi
 
-    # --- 1. Полная остановка перед тестом, чтобы cold start был честным ---
+    # --- 1. Full stop first so the cold start is honest ---
     backend_stop || true
     sleep 2
 
@@ -117,7 +116,7 @@ run_one_backend() {
     t1=$(now_ms)
     record "$backend" "cold_start" "daemon_ready" $((t1 - t0))
 
-    # --- 3. Compose up (одинаковый workload на всех) ---
+    # --- 3. Compose up (same workload on all backends) ---
     local compose_cmd
     compose_cmd="$(backend_compose_cmd)"
     t0=$(now_ms)
@@ -130,17 +129,16 @@ run_one_backend() {
     t1=$(now_ms)
     record "$backend" "cold_start" "compose_up_healthy" $((t1 - t0))
 
-    # --- 4. Idle RSS после того как всё поднято ---
+    # --- 4. Idle RSS after services are up ---
     local rss
     rss="$(backend_idle_rss)"
     record "$backend" "steady_state" "idle_rss_mb" "$rss"
 
-    # --- 5. Compose down, потом snapshot/stop для resume-теста ---
+    # --- 5. Compose down, then snapshot/stop for resume test ---
     $compose_cmd -f "$WORKLOAD" down
     backend_stop_keep_snapshot || backend_stop
 
-    # --- 6. Resume (если backend не поддерживает snapshot, это будет
-    #     просто второй cold start — driver сам это учитывает) ---
+    # --- 6. Resume (if snapshot is unsupported this is a second cold start) ---
     t0=$(now_ms)
     if ! backend_resume; then
         echo "!! backend '$backend' resume failed, skipping"
@@ -150,7 +148,7 @@ run_one_backend() {
     t1=$(now_ms)
     record "$backend" "resume" "daemon_ready" $((t1 - t0))
 
-    # --- 7. Compose up повторно на уже тёплом backend ---
+    # --- 7. Compose up again on the warm backend ---
     t0=$(now_ms)
     if ! $compose_cmd -f "$WORKLOAD" up -d; then
         echo "!! backend '$backend' resume compose up failed, skipping"
@@ -174,7 +172,7 @@ echo
 echo "Raw results: $CSV"
 
 python3 "$SCRIPT_DIR/report.py" "$CSV"
-# Aggregate latest.csv обновлён, latest.md перегенерирован.
-# Сырые CSV-файлы отдельных прогонов больше не нужны — удаляем.
+# Aggregate latest.csv updated, latest.md regenerated.
+# Per-run CSVs are no longer needed; remove them.
 rm -f "$CSV"
 cat "$MD"

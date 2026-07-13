@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Драйвер для Lima (instance "anvil"). Требует: brew install lima docker docker-compose
+# Driver for Lima (instance "anvil"). Requires: brew install lima docker docker-compose
 
 LIMA_INSTANCE="${LIMA_INSTANCE:-anvil}"
 
@@ -11,7 +11,7 @@ backend_is_available() {
         limactl list "$LIMA_INSTANCE" --format '{{.Name}}' 2>/dev/null | grep -qx "$LIMA_INSTANCE"
 }
 
-# Внутренняя обёртка для docker-команд внутри Lima VM
+# Internal wrapper for docker commands inside the Lima VM
 _lima_docker() {
     limactl shell "$LIMA_INSTANCE" docker "$@"
 }
@@ -25,8 +25,8 @@ backend_stop() {
     limactl stop "$LIMA_INSTANCE" >/dev/null 2>&1 || true
 }
 
-# Lima не предоставляет API для мгновенного snapshot/resume состояния VM.
-# "Resume" в терминах harness — это обычный warm start после stop.
+# Lima has no API for instant VM snapshot/resume.
+# "Resume" here means a normal warm start after stop.
 backend_stop_keep_snapshot() {
     return 1
 }
@@ -61,7 +61,7 @@ print(n)
 }
 
 backend_idle_rss() {
-    # Сумма RSS процессов Lima + VM backend (vz или qemu) на хосте.
+    # Sum RSS of Lima + VM backend (vz or qemu) processes on the host.
     ps aux | grep -E 'limactl|Virtualization\.VirtualMachine|qemu-system' | grep -v grep \
         | awk '{sum+=$6} END {printf "%.0f", sum/1024}'
 }

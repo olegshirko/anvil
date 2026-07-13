@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# Драйвер для vz-runner, использующий host `docker` CLI через anvil context.
-# Отличается от vz-runner.sh только командой compose: вместо `vzc.sh`
-# (nerdctl compose внутри VM) здесь `docker compose`, который ходит в
-# guest-agent через Docker API proxy (/Users/oleg/.anvil-vz/docker.sock).
+# Driver for vz-runner using the host `docker` CLI via the anvil context.
+# Differs from vz-runner.sh only in compose command: instead of `vzc.sh`
+# (nerdctl compose inside the VM) it uses `docker compose`, which talks to
+# the guest-agent through the Docker API proxy.
 #
-# Требования: активный docker context `anvil` (default) и запущенный/запускаемый
+# Requirements: active docker context `anvil` (default) and a startable
 # vz-runner daemon.
 
 VZRUNNER_BIN="${VZRUNNER_BIN:-vz-runner}"
-# Корень bench-harness расшариваем в VM через virtiofs на /mnt/anvil.
-# Для docker compose host-путь workload передаётся как есть, но share нужен
-# для синхронизации containerd cache между cold boot'ами.
+# Share the bench-harness root into the VM via virtiofs at /mnt/anvil.
+# docker compose receives the host workload path as-is, but the share keeps
+# containerd cache synchronized between cold boots.
 HOST_SHARE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Пути к kernel/initrd относительно корня проекта.
+# Kernel/initrd paths are relative to the project root.
 VZRUNNER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 KERNEL_PATH="$VZRUNNER_DIR/.download/ubuntu/vmlinuz-raw"
 INITRD_PATH="$VZRUNNER_DIR/.download/ubuntu/initramfs-containerd"
 # Persistent block disk for /var/lib/containerd. Without it stage2 falls back
-# to a virtiofs bind-mount, which does not satisfy containerd native snapshotter
+# to a virtiofs bind-mount, which breaks containerd native snapshotter
 # semantics (read-only rootfs errors on container start).
 CONTAINERD_DISK="${CONTAINERD_DISK:-$HOME/.anvil-vz/containerd-disk.img}"
 
@@ -74,7 +74,7 @@ backend_resume() {
 }
 
 backend_compose_cmd() {
-    # anvil context сделан default; явно указываем для надёжности.
+    # anvil context is the default; specify it explicitly for reliability.
     echo "docker --context anvil compose"
 }
 

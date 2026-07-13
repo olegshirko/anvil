@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Обновляет aggregate results/latest.csv и перегенерирует results/latest.md.
+"""Update aggregate results/latest.csv and regenerate results/latest.md.
 
-Использование: report.py results/20260710-120000.csv
+Usage: report.py results/20260710-120000.csv
 
-Логика:
-- results/latest.csv хранит последние известные значения для каждого
-  backend × phase × metric.
-- Каждый новый прогон обновляет только те backend'и, которые в нём есть,
-  остальные результаты сохраняются. Это позволяет перемерять один backend
-  (например, docker-desktop) без потери результатов по остальным.
-- results/latest.md — одна актуальная таблица, генерируется из latest.csv.
+Logic:
+- latest.csv keeps the last known value for each backend × phase × metric.
+- A new run only updates backends present in that run; other results are kept.
+  This lets you remeasure one backend (e.g. docker-desktop) without losing data.
+- latest.md is a single summary table generated from latest.csv.
 """
 import csv
 import sys
@@ -81,7 +79,7 @@ def main():
     with open(run_csv) as f:
         run_rows = list(csv.DictReader(f))
 
-    # Перезаписываем записи для backend'ов, которые есть в этом прогоне.
+    # Overwrite only backends that appear in this run.
     run_backends = set(r["backend"] for r in run_rows)
     aggregate = [r for r in aggregate if r["backend"] not in run_backends]
     aggregate.extend(run_rows)

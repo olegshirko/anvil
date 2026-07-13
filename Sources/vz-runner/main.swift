@@ -1,11 +1,12 @@
-// M0/M1: boot Linux VM через Virtualization.framework и управлять ей
-// через virtio-vsock guest-agent без SSH.
+// M0/M1: boot a Linux VM with Virtualization.framework and control it via
+// virtio-vsock guest-agent without SSH.
 //
-// Собирать и запускать ТОЛЬКО на macOS arm64 (13+), с Xcode/Swift toolchain.
-// Нужен entitlement com.apple.security.virtualization — см. Makefile.
+// Build and run ONLY on macOS arm64 (13+) with the Xcode/Swift toolchain.
+// Requires the com.apple.security.virtualization entitlement — see Makefile.
 //
-// Использование:
-//   vz-runner boot --kernel /path/vmlinuz --initrd /path/initrd [--agent]  (uses rdinit=/myinit)
+// Usage:
+//   vz-runner boot --kernel /path/vmlinuz --initrd /path/initrd [--agent]
+//                  (uses rdinit=/myinit)
 //   vz-runner status
 //   vz-runner exec <cmd>...
 

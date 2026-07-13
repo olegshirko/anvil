@@ -12,9 +12,9 @@ echo "[myinit] preparing tmpfs root"
 mkdir -p /newroot
 mount -t tmpfs tmpfs /newroot
 
-# Копируем ВСЁ, что есть в initramfs root, кроме псевдо-ФС и newroot
-# самого себя. Это важно из-за usrmerge: /bin, /sbin, /lib — симлинки
-# на /usr/*, так что "cp -a /bin ..." без /usr копирует битые ссылки.
+# Copy everything from the initramfs root except pseudo-FSes and newroot
+# itself. This matters because of usrmerge: /bin, /sbin, /lib are symlinks
+# to /usr/*, so "cp -a /bin ..." without /usr copies broken links.
 cd /
 for d in *; do
     case "$d" in
@@ -36,8 +36,8 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
 done
 [ -e /newroot/dev/vsock ] || mknod /newroot/dev/vsock c 10 241 2>/dev/null || true
 
-# Проверка перед прыжком — если тут пусто, лучше упасть с понятным
-# сообщением, чем ловить kernel panic из-за мёртвого PID 1.
+# Sanity check before switch_root — if this is empty, fail with a clear
+# message instead of getting a kernel panic from a dead PID 1.
 if [ ! -e /newroot/bin/sh ] && [ ! -L /newroot/bin ]; then
     echo "[myinit] FATAL: /newroot has no shell, aborting before switch_root"
     exec sh

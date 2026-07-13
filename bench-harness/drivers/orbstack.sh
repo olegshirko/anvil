@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Драйвер для OrbStack. Требует установленный OrbStack.app.
+# Driver for OrbStack. Requires OrbStack.app to be installed.
 
 backend_name() { echo "OrbStack"; }
 
@@ -11,9 +11,9 @@ _backend_orbstack_docker_config() {
         local tmp
         tmp="$(mktemp -d)"
         mkdir -p "$tmp"
-        # OrbStack при старте перезаписывает ~/.docker/config.json и выставляет
-        # credsStore=osxkeychain, которого нет без Docker Desktop.
-        # Используем временный config без credential helpers.
+        # OrbStack overwrites ~/.docker/config.json on start and sets
+        # credsStore=osxkeychain, which is unavailable without Docker Desktop.
+        # Use a temporary config without credential helpers.
         python3 -c "
 import json, os, shutil
 src = os.path.expanduser('~/.docker/config.json')
@@ -26,8 +26,8 @@ cfg.pop('credsStore', None)
 cfg.pop('credHelpers', None)
 with open('$tmp/config.json', 'w') as f:
     json.dump(cfg, f)
-# Docker Compose plugin иногда обращается к contexts даже при использовании
-# DOCKER_HOST, поэтому копируем их во временный config dir.
+# Docker Compose plugin sometimes looks at contexts even when DOCKER_HOST is
+# set, so copy them into the temporary config dir.
 ctx_src = os.path.expanduser('~/.docker/contexts')
 if os.path.isdir(ctx_src):
     shutil.copytree(ctx_src, os.path.join('$tmp', 'contexts'))
@@ -47,8 +47,8 @@ backend_start() {
     export DOCKER_CONFIG="$(_backend_orbstack_docker_config)"
     export DOCKER_HOST="unix://$ORBSTACK_SOCK"
     open -a OrbStack
-    # `docker info` без сервера возвращает 0 и показывает только Client.
-    # Ждём именно ServerVersion — он появляется только когда daemon готов.
+    # `docker info` returns 0 without a server and shows only the Client.
+    # Wait for ServerVersion, which appears only when the daemon is ready.
     wait_for "orbstack docker ready" 180 docker info --format '{{.ServerVersion}}'
 }
 
@@ -59,9 +59,9 @@ backend_stop() {
     sleep 1
 }
 
-# OrbStack держит машину "тёплой" в фоне и не имеет публичного snapshot
-# API — для честного сравнения считаем resume как повторный старт после
-# quit, это максимально близко к тому, что реально доступно пользователю.
+# OrbStack keeps the machine "warm" in the background and has no public
+# snapshot API. For a fair comparison we treat resume as a restart after quit,
+# which is the closest thing available to the user.
 backend_stop_keep_snapshot() {
     return 1
 }

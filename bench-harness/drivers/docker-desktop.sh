@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Драйвер для Docker Desktop. Требует установленный Docker Desktop.app.
+# Driver for Docker Desktop. Requires Docker Desktop.app to be installed.
 
 backend_name() { echo "Docker Desktop"; }
 
@@ -10,8 +10,8 @@ backend_is_available() {
 
 backend_start() {
     open -a Docker
-    # `docker info` без сервера возвращает 0 и показывает только Client.
-    # Ждём именно ServerVersion — он появляется только когда daemon готов.
+    # `docker info` returns 0 without a server and shows only the Client.
+    # Wait for ServerVersion, which appears only when the daemon is ready.
     wait_for "docker desktop ready" 180 docker --context desktop-linux info --format '{{.ServerVersion}}'
 }
 
@@ -21,7 +21,7 @@ backend_stop() {
 }
 
 backend_stop_keep_snapshot() {
-    return 1  # Docker Desktop не имеет snapshot/resume
+    return 1  # Docker Desktop has no snapshot/resume
 }
 
 backend_resume() {

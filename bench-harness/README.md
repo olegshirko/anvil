@@ -1,86 +1,83 @@
 # Anvil bench harness
 
-Сравнивает cold start / resume / compose-up время между vz-runner и
-конкурентами на одинаковом workload.
+Compares cold start / resume / compose-up time between vz-runner and
+competitors on the same workload.
 
 ## Setup
 
 ```bash
 chmod +x run_bench.sh scripts/*.sh drivers/*.sh
 
-# 1. Убедиться что vz-runner бинарник в PATH, либо:
+# 1. Make sure vz-runner binary is in PATH, or:
 export VZRUNNER_BIN=/path/to/.build/release/vz-runner
 
-# 2. Затянуть образы заранее на каждом backend'е, которым будешь мерить
-#    (иначе первый прогон меряет сеть, а не раннер)
-./scripts/prepull.sh docker        # текущий docker context (Colima, OrbStack, Docker Desktop)
+# 2. Pull workload images ahead of time on each backend you plan to measure,
+#    otherwise the benchmark measures network speed instead of the runtime.
+./scripts/prepull.sh docker        # current docker context (Colima, OrbStack, Docker Desktop)
 ./scripts/prepull.sh lima          # Lima VM instance "anvil"
-./scripts/prepull.sh vz-runner     # внутри vz-runner VM (namespace bench)
+./scripts/prepull.sh vz-runner     # inside vz-runner VM (namespace bench)
 
-# 3. Убедиться что vz-runner расшаривает корень этой папки в VM на
-#    /mnt/anvil через virtiofs (см. M2) — иначе vzc.sh не найдёт
-#    workload-файл внутри VM.
+# 3. Make sure vz-runner shares the root of this folder into the VM at
+#    /mnt/anvil via virtiofs (see M2); otherwise vzc.sh will not find the
+#    workload file inside the VM.
 ```
 
-## Запуск
+## Run
 
 ```bash
 ./run_bench.sh vz-runner lima colima orbstack docker-desktop
-# или
+# or
 ./run_bench.sh all
-# или только свой раннер, если конкуренты не установлены
+# or only your runner if competitors are not installed
 ./run_bench.sh vz-runner
-# или сравнить с предыдущим Lima-based Anvil
+# or compare with the previous Lima-based Anvil
 ./run_bench.sh vz-runner lima
 ```
 
-Каждый backend прогоняется изолированно: полный stop → cold start →
-compose up (первый раз) → idle RSS → compose down → snapshot/stop →
-resume → compose up (второй раз) → cleanup.
+Each backend is run in isolation: full stop → cold start → compose up (first
+time) → idle RSS → compose down → snapshot/stop → resume → compose up (second
+time) → cleanup.
 
-## Что меряется
+## What is measured
 
-| Фаза | Метрика | Что показывает |
+| Phase | Metric | Meaning |
 |---|---|---|
-| cold_start | daemon_ready | время от полного нуля до готовности принимать команды |
-| cold_start | compose_up_healthy | + время поднять весь стек (db+cache+api+web) до healthy |
-| resume | daemon_ready | то же, но после snapshot/resume (если backend поддерживает) вместо полного cold start |
-| resume | compose_up_healthy | compose up на уже тёплом backend |
-| steady_state | idle_rss_mb | память демона/VM-процесса на хосте в простое |
+| cold_start | daemon_ready | time from zero to accepting commands |
+| cold_start | compose_up_healthy | plus time to bring the whole stack (db+cache+api+web) to healthy |
+| resume | daemon_ready | same after snapshot/resume (if supported), otherwise a second cold start |
+| resume | compose_up_healthy | compose up on the already warm backend |
+| steady_state | idle_rss_mb | host daemon/VM process memory at idle |
 
-Для backend'ов без snapshot/resume API (Colima, OrbStack, Docker
-Desktop на сегодня) "resume" фаза — это честный повторный cold start,
-не подделка под resume. Это специально, чтобы разница была видна, а
-не скрыта.
+Backends without a snapshot/resume API (Colima, OrbStack, Docker Desktop today)
+run an honest second cold start in the "resume" phase. This makes the
+difference visible instead of hiding it.
 
-## Вывод
+## Output
 
-Актуальные результаты хранятся в двух файлах:
+Results are stored in two files:
 
-- `results/latest.csv` — aggregate-данные (последнее измерение для
-  каждого backend × phase × metric).
-- `results/latest.md` — одна сводная таблица, сгенерированная из
-  `latest.csv`, с автоматическим жирным выделением лучшего результата
-  по каждой строке.
+- `results/latest.csv` — aggregate data (last measurement for each backend ×
+  phase × metric).
+- `results/latest.md` — a single summary table generated from `latest.csv`,
+  with the best value in each row highlighted.
 
-Каждый новый прогон **обновляет** только те backend'и, которые в нём
-участвуют; результаты остальных backend'ов сохраняются. Это позволяет
-перемерять один конкурент, не теряя уже полученные данные:
+Each new run updates only the backends it includes; results for other backends
+are preserved. This lets you remeasure a single competitor without losing
+existing data:
 
 ```bash
-# Перемерять только Docker Desktop, сохранив результаты по остальным
+# Remeasure only Docker Desktop, keeping all other results
 ./run_bench.sh docker-desktop
-# или через Makefile
+# or via Makefile
 make harness BENCH_BACKENDS=docker-desktop
 ```
 
-Сырые CSV-файлы отдельных прогонов удаляются после обновления
-`latest.csv`, чтобы директория `results/` не разрасталась.
+Per-run CSV files are deleted after `latest.csv` is updated so `results/`
+does not grow.
 
-## Добавить новый backend
+## Add a new backend
 
-Скопируй `drivers/colima.sh` как шаблон, реализуй 7 функций
-(`backend_name`, `backend_start`, `backend_stop`,
-`backend_stop_keep_snapshot`, `backend_resume`,
-`backend_compose_cmd`, `backend_all_healthy`, `backend_idle_rss`),
-добавь имя в `ALL_BACKENDS` в `run_bench.sh`.
+Copy `drivers/colima.sh` as a template, implement the required functions
+(`backend_name`, `backend_start`, `backend_stop`, `backend_stop_keep_snapshot`,
+`backend_resume`, `backend_compose_cmd`, `backend_all_healthy`,
+`backend_idle_rss`), and add the name to `ALL_BACKENDS` in `run_bench.sh`.
