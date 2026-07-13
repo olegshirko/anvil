@@ -353,7 +353,9 @@ replace-release: sign
 update-brew:
 	@test -n "$(VERSION)" || { echo "Usage: make update-brew VERSION=x.y.z"; exit 1; }
 	@echo "[update-brew] downloading binary sha256..."
-	@SHA256=$$(curl -sfL "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/vz-runner-darwin-arm64" | shasum -a 256 | cut -d' ' -f1); \
+	@curl -sL "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/vz-runner-darwin-arm64" -o /tmp/vz-runner-darwin-arm64; \
+	SHA256=$$(shasum -a 256 /tmp/vz-runner-darwin-arm64 | cut -d' ' -f1); \
+	rm -f /tmp/vz-runner-darwin-arm64; \
 	if [ -z "$$SHA256" ]; then echo "Error: failed to download v$(VERSION) binary"; exit 1; fi; \
 	echo "[update-brew] sha256=$$SHA256"; \
 	sed -i '' 's|version ".*"|version "$(VERSION)"|' /tmp/homebrew-tap/anvil.rb; \
