@@ -8,7 +8,8 @@
     download-ubuntu ubuntu-modules \
     guest-agent initramfs-agent initramfs-ubuntu initramfs-containerd \
     container-tools time-boot time-service validate \
-    bench bench-prepull harness harness-all prune clean-containers
+    bench bench-prepull harness harness-all prune clean-containers \
+    release replace-release update-brew
 
 BINARY := .build/release/vz-runner
 ENTITLEMENTS := entitlements.plist
@@ -304,3 +305,58 @@ ALL_BENCH_BACKENDS ?= vz-runner lima colima orbstack docker-desktop
 bench-all harness-all: sign
 	@$(MAKE) service-stop
 	@VZRUNNER_BIN="$(CURDIR)/$(BINARY)" bash "$(CURDIR)/bench-harness/run_bench.sh" $(ALL_BENCH_BACKENDS)
+
+# -----------------------------------------------------------------------------
+# Release management
+# -----------------------------------------------------------------------------
+VERSION ?=
+
+release: sign
+	@test -n "$(VERSION)" || { echo "Usage: make release VERSION=x.y.z"; exit 1; }
+	@git rev-parse "v$(VERSION)" >/dev/null 2>&1 && \
+		{ echo "Error: tag v$(VERSION) already exists. Use 'make replace-release VERSION=$(VERSION)'."; exit 1; } || true
+	@echo "[release] tagging v$(VERSION) and pushing..."
+	git tag -a "v$(VERSION)" -m "v$(VERSION)"
+	git push origin "v$(VERSION)"
+	@echo "[release] waiting for CI to publish release..."
+	@i=0; while [ $$i -lt 20 ]; do \
+		sleep 15; \
+		curl -sf "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
+		i=$$((i + 1)); printf "."; \
+	done; echo ""
+	@curl -sf "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 || \
+		{ echo "[release] timeout. Check https://github.com/olegshirko/anvil/actions"; exit 1; }
+	@echo "[release] release published."
+	$(MAKE) update-brew VERSION=$(VERSION)
+
+replace-release: sign
+	@test -n "$(VERSION)" || { echo "Usage: make replace-release VERSION=x.y.z"; exit 1; }
+	@echo "[replace-release] deleting remote tag and GitHub release..."
+	git push origin ":refs/tags/v$(VERSION)" 2>/dev/null || true
+	git tag -d "v$(VERSION)" 2>/dev/null || true
+	gh release delete "v$(VERSION)" --repo olegshirko/anvil --yes 2>/dev/null || \
+		echo "[replace-release] note: gh not authed or release not found (run: gh auth login)"
+	@echo "[replace-release] tagging v$(VERSION) and pushing..."
+	git tag -a "v$(VERSION)" -m "v$(VERSION)"
+	git push origin "v$(VERSION)"
+	@echo "[replace-release] waiting for CI to publish release..."
+	@i=0; while [ $$i -lt 20 ]; do \
+		sleep 15; \
+		curl -sf "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
+		i=$$((i + 1)); printf "."; \
+	done; echo ""
+	@curl -sf "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 || \
+		{ echo "[replace-release] timeout. Check https://github.com/olegshirko/anvil/actions"; exit 1; }
+	@echo "[replace-release] release published."
+	$(MAKE) update-brew VERSION=$(VERSION)
+
+update-brew:
+	@test -n "$(VERSION)" || { echo "Usage: make update-brew VERSION=x.y.z"; exit 1; }
+	@echo "[update-brew] computing sha256 of source tarball..."
+	@SHA256=$$(curl -sfL "https://github.com/olegshirko/anvil/archive/refs/tags/v$(VERSION).tar.gz" | shasum -a 256 | cut -d' ' -f1); \
+	if [ -z "$$SHA256" ]; then echo "Error: failed to download v$(VERSION) tarball"; exit 1; fi; \
+	echo "[update-brew] sha256=$$SHA256"; \
+	sed -i '' 's|url ".*"|url "https://github.com/olegshirko/anvil/archive/refs/tags/v$(VERSION).tar.gz"|' /tmp/homebrew-tap/anvil.rb; \
+	sed -i '' 's|sha256 ".*"|sha256 "'$$SHA256'"|' /tmp/homebrew-tap/anvil.rb; \
+	cd /tmp/homebrew-tap && git add anvil.rb && git commit -m "v$(VERSION)" && git push; \
+	echo "[update-brew] done."
