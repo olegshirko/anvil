@@ -319,12 +319,14 @@ release: sign
 	git tag -a "v$(VERSION)" -m "v$(VERSION)"
 	git push origin "v$(VERSION)"
 	@echo "[release] waiting for CI to publish release..."
-	@i=0; while [ $$i -lt 20 ]; do \
+	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
+	i=0; while [ $$i -lt 20 ]; do \
 		sleep 15; \
-		curl -sf "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
+		curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
 		i=$$((i + 1)); printf "."; \
 	done; echo ""
-	@curl -sf "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 || \
+	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
+	curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 || \
 		{ echo "[release] timeout. Check https://github.com/olegshirko/anvil/actions"; exit 1; }
 	@echo "[release] release published."
 	$(MAKE) update-brew VERSION=$(VERSION)
@@ -340,12 +342,14 @@ replace-release: sign
 	git tag -a "v$(VERSION)" -m "v$(VERSION)"
 	git push origin "v$(VERSION)"
 	@echo "[replace-release] waiting for CI to publish release..."
-	@i=0; while [ $$i -lt 20 ]; do \
+	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
+	i=0; while [ $$i -lt 20 ]; do \
 		sleep 15; \
-		curl -sf "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
+		curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
 		i=$$((i + 1)); printf "."; \
 	done; echo ""
-	@curl -sf "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 || \
+	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
+	curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 || \
 		{ echo "[replace-release] timeout. Check https://github.com/olegshirko/anvil/actions"; exit 1; }
 	@echo "[replace-release] release published."
 	$(MAKE) update-brew VERSION=$(VERSION)
