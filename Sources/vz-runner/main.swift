@@ -253,6 +253,11 @@ func findArg(_ args: [String], _ key: String) -> String? {
 }
 
 func findProjectRoot() -> String? {
+    // Check current working directory first (user is in the project tree).
+    let cwd = FileManager.default.currentDirectoryPath
+    if FileManager.default.fileExists(atPath: URL(fileURLWithPath: cwd).appendingPathComponent("Package.swift").path) {
+        return cwd
+    }
     // Walk up from the executable looking for Package.swift.
     var url = URL(fileURLWithPath: currentExecutablePath()).deletingLastPathComponent()
     for _ in 0..<10 {
