@@ -78,6 +78,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${GITHUB_REF##*/}"
-          gh release create "${tag}" --draft --title "${tag}" --generate-notes \
+          gh release create "${tag}" --title "${tag}" --generate-notes \
             _output/vz-runner-darwin-arm64 \
             _output/vz-runner-darwin-arm64.sha256sum
