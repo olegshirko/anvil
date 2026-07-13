@@ -352,11 +352,12 @@ replace-release: sign
 
 update-brew:
 	@test -n "$(VERSION)" || { echo "Usage: make update-brew VERSION=x.y.z"; exit 1; }
-	@echo "[update-brew] computing sha256 of source tarball..."
-	@SHA256=$$(curl -sfL "https://github.com/olegshirko/anvil/archive/refs/tags/v$(VERSION).tar.gz" | shasum -a 256 | cut -d' ' -f1); \
-	if [ -z "$$SHA256" ]; then echo "Error: failed to download v$(VERSION) tarball"; exit 1; fi; \
+	@echo "[update-brew] downloading binary sha256..."
+	@SHA256=$$(curl -sfL "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/vz-runner-darwin-arm64" | shasum -a 256 | cut -d' ' -f1); \
+	if [ -z "$$SHA256" ]; then echo "Error: failed to download v$(VERSION) binary"; exit 1; fi; \
 	echo "[update-brew] sha256=$$SHA256"; \
-	sed -i '' 's|url ".*"|url "https://github.com/olegshirko/anvil/archive/refs/tags/v$(VERSION).tar.gz"|' /tmp/homebrew-tap/anvil.rb; \
+	sed -i '' 's|version ".*"|version "$(VERSION)"|' /tmp/homebrew-tap/anvil.rb; \
+	sed -i '' 's|url ".*vz-runner-darwin-arm64"|url "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/vz-runner-darwin-arm64"|' /tmp/homebrew-tap/anvil.rb; \
 	sed -i '' 's|sha256 ".*"|sha256 "'$$SHA256'"|' /tmp/homebrew-tap/anvil.rb; \
 	cd /tmp/homebrew-tap && git add anvil.rb && git commit -m "v$(VERSION)" && git push; \
 	echo "[update-brew] done."
