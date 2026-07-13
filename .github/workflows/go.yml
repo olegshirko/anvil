@@ -75,7 +75,7 @@ jobs:
           path: _output/
       - name: create release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${GITHUB_REF##*/}"
           gh release create "${tag}" --draft --title "${tag}" --generate-notes \
