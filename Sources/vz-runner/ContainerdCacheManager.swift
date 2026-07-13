@@ -1,7 +1,7 @@
 import Foundation
 
 /// Persists `/var/lib/containerd` to the virtiofs share by running a guest-side
-/// sync script via `vz-runner exec`. This keeps pulled images across cold boots
+/// sync script via `anvil exec`. This keeps pulled images across cold boots
 /// while containerd's runtime root stays on tmpfs.
 final class ContainerdCacheManager {
     /// Path on the host, used only for logging.

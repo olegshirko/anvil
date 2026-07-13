@@ -39,7 +39,7 @@ func decodeLengthPrefixed<T: Decodable>(_ type: T.Type, from stream: InputStream
     let lengthData = try readExactly(stream, count: MemoryLayout<UInt32>.size)
     let length = UInt32(bigEndian: lengthData.withUnsafeBytes { $0.load(as: UInt32.self) })
     guard length <= 16 * 1024 * 1024 else {
-        throw NSError(domain: "vz-runner", code: 1, userInfo: [NSLocalizedDescriptionKey: "response too large"])
+        throw NSError(domain: "anvil", code: 1, userInfo: [NSLocalizedDescriptionKey: "response too large"])
     }
     let body = try readExactly(stream, count: Int(length))
     return try JSONDecoder().decode(type, from: body)
@@ -49,14 +49,14 @@ func readExactly(_ stream: InputStream, count: Int) throws -> Data {
     var buffer = Data(repeating: 0, count: count)
     var total = 0
     try buffer.withUnsafeMutableBytes { raw in
-        guard let base = raw.baseAddress else { throw NSError(domain: "vz-runner", code: 2) }
+        guard let base = raw.baseAddress else { throw NSError(domain: "anvil", code: 2) }
         while total < count {
             let read = stream.read(base.advanced(by: total), maxLength: count - total)
             if read < 0, let error = stream.streamError {
                 throw error
             }
             if read == 0 {
-                throw NSError(domain: "vz-runner", code: 3, userInfo: [NSLocalizedDescriptionKey: "unexpected EOF"])
+                throw NSError(domain: "anvil", code: 3, userInfo: [NSLocalizedDescriptionKey: "unexpected EOF"])
             }
             total += read
         }
@@ -87,14 +87,14 @@ func loadState() -> RunState? {
 func writeAll(_ stream: OutputStream, data: Data) throws {
     var total = 0
     try data.withUnsafeBytes { raw in
-        guard let base = raw.baseAddress else { throw NSError(domain: "vz-runner", code: 4) }
+        guard let base = raw.baseAddress else { throw NSError(domain: "anvil", code: 4) }
         while total < data.count {
             let written = stream.write(base.advanced(by: total), maxLength: data.count - total)
             if written < 0, let error = stream.streamError {
                 throw error
             }
             if written == 0 {
-                throw NSError(domain: "vz-runner", code: 5, userInfo: [NSLocalizedDescriptionKey: "write failed"])
+                throw NSError(domain: "anvil", code: 5, userInfo: [NSLocalizedDescriptionKey: "write failed"])
             }
             total += written
         }
@@ -121,11 +121,11 @@ func readExactlyFD(_ fd: Int32, count: Int) -> Data? {
 func writeExactlyFD(_ fd: Int32, data: Data) throws {
     var total = 0
     try data.withUnsafeBytes { raw in
-        guard let base = raw.baseAddress else { throw NSError(domain: "vz-runner", code: 6) }
+        guard let base = raw.baseAddress else { throw NSError(domain: "anvil", code: 6) }
         while total < data.count {
             let n = write(fd, base.advanced(by: total), data.count - total)
-            if n < 0 { throw NSError(domain: "vz-runner", code: 7) }
-            if n == 0 { throw NSError(domain: "vz-runner", code: 8) }
+            if n < 0 { throw NSError(domain: "anvil", code: 7) }
+            if n == 0 { throw NSError(domain: "anvil", code: 8) }
             total += n
         }
     }
@@ -133,14 +133,14 @@ func writeExactlyFD(_ fd: Int32, data: Data) throws {
 
 func decodeLengthPrefixedFD<T: Decodable>(_ type: T.Type, fd: Int32) throws -> T {
     guard let lengthData = readExactlyFD(fd, count: MemoryLayout<UInt32>.size) else {
-        throw NSError(domain: "vz-runner", code: 9, userInfo: [NSLocalizedDescriptionKey: "EOF reading length"])
+        throw NSError(domain: "anvil", code: 9, userInfo: [NSLocalizedDescriptionKey: "EOF reading length"])
     }
     let length = UInt32(bigEndian: lengthData.withUnsafeBytes { $0.load(as: UInt32.self) })
     guard length <= 16 * 1024 * 1024 else {
-        throw NSError(domain: "vz-runner", code: 10, userInfo: [NSLocalizedDescriptionKey: "response too large"])
+        throw NSError(domain: "anvil", code: 10, userInfo: [NSLocalizedDescriptionKey: "response too large"])
     }
     guard let body = readExactlyFD(fd, count: Int(length)) else {
-        throw NSError(domain: "vz-runner", code: 11, userInfo: [NSLocalizedDescriptionKey: "EOF reading body"])
+        throw NSError(domain: "anvil", code: 11, userInfo: [NSLocalizedDescriptionKey: "EOF reading body"])
     }
     return try JSONDecoder().decode(type, from: body)
 }

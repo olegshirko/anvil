@@ -62,7 +62,7 @@ final class VMLifecycleManager: NSObject {
                 self.start()
                 completion(.success(()))
             default:
-                let error = NSError(domain: "vz-runner", code: 100,
+                let error = NSError(domain: "anvil", code: 100,
                                     userInfo: [NSLocalizedDescriptionKey: "unexpected VM state: \(vm.state)"])
                 completion(.failure(error))
             }
@@ -122,7 +122,7 @@ final class VMLifecycleManager: NSObject {
             }
             switch pauseResult {
             case .failure(let error):
-                print("[vz-runner] pause before stop failed: \(error)")
+                print("[anvil] pause before stop failed: \(error)")
                 completion()
             case .success:
                 self.saveSnapshot { _ in
@@ -138,7 +138,7 @@ final class VMLifecycleManager: NSObject {
             completion?(nil)
             return
         }
-        print("[vz-runner] saving VM snapshot...")
+        print("[anvil] saving VM snapshot...")
         snapshot.removeSnapshotStatePreservingSidecars()
         let start = Date()
         vm.saveMachineStateTo(url: snapshot.snapshotURL) { [weak self] error in
@@ -148,7 +148,7 @@ final class VMLifecycleManager: NSObject {
             }
             let duration = Date().timeIntervalSince(start)
             if let error = error {
-                print("[vz-runner] snapshot save failed after \(String(format: "%.3f", duration))s: \(error)")
+                print("[anvil] snapshot save failed after \(String(format: "%.3f", duration))s: \(error)")
                 completion?(error)
                 return
             }
@@ -159,7 +159,7 @@ final class VMLifecycleManager: NSObject {
                 memory: self.args.memoryGiB,
                 containerdDiskPath: self.args.containerdDiskPath
             )
-            print("[vz-runner] snapshot saved in \(String(format: "%.3f", duration))s")
+            print("[anvil] snapshot saved in \(String(format: "%.3f", duration))s")
             completion?(nil)
         }
     }
@@ -177,7 +177,7 @@ final class VMLifecycleManager: NSObject {
                 memory: self.args.memoryGiB,
                 containerdDiskPath: self.args.containerdDiskPath
             )
-            print("[vz-runner] snapshot exists=\(self.snapshot.hasSnapshot) hashMatches=\(hashMatches)")
+            print("[anvil] snapshot exists=\(self.snapshot.hasSnapshot) hashMatches=\(hashMatches)")
 
             var canRestore = self.args.useAgent
                 && !self.args.fresh
@@ -199,7 +199,7 @@ final class VMLifecycleManager: NSObject {
                 machineIdentifier: machineIdentifier,
                 macAddress: networkConfig.macAddresses.first
             ) else {
-                completion(.failure(NSError(domain: "vz-runner", code: 101,
+                completion(.failure(NSError(domain: "anvil", code: 101,
                                             userInfo: [NSLocalizedDescriptionKey: "invalid configuration"])))
                 return
             }
@@ -207,9 +207,9 @@ final class VMLifecycleManager: NSObject {
             if self.args.useAgent {
                 do {
                     try config.validateSaveRestoreSupport()
-                    print("[vz-runner] configuration supports save/restore")
+                    print("[anvil] configuration supports save/restore")
                 } catch {
-                    print("[vz-runner] configuration does not support save/restore: \(error)")
+                    print("[anvil] configuration does not support save/restore: \(error)")
                 }
             }
 
@@ -233,18 +233,18 @@ final class VMLifecycleManager: NSObject {
             && hashMatches
 
         if canRestore {
-            print("[vz-runner] restoring VM from snapshot...")
+            print("[anvil] restoring VM from snapshot...")
             let restoreStart = Date()
             vm.restoreMachineStateFrom(url: snapshot.snapshotURL) { [weak self] error in
                 guard let self = self else { return }
                 let restoreDuration = Date().timeIntervalSince(restoreStart)
                 if let error = error {
-                    print("[vz-runner] restore failed after \(String(format: "%.3f", restoreDuration))s: \(error)")
-                    print("[vz-runner] falling back to cold boot")
+                    print("[anvil] restore failed after \(String(format: "%.3f", restoreDuration))s: \(error)")
+                    print("[anvil] falling back to cold boot")
                     self.snapshot.removeSnapshot()
                     self.coldBoot(vm: vm)
                 } else {
-                    print("[vz-runner] VM restored in \(String(format: "%.3f", restoreDuration))s, resuming...")
+                    print("[anvil] VM restored in \(String(format: "%.3f", restoreDuration))s, resuming...")
                     let resumeStart = Date()
                     vm.resume { result in
                         DispatchQueue.main.async { [weak self] in
@@ -252,7 +252,7 @@ final class VMLifecycleManager: NSObject {
                             let resumeDuration = Date().timeIntervalSince(resumeStart)
                             switch result {
                             case .success:
-                                print("[vz-runner] VM resumed in \(String(format: "%.3f", resumeDuration))s, streaming console:\n---")
+                                print("[anvil] VM resumed in \(String(format: "%.3f", resumeDuration))s, streaming console:\n---")
                                 self.delegate?.vmLifecycleManagerDidBecomeReady(self)
                             case .failure(let error):
                                 self.delegate?.vmLifecycleManager(self, didFailWithError: error)
@@ -262,7 +262,7 @@ final class VMLifecycleManager: NSObject {
                 }
             }
         } else {
-            print("[vz-runner] starting VM (kernel=\(args.kernelPath))...")
+            print("[anvil] starting VM (kernel=\(args.kernelPath))...")
             coldBoot(vm: vm)
         }
     }
@@ -275,15 +275,15 @@ final class VMLifecycleManager: NSObject {
                 switch result {
                 case .success:
                     if let start = self.coldBootStart {
-                        print("[vz-runner] VM started in \(String(format: "%.3f", Date().timeIntervalSince(start)))s, streaming console:\n---")
+                        print("[anvil] VM started in \(String(format: "%.3f", Date().timeIntervalSince(start)))s, streaming console:\n---")
                     } else {
-                        print("[vz-runner] VM started, streaming console:\n---")
+                        print("[anvil] VM started, streaming console:\n---")
                     }
                     if self.args.useAgent {
                         self.waitForGuestAgent(vm: vm)
                     }
                 case .failure(let error):
-                    print("[vz-runner] failed to start: \(error)")
+                    print("[anvil] failed to start: \(error)")
                     self.delegate?.vmLifecycleManager(self, didFailWithError: error)
                 }
             }
@@ -292,7 +292,7 @@ final class VMLifecycleManager: NSObject {
 
     private func waitForGuestAgent(vm: VZVirtualMachine) {
         guard let device = vm.socketDevices.first as? VZVirtioSocketDevice else {
-            delegate?.vmLifecycleManager(self, didFailWithError: NSError(domain: "vz-runner", code: 102,
+            delegate?.vmLifecycleManager(self, didFailWithError: NSError(domain: "anvil", code: 102,
                                                                          userInfo: [NSLocalizedDescriptionKey: "virtio socket device not found"]))
             return
         }
@@ -300,7 +300,7 @@ final class VMLifecycleManager: NSObject {
 
         func attempt() {
             guard Date() < deadline else {
-                print("[vz-runner] guest agent did not become ready")
+                print("[anvil] guest agent did not become ready")
                 return
             }
             device.connect(toPort: controlPort) { [weak self] result in
@@ -309,9 +309,9 @@ final class VMLifecycleManager: NSObject {
                 case .success(let conn):
                     conn.close()
                     if let start = self.coldBootStart {
-                        print("[vz-runner] guest agent ready \(String(format: "%.3f", Date().timeIntervalSince(start)))s after VM start")
+                        print("[anvil] guest agent ready \(String(format: "%.3f", Date().timeIntervalSince(start)))s after VM start")
                     } else {
-                        print("[vz-runner] guest agent ready")
+                        print("[anvil] guest agent ready")
                     }
                     self.pause { pauseResult in
                         switch pauseResult {
@@ -322,7 +322,7 @@ final class VMLifecycleManager: NSObject {
                                 }
                             }
                         case .failure(let pauseError):
-                            print("[vz-runner] pause for snapshot failed: \(pauseError)")
+                            print("[anvil] pause for snapshot failed: \(pauseError)")
                             self.delegate?.vmLifecycleManagerDidBecomeReady(self)
                         }
                     }
@@ -345,11 +345,11 @@ final class VMLifecycleManager: NSObject {
             let storedNet = snapshot.loadNetworkConfig()
 
             if storedID == nil {
-                print("[vz-runner] snapshot machine identifier missing, disabling restore")
+                print("[anvil] snapshot machine identifier missing, disabling restore")
                 canRestore = false
             }
             if storedNet == nil {
-                print("[vz-runner] snapshot network config missing, disabling restore")
+                print("[anvil] snapshot network config missing, disabling restore")
                 canRestore = false
             }
 
@@ -359,19 +359,19 @@ final class VMLifecycleManager: NSObject {
                 snapshot.saveMachineIdentifier(machineIdentifier)
                 networkConfig = NetworkConfig(macAddresses: [VZMACAddress.randomLocallyAdministered().string])
                 snapshot.saveNetworkConfig(networkConfig)
-                print("[vz-runner] generated new machine identifier and network config")
+                print("[anvil] generated new machine identifier and network config")
             } else {
                 machineIdentifier = storedID!
                 networkConfig = storedNet!
-                print("[vz-runner] using stored machine identifier for restore")
-                print("[vz-runner] using stored network config for restore")
+                print("[anvil] using stored machine identifier for restore")
+                print("[anvil] using stored network config for restore")
             }
         } else {
             machineIdentifier = VZGenericMachineIdentifier().dataRepresentation
             snapshot.saveMachineIdentifier(machineIdentifier)
             networkConfig = NetworkConfig(macAddresses: [VZMACAddress.randomLocallyAdministered().string])
             snapshot.saveNetworkConfig(networkConfig)
-            print("[vz-runner] generated new machine identifier and network config")
+            print("[anvil] generated new machine identifier and network config")
         }
 
         return (machineIdentifier, networkConfig)
@@ -380,12 +380,12 @@ final class VMLifecycleManager: NSObject {
 
 extension VMLifecycleManager: VZVirtualMachineDelegate {
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
-        print("\n[vz-runner] guest stopped")
+        print("\n[anvil] guest stopped")
         delegate?.vmLifecycleManagerDidStop(self)
     }
 
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
-        print("\n[vz-runner] VM stopped with error: \(error)")
+        print("\n[anvil] VM stopped with error: \(error)")
         delegate?.vmLifecycleManager(self, didFailWithError: error)
     }
 }

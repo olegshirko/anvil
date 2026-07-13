@@ -9,7 +9,7 @@ enum DaemonCommand {
         let cliArgs = parseDaemonArgs(args)
 
         guard acquireDaemonLock() else {
-            print("[vz-runner] daemon already running")
+            print("[anvil] daemon already running")
             exit(1)
         }
 
@@ -19,14 +19,14 @@ enum DaemonCommand {
 
         signal(SIGINT) { _ in
             DispatchQueue.main.async {
-                print("\n[vz-runner] daemon received SIGINT, shutting down...")
+                print("\n[anvil] daemon received SIGINT, shutting down...")
                 globalDaemon?.shutdown()
             }
         }
 
         signal(SIGTERM) { _ in
             DispatchQueue.main.async {
-                print("\n[vz-runner] daemon received SIGTERM, shutting down...")
+                print("\n[anvil] daemon received SIGTERM, shutting down...")
                 globalDaemon?.shutdown()
             }
         }
@@ -188,7 +188,7 @@ enum DaemonCommand {
         }
 
         func start() {
-            print("[vz-runner] daemon starting...")
+            print("[anvil] daemon starting...")
             manager.start()
         }
 
@@ -237,7 +237,7 @@ enum DaemonCommand {
                 tracker.connect()
                 self?.manager.ensureRunning { result in
                     if case .failure(let error) = result {
-                        print("[vz-runner] resume on control client connect failed: \(error)")
+                        print("[anvil] resume on control client connect failed: \(error)")
                     }
                 }
             }
@@ -246,7 +246,7 @@ enum DaemonCommand {
             }
             server.start()
             self.server = server
-            print("[vz-runner] daemon ready, control socket: \(controlSocketPath)")
+            print("[anvil] daemon ready, control socket: \(controlSocketPath)")
 
             let dockerProxy = DockerProxyServer(
                 socketPath: dockerSocketPath,
@@ -271,7 +271,7 @@ enum DaemonCommand {
             }
             dockerProxy.start()
             self.dockerProxyServer = dockerProxy
-            print("[vz-runner] docker proxy socket: \(dockerSocketPath)")
+            print("[anvil] docker proxy socket: \(dockerSocketPath)")
 
             let forwarder = PortForwarder { [weak manager] in manager?.socketDevice }
             forwarder.start()
@@ -284,12 +284,12 @@ enum DaemonCommand {
         }
 
         func vmLifecycleManager(_ manager: VMLifecycleManager, didFailWithError error: Error) {
-            print("[vz-runner] daemon VM failed: \(error)")
+            print("[anvil] daemon VM failed: \(error)")
             shutdown()
         }
 
         func vmLifecycleManagerDidStop(_ manager: VMLifecycleManager) {
-            print("[vz-runner] daemon VM stopped")
+            print("[anvil] daemon VM stopped")
             shutdown()
         }
 
@@ -307,18 +307,18 @@ enum DaemonCommand {
 
         private func idleTimeoutFired() {
             guard !isShuttingDown, (server?.clientsCount ?? 0) == 0 else { return }
-            print("[vz-runner] idle timeout reached, syncing containerd cache...")
+            print("[anvil] idle timeout reached, syncing containerd cache...")
             cacheManager?.sync()
             GuestCacheDropper.dropCaches()
-            print("[vz-runner] pausing VM...")
+            print("[anvil] pausing VM...")
             manager.pause { [weak self] result in
                 guard let self = self else { return }
                 switch result {
                 case .success:
-                    print("[vz-runner] VM paused")
+                    print("[anvil] VM paused")
                     self.manager.saveSnapshot { _ in }
                 case .failure(let error):
-                    print("[vz-runner] idle pause failed: \(error)")
+                    print("[anvil] idle pause failed: \(error)")
                 }
             }
         }

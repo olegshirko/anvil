@@ -28,22 +28,22 @@ struct SnapshotManager {
         let components = configHashComponents(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory, containerdDiskPath: containerdDiskPath)
         let current = components.hash
         let storedClean = stored.trimmingCharacters(in: .whitespacesAndNewlines)
-        print("[vz-runner] stored config hash: \(storedClean)")
-        print("[vz-runner] current config hash: \(current)")
-        print("[vz-runner] hash inputs -> kernel:\(components.kernelSHA) initrd:\(components.initrdSHA) cpus:\(components.cpus) memory:\(components.memory) disk:\(components.diskToken)")
+        print("[anvil] stored config hash: \(storedClean)")
+        print("[anvil] current config hash: \(current)")
+        print("[anvil] hash inputs -> kernel:\(components.kernelSHA) initrd:\(components.initrdSHA) cpus:\(components.cpus) memory:\(components.memory) disk:\(components.diskToken)")
         return storedClean == current
     }
 
     @discardableResult
     func writeConfigHash(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?) -> Bool {
         let components = configHashComponents(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory, containerdDiskPath: containerdDiskPath)
-        print("[vz-runner] writing config hash: \(components.hash)")
-        print("[vz-runner] hash inputs -> kernel:\(components.kernelSHA) initrd:\(components.initrdSHA) cpus:\(components.cpus) memory:\(components.memory) disk:\(components.diskToken)")
+        print("[anvil] writing config hash: \(components.hash)")
+        print("[anvil] hash inputs -> kernel:\(components.kernelSHA) initrd:\(components.initrdSHA) cpus:\(components.cpus) memory:\(components.memory) disk:\(components.diskToken)")
         do {
             try components.hash.write(to: configHashURL, atomically: true, encoding: .utf8)
             return true
         } catch {
-            print("[vz-runner] failed to write config hash: \(error)")
+            print("[anvil] failed to write config hash: \(error)")
             return false
         }
     }
@@ -80,7 +80,7 @@ struct SnapshotManager {
 
     private func sha256OfFile(_ path: String) -> String? {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
-            print("[vz-runner] failed to read file for hash: \(path)")
+            print("[anvil] failed to read file for hash: \(path)")
             return nil
         }
         return SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
@@ -114,7 +114,7 @@ struct SnapshotManager {
             try data.write(to: machineIDURL, options: .atomic)
             return true
         } catch {
-            print("[vz-runner] failed to write machine identifier: \(error)")
+            print("[anvil] failed to write machine identifier: \(error)")
             return false
         }
     }
@@ -133,7 +133,7 @@ struct SnapshotManager {
             try data.write(to: networkConfigURL, options: .atomic)
             return true
         } catch {
-            print("[vz-runner] failed to write network config: \(error)")
+            print("[anvil] failed to write network config: \(error)")
             return false
         }
     }

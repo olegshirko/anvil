@@ -4,9 +4,9 @@ enum ControlClient {
     static func status() {
         do {
             let resp = try sendUnix(request: ControlRequest(cmd: "health", args: nil))
-            print("[vz-runner] VM status=\(resp.status ?? "unknown")")
+            print("[anvil] VM status=\(resp.status ?? "unknown")")
         } catch {
-            print("[vz-runner] status failed: \(error)")
+            print("[anvil] status failed: \(error)")
             exit(1)
         }
     }
@@ -26,11 +26,11 @@ enum ControlClient {
                 exit(Int32(code))
             }
             if let error = resp.error {
-                print("[vz-runner] error: \(error)")
+                print("[anvil] error: \(error)")
                 exit(1)
             }
         } catch {
-            print("[vz-runner] exec failed: \(error)")
+            print("[anvil] exec failed: \(error)")
             exit(1)
         }
     }
@@ -46,7 +46,7 @@ enum ControlClient {
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
-            throw NSError(domain: "vz-runner", code: 20, userInfo: [NSLocalizedDescriptionKey: "failed to create socket"])
+            throw NSError(domain: "anvil", code: 20, userInfo: [NSLocalizedDescriptionKey: "failed to create socket"])
         }
         setSocketNoSigPipe(fd)
         defer { close(fd) }
@@ -57,21 +57,21 @@ enum ControlClient {
             }
         }
         guard connected else {
-            throw NSError(domain: "vz-runner", code: 21, userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))])
+            throw NSError(domain: "anvil", code: 21, userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))])
         }
 
         let requestData = try encodeLengthPrefixed(request)
         try writeExactlyFD(fd, data: requestData)
 
         guard let lengthData = readExactlyFD(fd, count: MemoryLayout<UInt32>.size) else {
-            throw NSError(domain: "vz-runner", code: 24, userInfo: [NSLocalizedDescriptionKey: "unexpected EOF reading length"])
+            throw NSError(domain: "anvil", code: 24, userInfo: [NSLocalizedDescriptionKey: "unexpected EOF reading length"])
         }
         let length = UInt32(bigEndian: lengthData.withUnsafeBytes { $0.load(as: UInt32.self) })
         guard length <= 16 * 1024 * 1024 else {
-            throw NSError(domain: "vz-runner", code: 25, userInfo: [NSLocalizedDescriptionKey: "response too large"])
+            throw NSError(domain: "anvil", code: 25, userInfo: [NSLocalizedDescriptionKey: "response too large"])
         }
         guard let body = readExactlyFD(fd, count: Int(length)) else {
-            throw NSError(domain: "vz-runner", code: 28, userInfo: [NSLocalizedDescriptionKey: "unexpected EOF reading body"])
+            throw NSError(domain: "anvil", code: 28, userInfo: [NSLocalizedDescriptionKey: "unexpected EOF reading body"])
         }
 
         return try JSONDecoder().decode(ControlResponse.self, from: body)

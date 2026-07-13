@@ -42,7 +42,7 @@ final class ControlServer {
 
         fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
-            print("[vz-runner] failed to create unix socket")
+            print("[anvil] failed to create unix socket")
             return
         }
         setSocketNoSigPipe(fd)
@@ -54,13 +54,13 @@ final class ControlServer {
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, size) }
         }
         guard bindResult == 0 else {
-            print("[vz-runner] failed to bind unix socket: \(String(cString: strerror(errno)))")
+            print("[anvil] failed to bind unix socket: \(String(cString: strerror(errno)))")
             close(fd)
             fd = -1
             return
         }
         guard listen(fd, 5) == 0 else {
-            print("[vz-runner] failed to listen unix socket: \(String(cString: strerror(errno)))")
+            print("[anvil] failed to listen unix socket: \(String(cString: strerror(errno)))")
             close(fd)
             fd = -1
             return

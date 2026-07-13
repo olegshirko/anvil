@@ -23,15 +23,10 @@ sign: build
 	codesign --entitlements $(ENTITLEMENTS) --force -s - --identifier com.olegshirko.vz-runner $(BINARY)
 
 daemon: sign
-	$(BINARY) daemon --share /tmp/anvil-share
+	$(BINARY) start --share /tmp/anvil-share
 
 stop-daemon:
-	@PID=$$(cat ~/.anvil-vz/daemon.pid 2>/dev/null); \
-	if [ -n "$$PID" ]; then \
-	    kill $$PID 2>/dev/null && echo "[vz-runner] daemon stopped" || echo "[vz-runner] daemon not running"; \
-	else \
-	    echo "[vz-runner] no daemon pid file"; \
-	fi
+	@$(BINARY) stop 2>/dev/null || echo "[anvil] daemon not running"
 
 # -----------------------------------------------------------------------------
 # macOS service: LaunchAgent + shell wrapper
@@ -101,7 +96,7 @@ lima-restart:
 	@docker context use $(LIMA_DOCKER_CONTEXT)
 	@echo "[anvil] Lima VM '$(LIMA_INSTANCE)' restarted, docker context: $(LIMA_DOCKER_CONTEXT)"
 
-# Start/stop Colima with settings close to vz-runner (VZ VM + virtiofs mounts).
+# Start/stop Colima with settings close to anvil (VZ VM + virtiofs mounts).
 colima-start:
 	@colima start --vm-type=vz --mount-type=virtiofs
 	@docker context use colima
