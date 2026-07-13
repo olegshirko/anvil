@@ -1,0 +1,52 @@
+# Same workload for all backends. Images must be pulled
+# (docker/nerdctl pull) BEFORE measuring, otherwise you measure
+# network speed, not runtime speed. Run scripts/prepull.sh before benchmarking.
+#
+# Small but realistic: web + api + db + cache — a typical docker-compose
+# stack people actually run locally.
+
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  cache:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  api:
+    image: node:20-alpine
+    command: ["node", "-e", "require('http').createServer((q,r)=>r.end('ok')).listen(3000); console.log('ready')"]
+    depends_on:
+      - db
+      - cache
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000 || exit 1"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  web:
+    image: nginx:alpine
+    depends_on:
+      - api
+    ports:
+      - "18080:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80 || exit 1"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
