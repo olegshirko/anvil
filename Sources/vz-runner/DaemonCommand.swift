@@ -156,6 +156,11 @@ enum DaemonCommand {
             private let idleSeconds: TimeInterval
             private let scheduleIdle: () -> Void
             private let cancelIdle: () -> Void
+            /// When true, `disconnect()` will not re-schedule the idle timer.
+            /// Set by the daemon during `idleTimeoutFired` to prevent the
+            /// exec child processes (cache sync, page-cache drop) from
+            /// triggering a new idle cycle via their connect/disconnect.
+            var suppressIdleSchedule = false
 
             init(idleSeconds: TimeInterval, scheduleIdle: @escaping () -> Void, cancelIdle: @escaping () -> Void) {
                 self.idleSeconds = idleSeconds
@@ -183,7 +188,7 @@ enum DaemonCommand {
                 count -= 1
                 isZero = count == 0
                 lock.unlock()
-                if isZero { scheduleIdle() }
+                if isZero && !suppressIdleSchedule { scheduleIdle() }
             }
         }
 
@@ -307,6 +312,7 @@ enum DaemonCommand {
 
         private func idleTimeoutFired() {
             guard !isShuttingDown, (server?.clientsCount ?? 0) == 0 else { return }
+            clientTracker?.suppressIdleSchedule = true
             print("[anvil] idle timeout reached, syncing containerd cache...")
             cacheManager?.sync()
             GuestCacheDropper.dropCaches()
@@ -316,9 +322,12 @@ enum DaemonCommand {
                 switch result {
                 case .success:
                     print("[anvil] VM paused")
-                    self.manager.saveSnapshot { _ in }
+                    self.manager.saveSnapshot { [weak self] _ in
+                        self?.clientTracker?.suppressIdleSchedule = false
+                    }
                 case .failure(let error):
                     print("[anvil] idle pause failed: \(error)")
+                    self.clientTracker?.suppressIdleSchedule = false
                 }
             }
         }

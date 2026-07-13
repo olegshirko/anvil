@@ -1,5 +1,5 @@
 .PHONY: all build sign clean test \
-    daemon stop-daemon \
+    start stop daemon stop-daemon \
     service-install service-uninstall service-start service-stop service-restart service-status \
     service-debug service-debug-rebuild rebuild-all \
     docker-context-anvil docker-context-lima lima-restart colima-start colima-stop \
@@ -27,6 +27,10 @@ daemon: sign
 
 stop-daemon:
 	@$(BINARY) stop 2>/dev/null || echo "[anvil] daemon not running"
+
+start: daemon
+
+stop: stop-daemon
 
 # -----------------------------------------------------------------------------
 # macOS service: LaunchAgent + shell wrapper
