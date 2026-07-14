@@ -13,10 +13,12 @@
 
 BINARY := .build/release/vz-runner
 ENTITLEMENTS := entitlements.plist
+VERSION ?= dev
 
 all: sign
 
 build:
+	echo 'let buildVersion = "$(VERSION)"' > Sources/vz-runner/version.swift
 	swift build -c release
 
 sign: build
