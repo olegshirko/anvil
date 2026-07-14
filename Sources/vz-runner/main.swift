@@ -179,6 +179,7 @@ func cmdStart(args: [String]) {
         exit(1)
     }
 
+    _ = shell("docker", "context", "create", "anvil", "--docker", "host=unix://\(dockerSocketPath)")
     _ = shell("docker", "context", "use", "anvil")
     print("[anvil] ready (pid \(proc.processIdentifier))")
 }
