@@ -117,7 +117,7 @@ enum DaemonCommand {
                 initrdPath: initrd ?? ".download/ubuntu/initramfs-containerd",
                 useAgent: true,
                 fresh: false,
-                sharePath: sharePath ?? "/tmp/anvil-share",
+                sharePath: sharePath,
                 mountTag: mountTag,
                 memoryGiB: memory,
                 cpuCount: cpus,
