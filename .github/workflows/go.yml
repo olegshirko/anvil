@@ -97,8 +97,9 @@ jobs:
 
       - name: Build guest-agent
         run: |
-          cd guest-agent && go mod tidy
-          cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../.download/alpine/guest-agent .
+          cd guest-agent
+          go mod tidy
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../.download/alpine/guest-agent .
 
       - name: Download container tools
         run: |
