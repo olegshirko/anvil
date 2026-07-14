@@ -7,7 +7,7 @@ import Foundation
 enum GuestCacheDropper {
     static func dropCaches() {
         guard let executableURL = Bundle.main.executableURL ?? fallbackExecutableURL() else {
-            print("[guest-cache-drop] unable to locate vz-runner executable")
+            print("[guest-cache-drop] unable to locate anvil executable")
             return
         }
         let process = Process()

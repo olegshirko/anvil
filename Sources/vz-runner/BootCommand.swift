@@ -14,7 +14,7 @@ enum BootCommand {
         manager.delegate = delegate
 
         signal(SIGINT) { _ in
-            print("\n[vz-runner] received SIGINT, exiting...")
+            print("\n[anvil] received SIGINT, exiting...")
             exit(0)
         }
 
@@ -41,14 +41,14 @@ enum BootCommand {
             }
             server.start()
             self.server = server
-            print("[vz-runner] control server ready on \(controlSocketPath)")
+            print("[anvil] control server ready on \(controlSocketPath)")
 
             let dockerProxy = DockerProxyServer(socketPath: dockerSocketPath) { [weak manager] in
                 manager?.socketDevice
             }
             dockerProxy.start()
             self.dockerProxyServer = dockerProxy
-            print("[vz-runner] docker proxy socket: \(dockerSocketPath)")
+            print("[anvil] docker proxy socket: \(dockerSocketPath)")
 
             let forwarder = PortForwarder { [weak manager] in manager?.socketDevice }
             forwarder.start()
@@ -56,12 +56,12 @@ enum BootCommand {
         }
 
         func vmLifecycleManager(_ manager: VMLifecycleManager, didFailWithError error: Error) {
-            print("[vz-runner] VM failed: \(error)")
+            print("[anvil] VM failed: \(error)")
             exit(1)
         }
 
         func vmLifecycleManagerDidStop(_ manager: VMLifecycleManager) {
-            print("\n[vz-runner] VM stopped")
+            print("\n[anvil] VM stopped")
             exit(0)
         }
     }

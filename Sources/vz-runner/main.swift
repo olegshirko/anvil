@@ -3,18 +3,12 @@
 //
 // Build and run ONLY on macOS arm64 (13+) with the Xcode/Swift toolchain.
 // Requires the com.apple.security.virtualization entitlement — see Makefile.
-//
-// Usage:
-//   vz-runner boot --kernel /path/vmlinuz --initrd /path/initrd [--agent]
-//                  (uses rdinit=/myinit)
-//   vz-runner status
-//   vz-runner exec <cmd>...
 
 import Foundation
 
 // If this process was spawned by the daemon for a task that must not outlive
 // the daemon (e.g. containerd cache sync), exit immediately when the parent
-// disappears. This prevents orphan `vz-runner exec` processes after `kill -9`.
+// disappears. This prevents orphan `anvil exec` processes after `kill -9`.
 if ProcessInfo.processInfo.environment["ANVIL_EXIT_ON_PARENT_DEATH"] == "1" {
     DispatchQueue.global().async {
         while true {
@@ -26,20 +20,282 @@ if ProcessInfo.processInfo.environment["ANVIL_EXIT_ON_PARENT_DEATH"] == "1" {
     }
 }
 
+// MARK: - Service helpers
+
+private let daemonPIDFile = stateDir.appendingPathComponent("daemon.pid")
+private let prevContextFile = stateDir.appendingPathComponent("previous-docker-context")
+private let daemonLogFile = stateDir.appendingPathComponent("daemon.log")
+
+func isDaemonRunning() -> Bool {
+    guard let data = try? Data(contentsOf: daemonPIDFile),
+          let s = String(data: data, encoding: .utf8),
+          let pid = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        return false
+    }
+    return kill(pid, 0) == 0
+}
+
+func saveDockerContext() {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    proc.arguments = ["docker", "context", "show"]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = FileHandle.nullDevice
+    try? proc.run()
+    proc.waitUntilExit()
+    let ctx = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? "default"
+    if ctx != "anvil" {
+        try? ctx.write(toFile: prevContextFile.path, atomically: true, encoding: .utf8)
+    } else {
+        try? FileManager.default.removeItem(at: prevContextFile)
+    }
+}
+
+func restoreDockerContext() {
+    let current = shell("docker", "context", "show").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard current == "anvil" else { return }
+    let target: String
+    if let ctx = try? String(contentsOf: prevContextFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+       !ctx.isEmpty {
+        target = ctx
+    } else {
+        target = "default"
+    }
+    _ = shell("docker", "context", "use", target)
+    try? FileManager.default.removeItem(at: prevContextFile)
+}
+
+func shell(_ args: String...) -> String {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    proc.arguments = args
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = FileHandle.nullDevice
+    try? proc.run()
+    proc.waitUntilExit()
+    return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+}
+
+func waitForControlSocket(timeout: TimeInterval = 60) -> Bool {
+    let sockPath = controlSocketPath
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: sockPath, isDirectory: &isDir), !isDir.boolValue {
+            return true
+        }
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+    return false
+}
+
+// MARK: - Commands
+
+func cmdStart(args: [String]) {
+    if isDaemonRunning() {
+        let pid = (try? String(contentsOf: daemonPIDFile, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "?"
+        print("[anvil] daemon already running (pid \(pid))")
+        _ = shell("docker", "context", "use", "anvil")
+        return
+    }
+
+    // Resolve paths — use shell script defaults when run from dev tree.
+    let projectRoot = findProjectRoot()
+    let kernel = findArg(args, "--kernel")
+        ?? (projectRoot.map { "\($0)/.download/ubuntu/vmlinuz-raw" } ?? "")
+    let initrd = findArg(args, "--initrd")
+        ?? (projectRoot.map { "\($0)/.download/ubuntu/initramfs-containerd" } ?? "")
+    let share = findArg(args, "--share") ?? (projectRoot.map { "\($0)" } ?? "")
+    let memory = findArg(args, "--memory") ?? "2"
+    let idle = findArg(args, "--idle") ?? "600"
+    let containerdDisk = stateDir.appendingPathComponent("containerd-disk.img").path
+
+    guard !kernel.isEmpty, !initrd.isEmpty else {
+        print("[anvil] error: --kernel and --initrd are required (or run from the project root)") 
+        exit(1)
+    }
+
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    try? "".write(toFile: daemonLogFile.path, atomically: true, encoding: .utf8)
+
+    saveDockerContext()
+
+    // Build the daemon command line.
+    var cmdArgs = [
+        "daemon",
+        "--kernel", kernel,
+        "--initrd", initrd,
+        "--memory", memory,
+        "--idle", idle,
+    ]
+    if !share.isEmpty {
+        cmdArgs += ["--share", share]
+    }
+    if FileManager.default.fileExists(atPath: containerdDisk) {
+        cmdArgs += ["--containerd-disk", containerdDisk]
+    }
+
+    // Launch the daemon process in the background.
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: currentExecutablePath())
+    proc.arguments = cmdArgs
+    proc.standardOutput = FileHandle(forWritingAtPath: daemonLogFile.path)
+    proc.standardError = proc.standardOutput
+    // Detach from the controlling terminal.
+    proc.qualityOfService = .background
+    do {
+        try proc.run()
+    } catch {
+        print("[anvil] error: failed to launch daemon: \(error)")
+        exit(1)
+    }
+    print("[anvil] starting daemon (pid \(proc.processIdentifier))...")
+
+    // Wait for the control socket to appear.
+    guard waitForControlSocket() else {
+        print("[anvil] error: daemon did not become ready within 60s")
+        proc.terminate()
+        exit(1)
+    }
+
+    _ = shell("docker", "context", "use", "anvil")
+    print("[anvil] ready (pid \(proc.processIdentifier))")
+}
+
+func cmdStop(args: [String]) {
+    guard let data = try? Data(contentsOf: daemonPIDFile),
+          let s = String(data: data, encoding: .utf8),
+          let pid = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        print("[anvil] daemon not running")
+        restoreDockerContext()
+        return
+    }
+    guard kill(pid, 0) == 0 else {
+        print("[anvil] daemon not running (stale pid file)")
+        try? FileManager.default.removeItem(at: daemonPIDFile)
+        restoreDockerContext()
+        return
+    }
+
+    print("[anvil] stopping daemon (pid \(pid))...")
+    kill(pid, SIGTERM)
+
+    // Wait for the process to exit.
+    let deadline = Date().addingTimeInterval(90)
+    while Date() < deadline {
+        if kill(pid, 0) != 0 { break }
+        Thread.sleep(forTimeInterval: 0.3)
+    }
+    // Force kill if still alive.
+    if kill(pid, 0) == 0 {
+        print("[anvil] daemon did not stop gracefully, sending SIGKILL...")
+        kill(pid, SIGKILL)
+    }
+
+    try? FileManager.default.removeItem(at: daemonPIDFile)
+    print("[anvil] daemon stopped")
+    restoreDockerContext()
+}
+
+func cmdStatus() {
+    if isDaemonRunning() {
+        let pid = (try? String(contentsOf: daemonPIDFile, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "?"
+        print("[anvil] daemon running (pid \(pid))")
+    } else {
+        print("[anvil] daemon not running")
+    }
+    let ctx = shell("docker", "context", "show").trimmingCharacters(in: .whitespacesAndNewlines)
+    print("[anvil] docker context: \(ctx)")
+}
+
+// MARK: - Arg helpers
+
+func currentExecutablePath() -> String {
+    // Bundle.main.executableURL is the most reliable — resolves symlinks.
+    if let url = Bundle.main.executableURL {
+        return url.path
+    }
+    // Fallback: resolve CommandLine.arguments[0] through realpath.
+    let arg0 = CommandLine.arguments[0]
+    if !arg0.isEmpty {
+        if arg0.hasPrefix("/") {
+            if let cPath = arg0.cString(using: .utf8),
+               let resolved = realpath(cPath, nil) {
+                return String(cString: resolved)
+            }
+        } else {
+            // Relative or bare name — resolve against CWD, then try PATH.
+            let abs = URL(fileURLWithPath: arg0).path
+            if let cPath = abs.cString(using: .utf8),
+               let resolved = realpath(cPath, nil) {
+                return String(cString: resolved)
+            }
+            // Search PATH for the command name.
+            if let pathEnv = ProcessInfo.processInfo.environment["PATH"] {
+                for dir in pathEnv.split(separator: ":") {
+                    let candidate = "\(dir)/\(arg0)"
+                    if FileManager.default.isExecutableFile(atPath: candidate) {
+                        return candidate
+                    }
+                }
+            }
+        }
+    }
+    return arg0
+}
+
+func findArg(_ args: [String], _ key: String) -> String? {
+    guard let idx = args.firstIndex(of: key), idx + 1 < args.count else { return nil }
+    return args[idx + 1]
+}
+
+func findProjectRoot() -> String? {
+    // Check current working directory first (user is in the project tree).
+    let cwd = FileManager.default.currentDirectoryPath
+    if FileManager.default.fileExists(atPath: URL(fileURLWithPath: cwd).appendingPathComponent("Package.swift").path) {
+        return cwd
+    }
+    // Walk up from the executable looking for Package.swift.
+    var url = URL(fileURLWithPath: currentExecutablePath()).deletingLastPathComponent()
+    for _ in 0..<10 {
+        if FileManager.default.fileExists(atPath: url.appendingPathComponent("Package.swift").path) {
+            return url.path
+        }
+        let parent = url.deletingLastPathComponent()
+        if parent.path == url.path { break }
+        url = parent
+    }
+    return nil
+}
+
+// MARK: - Usage
+
 func printUsage() {
     print("""
     Usage:
-      vz-runner daemon [--kernel <path>] [--initrd <path>] [--share <path>]
-      vz-runner boot --kernel <path> --initrd <path> [--agent]
-      vz-runner status
-      vz-runner exec <command> [args...]
-      vz-runner docker-socket-path
+      anvil start [--kernel <path>] [--initrd <path>] [--share <path>]
+      anvil stop
+      anvil status
+      anvil daemon [--kernel <path>] [--initrd <path>] [--share <path>]
+      anvil boot --kernel <path> --initrd <path> [--agent]
+      anvil exec <command> [args...]
+      anvil docker-socket-path
 
-    Daemon options:
+    Service commands:
+      start     Launch the daemon in the background, wait for ready,
+                switch Docker context to "anvil".
+      stop      Stop the daemon, restore the previous Docker context.
+      status    Show daemon status and Docker context.
+
+    Daemon options (start / daemon):
       --kernel <path>   Path to the Linux kernel image (default: .download/ubuntu/vmlinuz-raw)
       --initrd <path>   Path to the initramfs/initrd image (default: .download/ubuntu/initramfs-containerd)
       --share <path>    Share host directory via virtiofs
-      --idle <seconds>  Seconds to wait before pausing VM (default: 60)
+      --idle <seconds>  Seconds to wait before pausing VM (default: 600)
+      --memory <gib>    Memory in GiB (default: 2)
 
     Boot options:
       --kernel <path>   Path to the Linux kernel image (ARM64 Image format)
@@ -53,6 +309,8 @@ func printUsage() {
     """)
 }
 
+// MARK: - Main
+
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let subcommand = arguments.first else {
     printUsage()
@@ -60,12 +318,16 @@ guard let subcommand = arguments.first else {
 }
 
 switch subcommand {
+case "start":
+    cmdStart(args: Array(arguments.dropFirst()))
+case "stop":
+    cmdStop(args: Array(arguments.dropFirst()))
+case "status":
+    cmdStatus()
 case "daemon":
     DaemonCommand.run(args: Array(arguments.dropFirst()))
 case "boot":
     BootCommand.run(args: Array(arguments.dropFirst()))
-case "status":
-    ControlClient.status()
 case "exec":
     let cmdArgs = Array(arguments.dropFirst())
     guard !cmdArgs.isEmpty else {

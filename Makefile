@@ -1,5 +1,5 @@
 .PHONY: all build sign clean test \
-    daemon stop-daemon \
+    start stop daemon stop-daemon \
     service-install service-uninstall service-start service-stop service-restart service-status \
     service-debug service-debug-rebuild rebuild-all \
     docker-context-anvil docker-context-lima lima-restart colima-start colima-stop \
@@ -23,15 +23,14 @@ sign: build
 	codesign --entitlements $(ENTITLEMENTS) --force -s - --identifier com.olegshirko.vz-runner $(BINARY)
 
 daemon: sign
-	$(BINARY) daemon --share /tmp/anvil-share
+	$(BINARY) start --share /tmp/anvil-share
 
 stop-daemon:
-	@PID=$$(cat ~/.anvil-vz/daemon.pid 2>/dev/null); \
-	if [ -n "$$PID" ]; then \
-	    kill $$PID 2>/dev/null && echo "[vz-runner] daemon stopped" || echo "[vz-runner] daemon not running"; \
-	else \
-	    echo "[vz-runner] no daemon pid file"; \
-	fi
+	@$(BINARY) stop 2>/dev/null || echo "[anvil] daemon not running"
+
+start: daemon
+
+stop: stop-daemon
 
 # -----------------------------------------------------------------------------
 # macOS service: LaunchAgent + shell wrapper
@@ -101,7 +100,7 @@ lima-restart:
 	@docker context use $(LIMA_DOCKER_CONTEXT)
 	@echo "[anvil] Lima VM '$(LIMA_INSTANCE)' restarted, docker context: $(LIMA_DOCKER_CONTEXT)"
 
-# Start/stop Colima with settings close to vz-runner (VZ VM + virtiofs mounts).
+# Start/stop Colima with settings close to anvil (VZ VM + virtiofs mounts).
 colima-start:
 	@colima start --vm-type=vz --mount-type=virtiofs
 	@docker context use colima
@@ -319,12 +318,14 @@ release: sign
 	git tag -a "v$(VERSION)" -m "v$(VERSION)"
 	git push origin "v$(VERSION)"
 	@echo "[release] waiting for CI to publish release..."
-	@i=0; while [ $$i -lt 20 ]; do \
+	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
+	i=0; while [ $$i -lt 20 ]; do \
 		sleep 15; \
-		curl -sf "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
+		curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
 		i=$$((i + 1)); printf "."; \
 	done; echo ""
-	@curl -sf "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 || \
+	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
+	curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 || \
 		{ echo "[release] timeout. Check https://github.com/olegshirko/anvil/actions"; exit 1; }
 	@echo "[release] release published."
 	$(MAKE) update-brew VERSION=$(VERSION)
@@ -340,23 +341,28 @@ replace-release: sign
 	git tag -a "v$(VERSION)" -m "v$(VERSION)"
 	git push origin "v$(VERSION)"
 	@echo "[replace-release] waiting for CI to publish release..."
-	@i=0; while [ $$i -lt 20 ]; do \
+	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
+	i=0; while [ $$i -lt 20 ]; do \
 		sleep 15; \
-		curl -sf "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
+		curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
 		i=$$((i + 1)); printf "."; \
 	done; echo ""
-	@curl -sf "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 || \
+	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
+	curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 || \
 		{ echo "[replace-release] timeout. Check https://github.com/olegshirko/anvil/actions"; exit 1; }
 	@echo "[replace-release] release published."
 	$(MAKE) update-brew VERSION=$(VERSION)
 
 update-brew:
 	@test -n "$(VERSION)" || { echo "Usage: make update-brew VERSION=x.y.z"; exit 1; }
-	@echo "[update-brew] computing sha256 of source tarball..."
-	@SHA256=$$(curl -sfL "https://github.com/olegshirko/anvil/archive/refs/tags/v$(VERSION).tar.gz" | shasum -a 256 | cut -d' ' -f1); \
-	if [ -z "$$SHA256" ]; then echo "Error: failed to download v$(VERSION) tarball"; exit 1; fi; \
+	@echo "[update-brew] downloading tar.gz sha256..."
+	@curl -sL "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz" -o /tmp/anvil-darwin-arm64.tar.gz; \
+	SHA256=$$(shasum -a 256 /tmp/anvil-darwin-arm64.tar.gz | cut -d' ' -f1); \
+	rm -f /tmp/anvil-darwin-arm64.tar.gz; \
+	if [ -z "$$SHA256" ]; then echo "Error: failed to download v$(VERSION) tar.gz"; exit 1; fi; \
 	echo "[update-brew] sha256=$$SHA256"; \
-	sed -i '' 's|url ".*"|url "https://github.com/olegshirko/anvil/archive/refs/tags/v$(VERSION).tar.gz"|' /tmp/homebrew-tap/anvil.rb; \
+	sed -i '' 's|version ".*"|version "$(VERSION)"|' /tmp/homebrew-tap/anvil.rb; \
+	sed -i '' 's|url ".*anvil-darwin-arm64.tar.gz"|url "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz"|' /tmp/homebrew-tap/anvil.rb; \
 	sed -i '' 's|sha256 ".*"|sha256 "'$$SHA256'"|' /tmp/homebrew-tap/anvil.rb; \
 	cd /tmp/homebrew-tap && git add anvil.rb && git commit -m "v$(VERSION)" && git push; \
 	echo "[update-brew] done."

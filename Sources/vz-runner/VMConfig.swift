@@ -173,7 +173,7 @@ func makeConfiguration(
     do {
         try config.validate()
     } catch {
-        print("[vz-runner] configuration validation failed: \(error)")
+        print("[anvil] configuration validation failed: \(error)")
         throw error
     }
     return config
@@ -181,12 +181,12 @@ func makeConfiguration(
 
 class VMDelegate: NSObject, VZVirtualMachineDelegate {
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
-        print("\n[vz-runner] guest stopped")
+        print("\n[anvil] guest stopped")
         exit(0)
     }
 
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
-        print("\n[vz-runner] VM stopped with error: \(error)")
+        print("\n[anvil] VM stopped with error: \(error)")
         exit(1)
     }
 }

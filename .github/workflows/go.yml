@@ -53,6 +53,8 @@ jobs:
           mkdir -p _output
           cp .build/release/vz-runner _output/vz-runner-darwin-arm64
           shasum -a 256 _output/vz-runner-darwin-arm64 > _output/vz-runner-darwin-arm64.sha256sum
+          tar czf _output/anvil-darwin-arm64.tar.gz -C _output vz-runner-darwin-arm64
+          shasum -a 256 _output/anvil-darwin-arm64.tar.gz > _output/anvil-darwin-arm64.tar.gz.sha256sum
 
       - name: Upload artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -80,4 +82,6 @@ jobs:
           tag="${GITHUB_REF##*/}"
           gh release create "${tag}" --title "${tag}" --generate-notes \
             _output/vz-runner-darwin-arm64 \
-            _output/vz-runner-darwin-arm64.sha256sum
+            _output/vz-runner-darwin-arm64.sha256sum \
+            _output/anvil-darwin-arm64.tar.gz \
+            _output/anvil-darwin-arm64.tar.gz.sha256sum
