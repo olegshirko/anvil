@@ -101,6 +101,8 @@ func cmdStart(args: [String]) {
     if isDaemonRunning() {
         let pid = (try? String(contentsOf: daemonPIDFile, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "?"
         print("[anvil] daemon already running (pid \(pid))")
+        _ = shell("docker", "context", "rm", "-f", "anvil")
+        _ = shell("docker", "context", "create", "anvil", "--docker", "host=unix://\(dockerSocketPath)")
         _ = shell("docker", "context", "use", "anvil")
         return
     }
@@ -179,6 +181,7 @@ func cmdStart(args: [String]) {
         exit(1)
     }
 
+    _ = shell("docker", "context", "rm", "-f", "anvil")
     _ = shell("docker", "context", "create", "anvil", "--docker", "host=unix://\(dockerSocketPath)")
     _ = shell("docker", "context", "use", "anvil")
     print("[anvil] ready (pid \(proc.processIdentifier))")
