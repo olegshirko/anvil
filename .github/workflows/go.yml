@@ -124,6 +124,10 @@ jobs:
             -v "$PWD/.download:/build/download" \
             -v "$PWD/scripts:/scripts:ro" \
             -v "$PWD/guest-agent:/guest-agent:ro" \
+            -e IN_CONTAINER=1 \
+            -e OUT=/build/download/ubuntu/initramfs-containerd \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
             alpine:3.20 \
             sh -c 'apk add --no-cache bash cpio zstd binutils && exec bash /scripts/build_initramfs_containerd.sh'
 
