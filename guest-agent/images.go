@@ -465,7 +465,7 @@ func pullDockerImage(image string) (string, string, error) {
 }
 
 // handleImageLoad implements POST /images/load — streams a Docker tar archive
-// from the request body into nerdctl load.
+// from the request body into containerd via ctr import.
 func handleImageLoad(w http.ResponseWriter, r *http.Request) {
 	ns := "default"
 	if r.URL.Query().Get("namespace") != "" {
@@ -487,21 +487,41 @@ func handleImageLoad(w http.ResponseWriter, r *http.Request) {
 	tmp.Close()
 
 	log.Printf("[docker-api] loading image from tar (%d bytes) into ns=%q", r.ContentLength, ns)
-	stdout, stderr, code, err := runNerdctl(ns, "load", "--input", tmp.Name())
-	if err != nil || code != 0 {
-		log.Printf("[docker-api] nerdctl load failed (%d): %s%s", code, stdout, stderr)
-		http.Error(w, fmt.Sprintf(`{"message":"load failed: %s"}`, stripANSI(stderr)), http.StatusInternalServerError)
+
+	// Import into containerd content store without unpacking (avoids whiteout
+	// conversion errors with the native snapshotter). Images are unpacked on
+	// first container start by containerd's snapshotter.
+	cmdArgs := []string{"-n", ns, "images", "import", "--no-unpack", tmp.Name()}
+	cmd := exec.Command("/opt/containerd/bin/ctr", cmdArgs...)
+	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
+	var outBuf, errBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		exitCode := 1
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+		log.Printf("[docker-api] ctr import failed (%d): %s%s", exitCode, outBuf.String(), errBuf.String())
+		http.Error(w, fmt.Sprintf(`{"message":"import failed: %s"}`, stripANSI(errBuf.String())), http.StatusInternalServerError)
 		return
 	}
 
+	// Parse imported image refs from ctr output.
 	var images []string
-	for _, line := range strings.Split(stdout, "\n") {
-		if strings.HasPrefix(line, "Loaded image:") {
-			name := strings.TrimSpace(strings.TrimPrefix(line, "Loaded image:"))
-			if name != "" {
-				images = append(images, name)
-			}
+	for _, line := range strings.Split(outBuf.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			images = append(images, line)
 		}
+	}
+
+	// Also try to unpack each imported image so it's immediately usable.
+	for _, ref := range images {
+		unpackArgs := []string{"-n", ns, "images", "unpack", "--snapshotter", "native", ref}
+		unpackCmd := exec.Command("/opt/containerd/bin/ctr", unpackArgs...)
+		unpackCmd.Env = append(unpackCmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
+		unpackCmd.Run()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
