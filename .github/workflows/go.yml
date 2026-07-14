@@ -97,7 +97,14 @@ jobs:
           mkdir -p .download/ubuntu
           curl -L -o .download/ubuntu/vmlinuz https://cloud-images.ubuntu.com/noble/current/unpacked/noble-server-cloudimg-arm64-vmlinuz-generic
           gunzip -c .download/ubuntu/vmlinuz > .download/ubuntu/vmlinuz-raw
-          curl -L -o .download/ubuntu/linux-modules.deb http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-modules-6.8.0-124-generic_6.8.0-124.124_arm64.deb
+          # Extract kernel version from the binary and download matching modules.
+          sudo apt-get install -y binutils >/dev/null 2>&1 || true
+          KVER=$(strings .download/ubuntu/vmlinuz-raw | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic' | head -1)
+          PKGVER=${KVER%-*}
+          echo "Kernel version: $KVER (package: $PKGVER)"
+          DEB_PATH=$(curl -sL "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/" | grep -o "linux-modules-${KVER}_${PKGVER}\.[0-9.]*_arm64.deb" | sort -V | tail -1)
+          echo "Modules deb: $DEB_PATH"
+          curl -L -o .download/ubuntu/linux-modules.deb "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/${DEB_PATH}"
 
       - name: Build guest-agent
         run: |

@@ -176,7 +176,7 @@ UBUNTU_KERNEL := $(UBUNTU_DIR)/vmlinuz-raw
 UBUNTU_INITRD := $(UBUNTU_DIR)/initramfs-agent
 UBUNTU_INITRD_CONTAINERD := $(UBUNTU_DIR)/initramfs-containerd
 UBUNTU_DEB := $(UBUNTU_DIR)/linux-modules.deb
-UBUNTU_MODULES_URL := http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-modules-6.8.0-124-generic_6.8.0-124.124_arm64.deb
+UBUNTU_MODULES_DEB := linux-modules-generic
 
 $(UBUNTU_DIR):
 	mkdir -p $(UBUNTU_DIR)
@@ -187,7 +187,12 @@ download-ubuntu: $(UBUNTU_DIR)
 	file $(UBUNTU_KERNEL)
 
 ubuntu-modules: $(UBUNTU_DIR)
-	@if [ ! -f $(UBUNTU_DEB) ]; then curl -L -o $(UBUNTU_DEB) $(UBUNTU_MODULES_URL); fi
+	@KVER=$$(strings $(UBUNTU_KERNEL) 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic' | head -1); \
+	PKGVER=$${KVER%-*}; \
+	echo "[ubuntu-modules] kernel $$KVER"; \
+	DEB_PATH=$$(curl -sL "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/" | grep -o "linux-modules-$${KVER}_$${PKGVER}\.[0-9.]*_arm64.deb" | sort -V | tail -1); \
+	echo "[ubuntu-modules] $$DEB_PATH"; \
+	curl -L -o $(UBUNTU_DEB) "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/$$DEB_PATH"
 
 guest-agent:
 	cd guest-agent && go mod tidy
