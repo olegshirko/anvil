@@ -451,6 +451,8 @@ func runDockerAPIServer() {
 				"ImagesDeleted":  []string{},
 				"SpaceReclaimed": 0,
 			})
+		case path == "/images/load" && r.Method == http.MethodPost:
+			handleImageLoad(w, r)
 		case path == "/build/prune" && r.Method == http.MethodPost:
 			// Build cache prune is not implemented; return empty so docker system prune
 			// does not fail with 404.

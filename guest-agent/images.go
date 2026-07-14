@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
+	"os"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -460,4 +462,50 @@ func pullDockerImage(image string) (string, string, error) {
 		return stdout, stderr, fmt.Errorf("nerdctl pull failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
 	}
 	return stdout, stderr, nil
+}
+
+// handleImageLoad implements POST /images/load — streams a Docker tar archive
+// from the request body into nerdctl load.
+func handleImageLoad(w http.ResponseWriter, r *http.Request) {
+	ns := "default"
+	if r.URL.Query().Get("namespace") != "" {
+		ns = r.URL.Query().Get("namespace")
+	}
+
+	tmp, err := os.CreateTemp("", "anvil-load-*.tar")
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+
+	if _, err := io.Copy(tmp, r.Body); err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	tmp.Close()
+
+	log.Printf("[docker-api] loading image from tar (%d bytes) into ns=%q", r.ContentLength, ns)
+	stdout, stderr, code, err := runNerdctl(ns, "load", "--input", tmp.Name())
+	if err != nil || code != 0 {
+		log.Printf("[docker-api] nerdctl load failed (%d): %s%s", code, stdout, stderr)
+		http.Error(w, fmt.Sprintf(`{"message":"load failed: %s"}`, stripANSI(stderr)), http.StatusInternalServerError)
+		return
+	}
+
+	var images []string
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.HasPrefix(line, "Loaded image:") {
+			name := strings.TrimSpace(strings.TrimPrefix(line, "Loaded image:"))
+			if name != "" {
+				images = append(images, name)
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"Images": images,
+	})
 }
