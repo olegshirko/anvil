@@ -33,7 +33,7 @@ fi
 set -euo pipefail
 
 # Tools needed to assemble and pack the initramfs.
-apk add --no-cache cpio zstd binutils
+apk add --no-cache cpio zstd binutils e2fsprogs
 
 ROOT=/build
 SCRIPT_DIR=/scripts
@@ -87,6 +87,15 @@ done
 
 # zstd for faster cold-boot cache sync/restore than gzip.
 cp /usr/bin/zstd bin/zstd
+
+# mkfs.ext4 for formatting the containerd persistent disk on first boot.
+cp /sbin/mkfs.ext4 sbin/mkfs.ext4 2>/dev/null || true
+cp /sbin/mke2fs sbin/mke2fs 2>/dev/null || true
+for lib in /lib/libcom_err.so* /lib/libe2p.so* /lib/libext2fs.so* /lib/libblkid.so* /lib/libuuid.so* /lib/librt.so*; do
+    for f in $lib; do
+        [ -f "$f" ] && cp "$f" lib/ 2>/dev/null || true
+    done
+done
 
 # Inject guest agent.
 cp "$AGENT_BIN" bin/guest-agent
@@ -499,6 +508,13 @@ mountpoint -q /var/lib || {
             if mount -t ext4 -o noatime,nobarrier,data=writeback,commit=60 "$blk" /var/lib 2>/dev/null; then
                 echo "[stage2] mounted $blk as /var/lib"
                 break
+            fi
+            # First boot: format the raw disk as ext4.
+            if command -v mkfs.ext4 >/dev/null 2>&1; then
+                echo "[stage2] formatting $blk as ext4"
+                mkfs.ext4 -F -q "$blk" 2>/dev/null && \
+                mount -t ext4 -o noatime,nobarrier,data=writeback,commit=60 "$blk" /var/lib 2>/dev/null && \
+                echo "[stage2] mounted $blk as /var/lib (fresh ext4)" && break
             fi
         fi
     done

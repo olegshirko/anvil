@@ -141,6 +141,17 @@ func cmdStart(args: [String]) {
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
     try? "".write(toFile: daemonLogFile.path, atomically: true, encoding: .utf8)
 
+    // Create the containerd persistent disk if it doesn't exist.
+    if !FileManager.default.fileExists(atPath: containerdDisk) {
+        print("[anvil] creating containerd disk image (16 GiB sparse)...")
+        // Create a 16 GiB sparse file; the guest formats it as ext4 on first boot.
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/dd")
+        proc.arguments = ["if=/dev/zero", "of=\(containerdDisk)", "bs=1", "count=0", "seek=16g"]
+        try? proc.run()
+        proc.waitUntilExit()
+    }
+
     saveDockerContext()
 
     // Build the daemon command line.
