@@ -163,6 +163,7 @@ jobs:
       - name: bundle tar.gz
         run: |
           cd _output
+          chmod +x vz-runner-darwin-arm64
           tar czf anvil-darwin-arm64.tar.gz vz-runner-darwin-arm64 vmlinuz-raw initramfs-containerd
           shasum -a 256 anvil-darwin-arm64.tar.gz | awk '{print $1}' > anvil-darwin-arm64.tar.gz.sha256sum
       - name: create release
