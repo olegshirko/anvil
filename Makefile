@@ -357,15 +357,11 @@ replace-release: sign
 
 update-brew:
 	@test -n "$(VERSION)" || { echo "Usage: make update-brew VERSION=x.y.z"; exit 1; }
-	@echo "[update-brew] downloading artifacts and computing sha256..."
+	@echo "[update-brew] downloading tar.gz and computing sha256..."
 	@SHA_TAR=$$(curl -sL "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz" | shasum -a 256 | cut -d' ' -f1); \
-	SHA_KERNEL=$$(curl -sL "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/vmlinuz-raw" | shasum -a 256 | cut -d' ' -f1); \
-	SHA_INITRD=$$(curl -sL "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/initramfs-containerd" | shasum -a 256 | cut -d' ' -f1); \
-	echo "[update-brew] tar.gz=$$SHA_TAR kernel=$$SHA_KERNEL initramfs=$$SHA_INITRD"; \
+	echo "[update-brew] sha256=$$SHA_TAR"; \
 	sed -i '' 's|version ".*"|version "$(VERSION)"|' /tmp/homebrew-tap/anvil.rb; \
 	sed -i '' 's|url ".*anvil-darwin-arm64.tar.gz"|url "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz"|' /tmp/homebrew-tap/anvil.rb; \
 	sed -i '' 's|sha256 ".*"|sha256 "'$$SHA_TAR'"|' /tmp/homebrew-tap/anvil.rb; \
-	sed -i '' 's|url ".*vmlinuz-raw"|url "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/vmlinuz-raw"|' /tmp/homebrew-tap/anvil.rb; \
-	sed -i '' 's|url ".*initramfs-containerd"|url "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/initramfs-containerd"|' /tmp/homebrew-tap/anvil.rb; \
 	cd /tmp/homebrew-tap && git add anvil.rb && git commit -m "v$(VERSION)" && git push; \
 	echo "[update-brew] done."
