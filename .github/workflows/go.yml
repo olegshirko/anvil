@@ -63,8 +63,80 @@ jobs:
           path: _output/
           retention-days: 1
 
+  guestbuild:
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.24"
+
+      - name: Download Alpine kernel + initramfs
+        run: |
+          mkdir -p .download/alpine
+          curl -L -o .download/alpine/vmlinuz-virt https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/netboot/vmlinuz-virt
+          curl -L -o .download/alpine/initramfs-virt https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/netboot/initramfs-virt
+
+      - name: Extract Alpine kernel
+        run: |
+          python3 scripts/extract_alpine_kernel.py .download/alpine/vmlinuz-virt .download/alpine/vmlinuz-raw.gz
+          gunzip -c .download/alpine/vmlinuz-raw.gz > .download/alpine/vmlinuz-raw
+
+      - name: Download Ubuntu kernel + modules
+        run: |
+          mkdir -p .download/ubuntu
+          curl -L -o .download/ubuntu/vmlinuz https://cloud-images.ubuntu.com/noble/current/unpacked/noble-server-cloudimg-arm64-vmlinuz-generic
+          gunzip -c .download/ubuntu/vmlinuz > .download/ubuntu/vmlinuz-raw
+          curl -L -o .download/ubuntu/linux-modules.deb http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-modules-6.8.0-124-generic_6.8.0-124.124_arm64.deb
+
+      - name: Build guest-agent
+        run: |
+          cd guest-agent && go mod tidy
+          cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../.download/alpine/guest-agent .
+
+      - name: Download container tools
+        run: |
+          mkdir -p .download/container-tools
+          curl -L -o .download/container-tools/containerd.tgz https://github.com/containerd/containerd/releases/download/v2.0.0/containerd-static-2.0.0-linux-arm64.tar.gz
+          curl -L -o .download/container-tools/nerdctl.tgz https://github.com/containerd/nerdctl/releases/download/v2.0.4/nerdctl-2.0.4-linux-arm64.tar.gz
+          curl -L -o .download/container-tools/runc https://github.com/opencontainers/runc/releases/download/v1.2.0/runc.arm64
+          chmod +x .download/container-tools/runc
+          curl -L -o .download/container-tools/cni-plugins.tgz https://github.com/containernetworking/plugins/releases/download/v1.6.0/cni-plugins-linux-arm64-v1.6.0.tgz
+
+      - name: Download Alpine iptables
+        run: |
+          mkdir -p .download/alpine-iptables
+          curl -L -o .download/alpine-iptables/iptables.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/iptables-1.8.10-r3.apk
+          curl -L -o .download/alpine-iptables/libmnl.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libmnl-1.0.5-r2.apk
+          curl -L -o .download/alpine-iptables/libnftnl.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libnftnl-1.2.6-r0.apk
+          curl -L -o .download/alpine-iptables/libxtables.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libxtables-1.8.10-r3.apk
+
+      - name: Build initramfs-containerd
+        run: |
+          docker run --rm \
+            -v "$PWD/.download:/build/download" \
+            -v "$PWD/scripts:/scripts:ro" \
+            -v "$PWD/guest-agent:/guest-agent:ro" \
+            alpine:3.20 \
+            sh -c 'apk add --no-cache bash cpio zstd binutils && exec bash /scripts/build_initramfs_containerd.sh'
+
+      - name: Upload kernel + initramfs
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: artifact-linux-arm64
+          path: |
+            .download/ubuntu/vmlinuz-raw
+            .download/ubuntu/initramfs-containerd
+          retention-days: 1
+
   release:
-    needs: build
+    needs: [build, guestbuild]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -75,6 +147,10 @@ jobs:
         with:
           name: artifact-macos-arm64
           path: _output/
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: artifact-linux-arm64
+          path: _output/
       - name: create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -84,4 +160,6 @@ jobs:
             _output/vz-runner-darwin-arm64 \
             _output/vz-runner-darwin-arm64.sha256sum \
             _output/anvil-darwin-arm64.tar.gz \
-            _output/anvil-darwin-arm64.tar.gz.sha256sum
+            _output/anvil-darwin-arm64.tar.gz.sha256sum \
+            _output/vmlinuz-raw \
+            _output/initramfs-containerd

@@ -6,6 +6,9 @@
 
 import Foundation
 
+var appVersion = "dev"
+let releaseBaseURL = "https://github.com/olegshirko/anvil/releases/download"
+
 // If this process was spawned by the daemon for a task that must not outlive
 // the daemon (e.g. containerd cache sync), exit immediately when the parent
 // disappears. This prevents orphan `anvil exec` processes after `kill -9`.
@@ -92,6 +95,41 @@ func waitForControlSocket(timeout: TimeInterval = 60) -> Bool {
     return false
 }
 
+// MARK: - Auto-download from GitHub release
+
+func downloadFromRelease() -> (kernel: String, initrd: String)? {
+    guard appVersion != "dev" else { return nil }
+    let tag = "v\(appVersion)"
+    let base = "\(releaseBaseURL)/\(tag)"
+
+    let names = ["vmlinuz-raw", "initramfs-containerd"]
+    var paths: [String] = []
+
+    for name in names {
+        let dest = stateDir.appendingPathComponent(name)
+        if FileManager.default.fileExists(atPath: dest.path) {
+            paths.append(dest.path)
+            continue
+        }
+        guard let url = URL(string: "\(base)/\(name)") else { return nil }
+        print("[anvil] downloading \(name) from \(base)/\(name) ...")
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        proc.arguments = ["-fSL", "-o", dest.path, url.absoluteString]
+        proc.standardOutput = FileHandle.standardOutput
+        proc.standardError = FileHandle.standardError
+        try? proc.run()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else {
+            print("[anvil] failed to download \(name)")
+            try? FileManager.default.removeItem(at: dest)
+            return nil
+        }
+        paths.append(dest.path)
+    }
+    return (paths[0], paths[1])
+}
+
 // MARK: - Commands
 
 func cmdStart(args: [String]) {
@@ -102,19 +140,39 @@ func cmdStart(args: [String]) {
         return
     }
 
-    // Resolve paths — use shell script defaults when run from dev tree.
-    let projectRoot = findProjectRoot()
+    let stateBinDir = stateDir.appendingPathComponent("bin")
+
+    // Resolve kernel path: flag > stateDir > project root > auto-download
     let kernel = findArg(args, "--kernel")
-        ?? (projectRoot.map { "\($0)/.download/ubuntu/vmlinuz-raw" } ?? "")
+        ?? findFile([stateDir.appendingPathComponent("vmlinuz-raw").path,
+                      stateBinDir.appendingPathComponent("vmlinuz-raw").path],
+                    fallback: findProjectRoot().map { "\($0)/.download/ubuntu/vmlinuz-raw" })
+
+    // Resolve initrd path: flag > stateDir > project root > auto-download
     let initrd = findArg(args, "--initrd")
-        ?? (projectRoot.map { "\($0)/.download/ubuntu/initramfs-containerd" } ?? "")
-    let share = findArg(args, "--share") ?? (projectRoot.map { "\($0)" } ?? "")
+        ?? findFile([stateDir.appendingPathComponent("initramfs-containerd").path,
+                      stateBinDir.appendingPathComponent("initramfs-containerd").path],
+                    fallback: findProjectRoot().map { "\($0)/.download/ubuntu/initramfs-containerd" })
+
+    // Auto-download from release if not found locally
+    let resolved = (kernel != nil && initrd != nil)
+        ? (kernel: kernel!, initrd: initrd!)
+        : downloadFromRelease()
+
+    let share = findArg(args, "--share") ?? (findProjectRoot().map { "\($0)" } ?? "")
     let memory = findArg(args, "--memory") ?? "2"
     let idle = findArg(args, "--idle") ?? "600"
     let containerdDisk = stateDir.appendingPathComponent("containerd-disk.img").path
 
-    guard !kernel.isEmpty, !initrd.isEmpty else {
-        print("[anvil] error: --kernel and --initrd are required (or run from the project root)") 
+    guard let kernelPath = resolved?.kernel, let initrdPath = resolved?.initrd else {
+        print("[anvil] error: kernel and initrd not found.")
+        print("")
+        print("  Place them in ~/.anvil-vz/:")
+        print("    cp /path/to/vmlinuz-raw      ~/.anvil-vz/vmlinuz-raw")
+        print("    cp /path/to/initramfs-containerd ~/.anvil-vz/initramfs-containerd")
+        print("")
+        print("  Or specify explicitly:")
+        print("    anvil start --kernel /path/to/vmlinuz-raw --initrd /path/to/initramfs-containerd")
         exit(1)
     }
 
@@ -126,8 +184,8 @@ func cmdStart(args: [String]) {
     // Build the daemon command line.
     var cmdArgs = [
         "daemon",
-        "--kernel", kernel,
-        "--initrd", initrd,
+        "--kernel", kernelPath,
+        "--initrd", initrdPath,
         "--memory", memory,
         "--idle", idle,
     ]
@@ -250,6 +308,18 @@ func currentExecutablePath() -> String {
 func findArg(_ args: [String], _ key: String) -> String? {
     guard let idx = args.firstIndex(of: key), idx + 1 < args.count else { return nil }
     return args[idx + 1]
+}
+
+func findFile(_ candidates: [String], fallback: String?) -> String? {
+    for path in candidates {
+        if FileManager.default.isReadableFile(atPath: path) {
+            return path
+        }
+    }
+    if let fallback = fallback, FileManager.default.isReadableFile(atPath: fallback) {
+        return fallback
+    }
+    return nil
 }
 
 func findProjectRoot() -> String? {
