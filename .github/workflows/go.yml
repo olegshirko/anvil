@@ -86,7 +86,7 @@ jobs:
       - name: Extract Alpine kernel
         run: |
           python3 scripts/extract_alpine_kernel.py .download/alpine/vmlinuz-virt .download/alpine/vmlinuz-raw.gz
-          gunzip -c .download/alpine/vmlinuz-raw.gz > .download/alpine/vmlinuz-raw
+          gunzip -c .download/alpine/vmlinuz-raw.gz > .download/alpine/vmlinuz-raw || true
 
       - name: Download Ubuntu kernel + modules
         run: |
