@@ -152,9 +152,11 @@ jobs:
 
       - name: Verify initramfs architecture
         run: |
+          sudo apt-get install -y cpio file >/dev/null 2>&1 || true
           mkdir -p /tmp/initrd-check
           cd /tmp/initrd-check
-          cat "$GITHUB_WORKSPACE/.download/ubuntu/initramfs-containerd" | cpio -idmv 2>/dev/null || true
+          gzip -dc "$GITHUB_WORKSPACE/.download/ubuntu/initramfs-containerd" | cpio -idmv 2>/dev/null || true
+          ls -l bin/tar sbin/mkfs.ext4
           file bin/tar
           file sbin/mkfs.ext4
           file -b bin/tar | grep -qiE 'aarch64|arm64' || { echo "ERROR: bin/tar is not ARM64"; exit 1; }
