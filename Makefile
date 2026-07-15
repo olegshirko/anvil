@@ -363,7 +363,7 @@ replace-release: sign
 update-brew:
 	@test -n "$(VERSION)" || { echo "Usage: make update-brew VERSION=x.y.z"; exit 1; }
 	@echo "[update-brew] downloading tar.gz and computing sha256..."
-	@HOMEBREW_TAP_DIR="${HOMEBREW_TAP_DIR:-$(CURDIR)/../homebrew-tap}"; \
+	@HOMEBREW_TAP_DIR="$${HOMEBREW_TAP_DIR:-$(CURDIR)/../homebrew-tap}"; \
 	FORMULA="$$HOMEBREW_TAP_DIR/anvil.rb"; \
 	test -f "$$FORMULA" || { echo "[update-brew] error: $$FORMULA not found"; exit 1; }; \
 	SHA_TAR=$$(curl -sL "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz" | shasum -a 256 | cut -d' ' -f1); \
