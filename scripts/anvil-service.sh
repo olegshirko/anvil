@@ -10,14 +10,51 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-VZRUNNER_BIN="${VZRUNNER_BIN:-$PROJECT_ROOT/.build/release/vz-runner}"
-KERNEL_PATH="${KERNEL_PATH:-$PROJECT_ROOT/.download/ubuntu/vmlinuz-raw}"
-INITRD_PATH="${INITRD_PATH:-$PROJECT_ROOT/.download/ubuntu/initramfs-containerd}"
-CONTAINERD_DISK="${CONTAINERD_DISK:-$HOME/.anvil-vz/containerd-disk.img}"
-SHARE_ROOT="${SHARE_ROOT:-$PROJECT_ROOT}"
+# Homebrew installs assets under $(brew --prefix)/share/anvil; source builds
+# keep them in PROJECT_ROOT/.download/ubuntu. The state dir always lives in
+# the user's home so upgrades do not wipe container data.
+STATE_DIR="$HOME/.anvil-vz"
+BREW_ASSETS_DIR="$PROJECT_ROOT/assets"
+
+# Resolve the vz-runner binary: explicit env var, PATH (brew), then source build.
+if [[ -z "${VZRUNNER_BIN:-}" ]]; then
+    if command -v vz-runner >/dev/null 2>&1; then
+        VZRUNNER_BIN="$(command -v vz-runner)"
+    elif [[ -x "$PROJECT_ROOT/.build/release/vz-runner" ]]; then
+        VZRUNNER_BIN="$PROJECT_ROOT/.build/release/vz-runner"
+    else
+        VZRUNNER_BIN=""
+    fi
+fi
+
+CONTAINERD_DISK="${CONTAINERD_DISK:-$STATE_DIR/containerd-disk.img}"
+# Source builds share the project directory; brew installs share the state dir.
+if [[ -f "$PROJECT_ROOT/Package.swift" ]]; then
+    SHARE_ROOT="${SHARE_ROOT:-$PROJECT_ROOT}"
+else
+    SHARE_ROOT="${SHARE_ROOT:-$STATE_DIR}"
+fi
 MEMORY_GB="${ANVIL_MEMORY:-2}"
 
-STATE_DIR="$HOME/.anvil-vz"
+# Look for kernel/initrd: user state dir first, then brew assets, then source tree.
+find_asset() {
+    for f in "$@"; do
+        if [[ -f "$f" ]]; then
+            printf '%s' "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+KERNEL_PATH="${KERNEL_PATH:-$(find_asset \
+    "$STATE_DIR/vmlinuz-raw" \
+    "$BREW_ASSETS_DIR/vmlinuz-raw" \
+    "$PROJECT_ROOT/.download/ubuntu/vmlinuz-raw")}"
+INITRD_PATH="${INITRD_PATH:-$(find_asset \
+    "$STATE_DIR/initramfs-containerd" \
+    "$BREW_ASSETS_DIR/initramfs-containerd" \
+    "$PROJECT_ROOT/.download/ubuntu/initramfs-containerd")}"
 PID_FILE="$STATE_DIR/daemon.pid"
 PREV_CONTEXT_FILE="$STATE_DIR/previous-docker-context"
 LOG_FILE="$STATE_DIR/daemon.log"
@@ -81,6 +118,14 @@ cmd_start() {
     fi
 
     check_proxy
+
+    # Create the containerd persistent disk if it doesn't exist.
+    # Without it stage2 falls back to a virtiofs share, which breaks overlayfs
+    # whiteouts and causes docker load/run to fail.
+    if [[ ! -f "$CONTAINERD_DISK" ]]; then
+        echo "[anvil-service] creating containerd disk image (16 GiB sparse)..."
+        /bin/dd if=/dev/zero of="$CONTAINERD_DISK" bs=1 count=0 seek=16g
+    fi
 
     echo "[anvil-service] starting vz-runner daemon..."
     rm -f "$PID_FILE"

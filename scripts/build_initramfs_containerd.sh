@@ -89,13 +89,17 @@ done
 cp /usr/bin/zstd bin/zstd
 
 # mkfs.ext4 for formatting the containerd persistent disk on first boot.
-cp /sbin/mkfs.ext4 sbin/mkfs.ext4 2>/dev/null || true
-cp /sbin/mke2fs sbin/mke2fs 2>/dev/null || true
+cp /sbin/mkfs.ext4 sbin/mkfs.ext4
+cp /sbin/mke2fs sbin/mke2fs
 for lib in /lib/libcom_err.so* /lib/libe2p.so* /lib/libext2fs.so* /lib/libblkid.so* /lib/libuuid.so* /lib/librt.so*; do
     for f in $lib; do
         [ -f "$f" ] && cp "$f" lib/ 2>/dev/null || true
     done
 done
+if [[ ! -x sbin/mkfs.ext4 ]]; then
+    echo "ERROR: mkfs.ext4 not present in initramfs" >&2
+    exit 1
+fi
 
 # Inject guest agent.
 cp "$AGENT_BIN" bin/guest-agent
@@ -177,19 +181,21 @@ done
 # GNU tar is required by nerdctl cp; busybox tar is not sufficient. The build
 # container is Alpine, so install the GNU tar package and copy it (along with
 # its libacl/libattr dependencies) into the initramfs.
-apk add --no-cache tar >/dev/null 2>&1 || true
-if /bin/tar --version 2>/dev/null | grep -q GNU; then
-    cp /bin/tar bin/tar-gnu
-    chmod +x bin/tar-gnu
-    rm -f bin/tar
-    cp bin/tar-gnu bin/tar
-    mkdir -p lib
-    for lib in /lib/libacl.so.1 /lib/libattr.so.1 /usr/lib/libacl.so.1 /usr/lib/libattr.so.1; do
-        if [ -f "$lib" ]; then
-            cp "$lib" lib/
-        fi
-    done
+apk add --no-cache tar >/dev/null 2>&1
+if ! /bin/tar --version 2>/dev/null | grep -q GNU; then
+    echo "ERROR: GNU tar installation failed" >&2
+    exit 1
 fi
+cp /bin/tar bin/tar-gnu
+chmod +x bin/tar-gnu
+rm -f bin/tar
+cp bin/tar-gnu bin/tar
+mkdir -p lib
+for lib in /lib/libacl.so.1 /lib/libattr.so.1 /usr/lib/libacl.so.1 /usr/lib/libattr.so.1; do
+    if [ -f "$lib" ]; then
+        cp "$lib" lib/
+    fi
+done
 
 # Helpers to persist containerd image cache across cold boots.
 cat > bin/anvil-sync-containerd <<'EOF'

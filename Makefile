@@ -363,10 +363,13 @@ replace-release: sign
 update-brew:
 	@test -n "$(VERSION)" || { echo "Usage: make update-brew VERSION=x.y.z"; exit 1; }
 	@echo "[update-brew] downloading tar.gz and computing sha256..."
-	@SHA_TAR=$$(curl -sL "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz" | shasum -a 256 | cut -d' ' -f1); \
+	@HOMEBREW_TAP_DIR="${HOMEBREW_TAP_DIR:-$(CURDIR)/../homebrew-tap}"; \
+	FORMULA="$$HOMEBREW_TAP_DIR/anvil.rb"; \
+	test -f "$$FORMULA" || { echo "[update-brew] error: $$FORMULA not found"; exit 1; }; \
+	SHA_TAR=$$(curl -sL "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz" | shasum -a 256 | cut -d' ' -f1); \
 	echo "[update-brew] sha256=$$SHA_TAR"; \
-	sed -i '' 's|version ".*"|version "$(VERSION)"|' /tmp/homebrew-tap/anvil.rb; \
-	sed -i '' 's|url ".*anvil-darwin-arm64.tar.gz"|url "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz"|' /tmp/homebrew-tap/anvil.rb; \
-	sed -i '' 's|sha256 ".*"|sha256 "'$$SHA_TAR'"|' /tmp/homebrew-tap/anvil.rb; \
-	cd /tmp/homebrew-tap && git add anvil.rb && git commit -m "v$(VERSION)" && git push; \
+	sed -i '' 's|version ".*"|version "$(VERSION)"|' "$$FORMULA"; \
+	sed -i '' 's|url ".*anvil-darwin-arm64.tar.gz"|url "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz"|' "$$FORMULA"; \
+	sed -i '' 's|sha256 ".*"|sha256 "'$$SHA_TAR'"|' "$$FORMULA"; \
+	cd "$$HOMEBREW_TAP_DIR" && git add anvil.rb && git commit -m "v$(VERSION)" && git push; \
 	echo "[update-brew] done."
