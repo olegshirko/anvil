@@ -109,19 +109,31 @@ func cmdStart(args: [String]) {
 
     let stateBinDir = stateDir.appendingPathComponent("bin")
 
-    // Resolve kernel path: flag > stateDir > project root
+    let brewAssets = brewAssetsDir()
+
+    // Resolve kernel path: flag > stateDir > brew assets > project root
+    var kernelCandidates = [stateDir.appendingPathComponent("vmlinuz-raw").path,
+                            stateBinDir.appendingPathComponent("vmlinuz-raw").path]
+    if let brewAssets = brewAssets {
+        kernelCandidates.append("\(brewAssets)/vmlinuz-raw")
+    }
     let kernel = findArg(args, "--kernel")
-        ?? findFile([stateDir.appendingPathComponent("vmlinuz-raw").path,
-                      stateBinDir.appendingPathComponent("vmlinuz-raw").path],
+        ?? findFile(kernelCandidates,
                     fallback: findProjectRoot().map { "\($0)/.download/ubuntu/vmlinuz-raw" })
 
-    // Resolve initrd path: flag > stateDir > project root
+    // Resolve initrd path: flag > stateDir > brew assets > project root
+    var initrdCandidates = [stateDir.appendingPathComponent("initramfs-containerd").path,
+                            stateBinDir.appendingPathComponent("initramfs-containerd").path]
+    if let brewAssets = brewAssets {
+        initrdCandidates.append("\(brewAssets)/initramfs-containerd")
+    }
     let initrd = findArg(args, "--initrd")
-        ?? findFile([stateDir.appendingPathComponent("initramfs-containerd").path,
-                      stateBinDir.appendingPathComponent("initramfs-containerd").path],
+        ?? findFile(initrdCandidates,
                     fallback: findProjectRoot().map { "\($0)/.download/ubuntu/initramfs-containerd" })
 
-    let share = findArg(args, "--share") ?? (findProjectRoot().map { "\($0)" } ?? "")
+    let share = findArg(args, "--share")
+        ?? findProjectRoot().map { "\($0)" }
+        ?? stateDir.path
     let memory = findArg(args, "--memory") ?? "2"
     let idle = findArg(args, "--idle") ?? "600"
     let containerdDisk = stateDir.appendingPathComponent("containerd-disk.img").path
@@ -312,6 +324,19 @@ func findProjectRoot() -> String? {
         let parent = url.deletingLastPathComponent()
         if parent.path == url.path { break }
         url = parent
+    }
+    return nil
+}
+
+func brewAssetsDir() -> String? {
+    // Homebrew installs assets next to the binary:
+    // /opt/homebrew/Cellar/anvil/<version>/bin/vz-runner
+    //   -> /opt/homebrew/Cellar/anvil/<version>/share/anvil/assets
+    let exe = currentExecutablePath()
+    let url = URL(fileURLWithPath: exe).deletingLastPathComponent().deletingLastPathComponent()
+    let assetsDir = url.appendingPathComponent("share/anvil/assets")
+    if FileManager.default.fileExists(atPath: assetsDir.path) {
+        return assetsDir.path
     }
     return nil
 }
