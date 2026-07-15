@@ -246,7 +246,7 @@ enum DaemonCommand {
                     }
                 }
             }
-            server.onClientDisconnect = { [weak self] in
+            server.onClientDisconnect = {
                 tracker.disconnect()
             }
             server.start()
