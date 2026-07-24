@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -16,7 +15,9 @@ import (
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	digest "github.com/opencontainers/go-digest"
 )
 
 // dockerImageSummary matches the JSON returned by GET /images/json.
@@ -107,14 +108,15 @@ func parseHumanSize(s string) int64 {
 // canonicalizeImageRef returns a fully-qualified containerd image reference.
 // Unqualified library images (e.g. "postgres:15.5") become
 // "docker.io/library/postgres:15.5", and user images (e.g. "foo/bar") become
-// "docker.io/foo/bar".
+// "docker.io/foo/bar". A registry domain is present only when the first path
+// component looks like a host (contains "." or ":", or is localhost) — a bare
+// "name:tag" has no slash and must NOT be mistaken for a registry.
 func canonicalizeImageRef(ref string) string {
 	if ref == "" {
 		return ref
 	}
-	// Already contains a registry/domain?
 	parts := strings.SplitN(ref, "/", 2)
-	if strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":") {
+	if len(parts) == 2 && (strings.ContainsAny(parts[0], ".:") || parts[0] == "localhost") {
 		return ref
 	}
 	if len(parts) == 1 {
@@ -137,6 +139,15 @@ func ensureImageInNamespace(ref, targetNs string) error {
 	ctx := context.Background()
 	canonicalRef := canonicalizeImageRef(ref)
 
+	put := func(nsCtx context.Context, img images.Image) error {
+		if _, err := cl.ImageService().Create(nsCtx, img); err != nil {
+			if _, uerr := cl.ImageService().Update(nsCtx, img, "target"); uerr != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	// Fast path: image already exists in target namespace.
 	targetCtx := namespaces.WithNamespace(ctx, targetNs)
 	if _, err := cl.GetImage(targetCtx, canonicalRef); err == nil {
@@ -144,30 +155,45 @@ func ensureImageInNamespace(ref, targetNs string) error {
 		return nil
 	}
 
+	// Images imported from OCI archives may be registered under the raw,
+	// unnormalized ref.name (e.g. "myapp:1" instead of
+	// "docker.io/library/myapp:1"). If the target namespace has the image
+	// under that raw name, alias it to the canonical one.
+	if ref != canonicalRef {
+		if img, err := cl.GetImage(targetCtx, ref); err == nil {
+			if err := put(targetCtx, images.Image{Name: canonicalRef, Target: img.Target(), Labels: img.Labels()}); err != nil {
+				return fmt.Errorf("alias image %s to %s: %w", ref, canonicalRef, err)
+			}
+			log.Printf("[images] aliased %s to %s in namespace %s", ref, canonicalRef, targetNs)
+			return nil
+		}
+	}
+
 	// Find the image in another namespace and copy its metadata.
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return fmt.Errorf("list namespaces: %w", err)
+	}
+	candidates := []string{canonicalRef}
+	if ref != canonicalRef {
+		candidates = append(candidates, ref)
 	}
 	for _, ns := range nss {
 		if ns == targetNs {
 			continue
 		}
 		nsCtx := namespaces.WithNamespace(ctx, ns)
-		img, err := cl.GetImage(nsCtx, canonicalRef)
-		if err != nil {
-			continue
+		for _, name := range candidates {
+			img, err := cl.GetImage(nsCtx, name)
+			if err != nil {
+				continue
+			}
+			if err := put(targetCtx, images.Image{Name: canonicalRef, Target: img.Target(), Labels: img.Labels()}); err != nil {
+				return fmt.Errorf("copy image metadata to %s: %w", targetNs, err)
+			}
+			log.Printf("[images] copied %s from %s to %s as %s", name, ns, targetNs, canonicalRef)
+			return nil
 		}
-		newImg := client.NewImage(cl, images.Image{
-			Name:   canonicalRef,
-			Target: img.Target(),
-			Labels: img.Labels(),
-		})
-		if _, err := cl.ImageService().Create(targetCtx, newImg.Metadata()); err != nil {
-			return fmt.Errorf("copy image metadata to %s: %w", targetNs, err)
-		}
-		log.Printf("[images] copied %s from %s to %s", canonicalRef, ns, targetNs)
-		return nil
 	}
 
 	// Image not found anywhere; pull it. Use the user-supplied short form so
@@ -464,68 +490,66 @@ func pullDockerImage(image string) (string, string, error) {
 	return stdout, stderr, nil
 }
 
-// handleImageLoad implements POST /images/load — streams a Docker tar archive
-// from the request body into containerd via ctr import.
+// handleImageLoad implements POST /images/load — streams a Docker/OCI tar
+// archive from the request body straight into containerd via the Go client.
+// No temp file is used: the guest root is a small RAM tmpfs, so buffering
+// large archives on disk can fill it up. gzip/zstd streams are auto-detected.
 func handleImageLoad(w http.ResponseWriter, r *http.Request) {
 	ns := "default"
 	if r.URL.Query().Get("namespace") != "" {
 		ns = r.URL.Query().Get("namespace")
 	}
 
-	tmp, err := os.CreateTemp("", "anvil-load-*.tar")
+	cl, err := client.New(containerdSocket)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
-	defer os.Remove(tmp.Name())
-	defer tmp.Close()
+	defer cl.Close()
 
-	if _, err := io.Copy(tmp, r.Body); err != nil {
+	log.Printf("[docker-api] loading image stream (%d bytes) into ns=%q", r.ContentLength, ns)
+
+	ds, err := compression.DecompressStream(r.Body)
+	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
-	tmp.Close()
+	defer ds.Close()
 
-	log.Printf("[docker-api] loading image from tar (%d bytes) into ns=%q", r.ContentLength, ns)
-
-	// Import into containerd content store without unpacking (avoids whiteout
-	// conversion errors with the native snapshotter). Images are unpacked on
-	// first container start by containerd's snapshotter.
-	cmdArgs := []string{"-n", ns, "images", "import", "--no-unpack", tmp.Name()}
-	cmd := exec.Command("/opt/containerd/bin/ctr", cmdArgs...)
-	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-	var outBuf, errBuf strings.Builder
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
-		exitCode := 1
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		}
-		log.Printf("[docker-api] ctr import failed (%d): %s%s", exitCode, outBuf.String(), errBuf.String())
-		http.Error(w, fmt.Sprintf(`{"message":"import failed: %s"}`, stripANSI(errBuf.String())), http.StatusInternalServerError)
+	// Archives without name annotations (e.g. `buildx --output type=oci`
+	// without -t) import content only and register no image reference, so
+	// `docker run <name>` would fall back to a registry pull. Give unnamed
+	// manifests a digest-based ref so they can be run/tagged locally.
+	nsCtx := namespaces.WithNamespace(context.Background(), ns)
+	imgs, err := cl.Import(nsCtx, ds,
+		client.WithDigestRef(func(d digest.Digest) string {
+			return "docker.io/imported/anvil-image:" + d.Encoded()[:12]
+		}),
+		client.WithSkipDigestRef(func(name string) bool { return name != "" }),
+	)
+	if err != nil {
+		log.Printf("[docker-api] import failed: %v", err)
+		http.Error(w, fmt.Sprintf(`{"message":"import failed: %s"}`, stripANSI(err.Error())), http.StatusInternalServerError)
 		return
 	}
 
-	// Parse imported image refs from ctr output.
-	var images []string
-	for _, line := range strings.Split(outBuf.String(), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			images = append(images, line)
-		}
+	// Import into the content store without unpacking (avoids whiteout
+	// conversion errors with the native snapshotter). Unpack best-effort so
+	// images are immediately usable; otherwise the first container start
+	// unpacks via containerd's snapshotter.
+	for _, img := range imgs {
+		_ = client.NewImage(cl, img).Unpack(nsCtx, "native")
 	}
 
-	// Also try to unpack each imported image so it's immediately usable.
-	for _, ref := range images {
-		unpackArgs := []string{"-n", ns, "images", "unpack", "--snapshotter", "native", ref}
-		unpackCmd := exec.Command("/opt/containerd/bin/ctr", unpackArgs...)
-		unpackCmd.Env = append(unpackCmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-		unpackCmd.Run()
-	}
-
+	// Docker CLI prints every "status" line from the response stream. Report
+	// the exact refs that were registered so the user knows which name to run.
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"Images": images,
-	})
+	enc := json.NewEncoder(w)
+	if len(imgs) == 0 {
+		enc.Encode(map[string]interface{}{"status": "Loaded image"})
+		return
+	}
+	for _, img := range imgs {
+		enc.Encode(map[string]interface{}{"status": fmt.Sprintf("Loaded image: %s", img.Name)})
+	}
 }

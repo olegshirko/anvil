@@ -36,7 +36,9 @@ else
 fi
 MEMORY_GB="${ANVIL_MEMORY:-2}"
 
-# Look for kernel/initrd: user state dir first, then brew assets, then source tree.
+# Look for kernel/initrd. In a source tree, freshly built assets under
+# .download win over state-dir copies (which may be stale after rebuilds);
+# otherwise (brew installs) prefer user-provided state-dir assets.
 find_asset() {
     for f in "$@"; do
         if [[ -f "$f" ]]; then
@@ -47,14 +49,25 @@ find_asset() {
     return 1
 }
 
-KERNEL_PATH="${KERNEL_PATH:-$(find_asset \
-    "$STATE_DIR/vmlinuz-raw" \
-    "$BREW_ASSETS_DIR/vmlinuz-raw" \
-    "$PROJECT_ROOT/.download/ubuntu/vmlinuz-raw")}"
-INITRD_PATH="${INITRD_PATH:-$(find_asset \
-    "$STATE_DIR/initramfs-containerd" \
-    "$BREW_ASSETS_DIR/initramfs-containerd" \
-    "$PROJECT_ROOT/.download/ubuntu/initramfs-containerd")}"
+if [[ -f "$PROJECT_ROOT/Package.swift" ]]; then
+    KERNEL_PATH="${KERNEL_PATH:-$(find_asset \
+        "$PROJECT_ROOT/.download/ubuntu/vmlinuz-raw" \
+        "$STATE_DIR/vmlinuz-raw" \
+        "$BREW_ASSETS_DIR/vmlinuz-raw")}"
+    INITRD_PATH="${INITRD_PATH:-$(find_asset \
+        "$PROJECT_ROOT/.download/ubuntu/initramfs-containerd" \
+        "$STATE_DIR/initramfs-containerd" \
+        "$BREW_ASSETS_DIR/initramfs-containerd")}"
+else
+    KERNEL_PATH="${KERNEL_PATH:-$(find_asset \
+        "$STATE_DIR/vmlinuz-raw" \
+        "$BREW_ASSETS_DIR/vmlinuz-raw" \
+        "$PROJECT_ROOT/.download/ubuntu/vmlinuz-raw")}"
+    INITRD_PATH="${INITRD_PATH:-$(find_asset \
+        "$STATE_DIR/initramfs-containerd" \
+        "$BREW_ASSETS_DIR/initramfs-containerd" \
+        "$PROJECT_ROOT/.download/ubuntu/initramfs-containerd")}"
+fi
 PID_FILE="$STATE_DIR/daemon.pid"
 PREV_CONTEXT_FILE="$STATE_DIR/previous-docker-context"
 LOG_FILE="$STATE_DIR/daemon.log"

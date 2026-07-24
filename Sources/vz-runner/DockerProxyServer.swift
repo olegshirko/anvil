@@ -156,8 +156,7 @@ final class DockerProxyServer {
                 let n = read(clientFd, &buf, buf.count)
                 if n <= 0 { break }
                 total += n
-                let written = buf.withUnsafeBytes { write(vfd, $0.baseAddress, n) }
-                if written < 0 { break }
+                if !self.writeAll(fd: vfd, buffer: buf, count: n) { break }
             }
             if self.debug {
                 print("[docker-proxy] host -> guest: \(total) bytes")
@@ -175,8 +174,7 @@ final class DockerProxyServer {
                 let n = read(vfd, &buf, buf.count)
                 if n <= 0 { break }
                 total += n
-                let written = buf.withUnsafeBytes { write(clientFd, $0.baseAddress, n) }
-                if written < 0 { break }
+                if !self.writeAll(fd: clientFd, buffer: buf, count: n) { break }
             }
             if self.debug {
                 print("[docker-proxy] guest -> host: \(total) bytes")
@@ -186,5 +184,26 @@ final class DockerProxyServer {
         }
 
         group.wait()
+    }
+
+    /// Write the whole buffer, looping over short writes. Blocking vsock and
+    /// unix-socket fds may return fewer bytes than requested under memory
+    /// pressure; dropping the remainder silently corrupts the proxied stream
+    /// (e.g. truncated `docker load` request bodies).
+    private func writeAll(fd: Int32, buffer: [UInt8], count: Int) -> Bool {
+        var total = 0
+        while total < count {
+            let n = buffer.withUnsafeBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return -1 }
+                return write(fd, base.advanced(by: total), count - total)
+            }
+            if n < 0 {
+                if errno == EINTR { continue }
+                return false
+            }
+            if n == 0 { return false }
+            total += n
+        }
+        return true
     }
 }
