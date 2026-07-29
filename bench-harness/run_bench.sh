@@ -105,6 +105,11 @@ run_one_backend() {
     # --- 1. Full stop first so the cold start is honest ---
     backend_stop || true
     sleep 2
+    # Give drivers a chance to invalidate any saved state (e.g. vz-runner's
+    # snapshot) so "cold start" really is a cold boot, not a resume.
+    if declare -f backend_cold_reset >/dev/null; then
+        backend_cold_reset
+    fi
 
     # --- 2. Cold start ---
     local t0 t1

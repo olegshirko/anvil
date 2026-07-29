@@ -313,19 +313,11 @@ final class VMLifecycleManager: NSObject {
                     } else {
                         print("[anvil] guest agent ready")
                     }
-                    self.pause { pauseResult in
-                        switch pauseResult {
-                        case .success:
-                            self.saveSnapshot { _ in
-                                self.resume { _ in
-                                    self.delegate?.vmLifecycleManagerDidBecomeReady(self)
-                                }
-                            }
-                        case .failure(let pauseError):
-                            print("[anvil] pause for snapshot failed: \(pauseError)")
-                            self.delegate?.vmLifecycleManagerDidBecomeReady(self)
-                        }
-                    }
+                    // Declare readiness immediately. Saving the snapshot used
+                    // to block here for ~2.4s (pause -> save -> resume); the
+                    // daemon already saves on idle timeout and on shutdown,
+                    // so an inline save only delayed first use.
+                    self.delegate?.vmLifecycleManagerDidBecomeReady(self)
                 case .failure:
                     DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) {
                         attempt()

@@ -90,7 +90,7 @@ func waitForControlSocket(timeout: TimeInterval = 60) -> Bool {
         if FileManager.default.fileExists(atPath: sockPath, isDirectory: &isDir), !isDir.boolValue {
             return true
         }
-        Thread.sleep(forTimeInterval: 0.5)
+        Thread.sleep(forTimeInterval: 0.1)
     }
     return false
 }
@@ -251,9 +251,16 @@ func cmdStatus() {
         print("[anvil] daemon running (pid \(pid))")
     } else {
         print("[anvil] daemon not running")
+        // Non-zero exit so scripts and the bench harness can poll this as a
+        // readiness gate; previously status always succeeded.
+        exit(1)
     }
     let ctx = shell("docker", "context", "show").trimmingCharacters(in: .whitespacesAndNewlines)
     print("[anvil] docker context: \(ctx)")
+    // Query the control socket; exits non-zero until the full chain
+    // (daemon -> control server -> guest agent) answers, so scripts and the
+    // bench harness can poll `status` as an honest readiness gate.
+    ControlClient.status()
 }
 
 // MARK: - Arg helpers

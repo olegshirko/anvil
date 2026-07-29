@@ -197,7 +197,7 @@ ubuntu-modules: $(UBUNTU_DIR)
 
 guest-agent:
 	cd guest-agent && go mod tidy
-	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../$(AGENT_BIN) .
+	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o ../$(AGENT_BIN) .
 
 initramfs-agent: extract-alpine-kernel guest-agent
 	scripts/build_initramfs.sh

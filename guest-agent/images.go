@@ -526,6 +526,11 @@ func handleImageLoad(w http.ResponseWriter, r *http.Request) {
 			return "docker.io/imported/anvil-image:" + d.Encoded()[:12]
 		}),
 		client.WithSkipDigestRef(func(name string) bool { return name != "" }),
+		// Archives exported for a single platform may still reference
+		// manifests/blobs of other platforms (e.g. a multi-arch index) that
+		// are not included. Skip those instead of failing the whole import;
+		// ctr's transfer-based import is lenient the same way.
+		client.WithSkipMissing(),
 	)
 	if err != nil {
 		log.Printf("[docker-api] import failed: %v", err)

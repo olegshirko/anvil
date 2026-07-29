@@ -111,6 +111,8 @@ tar -xzf "$TOOLS_DIR/containerd.tgz" -C opt/containerd/bin --strip-components=1 
 tar -xzf "$TOOLS_DIR/nerdctl.tgz" -C opt/containerd/bin 2>/dev/null || true
 cp "$TOOLS_DIR/runc" opt/containerd/bin/runc
 chmod +x opt/containerd/bin/*
+# Drop unused containerd tools (~19 MB): stress tester and rootless helpers.
+rm -f opt/containerd/bin/containerd-stress opt/containerd/bin/containerd-rootless*.sh
 cat > bin/nerdctl <<'NERDCTLEOF'
 #!/bin/sh
 # Thin wrapper that ensures a per-project CNI bridge exists and is used
@@ -172,6 +174,13 @@ ln -sf /opt/containerd/bin/ctr bin/ctr
 mkdir -p opt/cni/bin etc/cni/net.d
 tar -xzf "$TOOLS_DIR/cni-plugins.tgz" -C opt/cni/bin 2>/dev/null || true
 chmod +x opt/cni/bin/*
+# Keep only the plugins the generated configs actually use; the full set is ~78 MB.
+for plugin in opt/cni/bin/*; do
+    case "$(basename "$plugin")" in
+        bridge|host-local|loopback|portmap|firewall|tuning) ;;
+        *) rm -f "$plugin" ;;
+    esac
+done
 
 # iptables + libraries required by CNI plugins.
 for apk in iptables libmnl libnftnl libxtables; do
@@ -425,22 +434,28 @@ done
 mkdir -p /mnt/anvil
 mount -t virtiofs anvil /mnt/anvil 2>/dev/null || true
 
-# Bring up NAT network via virtio-net.
+# Bring up NAT network via virtio-net. udhcpc -n -q blocks until the lease is
+# obtained (typically <200 ms on VZ NAT) and exits on failure, so no polling.
 echo "[myinit] configuring network"
 ifconfig lo up 2>/dev/null || true
 ifconfig eth0 up 2>/dev/null || true
-udhcpc -i eth0 -s /usr/share/udhcpc/default.script >/tmp/udhcpc.log 2>&1 &
-for i in 1 2 3 4 5 6 7 8 9 10; do
-    if ip addr show eth0 2>/dev/null | grep -q 'inet '; then break; fi
-    sleep 0.5
-done
+udhcpc -i eth0 -n -q -s /usr/share/udhcpc/default.script >/tmp/udhcpc.log 2>&1 || true
 ip addr show eth0 >/tmp/network.log 2>&1 || true
 mkdir -p /etc
-printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\n' > /etc/resolv.conf
+# Keep the DNS servers provided by DHCP (the VZ NAT gateway forwards to the
+# host resolver, which also works on VPN/restricted networks). If the lease
+# included none, use the NAT gateway first and public DNS as backup — VZ NAT
+# runs a DNS forwarder on the gateway address.
+if [ ! -s /etc/resolv.conf ]; then
+    gw=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')
+    [ -n "$gw" ] && printf 'nameserver %s\n' "$gw" >> /etc/resolv.conf
+    printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\n' >> /etc/resolv.conf
+fi
 
-# Sync clock; TLS to registries fails with 1970-01-01.
+# Sync clock in the background; VZ sets the RTC from the host, so boot does
+# not need to wait for NTP. TLS to registries fails under 1970-01-01.
 echo "[myinit] syncing clock"
-ntpd -nq -p pool.ntp.org >/tmp/ntpd.log 2>&1 || true
+( ntpd -nq -p pool.ntp.org >/tmp/ntpd.log 2>&1 || true ) &
 
 # containerd needs /etc/containerd and a state dir.
 mkdir -p /etc/containerd /run/containerd /var/lib/containerd
@@ -606,10 +621,12 @@ iptables -t nat -A POSTROUTING -p tcp -m conntrack --ctstate DNAT -j MASQUERADE 
 echo "[stage2] starting containerd"
 /opt/containerd/bin/containerd > /tmp/containerd.log 2>&1 &
 
-# Wait for containerd socket.
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+# Wait for containerd socket (it usually appears within ~300 ms).
+i=0
+while [ $i -lt 75 ]; do
     if [ -S /run/containerd/containerd.sock ]; then break; fi
-    sleep 0.5
+    sleep 0.1
+    i=$((i + 1))
 done
 
 # Cold boot only: per-container nerdctl state (/var/lib/nerdctl) is persisted
@@ -622,11 +639,13 @@ done
 echo "[stage2] cleaning up containers from restored metadata"
 
 # Old shims/hooks from a crashed/hung previous session cannot be talked to;
-# trying to delete their tasks through containerd would hang. Kill them first.
-killall -9 containerd-shim-runc-v2 2>/dev/null || true
-killall -9 runc 2>/dev/null || true
-killall -9 nerdctl 2>/dev/null || true
-sleep 1
+# trying to delete their tasks through containerd would hang. Kill them first,
+# and only wait if there was actually something to kill.
+killed=0
+killall -9 containerd-shim-runc-v2 2>/dev/null && killed=1
+killall -9 runc 2>/dev/null && killed=1
+killall -9 nerdctl 2>/dev/null && killed=1
+[ "$killed" = 1 ] && sleep 1
 
 for ns in $(/opt/containerd/bin/ctr namespace ls -q 2>/dev/null); do
     for id in $(/opt/containerd/bin/ctr -n "$ns" c ls -q 2>/dev/null); do
@@ -658,8 +677,9 @@ exec switch_root /newroot /bin/sh /stage2.sh
 EOF
 chmod +x myinit
 
-# Pack the rootfs with GNU cpio inside the Linux container.
-find . -mindepth 1 -print0 | cpio -o -0 -H newc | gzip -9 > "$OUT"
+# Pack the rootfs with GNU cpio inside the Linux container. zstd decompresses
+# much faster than gzip at boot (the kernel supports CONFIG_RD_ZSTD).
+find . -mindepth 1 -print0 | cpio -o -0 -H newc | zstd -q -19 -T0 > "$OUT"
 
 if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
     chown "$HOST_UID:$HOST_GID" "$OUT" 2>/dev/null || true

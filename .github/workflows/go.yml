@@ -118,7 +118,7 @@ jobs:
         run: |
           cd guest-agent
           go mod tidy
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../.download/alpine/guest-agent .
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o ../.download/alpine/guest-agent .
 
       - name: Download container tools
         run: |
@@ -152,10 +152,10 @@ jobs:
 
       - name: Verify initramfs architecture
         run: |
-          sudo apt-get install -y cpio file >/dev/null 2>&1 || true
+          sudo apt-get install -y cpio file zstd >/dev/null 2>&1 || true
           mkdir -p /tmp/initrd-check
           cd /tmp/initrd-check
-          gzip -dc "$GITHUB_WORKSPACE/.download/ubuntu/initramfs-containerd" | cpio -idmv 2>/dev/null || true
+          zstd -dc "$GITHUB_WORKSPACE/.download/ubuntu/initramfs-containerd" | cpio -idmv 2>/dev/null || true
           ls -l bin/tar sbin/mkfs.ext4
           file bin/tar
           file sbin/mkfs.ext4

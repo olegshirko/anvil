@@ -79,11 +79,23 @@ struct SnapshotManager {
     }
 
     private func sha256OfFile(_ path: String) -> String? {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+        let url = URL(fileURLWithPath: path)
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attrs[.size] as? NSNumber)?.int64Value,
+              let mtime = attrs[.modificationDate] as? Date else {
+            print("[anvil] failed to stat file for hash: \(path)")
+            return nil
+        }
+        if let cached = AssetHashCache.lookup(path: path, size: size, mtime: mtime) {
+            return cached
+        }
+        guard let data = try? Data(contentsOf: url) else {
             print("[anvil] failed to read file for hash: \(path)")
             return nil
         }
-        return SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
+        let sha = SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
+        AssetHashCache.store(path: path, size: size, mtime: mtime, sha256: sha)
+        return sha
     }
 
     func removeSnapshot() {
@@ -141,4 +153,44 @@ struct SnapshotManager {
 
 struct NetworkConfig: Codable {
     let macAddresses: [String]
+}
+
+/// Persistent sha256 cache for large boot assets (kernel/initrd). Hashing
+/// ~170 MB on every launch is measurable; entries are keyed by path, size and
+/// mtime, so a rebuilt asset is always re-hashed.
+enum AssetHashCache {
+    private struct Entry: Codable {
+        let size: Int64
+        let mtime: TimeInterval
+        let sha256: String
+    }
+
+    private static var cacheURL: URL {
+        stateDir.appendingPathComponent("asset-hashes.json")
+    }
+
+    private static func load() -> [String: Entry] {
+        guard let data = try? Data(contentsOf: cacheURL),
+              let dict = try? JSONDecoder().decode([String: Entry].self, from: data) else {
+            return [:]
+        }
+        return dict
+    }
+
+    static func lookup(path: String, size: Int64, mtime: Date) -> String? {
+        guard let entry = load()[path],
+              entry.size == size,
+              entry.mtime == mtime.timeIntervalSince1970 else {
+            return nil
+        }
+        return entry.sha256
+    }
+
+    static func store(path: String, size: Int64, mtime: Date, sha256: String) {
+        var dict = load()
+        dict[path] = Entry(size: size, mtime: mtime.timeIntervalSince1970, sha256: sha256)
+        if let data = try? JSONEncoder().encode(dict) {
+            try? data.write(to: cacheURL, options: .atomic)
+        }
+    }
 }

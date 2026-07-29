@@ -16,9 +16,13 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 STATE_DIR="$HOME/.anvil-vz"
 BREW_ASSETS_DIR="$PROJECT_ROOT/assets"
 
-# Resolve the vz-runner binary: explicit env var, PATH (brew), then source build.
+# Resolve the vz-runner binary: explicit env var first. In a source tree the
+# fresh build wins over PATH (which may hold an older brew install); otherwise
+# fall back to PATH (brew), then the source build.
 if [[ -z "${VZRUNNER_BIN:-}" ]]; then
-    if command -v vz-runner >/dev/null 2>&1; then
+    if [[ -f "$PROJECT_ROOT/Package.swift" && -x "$PROJECT_ROOT/.build/release/vz-runner" ]]; then
+        VZRUNNER_BIN="$PROJECT_ROOT/.build/release/vz-runner"
+    elif command -v vz-runner >/dev/null 2>&1; then
         VZRUNNER_BIN="$(command -v vz-runner)"
     elif [[ -x "$PROJECT_ROOT/.build/release/vz-runner" ]]; then
         VZRUNNER_BIN="$PROJECT_ROOT/.build/release/vz-runner"
@@ -74,10 +78,6 @@ LOG_FILE="$STATE_DIR/daemon.log"
 LAUNCHAGENT_LOG="$STATE_DIR/launchagent.log"
 
 mkdir -p "$STATE_DIR"
-
-now_ms() {
-    python3 -c 'import time; print(int(time.time()*1000))'
-}
 
 # Warn if the user's shell proxy settings will route localhost traffic away from
 # the vz-runner listeners. The service itself is unaffected, but `docker`/`curl`
@@ -164,16 +164,14 @@ cmd_start() {
         >>"$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 
-    local start_ms
-    start_ms=$(now_ms)
+    local start_sec=$SECONDS
     local control_sock="$STATE_DIR/control.sock"
     until [[ -S "$control_sock" ]]; do
-        local elapsed=$(( ($(now_ms) - start_ms) / 1000 ))
-        if (( elapsed > 60 )); then
+        if (( SECONDS - start_sec > 60 )); then
             echo "[anvil-service] error: daemon did not become ready within 60s" >&2
             return 1
         fi
-        sleep 0.5
+        sleep 0.1
     done
 
     echo "[anvil-service] switching docker context to anvil..."
@@ -190,11 +188,9 @@ cmd_stop() {
         pid="$(cat "$PID_FILE" 2>/dev/null || true)"
         echo "[anvil-service] stopping daemon (pid $pid)..."
         kill -TERM "$pid" 2>/dev/null || true
-        local start_ms
-        start_ms=$(now_ms)
+        local start_sec=$SECONDS
         while kill -0 "$pid" 2>/dev/null; do
-            local elapsed=$(( ($(now_ms) - start_ms) / 1000 ))
-            if (( elapsed > 90 )); then
+            if (( SECONDS - start_sec > 90 )); then
                 echo "[anvil-service] warning: daemon did not stop gracefully, sending SIGKILL" >&2
                 kill -KILL "$pid" 2>/dev/null || true
                 break

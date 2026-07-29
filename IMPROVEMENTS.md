@@ -10,56 +10,46 @@
 - Холодный старт до готовности ≈ 8.3 с: VM start 0.12 с → guest-agent ready
   5.76 с → сохранение снапшота 2.44 с (инлайн, до объявления готовности).
 - Resume из снапшота ≈ 1 с.
-- Внутри гостя: ядро до myinit 0.64 с; mount ext4 на 3.29 с (≈2.6 с уходит на
-  DHCP + ntpd + копию rootfs в tmpfs); containerd → guest-agent ≈ 2.4 с.
 
-Шаги (ожидаемый суммарный эффект: холодный старт ~2.5–3.5 с):
+**Результат после первой итерации (сделано, bench-harness): холодный старт
+daemon ready 1339 мс (честный cold boot, для сравнения OrbStack 1560 мс,
+Docker Desktop 2175 мс), resume 568 мс (Colima 13301 мс, Lima 9114 мс),
+guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
+109 → 51 МБ, idle RSS 2766 → ~700 МБ.**
 
-1. **Ленивое сохранение снапшота (−2.4 с).** `VMLifecycleManager.swift:293-337`:
-   сейчас после готовности guest-agent VM встаёт на паузу, снапшот пишется
-   2.4 с, потом resume — и только затем `didBecomeReady`. Сохранять снапшот
-   после `didBecomeReady` (в фоне или на первом idle), готовность не блокировать.
-2. **Убрать блокирующий ntpd.** myinit (`build_initramfs_containerd.sh` ~443):
-   `ntpd -nq -p pool.ntp.org` выполняется синхронно после DHCP без таймаута.
-   RTC от Virtualization.framework уже даёт правильное время — убрать совсем
-   или в фон с `timeout 2`.
-3. **DHCP без медленного опроса.** myinit (~432-436): poll `sleep 0.5` ×10.
-   `udhcpc -n -q` в foreground обычно отрабатывает <200 мс на VZ NAT,
-   либо опрос каждые 50–100 мс.
-4. **Не копировать rootfs в tmpfs (−0.5–1 с).** myinit делает `cp -a` ~246 МБ
-   в /newroot + switch_root на каждом холодном старте. Выполнять stage2 прямо
-   из корня initramfs.
-5. **Похудение initramfs 109 → ~50 МБ.**
-   - `containerd-stress` (18.5 МБ) в `opt/containerd/bin` не используется;
-   - 18 CNI-плагинов (78 МБ), реально нужны ~5 (bridge, portmap, firewall,
-     tuning, host-local) → −56 МБ;
-   - `gzip -9` → `zstd` (ядро поддерживает, распаковка быстрее);
-   - guest-agent собирать с `-ldflags="-s -w"`.
-6. **Мелкие задержки stage2.** Poll `containerd.sock`: `sleep 0.5` → 0.05–0.1 с;
-   безусловный `sleep 1` после `killall -9` — только если реально были убиты
-   процессы.
-7. **Хеш снапшота.** `SnapshotManager.swift:81-87` читает и хеширует
-   ~172 МБ (kernel+initrd), и это происходит дважды за запуск
-   (`VMLifecycleManager.swift:173,223`). Кешировать sha256 по mtime/size,
-   считать один раз.
-8. **Cmdline ядра и энтропия.** Добавить `quiet loglevel=3` (меньше записей
-   в serial-консоль) и `random.trust_cpu=on` + virtio-entropy — сейчас
-   `crng init done` только на ~81-й секунде, что может тормозить первые
-   TLS-операции контейнеров.
-9. **Честные замеры (сделать первым).** `cmdStatus` всегда выходит с кодом 0
-   (`main.swift:248-257`) — readiness-gate в bench-harness (`vz-runner status`)
-   ничего не ждёт, а «cold start 1779 мс» в `bench-harness/results/latest.md`
-   на деле является resume (харнес не удаляет снапшоты между фазами). Исправить
-   exit-код `status` до готовности и добавить в харнес фазу настоящего
-   холодного старта.
-10. **(дорого, опционально) Alpine linux-virt ядро** вместо Ubuntu generic:
-    образ в разы меньше, инициализация быстрее. Нужно подобрать набор модулей
-    (ext4, vsock, virtiofs, bridge, netfilter).
+Сделано:
 
-Не на горячем пути, но бесплатно: `anvil-service.sh` на каждой итерации
-ожидания сокета запускает `python3`; три последовательных вызова
-`docker context rm/create/use` в `cmdStart` (~0.3–0.5 с) можно заменить на
-проверку текущего контекста.
+1. **Честные замеры.** `cmdStatus` выходил с кодом 0 всегда — теперь != 0,
+   пока демон не поднялся и control-цепочка (daemon → control server →
+   guest-agent health) не отвечает (`main.swift`). В bench-harness добавлен
+   хук `backend_cold_reset` (удаляет снапшот vz-runner перед фазой cold
+   start) — раньше «cold start» в бенче на деле был resume.
+2. **Ленивый снапшот (−2.4 с на холодный старт).** `VMLifecycleManager`
+   больше не делает pause → save → resume до `didBecomeReady`; снапшот
+   сохраняется на idle-таймауте и при штатной остановке, как раньше.
+3. **Кеш sha256 ассетов.** Хеш kernel+initrd (~172 МБ) считался дважды за
+   запуск; теперь persistent-кеш по (path, size, mtime) в
+   `~/.anvil-vz/asset-hashes.json` (`SnapshotManager.swift`).
+4. **Гостевая загрузка.** Убран блокирующий `ntpd` (фон, RTC от VZ
+   достаточно); `udhcpc -n -q` вместо опроса 0.5 с; poll `containerd.sock`
+   0.5 → 0.1 с; `sleep 1` после killall — только если были убиты процессы.
+5. **Похудение initramfs 109 → 51 МБ:** выкинуты `containerd-stress` и
+   rootless-скрипты (−19 МБ), оставлены 6 нужных CNI-плагинов (−56 МБ),
+   упаковка `gzip -9` → `zstd -19` (распаковка initrd 0.63 → 0.2 с),
+   guest-agent с `-ldflags="-s -w"`.
+6. **Прочее:** `random.trust_cpu=on` в cmdline (crng init был на ~81 с),
+   быстрые опросы сокетов на хосте (0.5 → 0.1 с), `anvil-service.sh` без
+   `python3` в циклах ожидания.
+
+Осталось (отложено):
+
+7. **Копия rootfs в tmpfs + switch_root (~0.3–0.5 с).** myinit копирует
+   ~165 МБ в /newroot, т.к. rootfs initramfs — не отдельный mount и runc
+   pivot_root ломается. Пока оставлено (рискованно), частично компенсировано
+   похудением образа.
+8. **(дорого, опционально) Alpine linux-virt ядро** вместо Ubuntu generic:
+   образ в разы меньше, инициализация быстрее. Нужно подобрать набор модулей
+   (ext4, vsock, virtiofs, bridge, netfilter).
 
 ## 2. Баги и надёжность
 
@@ -85,8 +75,12 @@
    («Run 'docker run --help'») на первом запросе к только что поднятому
    демону; повторный запуск работает. Похоже на race при первом
    vsock-соединении — воспроизвести и разобраться.
+6. **Resume compose up регресс в бенче (5567 мс, было ~460 мс)** — после
+   resume стек поднимается заметно дольше, чем раньше; проверить, не
+   пересоздаются ли контейнеры вместо no-op.
 
-Сделано в ходе расследования `docker load` (июль 2026, уже в коде):
+Сделано в ходе расследования `docker load` и итерации скорости (июль 2026,
+уже в коде):
 
 - `DockerProxyServer.swift`: дозапись буфера циклом в обоих направлениях —
   раньше частичный `write()` молча ронял хвост 64-КБ чанка.
@@ -106,9 +100,17 @@
   «загружались» молча, но образ был недоступен по имени и `docker run`
   уходил в registry pull — теперь таким манифестам выдаётся ref по дайджесту
   (`docker.io/imported/anvil-image:<digest12>`).
-- `anvil-service.sh`: в source-дереве свежие assets из `.download` теперь
-  важнее копий в `~/.anvil-vz` — иначе после `make rebuild-all` сервис
-  продолжал грузить старый initramfs со старым guest-agent.
+- `anvil-service.sh`: в source-дереве свежие assets из `.download` и свежий
+  бинарник `.build/release/vz-runner` теперь приоритетнее копий в
+  `~/.anvil-vz` и PATH — иначе после `make rebuild-all` сервис продолжал
+  грузить старый initramfs со старым guest-agent и старый brew-бинарник.
+- DNS в госте: myinit больше не затирает `/etc/resolv.conf` хардкодом
+  8.8.8.8 — берётся DNS из DHCP (VZ NAT-шлюз проксирует резолвер хоста,
+  работает в VPN/ограниченных сетях), 8.8.8.8 только как запасной. Раньше
+  на сетях с заблокированным внешним DNS pull'ы висли бессимптомно.
+- `/images/load`: добавлен `client.WithSkipMissing()` — одноплатформенные
+  экспорты с мультиархитектурным индексом (без чужих блобов) больше не
+  падают с «content digest ... not found».
 
 ## 3. Функциональность
 

@@ -77,6 +77,14 @@ backend_stop_keep_snapshot() {
     backend_stop
 }
 
+# Remove the saved snapshot so the next backend_start is a true cold boot
+# (the daemon saves a snapshot on every graceful stop, including the one the
+# harness runs right before the "cold start" phase).
+backend_cold_reset() {
+    rm -f "$HOME/.anvil-vz/snapshots/default.vzstate" \
+          "$HOME/.anvil-vz/snapshots/default.config-hash"
+}
+
 backend_resume() {
     # On restart the daemon restores from snapshot if it is valid.
     backend_start
