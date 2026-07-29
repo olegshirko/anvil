@@ -41,8 +41,10 @@ fi
 MEMORY_GB="${ANVIL_MEMORY:-2}"
 
 # Look for kernel/initrd. In a source tree, freshly built assets under
-# .download win over state-dir copies (which may be stale after rebuilds);
-# otherwise (brew installs) prefer user-provided state-dir assets.
+# .download win over state-dir copies (which may be stale after rebuilds).
+# For brew installs the package assets win over state-dir copies too —
+# otherwise a stale ~/.anvil-vz initramfs silently shadows every upgrade
+# (custom kernel/initrd can still be forced via KERNEL_PATH/INITRD_PATH).
 find_asset() {
     for f in "$@"; do
         if [[ -f "$f" ]]; then
@@ -64,14 +66,21 @@ if [[ -f "$PROJECT_ROOT/Package.swift" ]]; then
         "$BREW_ASSETS_DIR/initramfs-containerd")}"
 else
     KERNEL_PATH="${KERNEL_PATH:-$(find_asset \
-        "$STATE_DIR/vmlinuz-raw" \
         "$BREW_ASSETS_DIR/vmlinuz-raw" \
+        "$STATE_DIR/vmlinuz-raw" \
         "$PROJECT_ROOT/.download/ubuntu/vmlinuz-raw")}"
     INITRD_PATH="${INITRD_PATH:-$(find_asset \
-        "$STATE_DIR/initramfs-containerd" \
         "$BREW_ASSETS_DIR/initramfs-containerd" \
+        "$STATE_DIR/initramfs-containerd" \
         "$PROJECT_ROOT/.download/ubuntu/initramfs-containerd")}"
 fi
+# Warn about ignored state-dir shadow assets so they don't silently mask
+# package upgrades again.
+for shadow in "$STATE_DIR/vmlinuz-raw" "$STATE_DIR/initramfs-containerd"; do
+    if [[ -f "$shadow" && "$shadow" != "$KERNEL_PATH" && "$shadow" != "$INITRD_PATH" ]]; then
+        echo "[anvil-service] note: ignoring $shadow (package assets take priority; set KERNEL_PATH/INITRD_PATH to override)" >&2
+    fi
+done
 PID_FILE="$STATE_DIR/daemon.pid"
 PREV_CONTEXT_FILE="$STATE_DIR/previous-docker-context"
 LOG_FILE="$STATE_DIR/daemon.log"

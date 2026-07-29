@@ -126,9 +126,11 @@ func canonicalizeImageRef(ref string) string {
 }
 
 // ensureImageInNamespace makes sure an image reference exists in the target
-// namespace. If the image already exists there, it returns nil. If it exists in
-// another namespace, its metadata is copied to the target namespace using the
-// shared content store. Otherwise it is pulled into the target namespace.
+// namespace. If the image already exists there, it returns nil. If it exists
+// in another namespace, the image is streamed into the target namespace
+// (containerd's content store is namespaced, so a bare metadata copy would
+// leave a dangling pointer and nerdctl would fall back to a registry pull).
+// Otherwise it is pulled into the target namespace.
 func ensureImageInNamespace(ref, targetNs string) error {
 	cl, err := client.New(containerdSocket)
 	if err != nil {
@@ -138,15 +140,6 @@ func ensureImageInNamespace(ref, targetNs string) error {
 
 	ctx := context.Background()
 	canonicalRef := canonicalizeImageRef(ref)
-
-	put := func(nsCtx context.Context, img images.Image) error {
-		if _, err := cl.ImageService().Create(nsCtx, img); err != nil {
-			if _, uerr := cl.ImageService().Update(nsCtx, img, "target"); uerr != nil {
-				return err
-			}
-		}
-		return nil
-	}
 
 	// Fast path: image already exists in target namespace.
 	targetCtx := namespaces.WithNamespace(ctx, targetNs)
@@ -158,10 +151,11 @@ func ensureImageInNamespace(ref, targetNs string) error {
 	// Images imported from OCI archives may be registered under the raw,
 	// unnormalized ref.name (e.g. "myapp:1" instead of
 	// "docker.io/library/myapp:1"). If the target namespace has the image
-	// under that raw name, alias it to the canonical one.
+	// under that raw name, alias it to the canonical one (same namespace, so
+	// the content store already sees the blobs).
 	if ref != canonicalRef {
 		if img, err := cl.GetImage(targetCtx, ref); err == nil {
-			if err := put(targetCtx, images.Image{Name: canonicalRef, Target: img.Target(), Labels: img.Labels()}); err != nil {
+			if err := putImage(cl, targetCtx, images.Image{Name: canonicalRef, Target: img.Target(), Labels: img.Labels()}); err != nil {
 				return fmt.Errorf("alias image %s to %s: %w", ref, canonicalRef, err)
 			}
 			log.Printf("[images] aliased %s to %s in namespace %s", ref, canonicalRef, targetNs)
@@ -169,7 +163,7 @@ func ensureImageInNamespace(ref, targetNs string) error {
 		}
 	}
 
-	// Find the image in another namespace and copy its metadata.
+	// Find the image in another namespace and stream it into the target one.
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return fmt.Errorf("list namespaces: %w", err)
@@ -184,14 +178,13 @@ func ensureImageInNamespace(ref, targetNs string) error {
 		}
 		nsCtx := namespaces.WithNamespace(ctx, ns)
 		for _, name := range candidates {
-			img, err := cl.GetImage(nsCtx, name)
-			if err != nil {
+			if _, err := cl.GetImage(nsCtx, name); err != nil {
 				continue
 			}
-			if err := put(targetCtx, images.Image{Name: canonicalRef, Target: img.Target(), Labels: img.Labels()}); err != nil {
-				return fmt.Errorf("copy image metadata to %s: %w", targetNs, err)
+			if err := copyImageBetweenNamespaces(ns, name, targetNs); err != nil {
+				return fmt.Errorf("copy image %s from %s to %s: %w", name, ns, targetNs, err)
 			}
-			log.Printf("[images] copied %s from %s to %s as %s", name, ns, targetNs, canonicalRef)
+			log.Printf("[images] streamed %s from %s to %s", name, ns, targetNs)
 			return nil
 		}
 	}
@@ -204,6 +197,49 @@ func ensureImageInNamespace(ref, targetNs string) error {
 		return fmt.Errorf("nerdctl pull failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
 	}
 	log.Printf("[images] pulled %q into namespace %s", ref, targetNs)
+	return nil
+}
+
+// putImage creates or updates an image record.
+func putImage(cl *client.Client, nsCtx context.Context, img images.Image) error {
+	if _, err := cl.ImageService().Create(nsCtx, img); err != nil {
+		if _, uerr := cl.ImageService().Update(nsCtx, img, "target"); uerr != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// copyImageBetweenNamespaces streams an image from one containerd namespace
+// to another via `nerdctl save | ctr images import`, so that both the image
+// record and the content store entries exist in the target namespace.
+// containerd's content store is namespaced: a metadata-only copy would
+// reference blobs the target namespace cannot see.
+func copyImageBetweenNamespaces(srcNs, ref, targetNs string) error {
+	env := append([]string{}, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
+	save := exec.Command("/opt/containerd/bin/nerdctl", "--namespace", srcNs, "save", ref)
+	save.Env = env
+	imp := exec.Command("/opt/containerd/bin/ctr", "-n", targetNs, "images", "import", "--no-unpack", "-")
+	imp.Env = env
+	pipe, err := save.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	imp.Stdin = pipe
+	var saveErr, impErr strings.Builder
+	save.Stderr = &saveErr
+	imp.Stderr = &impErr
+	if err := imp.Start(); err != nil {
+		return err
+	}
+	if err := save.Run(); err != nil {
+		_ = imp.Process.Kill()
+		_ = imp.Wait()
+		return fmt.Errorf("save: %v: %s", err, saveErr.String())
+	}
+	if err := imp.Wait(); err != nil {
+		return fmt.Errorf("import: %v: %s", err, impErr.String())
+	}
 	return nil
 }
 

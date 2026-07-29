@@ -434,6 +434,12 @@ done
 mkdir -p /mnt/anvil
 mount -t virtiofs anvil /mnt/anvil 2>/dev/null || true
 
+# Set the clock from the host-written time file: VZ does not guarantee a sane
+# RTC (boots can start at 1970-01-01) and TLS to registries fails then.
+if [ -s /mnt/anvil/.anvil-host-time ]; then
+    date -s @"$(cat /mnt/anvil/.anvil-host-time)" 2>/dev/null || true
+fi
+
 # Bring up NAT network via virtio-net. udhcpc -n -q blocks until the lease is
 # obtained (typically <200 ms on VZ NAT) and exits on failure, so no polling.
 echo "[myinit] configuring network"
@@ -451,11 +457,6 @@ if [ ! -s /etc/resolv.conf ]; then
     [ -n "$gw" ] && printf 'nameserver %s\n' "$gw" >> /etc/resolv.conf
     printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\n' >> /etc/resolv.conf
 fi
-
-# Sync clock in the background; VZ sets the RTC from the host, so boot does
-# not need to wait for NTP. TLS to registries fails under 1970-01-01.
-echo "[myinit] syncing clock"
-( ntpd -nq -p pool.ntp.org >/tmp/ntpd.log 2>&1 || true ) &
 
 # containerd needs /etc/containerd and a state dir.
 mkdir -p /etc/containerd /run/containerd /var/lib/containerd
@@ -497,6 +498,11 @@ mount --move /var/lib/containerd /newroot/var/lib/containerd 2>/dev/null || true
 
 cat > /newroot/stage2.sh <<'STAGE2'
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+# Background drift correction only; the clock is already set from the host
+# time file in myinit. Must run in stage2: processes started in myinit do
+# not survive switch_root.
+( ntpd -nq -p pool.ntp.org >/dev/null 2>&1 || true ) &
 
 # Remount virtual filesystems if switch_root did not move them.
 mountpoint -q /proc || mount -t proc proc /proc

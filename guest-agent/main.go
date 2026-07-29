@@ -79,6 +79,10 @@ func main() {
 	// itself is on tmpfs and disappears on reboot.
 	restoreNetworkConfigs()
 
+	// VZ does not guarantee a sane RTC and snapshot resume leaves the clock
+	// frozen at pause time; sync it from the host-written time file.
+	syncClockFromShare()
+
 	scanner := newPortScanner()
 	go scanner.run()
 
@@ -131,6 +135,10 @@ func handleSubscribe(conn net.Conn, scanner *portScanner) {
 	ch := scanner.subscribe()
 	defer scanner.unsubscribe(ch)
 
+	// A fresh subscribe means the host daemon (re)started; if this VM was
+	// restored from a snapshot, the clock is stale — sync it again.
+	syncClockFromShare()
+
 	// Send full state immediately on connect (covers cold start and resume).
 	if err := writePortState(conn, scanner.currentState()); err != nil {
 		log.Printf("write initial port state: %v", err)
@@ -143,6 +151,26 @@ func handleSubscribe(conn net.Conn, scanner *portScanner) {
 			return
 		}
 	}
+}
+
+// syncClockFromShare sets the VM clock from the epoch file vz-runner writes
+// into the virtiofs share at VM start. VZ does not guarantee a sane RTC
+// (boots can start at 1970-01-01) and after a snapshot resume the clock is
+// frozen at pause time; TLS to registries fails in both cases.
+func syncClockFromShare() {
+	data, err := os.ReadFile("/mnt/anvil/.anvil-host-time")
+	if err != nil {
+		return
+	}
+	epoch := strings.TrimSpace(string(data))
+	if epoch == "" {
+		return
+	}
+	if out, err := exec.Command("date", "-s", "@"+epoch).CombinedOutput(); err != nil {
+		log.Printf("[clock] sync from host time failed: %v: %s", err, out)
+		return
+	}
+	log.Printf("[clock] synced from host time file (%s)", epoch)
 }
 
 func dispatch(req *Request) Response {

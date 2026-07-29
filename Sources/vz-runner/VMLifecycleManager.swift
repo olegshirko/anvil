@@ -30,6 +30,7 @@ final class VMLifecycleManager: NSObject {
 
     /// Start the VM. Tries restore from snapshot first; falls back to cold boot.
     func start() {
+        writeHostTimeFile()
         configureAndCreateVM { [weak self] result in
             guard let self = self else { return }
             switch result {
@@ -165,6 +166,15 @@ final class VMLifecycleManager: NSObject {
     }
 
     // MARK: - Internals
+
+    /// Write the current host time into the virtiofs share so the guest can
+    /// set its clock without NTP: VZ does not guarantee a sane RTC (boots can
+    /// start at 1970-01-01), which breaks TLS for registry access.
+    private func writeHostTimeFile() {
+        guard let share = args.sharePath, !share.isEmpty else { return }
+        let url = URL(fileURLWithPath: share).appendingPathComponent(".anvil-host-time")
+        try? "\(Int(Date().timeIntervalSince1970))\n".write(to: url, atomically: true, encoding: .utf8)
+    }
 
     private func configureAndCreateVM(completion: @escaping (Result<VZVirtualMachine, Error>) -> Void) {
         DispatchQueue.main.async { [weak self] in
