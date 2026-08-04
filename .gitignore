@@ -16,3 +16,4 @@ bench-harness/containerd-cache.tar.zst.size
 __pycache__/
 Sources/vz-runner/version.swift
 
+.anvil-host-time
