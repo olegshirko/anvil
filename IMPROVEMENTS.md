@@ -189,9 +189,11 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
 
 ## 4. Тесты и CI
 
-1. **CI-прогон на macos-15**: `make test` + `scripts/validate_robustness.py`
-   на каждый PR (Virtualization.framework на раннерах работает, ad-hoc
-   подписи достаточно). Сейчас workflow только компилирует Swift.
+1. **~~CI-прогон на macos-15~~ — сделано.** Новый job `validate`: собирает и
+   ad-hoc подписывает vz-runner, скачивает kernel+initramfs из guestbuild и
+   гоняет `scripts/validate_robustness.py` (save/resume, kill -9, FD leaks,
+   CNI, изоляция проектов) на каждый push/PR; релиз блокируется при падении
+   (`release` needs `validate`).
 2. **Go unit-тесты guest-agent** на инварианты из ARCHITECTURE.md §4.3:
    детерминированный container ID, `/containers/{id}/wait` (заголовки до
    блокировки), жизненный цикл AutoRemove. `httptest` по хендлерам.

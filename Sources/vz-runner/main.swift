@@ -119,7 +119,8 @@ func cmdStart(args: [String]) {
     }
     let kernel = findArg(args, "--kernel")
         ?? findFile(kernelCandidates,
-                    fallback: findProjectRoot().map { "\($0)/.download/ubuntu/vmlinuz-raw" })
+                    fallback: findProjectRoot().map { "\($0)/.download/alpine/vmlinuz-raw" }
+                        ?? findProjectRoot().map { "\($0)/.download/ubuntu/vmlinuz-raw" })
 
     // Resolve initrd path: flag > stateDir > brew assets > project root
     var initrdCandidates = [stateDir.appendingPathComponent("initramfs-containerd").path,
