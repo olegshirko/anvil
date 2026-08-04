@@ -173,6 +173,7 @@ cmd_start() {
     if [[ ! -f "$CONTAINERD_DISK" ]]; then
         echo "[anvil-service] creating containerd disk image (16 GiB sparse)..."
         /bin/dd if=/dev/zero of="$CONTAINERD_DISK" bs=1 count=0 seek=16g
+        chmod 600 "$CONTAINERD_DISK"
     fi
 
     echo "[anvil-service] starting vz-runner daemon..."

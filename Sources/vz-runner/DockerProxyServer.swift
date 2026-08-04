@@ -58,6 +58,9 @@ final class DockerProxyServer {
             fd = -1
             return
         }
+        // The Docker socket is root-equivalent inside the VM; restrict it to
+        // the owner.
+        chmod(socketPath, 0o600)
         guard listen(fd, 5) == 0 else {
             print("[docker-proxy] failed to listen unix socket: \(String(cString: strerror(errno)))")
             close(fd)

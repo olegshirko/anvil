@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/containerd/containerd/v2/client"
@@ -224,8 +226,21 @@ func runExec(args []string) Response {
 		return Response{Error: err.Error(), ExitCode: 1}
 	}
 
-	out, _ := io.ReadAll(stdout)
-	errOut, _ := io.ReadAll(stderr)
+	// Drain stdout and stderr concurrently: sequential reads deadlock as soon
+	// as the child writes more than a pipe buffer (64 KiB) to stderr while
+	// stdout stays open (e.g. nerdctl compose progress output).
+	var outBuf, errBuf bytes.Buffer
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(&outBuf, stdout)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(&errBuf, stderr)
+	}()
+	wg.Wait()
 	exitCode := 0
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -236,8 +251,8 @@ func runExec(args []string) Response {
 	}
 
 	return Response{
-		Stdout:   string(out),
-		Stderr:   string(errOut),
+		Stdout:   outBuf.String(),
+		Stderr:   errBuf.String(),
 		ExitCode: exitCode,
 	}
 }

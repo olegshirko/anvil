@@ -104,6 +104,45 @@ func unmarkAutoRemove(dockerID string) {
 	autoRemoveContainers.mu.Unlock()
 }
 
+// attachTracker counts active attach connections per container. AutoRemove
+// deletion waits for attaches to drain so a fast-exiting --rm container is
+// not deleted before its output is replayed to the client.
+var attachTracker = struct {
+	mu     sync.Mutex
+	counts map[string]int
+}{
+	counts: make(map[string]int),
+}
+
+func attachBegin(dockerID string) {
+	attachTracker.mu.Lock()
+	attachTracker.counts[dockerID]++
+	attachTracker.mu.Unlock()
+}
+
+func attachEnd(dockerID string) {
+	attachTracker.mu.Lock()
+	if attachTracker.counts[dockerID] > 0 {
+		attachTracker.counts[dockerID]--
+	}
+	attachTracker.mu.Unlock()
+}
+
+// waitForAttachDrain blocks until no attach connections remain for the
+// container or the timeout elapses.
+func waitForAttachDrain(dockerID string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		attachTracker.mu.Lock()
+		n := attachTracker.counts[dockerID]
+		attachTracker.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // containerExitCodes caches exit codes for containers that may be auto-removed
 // before /wait can read their task status.
 var containerExitCodes = struct {
@@ -297,6 +336,24 @@ func runNerdctl(ns string, args ...string) (stdout, stderr string, exitCode int,
 
 // isNerdctlContainerRunning reports whether the named container is currently
 // running, using nerdctl inspect.
+// nerdctlContainerStatus returns the container's status string ("created",
+// "running", "exited", ...) or "" when it cannot be determined.
+func nerdctlContainerStatus(ns, name string) string {
+	stdout, _, code, err := runNerdctl(ns, "inspect", "--format", "json", name)
+	if err != nil || code != 0 {
+		return ""
+	}
+	var infos []struct {
+		State struct {
+			Status string `json:"Status"`
+		} `json:"State"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &infos); err != nil || len(infos) == 0 {
+		return ""
+	}
+	return infos[0].State.Status
+}
+
 func isNerdctlContainerRunning(ns, name string) bool {
 	stdout, _, code, err := runNerdctl(ns, "inspect", "--format", "json", name)
 	if err != nil || code != 0 {
@@ -526,6 +583,9 @@ func startDockerContainer(id string) error {
 		go func() {
 			code, _ := waitContainerTask(ns, containerdID)
 			cacheContainerExitCode(did, code)
+			// Let any attach connection finish replaying the output before
+			// the container (and its logs) disappear.
+			waitForAttachDrain(did, 30*time.Second)
 			if err := deleteDockerContainer(did, true); err != nil {
 				log.Printf("[docker-api] auto-remove %s: %v", did, err)
 			}

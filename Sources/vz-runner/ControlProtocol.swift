@@ -66,6 +66,7 @@ func readExactly(_ stream: InputStream, count: Int) throws -> Data {
 
 func saveState(_ state: RunState) {
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    chmod(stateDir.path, 0o700)
     if let data = try? JSONEncoder().encode(state) {
         try? data.write(to: stateFile)
     }

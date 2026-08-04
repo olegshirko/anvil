@@ -10,20 +10,33 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# If we are not already inside the build container, re-run this script there.
+# If we are not already inside a Linux build environment, re-run this script
+# in a docker container.
 if [[ -z "${IN_CONTAINER:-}" ]]; then
-    # Force the default Docker context so a user-selected anvil context does
-    # not break the build container step.
-    docker --context default run --rm --platform linux/arm64 \
-        -v "$ROOT/.download:/build/download" \
-        -v "$SCRIPT_DIR:/scripts:ro" \
-        -e IN_CONTAINER=1 \
-        -e OUT=/build/download/ubuntu/initramfs-containerd \
-        -e HOST_UID="$(id -u)" \
-        -e HOST_GID="$(id -g)" \
-        alpine:3.20 \
-        sh -c 'apk add --no-cache bash cpio zstd binutils && exec bash /scripts/build_initramfs_containerd.sh'
-    exit 0
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        # Already on Linux (e.g. the Lima build VM): all required tools are
+        # present. Build directly — no nested docker, no network needed.
+        export IN_CONTAINER=1
+        export BUILD_DIR="$ROOT/.download"
+        # The body runs as a regular user here (not root as in the docker
+        # build container), so use a writable scratch area.
+        ANVIL_WORK_BASE="$(mktemp -d)"
+        export ANVIL_WORK_DIR="$ANVIL_WORK_BASE/rootfs-work"
+        export ANVIL_DEB_WORK="$ANVIL_WORK_BASE/deb-extract"
+    else
+        # Force the default Docker context so a user-selected anvil context does
+        # not break the build container step.
+        docker --context default run --rm --platform linux/arm64 \
+            -v "$ROOT/.download:/build/download" \
+            -v "$SCRIPT_DIR:/scripts:ro" \
+            -e IN_CONTAINER=1 \
+            -e OUT=/build/download/ubuntu/initramfs-containerd \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            alpine:3.20 \
+            sh -c 'apk add --no-cache bash cpio zstd binutils && exec bash /scripts/build_initramfs_containerd.sh'
+        exit 0
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -32,12 +45,22 @@ fi
 
 set -euo pipefail
 
-# Tools needed to assemble and pack the initramfs.
-apk add --no-cache cpio zstd binutils e2fsprogs
+# Install only missing tools; the Lima build VM usually has them already, and
+# `apk add` needs network access to the Alpine CDN even when it does.
+need_pkgs=""
+command -v cpio >/dev/null 2>&1 || need_pkgs="$need_pkgs cpio"
+command -v zstd >/dev/null 2>&1 || need_pkgs="$need_pkgs zstd"
+command -v objdump >/dev/null 2>&1 || need_pkgs="$need_pkgs binutils"
+command -v mkfs.ext4 >/dev/null 2>&1 || need_pkgs="$need_pkgs e2fsprogs"
+if [[ -n "$need_pkgs" ]]; then
+    apk add --no-cache $need_pkgs
+fi
 
-ROOT=/build
-SCRIPT_DIR=/scripts
-DOWNLOAD_DIR=/build/download
+# BUILD_DIR points at the shared download directory: /build/download inside
+# the docker build container, the project .download when building directly
+# on Linux (Lima VM).
+DOWNLOAD_DIR="${BUILD_DIR:-/build/download}"
+SCRIPT_DIR="${SCRIPT_DIR:-/scripts}"
 ALPINE_DIR="$DOWNLOAD_DIR/alpine"
 UBUNTU_DIR="$DOWNLOAD_DIR/ubuntu"
 TOOLS_DIR="$DOWNLOAD_DIR/container-tools"
@@ -46,7 +69,7 @@ IPTABLES_DIR="$DOWNLOAD_DIR/alpine-iptables"
 ALPINE_INITRD="$ALPINE_DIR/initramfs-virt"
 AGENT_BIN="$ALPINE_DIR/guest-agent"
 UBUNTU_DEB="$UBUNTU_DIR/linux-modules.deb"
-OUT="${OUT:-/build/download/ubuntu/initramfs-containerd}"
+OUT="${OUT:-$DOWNLOAD_DIR/ubuntu/initramfs-containerd}"
 
 if [[ ! -f "$ALPINE_INITRD" ]]; then
     echo "Alpine initramfs not found; run 'make download-alpine' first"
@@ -65,8 +88,8 @@ if [[ ! -d "$TOOLS_DIR" ]]; then
     exit 1
 fi
 
-WORK_DIR=/rootfs-work
-DEB_WORK=/deb-extract
+WORK_DIR="${ANVIL_WORK_DIR:-/rootfs-work}"
+DEB_WORK="${ANVIL_DEB_WORK:-/deb-extract}"
 
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR"
@@ -188,10 +211,13 @@ for apk in iptables libmnl libnftnl libxtables; do
 done
 
 # GNU tar is required by nerdctl cp; busybox tar is not sufficient. The build
-# container is Alpine, so install the GNU tar package and copy it (along with
-# its libacl/libattr dependencies) into the initramfs.
-apk add --no-cache tar >/dev/null 2>&1
-if ! /bin/tar --version 2>/dev/null | grep -q GNU; then
+# container is Alpine, so install the GNU tar package if it is missing (the
+# Lima build VM already has GNU tar) and copy it (along with its
+# libacl/libattr dependencies) into the initramfs.
+if ! tar --version 2>/dev/null | grep -q GNU; then
+    apk add --no-cache tar >/dev/null 2>&1 || true
+fi
+if ! tar --version 2>/dev/null | grep -q GNU; then
     echo "ERROR: GNU tar installation failed" >&2
     exit 1
 fi
@@ -200,7 +226,9 @@ chmod +x bin/tar-gnu
 rm -f bin/tar
 cp bin/tar-gnu bin/tar
 mkdir -p lib
-for lib in /lib/libacl.so.1 /lib/libattr.so.1 /usr/lib/libacl.so.1 /usr/lib/libattr.so.1; do
+for lib in /lib/libacl.so.1 /lib/libattr.so.1 /usr/lib/libacl.so.1 /usr/lib/libattr.so.1 \
+           /lib/aarch64-linux-gnu/libacl.so.1 /lib/aarch64-linux-gnu/libattr.so.1 \
+           /usr/lib/aarch64-linux-gnu/libacl.so.1 /usr/lib/aarch64-linux-gnu/libattr.so.1; do
     if [ -f "$lib" ]; then
         cp "$lib" lib/
     fi

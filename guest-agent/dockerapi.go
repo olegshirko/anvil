@@ -160,14 +160,23 @@ func streamNerdctlLogsTo(out io.Writer, ns, name string, follow bool) {
 		return total, nil
 	}
 
+	// Attach often arrives before the client issues start. Wait briefly for
+	// the container to leave the "created" state, otherwise a short-lived
+	// container may start, print and exit while we are still replaying
+	// nothing — and its output is lost.
+	for i := 0; i < 100; i++ {
+		status := nerdctlContainerStatus(ns, name)
+		if status != "" && status != "created" && status != "paused" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	// First replay any output that already exists. Short-lived containers may
 	// need a brief moment for the json-file log to be flushed after exit.
 	for attempt := 0; attempt < 10; attempt++ {
 		n, err := runLogs()
-		if err != nil {
-			return
-		}
-		if n > 0 {
+		if err == nil && n > 0 {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -184,11 +193,16 @@ func streamNerdctlLogsTo(out io.Writer, ns, name string, follow bool) {
 // the container is still running and the client asked for a stream. This avoids
 // the race where short-lived containers exit before attach is called.
 func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
-	ns, _, name, err := resolveDockerID(id)
+	ns, containerdID, name, err := resolveDockerID(id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
 		return
 	}
+	// Keep AutoRemove from deleting the container (and its logs) while we
+	// are replaying output to the client.
+	did := dockerID(ns, containerdID)
+	attachBegin(did)
+	defer attachEnd(did)
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -325,6 +339,7 @@ func runDockerAPIServer() {
 		}
 		tagName, isTag := imageSubresource("/images/", "/tag")
 		pushName, isPush := imageSubresource("/images/", "/push")
+		getName, isGet := imageSubresource("/images/", "/get")
 		imageInspectName, isImageInspect := imageSubresource("/images/", "/json")
 		rmiName := ""
 		isRMI := false
@@ -453,6 +468,10 @@ func runDockerAPIServer() {
 			})
 		case path == "/images/load" && r.Method == http.MethodPost:
 			handleImageLoad(w, r)
+		case path == "/images/get" && r.Method == http.MethodGet:
+			handleImagesGet(w, r)
+		case isGet && r.Method == http.MethodGet:
+			handleImageGet(w, r, getName)
 		case path == "/build/prune" && r.Method == http.MethodPost:
 			// Build cache prune is not implemented; return empty so docker system prune
 			// does not fail with 404.

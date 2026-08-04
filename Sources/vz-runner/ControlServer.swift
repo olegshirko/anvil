@@ -59,6 +59,9 @@ final class ControlServer {
             fd = -1
             return
         }
+        // The control socket executes arbitrary commands in the VM as root;
+        // restrict it to the owner.
+        chmod(socketPath, 0o600)
         guard listen(fd, 5) == 0 else {
             print("[anvil] failed to listen unix socket: \(String(cString: strerror(errno)))")
             close(fd)

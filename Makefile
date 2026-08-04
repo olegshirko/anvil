@@ -114,8 +114,8 @@ colima-stop:
 	@echo "[anvil] Colima stopped"
 
 # Prune leftover containers, volumes and images inside the anvil VM.
-# Useful because `docker run --rm` is not yet implemented; test leftovers can
-# fill the persistent containerd disk and break subsequent compose runs.
+# Test leftovers can fill the persistent containerd disk and break
+# subsequent compose runs.
 prune clean-containers:
 	@containers=$$(docker --context anvil ps -aq 2>/dev/null); \
 	if [ -n "$$containers" ]; then \

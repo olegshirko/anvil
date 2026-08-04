@@ -151,6 +151,9 @@ func cmdStart(args: [String]) {
     }
 
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    // State dir holds the containerd disk (user data) and the sockets;
+    // keep it owner-only.
+    chmod(stateDir.path, 0o700)
     try? "".write(toFile: daemonLogFile.path, atomically: true, encoding: .utf8)
 
     // Create the containerd persistent disk if it doesn't exist.
@@ -162,6 +165,7 @@ func cmdStart(args: [String]) {
         proc.arguments = ["if=/dev/zero", "of=\(containerdDisk)", "bs=1", "count=0", "seek=16g"]
         try? proc.run()
         proc.waitUntilExit()
+        chmod(containerdDisk, 0o600)
     }
 
     saveDockerContext()

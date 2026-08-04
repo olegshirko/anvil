@@ -411,6 +411,50 @@ func tagDockerImage(source, target string) error {
 	return nil
 }
 
+// handleImageGet implements GET /images/{name}/get (docker save) — streams a
+// Docker-format tar of the image into the response.
+func handleImageGet(w http.ResponseWriter, r *http.Request, name string) {
+	streamImageSave(w, []string{name})
+}
+
+// handleImagesGet implements GET /images/get?names=a&names=b — same, for
+// multiple images in one archive.
+func handleImagesGet(w http.ResponseWriter, r *http.Request) {
+	names := r.URL.Query()["names"]
+	if len(names) == 0 {
+		http.Error(w, `{"message":"no images specified"}`, http.StatusBadRequest)
+		return
+	}
+	streamImageSave(w, names)
+}
+
+func streamImageSave(w http.ResponseWriter, names []string) {
+	// Verify all images exist first so a missing one is a clean 404 instead
+	// of a failed stream mid-response.
+	ns := "default"
+	for _, name := range names {
+		imgNs := findImageNamespace(name)
+		if imgNs == "" {
+			http.Error(w, fmt.Sprintf(`{"message":"No such image: %s"}`, name), http.StatusNotFound)
+			return
+		}
+		ns = imgNs
+	}
+
+	log.Printf("[docker-api] saving images %v from ns=%q", names, ns)
+	w.Header().Set("Content-Type", "application/x-tar")
+	args := append([]string{"--namespace", ns, "save"}, names...)
+	cmd := exec.Command("/opt/containerd/bin/nerdctl", args...)
+	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
+	cmd.Stdout = w
+	var errBuf strings.Builder
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		// Headers are already sent; only log.
+		log.Printf("[docker-api] save %v failed: %v: %s", names, err, stripANSI(errBuf.String()))
+	}
+}
+
 // removeDockerImage removes an image using nerdctl.
 func removeDockerImage(name string) error {
 	ns := findImageNamespace(name)
