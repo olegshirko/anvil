@@ -69,6 +69,16 @@ func main() {
 		return
 	}
 
+	// seed-entropy <file>: credit the kernel entropy pool with a host-provided
+	// seed via RNDADDENTROPY. The virt kernel lacks RANDOM_TRUST_CPU and VZ
+	// has no virtio-rng, so crng init otherwise takes ~10 s on boot.
+	if len(os.Args) > 2 && os.Args[1] == "seed-entropy" {
+		if err := seedEntropy(os.Args[2]); err != nil {
+			log.Fatalf("seed-entropy: %v", err)
+		}
+		return
+	}
+
 	log.Printf("listening on vsock port %d", listenPort)
 
 	// guest-agent is PID 1 inside the VM. Orphaned children reparent to PID 1,

@@ -68,7 +68,7 @@ IPTABLES_DIR="$DOWNLOAD_DIR/alpine-iptables"
 
 ALPINE_INITRD="$ALPINE_DIR/initramfs-virt"
 AGENT_BIN="$ALPINE_DIR/guest-agent"
-UBUNTU_DEB="$UBUNTU_DIR/linux-modules.deb"
+VIRT_APK="$ALPINE_DIR/linux-virt.apk"
 OUT="${OUT:-$DOWNLOAD_DIR/ubuntu/initramfs-containerd}"
 
 if [[ ! -f "$ALPINE_INITRD" ]]; then
@@ -79,8 +79,9 @@ if [[ ! -f "$AGENT_BIN" ]]; then
     echo "guest-agent not found; run 'make guest-agent' first"
     exit 1
 fi
-if [[ ! -f "$UBUNTU_DEB" ]]; then
-    echo "Ubuntu modules .deb not found at $UBUNTU_DEB"
+if [[ ! -d "$ALPINE_DIR/linux-virt-pkg/lib/modules" ]]; then
+    echo "Alpine linux-virt modules not extracted at $ALPINE_DIR/linux-virt-pkg"
+    echo "run 'make alpine-virt-modules' first"
     exit 1
 fi
 if [[ ! -d "$TOOLS_DIR" ]]; then
@@ -100,7 +101,7 @@ cd "$WORK_DIR"
 gunzip -c "$ALPINE_INITRD" | cpio -idm 2>/dev/null || true
 
 # Busybox applets.
-for applet in mount umount mkdir mknod sleep sh insmod \
+for applet in mount umount mkdir mknod sleep sh insmod modprobe \
               uname id cat ls ps echo printf chmod chown \
               kill killall pwd whoami hostname udhcpc ifconfig \
               ip grep ntpd switch_root cp rm mv head mountpoint \
@@ -286,148 +287,93 @@ DURATION=$((END - START))
 echo "[anvil-restore] restored containerd cache in ${DURATION}ms"
 EOF
 chmod +x bin/anvil-restore-containerd
+# Alpine linux-virt kernel modules (.ko.gz), pre-extracted by
+# `make alpine-virt-modules` into $ALPINE_DIR/linux-virt-pkg. Modules are
+# placed at their original paths under lib/modules/<kver>/ and loaded with
+# modprobe, which resolves dependency chains (fuse, crc32c, virtio, ...)
+# via modules.dep — explicit insmod lists kept breaking on missing deps.
+APK_MODDIR="$(echo $ALPINE_DIR/linux-virt-pkg/lib/modules/*/)"
+MODKVER="$(basename "$APK_MODDIR")"
 
-# Ubuntu kernel modules: vsock + virtiofs.
-mkdir -p lib/modules/vsock lib/modules/virtiofs lib/modules/overlayfs
-rm -rf "$DEB_WORK"
-mkdir -p "$DEB_WORK"
-cd "$DEB_WORK"
-ar x "$UBUNTU_DEB"
-tar -xf data.tar
-cd "$WORK_DIR"
+# modinfo metadata required by modprobe.
+for meta in modules.dep modules.dep.bin modules.alias modules.alias.bin \
+            modules.builtin modules.builtin.bin modules.symbols modules.symbols.bin; do
+    if [[ -f "$APK_MODDIR/$meta" ]]; then
+        mkdir -p "lib/modules/$MODKVER"
+        cp "$APK_MODDIR/$meta" "lib/modules/$MODKVER/"
+    fi
+done
 
-MOD_SRC="$DEB_WORK/lib/modules/*/kernel/net/vmw_vsock"
-for mod in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
-    src="$(echo $MOD_SRC/$mod.ko.zst)"
+# putmod <module> [required] — decompress a module from the apk to its
+# original lib/modules/<kver>/... path; exit on missing if "required".
+putmod() {
+    local mod="$1" required="${2:-}"
+    local src dst
+    src=$(find "$APK_MODDIR" -name "$mod.ko.gz" -print -quit)
     if [[ -f "$src" ]]; then
-        zstd -d -f "$src" -o "lib/modules/vsock/$mod.ko"
-    else
+        dst="lib/modules/$MODKVER/${src#"$APK_MODDIR"}"
+        mkdir -p "$(dirname "$dst")"
+        gunzip -c "$src" > "$dst"
+    elif [[ -n "$required" ]]; then
         echo "missing module: $mod"
         exit 1
     fi
-done
+}
 
-VIRTIOFS_SRC="$DEB_WORK/lib/modules/*/kernel/fs/fuse/virtiofs.ko.zst"
-if [[ -f $(echo $VIRTIOFS_SRC) ]]; then
-    zstd -d -f $(echo $VIRTIOFS_SRC) -o lib/modules/virtiofs/virtiofs.ko
-else
-    echo "missing virtiofs module"
-    exit 1
-fi
+# vsock control channel + virtiofs share (+ fuse) + overlayfs.
+putmod vsock required
+putmod vmw_vsock_virtio_transport_common required
+putmod vmw_vsock_virtio_transport required
+putmod virtiofs required
+putmod fuse required
+putmod overlay required
 
-OVERLAY_SRC="$DEB_WORK/lib/modules/*/kernel/fs/overlayfs/overlay.ko.zst"
-if [[ -f $(echo $OVERLAY_SRC) ]]; then
-    zstd -d -f $(echo $OVERLAY_SRC) -o lib/modules/overlayfs/overlay.ko
-else
-    echo "missing overlayfs module"
-    exit 1
-fi
+# virtio devices: network and block disk.
+putmod virtio_net required
+putmod virtio_blk required
+putmod failover
+putmod net_failover
+
+# AF_PACKET sockets (CONFIG_PACKET=m in linux-virt) — required by udhcpc.
+putmod af_packet required
+
+# CRC32C chain: needed by both ext4 (metadata_csum) and nf_conntrack.
+# busybox modprobe does not resolve the libcrc32c->crc32c softdep, so
+# crc32c_generic is loaded explicitly in stage2.
+putmod crc32c_generic
 
 # ext4 for the optional persistent containerd block disk.
-mkdir -p lib/modules/ext4 lib/modules/jbd2 lib/modules/mbcache lib/modules/crc16
-EXT4_SRC="$DEB_WORK/lib/modules/*/kernel/fs/ext4/ext4.ko.zst"
-if [[ -f $(echo $EXT4_SRC) ]]; then
-    zstd -d -f $(echo $EXT4_SRC) -o lib/modules/ext4/ext4.ko
-fi
-JBD2_SRC="$DEB_WORK/lib/modules/*/kernel/fs/jbd2/jbd2.ko.zst"
-if [[ -f $(echo $JBD2_SRC) ]]; then
-    zstd -d -f $(echo $JBD2_SRC) -o lib/modules/jbd2/jbd2.ko
-fi
-MBCACHE_SRC="$DEB_WORK/lib/modules/*/kernel/fs/mbcache.ko.zst"
-if [[ -f $(echo $MBCACHE_SRC) ]]; then
-    zstd -d -f $(echo $MBCACHE_SRC) -o lib/modules/mbcache/mbcache.ko
-fi
-CRC16_SRC="$DEB_WORK/lib/modules/*/kernel/lib/crc16.ko.zst"
-if [[ -f $(echo $CRC16_SRC) ]]; then
-    zstd -d -f $(echo $CRC16_SRC) -o lib/modules/crc16/crc16.ko
-fi
+putmod ext4
+putmod jbd2
+putmod mbcache
+putmod crc16
 
-# Networking modules for CNI bridge/veth + nftables for iptables-nft.
-mkdir -p lib/modules/llc lib/modules/stp lib/modules/bridge lib/modules/veth lib/modules/br_netfilter lib/modules/nfnetlink lib/modules/nf_tables lib/modules/libcrc32c lib/modules/x_tables lib/modules/nf_defrag_ipv4 lib/modules/nf_defrag_ipv6 lib/modules/nft
-LLC_SRC="$DEB_WORK/lib/modules/*/kernel/net/llc/llc.ko.zst"
-if [[ -f $(echo $LLC_SRC) ]]; then
-    zstd -d -f $(echo $LLC_SRC) -o lib/modules/llc/llc.ko
-else
-    echo "missing llc module"
-    exit 1
-fi
-STP_SRC="$DEB_WORK/lib/modules/*/kernel/net/802/stp.ko.zst"
-if [[ -f $(echo $STP_SRC) ]]; then
-    zstd -d -f $(echo $STP_SRC) -o lib/modules/stp/stp.ko
-else
-    echo "missing stp module"
-    exit 1
-fi
-BRIDGE_SRC="$DEB_WORK/lib/modules/*/kernel/net/bridge/bridge.ko.zst"
-if [[ -f $(echo $BRIDGE_SRC) ]]; then
-    zstd -d -f $(echo $BRIDGE_SRC) -o lib/modules/bridge/bridge.ko
-else
-    echo "missing bridge module"
-    exit 1
-fi
-VETH_SRC="$DEB_WORK/lib/modules/*/kernel/drivers/net/veth.ko.zst"
-if [[ -f $(echo $VETH_SRC) ]]; then
-    zstd -d -f $(echo $VETH_SRC) -o lib/modules/veth/veth.ko
-else
-    echo "missing veth module"
-    exit 1
-fi
-BRNF_SRC="$DEB_WORK/lib/modules/*/kernel/net/bridge/br_netfilter.ko.zst"
-if [[ -f $(echo $BRNF_SRC) ]]; then
-    zstd -d -f $(echo $BRNF_SRC) -o lib/modules/br_netfilter/br_netfilter.ko
-fi
-NFNL_SRC="$DEB_WORK/lib/modules/*/kernel/net/netfilter/nfnetlink.ko.zst"
-if [[ -f $(echo $NFNL_SRC) ]]; then
-    zstd -d -f $(echo $NFNL_SRC) -o lib/modules/nfnetlink/nfnetlink.ko
-fi
-NFT_SRC="$DEB_WORK/lib/modules/*/kernel/net/netfilter/nf_tables.ko.zst"
-if [[ -f $(echo $NFT_SRC) ]]; then
-    zstd -d -f $(echo $NFT_SRC) -o lib/modules/nf_tables/nf_tables.ko
-fi
+# Networking modules for CNI bridge/veth.
+putmod llc required
+putmod stp required
+putmod bridge required
+putmod veth required
+putmod br_netfilter
 
-CRC32C_SRC="$DEB_WORK/lib/modules/*/kernel/lib/libcrc32c.ko.zst"
-if [[ -f $(echo $CRC32C_SRC) ]]; then
-    zstd -d -f $(echo $CRC32C_SRC) -o lib/modules/libcrc32c/libcrc32c.ko
-fi
-
-XTABLES_SRC="$DEB_WORK/lib/modules/*/kernel/net/netfilter/x_tables.ko.zst"
-if [[ -f $(echo $XTABLES_SRC) ]]; then
-    zstd -d -f $(echo $XTABLES_SRC) -o lib/modules/x_tables/x_tables.ko
-fi
-
-NF_DEFRAG4_SRC="$DEB_WORK/lib/modules/*/kernel/net/ipv4/netfilter/nf_defrag_ipv4.ko.zst"
-if [[ -f $(echo $NF_DEFRAG4_SRC) ]]; then
-    zstd -d -f $(echo $NF_DEFRAG4_SRC) -o lib/modules/nf_defrag_ipv4/nf_defrag_ipv4.ko
-fi
-
-NF_DEFRAG6_SRC="$DEB_WORK/lib/modules/*/kernel/net/ipv6/netfilter/nf_defrag_ipv6.ko.zst"
-if [[ -f $(echo $NF_DEFRAG6_SRC) ]]; then
-    zstd -d -f $(echo $NF_DEFRAG6_SRC) -o lib/modules/nf_defrag_ipv6/nf_defrag_ipv6.ko
-fi
-
+# nftables/iptables modules for CNI bridge/firewall/portmap rules.
+putmod nfnetlink
+putmod nf_tables
+putmod libcrc32c
+putmod crc32c
+putmod crc32c_intel
+putmod x_tables
+putmod nf_defrag_ipv4
+putmod nf_defrag_ipv6
+putmod nf_conntrack required
+putmod nf_nat required
 for nft_mod in nft_compat nft_ct nft_nat nft_chain_nat nft_masq nft_reject; do
-    NFT_MOD_SRC="$DEB_WORK/lib/modules/*/kernel/net/netfilter/${nft_mod}.ko.zst"
-    if [[ -f $(echo $NFT_MOD_SRC) ]]; then
-        zstd -d -f $(echo $NFT_MOD_SRC) -o "lib/modules/nft/${nft_mod}.ko"
-    fi
+    putmod "$nft_mod"
 done
-
-# x_tables matches/targets used by CNI bridge/firewall/portmap rules.
-mkdir -p lib/modules/netfilter
 for xt_mod in xt_comment xt_conntrack xt_addrtype xt_MASQUERADE xt_REDIRECT xt_nat xt_tcpudp xt_multiport xt_mark xt_limit; do
-    XT_MOD_SRC="$DEB_WORK/lib/modules/*/kernel/net/netfilter/${xt_mod}.ko.zst"
-    if [[ -f $(echo $XT_MOD_SRC) ]]; then
-        zstd -d -f $(echo $XT_MOD_SRC) -o "lib/modules/netfilter/${xt_mod}.ko"
-    fi
+    putmod "$xt_mod"
 done
-
-# Netfilter modules for iptables-nft NAT/filter rules used by CNI portmap/firewall.
-mkdir -p lib/modules/netfilter
-for mod in nf_conntrack nf_nat iptable_nat iptable_filter ip_tables nf_conntrack_netlink; do
-    src=$(find "$DEB_WORK/lib/modules" -name "$mod.ko.zst" -print -quit)
-    if [[ -f "$src" ]]; then
-        zstd -d -f "$src" -o "lib/modules/netfilter/$mod.ko"
-    fi
+for nf_mod in iptable_nat iptable_filter ip_tables nf_conntrack_netlink; do
+    putmod "$nf_mod"
 done
 
 # Init script.
@@ -443,16 +389,10 @@ mount -t devpts devpts /dev/pts
 mkdir -p /tmp /var/log /sys/fs/cgroup
 mount -t cgroup2 cgroup2 /sys/fs/cgroup
 
-# Load modules.
-insmod /lib/modules/vsock/vsock.ko
-insmod /lib/modules/vsock/vmw_vsock_virtio_transport_common.ko
-insmod /lib/modules/vsock/vmw_vsock_virtio_transport.ko
-insmod /lib/modules/virtiofs/virtiofs.ko
-insmod /lib/modules/overlayfs/overlay.ko
-insmod /lib/modules/llc/llc.ko
-insmod /lib/modules/stp/stp.ko
-insmod /lib/modules/bridge/bridge.ko
-insmod /lib/modules/veth/veth.ko
+# Load modules (modprobe resolves dependency chains via modules.dep).
+for m in vmw_vsock_virtio_transport af_packet virtio_net virtiofs overlay llc stp bridge veth; do
+    modprobe $m 2>/dev/null || echo "[myinit] modprobe $m failed"
+done
 
 for i in 1 2 3 4 5 6 7 8 9 10; do
     if [ -e /dev/vsock ]; then break; fi
@@ -467,6 +407,11 @@ mount -t virtiofs anvil /mnt/anvil 2>/dev/null || true
 if [ -s /mnt/anvil/.anvil-host-time ]; then
     date -s @"$(cat /mnt/anvil/.anvil-host-time)" 2>/dev/null || true
 fi
+
+# Seed the kernel entropy pool from the host: the virt kernel has no
+# RANDOM_TRUST_CPU and VZ provides no virtio-rng, so crng init otherwise
+# takes ~10 s and stalls containerd/guest-agent start.
+/bin/guest-agent seed-entropy /mnt/anvil/.anvil-host-entropy 2>/dev/null || true
 
 # Bring up NAT network via virtio-net. udhcpc -n -q blocks until the lease is
 # obtained (typically <200 ms on VZ NAT) and exits on failure, so no polling.
@@ -550,11 +495,9 @@ mountpoint -q /mnt/anvil || mount -t virtiofs anvil /mnt/anvil 2>/dev/null || tr
 # (/var/lib/nerdctl) survive reboots and resume, instead of filling tmpfs root.
 mkdir -p /var/lib
 mountpoint -q /var/lib || {
-    # Load ext4 modules for the optional persistent block disk.
-    insmod /lib/modules/crc16/crc16.ko 2>/dev/null || true
-    insmod /lib/modules/mbcache/mbcache.ko 2>/dev/null || true
-    insmod /lib/modules/jbd2/jbd2.ko 2>/dev/null || true
-    insmod /lib/modules/ext4/ext4.ko 2>/dev/null || true
+    # Load virtio-blk and ext4 for the optional persistent block disk.
+    modprobe virtio_blk 2>/dev/null || true
+    modprobe ext4 2>/dev/null || true
     # The first virtio-blk device is exposed as /dev/vda inside the VM.
     for blk in /dev/vda /dev/vdb /dev/vdc; do
         if [ -b "$blk" ]; then
@@ -609,36 +552,14 @@ fi
 mkdir -p /var/lib/containerd /var/lib/nerdctl /var/lib/cni
 
 # Load netfilter modules so CNI bridge/portmap/firewall and iptables-nft work.
-# Order matters: load dependencies before dependents.
-insmod /lib/modules/libcrc32c/libcrc32c.ko
-insmod /lib/modules/x_tables/x_tables.ko
-insmod /lib/modules/nfnetlink/nfnetlink.ko
-insmod /lib/modules/nf_defrag_ipv4/nf_defrag_ipv4.ko
-insmod /lib/modules/nf_defrag_ipv6/nf_defrag_ipv6.ko
-insmod /lib/modules/netfilter/nf_conntrack.ko
-insmod /lib/modules/netfilter/nf_nat.ko
-insmod /lib/modules/nf_tables/nf_tables.ko
-insmod /lib/modules/nft/nft_compat.ko 2>/dev/null || true
-insmod /lib/modules/nft/nft_ct.ko 2>/dev/null || true
-insmod /lib/modules/nft/nft_nat.ko 2>/dev/null || true
-insmod /lib/modules/nft/nft_chain_nat.ko 2>/dev/null || true
-insmod /lib/modules/nft/nft_masq.ko 2>/dev/null || true
-insmod /lib/modules/nft/nft_reject.ko 2>/dev/null || true
-insmod /lib/modules/netfilter/ip_tables.ko
-insmod /lib/modules/netfilter/iptable_filter.ko
-insmod /lib/modules/netfilter/iptable_nat.ko
-insmod /lib/modules/netfilter/nf_conntrack_netlink.ko
-insmod /lib/modules/netfilter/xt_comment.ko 2>/dev/null || true
-insmod /lib/modules/netfilter/xt_conntrack.ko 2>/dev/null || true
-insmod /lib/modules/netfilter/xt_addrtype.ko 2>/dev/null || true
-insmod /lib/modules/netfilter/xt_tcpudp.ko 2>/dev/null || true
-insmod /lib/modules/netfilter/xt_multiport.ko 2>/dev/null || true
-insmod /lib/modules/netfilter/xt_mark.ko 2>/dev/null || true
-insmod /lib/modules/netfilter/xt_limit.ko 2>/dev/null || true
-insmod /lib/modules/netfilter/xt_nat.ko 2>/dev/null || true
-insmod /lib/modules/netfilter/xt_REDIRECT.ko 2>/dev/null || true
-insmod /lib/modules/netfilter/xt_MASQUERADE.ko 2>/dev/null || true
-insmod /lib/modules/br_netfilter/br_netfilter.ko 2>/dev/null || true
+# modprobe resolves dependency order itself; crc32c_generic must come first
+# (busybox modprobe misses the libcrc32c->crc32c softdep).
+for m in crc32c_generic nf_conntrack nf_nat nf_tables nft_compat nft_ct nft_nat nft_chain_nat \
+         nft_masq nft_reject ip_tables iptable_filter iptable_nat nf_conntrack_netlink \
+         xt_comment xt_conntrack xt_addrtype xt_tcpudp xt_multiport xt_mark xt_limit \
+         xt_nat xt_REDIRECT xt_MASQUERADE br_netfilter; do
+    modprobe $m 2>/dev/null || echo "[stage2] modprobe $m failed"
+done
 
 # Ensure mount propagation is private so runc can pivot_root into containers.
 mount --make-rprivate /

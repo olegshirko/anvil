@@ -17,3 +17,4 @@ __pycache__/
 Sources/vz-runner/version.swift
 
 .anvil-host-time
+.anvil-host-entropy

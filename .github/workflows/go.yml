@@ -89,30 +89,22 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Download Alpine kernel + initramfs
+      - name: Download Alpine initramfs (base userspace)
         run: |
           mkdir -p .download/alpine
-          curl -L -o .download/alpine/vmlinuz-virt https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/netboot/vmlinuz-virt
           curl -L -o .download/alpine/initramfs-virt https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/netboot/initramfs-virt
 
-      - name: Extract Alpine kernel
+      - name: Download Alpine linux-virt package (kernel + modules)
         run: |
-          python3 scripts/extract_alpine_kernel.py .download/alpine/vmlinuz-virt .download/alpine/vmlinuz-raw.gz
-          gunzip -c .download/alpine/vmlinuz-raw.gz > .download/alpine/vmlinuz-raw || true
+          mkdir -p .download/alpine/linux-virt-pkg
+          curl -L -o .download/alpine/linux-virt.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/linux-virt-6.6.142-r0.apk
+          tar -xzf .download/alpine/linux-virt.apk -C .download/alpine/linux-virt-pkg boot lib/modules
 
-      - name: Download Ubuntu kernel + modules
+      - name: Extract raw kernel
         run: |
-          mkdir -p .download/ubuntu
-          curl -L -o .download/ubuntu/vmlinuz https://cloud-images.ubuntu.com/noble/current/unpacked/noble-server-cloudimg-arm64-vmlinuz-generic
-          gunzip -c .download/ubuntu/vmlinuz > .download/ubuntu/vmlinuz-raw
-          # Extract kernel version from the binary and download matching modules.
-          sudo apt-get install -y binutils >/dev/null 2>&1 || true
-          KVER=$(strings .download/ubuntu/vmlinuz-raw | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic' | head -1)
-          PKGVER=${KVER%-*}
-          echo "Kernel version: $KVER (package: $PKGVER)"
-          DEB_PATH=$(curl -sL "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/" | grep -o "linux-modules-${KVER}_${PKGVER}\.[0-9.]*_arm64.deb" | sort -V | tail -1)
-          echo "Modules deb: $DEB_PATH"
-          curl -L -o .download/ubuntu/linux-modules.deb "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/${DEB_PATH}"
+          python3 scripts/extract_alpine_kernel.py .download/alpine/linux-virt-pkg/boot/vmlinuz-virt .download/alpine/vmlinuz-raw.gz
+          gunzip -c .download/alpine/vmlinuz-raw.gz > .download/alpine/vmlinuz-raw || test -s .download/alpine/vmlinuz-raw
+          file .download/alpine/vmlinuz-raw
 
       - name: Build guest-agent
         run: |
@@ -166,7 +158,7 @@ jobs:
         with:
           name: artifact-linux-arm64
           path: |
-            .download/ubuntu/vmlinuz-raw
+            .download/alpine/vmlinuz-raw
             .download/ubuntu/initramfs-containerd
           retention-days: 1
 
@@ -192,7 +184,10 @@ jobs:
           chmod +x vz-runner-darwin-arm64
           cp ../scripts/anvil-service.sh .
           cp ../scripts/com.olegshirko.anvil.plist .
-          # Ship the kernel gzipped (~19 MB instead of ~59 MB raw);
+          # Artifacts keep their .download/<dir>/ structure; flatten them.
+          cp .download/alpine/vmlinuz-raw .
+          cp .download/ubuntu/initramfs-containerd .
+          # Ship the kernel gzipped (~10 MB instead of ~34 MB raw);
           # anvil-service.sh unpacks it once on first start.
           gzip -9 -n -c vmlinuz-raw > vmlinuz-raw.gz
           # GZIP=-n makes the tarball deterministic so the Homebrew sha256 matches.

@@ -15,7 +15,7 @@ HOST_SHARE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GUEST_SHARE_ROOT="/mnt/anvil"
 # Kernel/initrd paths are relative to the project root.
 VZRUNNER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-KERNEL_PATH="$VZRUNNER_DIR/.download/ubuntu/vmlinuz-raw"
+KERNEL_PATH="$VZRUNNER_DIR/.download/alpine/vmlinuz-raw"
 INITRD_PATH="$VZRUNNER_DIR/.download/ubuntu/initramfs-containerd"
 # Persistent block disk for /var/lib/containerd.
 CONTAINERD_DISK="${CONTAINERD_DISK:-$HOME/.anvil-vz/containerd-disk.img}"

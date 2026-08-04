@@ -55,6 +55,28 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
    образ в разы меньше, инициализация быстрее. Нужно подобрать набор модулей
    (ext4, vsock, virtiofs, bridge, netfilter).
 
+## 1а. Переход на Alpine linux-virt (сделано)
+
+- Ядро и модули берутся из **одного apk** `linux-virt-<ver>` (vermagic
+  совпадает по построению; netboot-образы Alpine отстают от репо, поэтому
+  ядро из netboot использовать нельзя). Ubuntu generic (59 МБ raw, 87 МБ
+  modules.deb, хантинг версии по `strings`) полностью удалён из pipeline;
+  ядро raw 59 → 34.4 МБ (~10 МБ в gzip), сборка детерминирована.
+- Подводные камни linux-virt vs Ubuntu generic (все закрыты):
+  - `CONFIG_VIRTIO_BLK/NET/FS/PACKET=m` (у Ubuntu — built-in): нужны модули
+    `virtio_blk`, `virtio_net` (+`failover`/`net_failover`), `fuse`,
+    `af_packet` (иначе нет диска, сети, шары и DHCP).
+  - `libcrc32c` требует `crc32c` (softdep, busybox modprobe его не
+    разрешает) → грузим `crc32c_generic` явно; без него не работают и
+    nf_conntrack, и ext4 (metadata_csum).
+  - Нет `RANDOM_TRUST_CPU` и virtio-rng в VZ: crng init занимал ~10 с.
+    Решено сидированием из хоста: vz-runner пишет 64 байта в
+    `.anvil-host-entropy`, guest-agent кредитит пул через RNDADDENTROPY.
+- Загрузка модулей переведена с явных `insmod`-списков на `modprobe`
+  (modules.dep из apk) — dependency-цепочки больше не ломаются.
+- Итог: guest-agent ready 1.14 с (как у Ubuntu), вся матрица (DHCP, ext4,
+  шара, порты, pull, save/load, compose, resume) зелёная.
+
 ## 2. Баги и надёжность
 
 1. **~~virtiofs обрезает большие записи из гостя в шару~~ — расследовано,

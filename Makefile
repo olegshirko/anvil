@@ -156,10 +156,10 @@ download-alpine: $(ALPINE_DIR)
 	@if [ ! -f $(ALPINE_KERNEL_PE) ]; then curl -L -o $(ALPINE_KERNEL_PE) $(ALPINE_URL)/vmlinuz-virt; fi
 	@if [ ! -f $(ALPINE_INITRD) ]; then curl -L -o $(ALPINE_INITRD) $(ALPINE_URL)/initramfs-virt; fi
 
-extract-alpine-kernel: download-alpine
+extract-alpine-kernel: alpine-virt-modules
 	@if [ ! -f $(ALPINE_KERNEL_RAW) ]; then \
-	    python3 scripts/extract_alpine_kernel.py $(ALPINE_KERNEL_PE) $(ALPINE_KERNEL_RAW).gz && \
-	    gunzip -c $(ALPINE_KERNEL_RAW).gz > $(ALPINE_KERNEL_RAW) 2>/dev/null && \
+	    python3 scripts/extract_alpine_kernel.py $(ALPINE_VIRT_KERNEL_PE) $(ALPINE_KERNEL_RAW).gz && \
+	    (gunzip -c $(ALPINE_KERNEL_RAW).gz > $(ALPINE_KERNEL_RAW) 2>/dev/null || test -s $(ALPINE_KERNEL_RAW)) && \
 	    file $(ALPINE_KERNEL_RAW); \
 	fi
 
@@ -220,6 +220,23 @@ RUNC_URL := https://github.com/opencontainers/runc/releases/download/v1.2.0/runc
 CNI_PLUGINS_URL := https://github.com/containernetworking/plugins/releases/download/v1.6.0/cni-plugins-linux-arm64-v1.6.0.tgz
 DOCKER_URL := https://download.docker.com/linux/static/stable/aarch64/docker-29.6.1.tgz
 
+# Alpine linux-virt kernel + modules, both from the SAME apk (guaranteed
+# vermagic match; the netboot images lag the repo kernel). The apk ships
+# boot/vmlinuz-virt and lib/modules/<kver>-virt/**.
+ALPINE_VIRT_APK_VER := 6.6.142-r0
+ALPINE_VIRT_APK := $(ALPINE_DIR)/linux-virt.apk
+ALPINE_VIRT_PKG := $(ALPINE_DIR)/linux-virt-pkg
+ALPINE_VIRT_KERNEL_PE := $(ALPINE_VIRT_PKG)/boot/vmlinuz-virt
+
+alpine-virt-modules: $(ALPINE_DIR)
+	@if [ ! -d $(ALPINE_VIRT_PKG) ]; then \
+		if [ ! -f $(ALPINE_VIRT_APK) ]; then \
+			curl -L -o $(ALPINE_VIRT_APK) "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/linux-virt-$(ALPINE_VIRT_APK_VER).apk"; \
+		fi; \
+		mkdir -p $(ALPINE_VIRT_PKG); \
+		tar -xzf $(ALPINE_VIRT_APK) -C $(ALPINE_VIRT_PKG) boot lib/modules; \
+	fi
+
 $(CONTAINER_TOOLS_DIR):
 	mkdir -p $(CONTAINER_TOOLS_DIR)
 
@@ -262,7 +279,7 @@ alpine-iptables: $(ALPINE_IPTABLES_DIR)
 	    curl -L -o $(ALPINE_IPTABLES_DIR)/libxtables.apk $(ALPINE_LIBXTABLES_URL); \
 	fi
 
-initramfs-containerd: extract-alpine-kernel ubuntu-modules guest-agent container-tools alpine-iptables
+initramfs-containerd: extract-alpine-kernel alpine-virt-modules guest-agent container-tools alpine-iptables
 	@if command -v limactl >/dev/null 2>&1 && limactl list anvil --format '{{.Status}}' 2>/dev/null | grep -q Running; then \
 	    echo "Building initramfs inside Lima VM 'anvil'..."; \
 	    limactl shell anvil -- bash $(CURDIR)/scripts/build_initramfs_containerd.sh; \
@@ -278,11 +295,11 @@ boot-containerd: sign
 	@if [ ! -f $(UBUNTU_INITRD_CONTAINERD) ]; then \
 	    echo "initramfs not found; run 'make initramfs-containerd' first"; exit 1; \
 	fi
-	$(BINARY) boot --kernel $(UBUNTU_KERNEL) --initrd $(UBUNTU_INITRD_CONTAINERD) --agent --share /tmp/anvil-share
+	$(BINARY) boot --kernel $(ALPINE_KERNEL_RAW) --initrd $(UBUNTU_INITRD_CONTAINERD) --agent --share /tmp/anvil-share
 
 # Explicit cold-boot target that rebuilds the initramfs first.
 boot-containerd-fresh: sign initramfs-containerd
-	$(BINARY) boot --kernel $(UBUNTU_KERNEL) --initrd $(UBUNTU_INITRD_CONTAINERD) --agent --share /tmp/anvil-share --fresh
+	$(BINARY) boot --kernel $(ALPINE_KERNEL_RAW) --initrd $(UBUNTU_INITRD_CONTAINERD) --agent --share /tmp/anvil-share --fresh
 
 # -----------------------------------------------------------------------------
 # Bench harness

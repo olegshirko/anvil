@@ -70,6 +70,7 @@ fi
 
 if [[ -f "$PROJECT_ROOT/Package.swift" ]]; then
     KERNEL_PATH="${KERNEL_PATH:-$(find_asset \
+        "$PROJECT_ROOT/.download/alpine/vmlinuz-raw" \
         "$PROJECT_ROOT/.download/ubuntu/vmlinuz-raw" \
         "$STATE_DIR/vmlinuz-raw" \
         "$BREW_ASSETS_DIR/vmlinuz-raw")}"

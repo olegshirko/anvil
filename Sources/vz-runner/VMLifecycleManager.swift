@@ -169,11 +169,19 @@ final class VMLifecycleManager: NSObject {
 
     /// Write the current host time into the virtiofs share so the guest can
     /// set its clock without NTP: VZ does not guarantee a sane RTC (boots can
-    /// start at 1970-01-01), which breaks TLS for registry access.
+    /// start at 1970-01-01), which breaks TLS for registry access. Also write
+    /// a random seed for the guest entropy pool: the virt kernel has no
+    /// RANDOM_TRUST_CPU and VZ has no virtio-rng device.
     private func writeHostTimeFile() {
         guard let share = args.sharePath, !share.isEmpty else { return }
-        let url = URL(fileURLWithPath: share).appendingPathComponent(".anvil-host-time")
-        try? "\(Int(Date().timeIntervalSince1970))\n".write(to: url, atomically: true, encoding: .utf8)
+        let shareURL = URL(fileURLWithPath: share)
+        try? "\(Int(Date().timeIntervalSince1970))\n".write(
+            to: shareURL.appendingPathComponent(".anvil-host-time"),
+            atomically: true, encoding: .utf8)
+        var entropy = [UInt8](repeating: 0, count: 64)
+        if SecRandomCopyBytes(kSecRandomDefault, entropy.count, &entropy) == errSecSuccess {
+            try? Data(entropy).write(to: shareURL.appendingPathComponent(".anvil-host-entropy"), options: .atomic)
+        }
     }
 
     private func configureAndCreateVM(completion: @escaping (Result<VZVirtualMachine, Error>) -> Void) {
