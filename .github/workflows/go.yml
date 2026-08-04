@@ -181,7 +181,16 @@ jobs:
           swift build -c release
           codesign --entitlements entitlements.plist --force -s - --identifier com.olegshirko.vz-runner .build/release/vz-runner
       - name: Robustness checks (save/resume, kill -9, FD leaks, CNI, isolation)
-        run: python3 scripts/validate_robustness.py
+        run: |
+          python3 scripts/validate_robustness.py || {
+            echo "=== /tmp/validate_robustness.log ==="
+            tail -60 /tmp/validate_robustness.log 2>/dev/null
+            echo "=== daemon.log ==="
+            tail -40 ~/.anvil-vz/daemon.log 2>/dev/null
+            echo "=== console.log ==="
+            tail -20 ~/.anvil-vz/console.log 2>/dev/null
+            exit 1
+          }
 
   release:
     needs: [build, guestbuild, validate]
