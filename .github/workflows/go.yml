@@ -167,8 +167,12 @@ jobs:
           retention-days: 1
 
   validate:
+    # GitHub-hosted macos runners have no hypervisor ("Virtualization is not
+    # available on this hardware"), so VM-booting robustness checks only run
+    # on a self-hosted Apple Silicon runner, triggered manually.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, macOS, ARM64]
     needs: guestbuild
-    runs-on: macos-15
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -193,7 +197,7 @@ jobs:
           }
 
   release:
-    needs: [build, guestbuild, validate]
+    needs: [build, guestbuild]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
