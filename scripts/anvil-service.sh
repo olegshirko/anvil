@@ -55,6 +55,19 @@ find_asset() {
     return 1
 }
 
+# The release tarball ships the kernel gzipped (~19 MB vs ~59 MB raw) to keep
+# the download small. Unpack it into the state dir, re-unpacking whenever the
+# packaged gz is newer (package upgrade). Skipped when KERNEL_PATH is forced.
+if [[ -z "${KERNEL_PATH:-}" ]]; then
+    GZ_KERNEL="$(find_asset \
+        "$BREW_ASSETS_DIR/vmlinuz-raw.gz" \
+        "$PROJECT_ROOT/.download/ubuntu/vmlinuz-raw.gz" || true)"
+    if [[ -n "$GZ_KERNEL" && "$GZ_KERNEL" -nt "$STATE_DIR/vmlinuz-raw" ]]; then
+        echo "[anvil-service] decompressing kernel to $STATE_DIR/vmlinuz-raw..." >&2
+        gunzip -c "$GZ_KERNEL" > "$STATE_DIR/vmlinuz-raw"
+    fi
+fi
+
 if [[ -f "$PROJECT_ROOT/Package.swift" ]]; then
     KERNEL_PATH="${KERNEL_PATH:-$(find_asset \
         "$PROJECT_ROOT/.download/ubuntu/vmlinuz-raw" \

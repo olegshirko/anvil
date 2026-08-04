@@ -192,10 +192,13 @@ jobs:
           chmod +x vz-runner-darwin-arm64
           cp ../scripts/anvil-service.sh .
           cp ../scripts/com.olegshirko.anvil.plist .
+          # Ship the kernel gzipped (~19 MB instead of ~59 MB raw);
+          # anvil-service.sh unpacks it once on first start.
+          gzip -9 -n -c vmlinuz-raw > vmlinuz-raw.gz
           # GZIP=-n makes the tarball deterministic so the Homebrew sha256 matches.
           GZIP=-n tar czf anvil-darwin-arm64.tar.gz \
             vz-runner-darwin-arm64 \
-            vmlinuz-raw initramfs-containerd \
+            vmlinuz-raw.gz initramfs-containerd \
             anvil-service.sh com.olegshirko.anvil.plist
           shasum -a 256 anvil-darwin-arm64.tar.gz | awk '{print $1}' > anvil-darwin-arm64.tar.gz.sha256sum
       - name: create release
