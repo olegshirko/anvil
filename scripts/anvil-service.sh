@@ -119,10 +119,23 @@ is_running() {
 
 cmd_start() {
     if is_running; then
-        echo "[anvil-service] daemon already running (pid $(cat "$PID_FILE"))"
-        docker context use anvil >/dev/null 2>&1 || true
-        echo "[anvil-service] docker context: $(docker context show 2>/dev/null || echo unknown)"
-        return 0
+        local pid running_bin
+        pid="$(cat "$PID_FILE")"
+        # After a package upgrade the old daemon keeps running the old binary.
+        # Detect the skew and restart instead of a no-op. Compare resolved
+        # paths: the brew /opt/homebrew/bin symlink is stable across versions,
+        # but its Cellar target changes on every upgrade.
+        running_bin="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+        if [[ -n "$running_bin" && -x "$VZRUNNER_BIN" && \
+              "$(realpath "$running_bin" 2>/dev/null)" != "$(realpath "$VZRUNNER_BIN" 2>/dev/null)" ]]; then
+            echo "[anvil-service] daemon runs an older binary; restarting after upgrade..."
+            cmd_stop
+        else
+            echo "[anvil-service] daemon already running (pid $pid)"
+            docker context use anvil >/dev/null 2>&1 || true
+            echo "[anvil-service] docker context: $(docker context show 2>/dev/null || echo unknown)"
+            return 0
+        fi
     fi
 
     if [[ ! -x "$VZRUNNER_BIN" ]]; then
