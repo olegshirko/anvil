@@ -110,19 +110,31 @@ func parseHumanSize(s string) int64 {
 // "docker.io/library/postgres:15.5", and user images (e.g. "foo/bar") become
 // "docker.io/foo/bar". A registry domain is present only when the first path
 // component looks like a host (contains "." or ":", or is localhost) — a bare
-// "name:tag" has no slash and must NOT be mistaken for a registry.
+// "name:tag" has no slash and must NOT be mistaken for a registry. When
+// neither tag nor digest is present, ":latest" is appended (Docker
+// semantics; the check looks at the last path component so a registry port
+// is not treated as a tag).
 func canonicalizeImageRef(ref string) string {
 	if ref == "" {
 		return ref
 	}
 	parts := strings.SplitN(ref, "/", 2)
+	result := ref
 	if len(parts) == 2 && (strings.ContainsAny(parts[0], ".:") || parts[0] == "localhost") {
-		return ref
+		result = ref
+	} else if len(parts) == 1 {
+		result = "docker.io/library/" + ref
+	} else {
+		result = "docker.io/" + ref
 	}
-	if len(parts) == 1 {
-		return "docker.io/library/" + ref
+	last := result
+	if i := strings.LastIndex(result, "/"); i != -1 {
+		last = result[i+1:]
 	}
-	return "docker.io/" + ref
+	if !strings.ContainsAny(last, ":@") {
+		result += ":latest"
+	}
+	return result
 }
 
 // ensureImageInNamespace makes sure an image reference exists in the target

@@ -134,6 +134,8 @@ mkdir -p opt/containerd/bin
 tar -xzf "$TOOLS_DIR/containerd.tgz" -C opt/containerd/bin --strip-components=1 2>/dev/null || true
 tar -xzf "$TOOLS_DIR/nerdctl.tgz" -C opt/containerd/bin 2>/dev/null || true
 cp "$TOOLS_DIR/runc" opt/containerd/bin/runc
+# buildkitd + buildctl for `docker build` (nerdctl build frontend).
+tar -xzf "$TOOLS_DIR/buildkit.tgz" -C opt/containerd/bin --strip-components=1 2>/dev/null || true
 chmod +x opt/containerd/bin/*
 # Drop unused containerd tools (~19 MB): stress tester and rootless helpers.
 rm -f opt/containerd/bin/containerd-stress opt/containerd/bin/containerd-rootless*.sh
@@ -193,6 +195,8 @@ exec /opt/containerd/bin/nerdctl "$@"
 NERDCTLEOF
 chmod +x bin/nerdctl
 ln -sf /opt/containerd/bin/ctr bin/ctr
+# nerdctl build shells out to buildctl and needs it in PATH.
+ln -sf /opt/containerd/bin/buildctl bin/buildctl
 
 # CNI plugins for per-project bridge networking.
 mkdir -p opt/cni/bin etc/cni/net.d
@@ -207,33 +211,20 @@ for plugin in opt/cni/bin/*; do
 done
 
 # iptables + libraries required by CNI plugins.
-for apk in iptables libmnl libnftnl libxtables; do
+for apk in iptables libmnl libnftnl libxtables tar libacl libattr; do
     tar -xf "$IPTABLES_DIR/$apk.apk" -C . 2>/dev/null || true
 done
 
-# GNU tar is required by nerdctl cp; busybox tar is not sufficient. The build
-# container is Alpine, so install the GNU tar package if it is missing (the
-# Lima build VM already has GNU tar) and copy it (along with its
-# libacl/libattr dependencies) into the initramfs.
-if ! tar --version 2>/dev/null | grep -q GNU; then
-    apk add --no-cache tar >/dev/null 2>&1 || true
-fi
-if ! tar --version 2>/dev/null | grep -q GNU; then
-    echo "ERROR: GNU tar installation failed" >&2
+# GNU tar is required by nerdctl cp and /build; busybox tar is not sufficient.
+# The Alpine tar/acl/attr apks (musl-linked) extracted above put GNU tar at
+# bin/tar and its libs under usr/lib — no build-VM tar is used (a glibc-linked
+# one would not run on the musl rootfs).
+if [[ ! -x bin/tar ]]; then
+    echo "ERROR: GNU tar not present in initramfs" >&2
     exit 1
 fi
-cp /bin/tar bin/tar-gnu
+cp bin/tar bin/tar-gnu
 chmod +x bin/tar-gnu
-rm -f bin/tar
-cp bin/tar-gnu bin/tar
-mkdir -p lib
-for lib in /lib/libacl.so.1 /lib/libattr.so.1 /usr/lib/libacl.so.1 /usr/lib/libattr.so.1 \
-           /lib/aarch64-linux-gnu/libacl.so.1 /lib/aarch64-linux-gnu/libattr.so.1 \
-           /usr/lib/aarch64-linux-gnu/libacl.so.1 /usr/lib/aarch64-linux-gnu/libattr.so.1; do
-    if [ -f "$lib" ]; then
-        cp "$lib" lib/
-    fi
-done
 
 # Helpers to persist containerd image cache across cold boots.
 cat > bin/anvil-sync-containerd <<'EOF'
@@ -584,6 +575,10 @@ while [ $i -lt 75 ]; do
     i=$((i + 1))
 done
 
+# buildkitd for `docker build` (nerdctl build connects to the default socket).
+mkdir -p /var/lib/buildkit
+/opt/containerd/bin/buildkitd > /tmp/buildkitd.log 2>&1 &
+
 # Cold boot only: per-container nerdctl state (/var/lib/nerdctl) is persisted
 # on disk. Restored containerd metadata would reference missing or stale state
 # files, causing containers to fail on start. Drop all containers on cold boot
@@ -634,6 +629,7 @@ chmod +x myinit
 
 # Pack the rootfs with GNU cpio inside the Linux container. zstd decompresses
 # much faster than gzip at boot (the kernel supports CONFIG_RD_ZSTD).
+mkdir -p "$(dirname "$OUT")"
 find . -mindepth 1 -print0 | cpio -o -0 -H newc | zstd -q -19 -T0 > "$OUT"
 
 if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then

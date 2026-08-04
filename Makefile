@@ -218,6 +218,7 @@ CONTAINERD_URL := https://github.com/containerd/containerd/releases/download/v2.
 NERDCTL_URL := https://github.com/containerd/nerdctl/releases/download/v2.0.4/nerdctl-2.0.4-linux-arm64.tar.gz
 RUNC_URL := https://github.com/opencontainers/runc/releases/download/v1.2.0/runc.arm64
 CNI_PLUGINS_URL := https://github.com/containernetworking/plugins/releases/download/v1.6.0/cni-plugins-linux-arm64-v1.6.0.tgz
+BUILDKIT_URL := https://github.com/moby/buildkit/releases/download/v0.32.2/buildkit-v0.32.2.linux-arm64.tar.gz
 DOCKER_URL := https://download.docker.com/linux/static/stable/aarch64/docker-29.6.1.tgz
 
 # Alpine linux-virt kernel + modules, both from the SAME apk (guaranteed
@@ -254,13 +255,20 @@ container-tools: $(CONTAINER_TOOLS_DIR)
 	if [ ! -f $(CONTAINER_TOOLS_DIR)/cni-plugins.tgz ]; then \
 	    curl -L -o $(CONTAINER_TOOLS_DIR)/cni-plugins.tgz $(CNI_PLUGINS_URL); \
 	fi
+	if [ ! -f $(CONTAINER_TOOLS_DIR)/buildkit.tgz ]; then \
+	    curl -L -o $(CONTAINER_TOOLS_DIR)/buildkit.tgz $(BUILDKIT_URL); \
+	fi
 
 # Alpine iptables + libs needed by CNI bridge/portmap/firewall plugins.
+# Plus GNU tar + acl/attr (musl-linked, required by nerdctl cp and /build).
 ALPINE_IPTABLES_DIR := .download/alpine-iptables
 ALPINE_IPTABLES_URL := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/iptables-1.8.10-r3.apk
 ALPINE_LIBMNL_URL   := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libmnl-1.0.5-r2.apk
 ALPINE_LIBNFTNL_URL := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libnftnl-1.2.6-r0.apk
 ALPINE_LIBXTABLES_URL := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libxtables-1.8.10-r3.apk
+ALPINE_TAR_URL      := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/tar-1.35-r2.apk
+ALPINE_LIBACL_URL   := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libacl-2.3.2-r0.apk
+ALPINE_LIBATTR_URL  := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libattr-2.5.2-r0.apk
 
 $(ALPINE_IPTABLES_DIR):
 	mkdir -p $(ALPINE_IPTABLES_DIR)
@@ -277,6 +285,15 @@ alpine-iptables: $(ALPINE_IPTABLES_DIR)
 	fi
 	if [ ! -f $(ALPINE_IPTABLES_DIR)/libxtables.apk ]; then \
 	    curl -L -o $(ALPINE_IPTABLES_DIR)/libxtables.apk $(ALPINE_LIBXTABLES_URL); \
+	fi
+	if [ ! -f $(ALPINE_IPTABLES_DIR)/tar.apk ]; then \
+	    curl -L -o $(ALPINE_IPTABLES_DIR)/tar.apk $(ALPINE_TAR_URL); \
+	fi
+	if [ ! -f $(ALPINE_IPTABLES_DIR)/libacl.apk ]; then \
+	    curl -L -o $(ALPINE_IPTABLES_DIR)/libacl.apk $(ALPINE_LIBACL_URL); \
+	fi
+	if [ ! -f $(ALPINE_IPTABLES_DIR)/libattr.apk ]; then \
+	    curl -L -o $(ALPINE_IPTABLES_DIR)/libattr.apk $(ALPINE_LIBATTR_URL); \
 	fi
 
 initramfs-containerd: extract-alpine-kernel alpine-virt-modules guest-agent container-tools alpine-iptables

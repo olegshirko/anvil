@@ -120,6 +120,7 @@ jobs:
           curl -L -o .download/container-tools/runc https://github.com/opencontainers/runc/releases/download/v1.2.0/runc.arm64
           chmod +x .download/container-tools/runc
           curl -L -o .download/container-tools/cni-plugins.tgz https://github.com/containernetworking/plugins/releases/download/v1.6.0/cni-plugins-linux-arm64-v1.6.0.tgz
+          curl -L -o .download/container-tools/buildkit.tgz https://github.com/moby/buildkit/releases/download/v0.32.2/buildkit-v0.32.2.linux-arm64.tar.gz
 
       - name: Download Alpine iptables
         run: |
@@ -128,6 +129,9 @@ jobs:
           curl -L -o .download/alpine-iptables/libmnl.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libmnl-1.0.5-r2.apk
           curl -L -o .download/alpine-iptables/libnftnl.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libnftnl-1.2.6-r0.apk
           curl -L -o .download/alpine-iptables/libxtables.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libxtables-1.8.10-r3.apk
+          curl -L -o .download/alpine-iptables/tar.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/tar-1.35-r2.apk
+          curl -L -o .download/alpine-iptables/libacl.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libacl-2.3.2-r0.apk
+          curl -L -o .download/alpine-iptables/libattr.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libattr-2.5.2-r0.apk
 
       - name: Build initramfs-containerd
         run: |

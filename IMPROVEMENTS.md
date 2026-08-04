@@ -176,10 +176,22 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
 
 ## 3. Функциональность
 
-1. **`docker build`** — главный функциональный пробел (в `dockerapi.go` нет
-   `/build`, только заглушка `/build/prune`). Путь: buildkitd в initramfs +
-   проксирование `/build` и сессий. Временная мера: задокументировать
-   `docker buildx` с внешним builder + `docker load`.
+1. **~~`docker build`~~ — сделано (классический путь).** В initramfs добавлен
+   buildkitd (v0.32.2) + buildctl; guest-agent реализует классический
+   `POST /build`: контекст распаковывается на persistent-диск
+   (`/var/lib/anvil-build`), сборка через `nerdctl build`, прогресс — JSON
+   stream как у Docker. Работает `DOCKER_BUILDKIT=0 docker build` и
+   `DOCKER_BUILDKIT=0 docker compose build` (проверено: build→run по
+   короткому имени, compose build→up→logs).
+   Ограничения:
+   - Дефолтный buildx docker-container драйвер НЕ работает: buildx тянет
+     moby/buildkit как контейнер и копирует файлы через `nerdctl cp`, а в
+     образе нет tar. Нужен `DOCKER_BUILDKIT=0` (или alias).
+   - Попутно исправлено: `canonicalizeImageRef` не добавлял `:latest` к
+     именам без тега (`docker run myimg` → мимо локального образа → pull);
+     GNU tar в initramfs теперь из Alpine apk (musl), а не из build-VM
+     (glibc tar из Ubuntu не запускался).
+   - `/build/prune` по-прежнему заглушка.
 2. **Rosetta для x86_64** (`VZRosettaDirectoryShare`, macOS 13+) — запуск
    amd64-образов почти нативно, как у Lima.
 3. **Bind-mounts произвольных host-путей** — сейчас один virtiofs share.
