@@ -168,13 +168,27 @@ cmd_start() {
 
     check_proxy
 
-    # Create the containerd persistent disk if it doesn't exist.
+    # Create the containerd persistent disk if it doesn't exist, or grow it
+    # when ANVIL_DISK_GB (default 64) exceeds the current size. Sparse either
+    # way. Growing changes the file size, which is part of the snapshot config
+    # hash — the next boot is a cold boot and stage2 extends the ext4 fs with
+    # resize2fs. Never shrink an existing image.
     # Without it stage2 falls back to a virtiofs share, which breaks overlayfs
     # whiteouts and causes docker load/run to fail.
+    DISK_GB="${ANVIL_DISK_GB:-64}"
+    DISK_BYTES=$((DISK_GB * 1024 * 1024 * 1024))
     if [[ ! -f "$CONTAINERD_DISK" ]]; then
-        echo "[anvil-service] creating containerd disk image (16 GiB sparse)..."
-        /bin/dd if=/dev/zero of="$CONTAINERD_DISK" bs=1 count=0 seek=16g
+        echo "[anvil-service] creating containerd disk image (${DISK_GB} GiB sparse)..."
+        /bin/dd if=/dev/zero of="$CONTAINERD_DISK" bs=1 count=0 seek=${DISK_GB}g
         chmod 600 "$CONTAINERD_DISK"
+    else
+        current_size=$(stat -f %z "$CONTAINERD_DISK")
+        if (( current_size < DISK_BYTES )); then
+            echo "[anvil-service] growing containerd disk to ${DISK_GB} GiB (sparse; next boot is a cold boot)..."
+            # Extend by writing one zero byte at the last offset; conv=notrunc
+            # keeps existing data intact and the file stays sparse.
+            /bin/dd if=/dev/zero of="$CONTAINERD_DISK" bs=1 count=1 seek=$((DISK_BYTES - 1)) conv=notrunc 2>/dev/null
+        fi
     fi
 
     echo "[anvil-service] starting vz-runner daemon..."

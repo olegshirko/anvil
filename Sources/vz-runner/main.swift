@@ -157,16 +157,26 @@ func cmdStart(args: [String]) {
     chmod(stateDir.path, 0o700)
     try? "".write(toFile: daemonLogFile.path, atomically: true, encoding: .utf8)
 
-    // Create the containerd persistent disk if it doesn't exist.
+    // Create the containerd persistent disk if it doesn't exist, or grow it
+    // when the target size (ANVIL_DISK_GB, default 64) exceeds the current
+    // one. Sparse either way, so the extra capacity costs no host space.
+    // Growing changes the file size, which is part of the snapshot config
+    // hash — the next boot is a cold boot and stage2 extends the ext4 fs
+    // with resize2fs. Never shrink an existing image.
+    let diskGB = UInt64(ProcessInfo.processInfo.environment["ANVIL_DISK_GB"] ?? "") ?? 64
+    let diskBytes = diskGB * 1024 * 1024 * 1024
     if !FileManager.default.fileExists(atPath: containerdDisk) {
-        print("[anvil] creating containerd disk image (16 GiB sparse)...")
-        // Create a 16 GiB sparse file; the guest formats it as ext4 on first boot.
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/dd")
-        proc.arguments = ["if=/dev/zero", "of=\(containerdDisk)", "bs=1", "count=0", "seek=16g"]
-        try? proc.run()
-        proc.waitUntilExit()
+        print("[anvil] creating containerd disk image (\(diskGB) GiB sparse)...")
+        FileManager.default.createFile(atPath: containerdDisk, contents: nil)
         chmod(containerdDisk, 0o600)
+    }
+    if let fh = try? FileHandle(forWritingTo: URL(fileURLWithPath: containerdDisk)) {
+        let currentSize = fh.seekToEndOfFile()
+        if currentSize < diskBytes {
+            print("[anvil] growing containerd disk to \(diskGB) GiB (sparse; next boot is a cold boot)...")
+            try? fh.truncate(atOffset: diskBytes)
+        }
+        try? fh.close()
     }
 
     saveDockerContext()

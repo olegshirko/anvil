@@ -132,6 +132,12 @@ jobs:
           curl -L -o .download/alpine-iptables/tar.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/tar-1.35-r2.apk
           curl -L -o .download/alpine-iptables/libacl.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libacl-2.3.2-r0.apk
           curl -L -o .download/alpine-iptables/libattr.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libattr-2.5.2-r0.apk
+          curl -L -o .download/alpine-iptables/e2fsprogs.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/e2fsprogs-1.47.0-r5.apk
+          curl -L -o .download/alpine-iptables/e2fsprogs-extra.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/e2fsprogs-extra-1.47.0-r5.apk
+          curl -L -o .download/alpine-iptables/e2fsprogs-libs.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/e2fsprogs-libs-1.47.0-r5.apk
+          curl -L -o .download/alpine-iptables/libcom_err.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libcom_err-1.47.0-r5.apk
+          curl -L -o .download/alpine-iptables/libblkid.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libblkid-2.40.1-r1.apk
+          curl -L -o .download/alpine-iptables/libuuid.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libuuid-2.40.1-r1.apk
 
       - name: Build initramfs-containerd
         run: |

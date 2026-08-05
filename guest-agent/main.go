@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -393,29 +394,85 @@ func findHostPortConflict(ports []int) (*PortMapping, error) {
 	return nil, nil
 }
 
-// reapZombies runs for the lifetime of the process and waits on any child
-// processes that reparent to PID 1. It drains all available zombies on each
-// SIGCHLD so none are left behind.
+// reapZombies runs for the lifetime of the process and reaps orphaned
+// grandchildren that get reparented to PID 1. Direct children spawned via
+// os/exec are reaped by their own Wait(); to avoid racing it (a stolen
+// zombie makes Wait fail with "waitid: no child processes"), a zombie is
+// reaped only after it stays unclaimed for a grace period.
 func reapZombies() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGCHLD)
 
-	// Drain any zombies that already exist at startup.
-	reapOnce()
+	// Drain any orphans that already exist at startup.
+	reapOrphans()
 
 	for range sigCh {
-		reapOnce()
+		reapOrphans()
 	}
 }
 
-func reapOnce() {
-	for {
-		var status syscall.WaitStatus
-		pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
-		if err != nil || pid <= 0 {
-			break
+// zombiePids lists current zombie children via /proc (state 'Z', ppid = us)
+// without reaping them.
+func zombiePids() []int {
+	self := strconv.Itoa(os.Getpid())
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
 		}
-		log.Printf("reaped child pid %d", pid)
+		data, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		// stat format: pid (comm) state ppid ... — comm may contain spaces
+		// and parens, so parse from the last ')'.
+		s := string(data)
+		i := strings.LastIndex(s, ")")
+		if i < 0 || i+2 >= len(s) {
+			continue
+		}
+		fields := strings.Fields(s[i+1:])
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[0] == "Z" && fields[1] == self {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+// isZombie reports whether pid is still an unclaimed zombie child of ours.
+func isZombie(pid int) bool {
+	for _, z := range zombiePids() {
+		if z == pid {
+			return true
+		}
+	}
+	return false
+}
+
+func reapOrphans() {
+	pids := zombiePids()
+	if len(pids) == 0 {
+		return
+	}
+	// os/exec claims its children immediately after they exit; anything still
+	// a zombie after the grace period is an orphan reparented to PID 1.
+	time.Sleep(2 * time.Second)
+	for _, pid := range pids {
+		if !isZombie(pid) {
+			continue // already claimed by os/exec
+		}
+		var status syscall.WaitStatus
+		if wpid, err := syscall.Wait4(pid, &status, syscall.WNOHANG, nil); err == nil && wpid > 0 {
+			log.Printf("reaped orphaned child pid %d", pid)
+		}
 	}
 }
 

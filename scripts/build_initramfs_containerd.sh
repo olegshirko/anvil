@@ -51,7 +51,6 @@ need_pkgs=""
 command -v cpio >/dev/null 2>&1 || need_pkgs="$need_pkgs cpio"
 command -v zstd >/dev/null 2>&1 || need_pkgs="$need_pkgs zstd"
 command -v objdump >/dev/null 2>&1 || need_pkgs="$need_pkgs binutils"
-command -v mkfs.ext4 >/dev/null 2>&1 || need_pkgs="$need_pkgs e2fsprogs"
 if [[ -n "$need_pkgs" ]]; then
     apk add --no-cache $need_pkgs
 fi
@@ -112,18 +111,9 @@ done
 # zstd for faster cold-boot cache sync/restore than gzip.
 cp /usr/bin/zstd bin/zstd
 
-# mkfs.ext4 for formatting the containerd persistent disk on first boot.
-cp /sbin/mkfs.ext4 sbin/mkfs.ext4
-cp /sbin/mke2fs sbin/mke2fs
-for lib in /lib/libcom_err.so* /lib/libe2p.so* /lib/libext2fs.so* /lib/libblkid.so* /lib/libuuid.so* /lib/librt.so*; do
-    for f in $lib; do
-        [ -f "$f" ] && cp "$f" lib/ 2>/dev/null || true
-    done
-done
-if [[ ! -x sbin/mkfs.ext4 ]]; then
-    echo "ERROR: mkfs.ext4 not present in initramfs" >&2
-    exit 1
-fi
+# mkfs.ext4/resize2fs come from the Alpine e2fsprogs apks (musl-linked),
+# extracted below together with iptables — a glibc mkfs.ext4 copied from the
+# build VM would not run on the musl rootfs.
 
 # Inject guest agent.
 cp "$AGENT_BIN" bin/guest-agent
@@ -200,7 +190,24 @@ ln -sf /opt/containerd/bin/buildctl bin/buildctl
 
 # CNI plugins for per-project bridge networking.
 mkdir -p opt/cni/bin etc/cni/net.d
-tar -xzf "$TOOLS_DIR/cni-plugins.tgz" -C opt/cni/bin 2>/dev/null || true
+# The tgz is read from the host share (virtiofs/sshfs in Lima), where a read
+# hiccup previously produced zero-byte plugins. Extract, verify, retry once,
+# then fail loudly instead of shipping a broken initramfs.
+for attempt in 1 2; do
+    tar -xzf "$TOOLS_DIR/cni-plugins.tgz" -C opt/cni/bin 2>/dev/null || true
+    broken=0
+    for plugin in bridge host-local loopback portmap firewall tuning; do
+        [[ -s "opt/cni/bin/$plugin" ]] || broken=1
+    done
+    [[ "$broken" == 0 ]] && break
+    echo "WARNING: CNI plugin extraction incomplete (attempt $attempt), retrying" >&2
+done
+for plugin in bridge host-local loopback portmap firewall tuning; do
+    if [[ ! -s "opt/cni/bin/$plugin" ]]; then
+        echo "ERROR: CNI plugin $plugin missing or empty after extraction" >&2
+        exit 1
+    fi
+done
 chmod +x opt/cni/bin/*
 # Keep only the plugins the generated configs actually use; the full set is ~78 MB.
 for plugin in opt/cni/bin/*; do
@@ -210,10 +217,22 @@ for plugin in opt/cni/bin/*; do
     esac
 done
 
-# iptables + libraries required by CNI plugins.
-for apk in iptables libmnl libnftnl libxtables tar libacl libattr; do
+# iptables + libraries required by CNI plugins; GNU tar for nerdctl cp and
+# /build; e2fsprogs for the containerd disk (mkfs.ext4 on first boot,
+# resize2fs when the disk image has grown).
+for apk in iptables libmnl libnftnl libxtables tar libacl libattr \
+           e2fsprogs e2fsprogs-extra e2fsprogs-libs libcom_err libblkid libuuid; do
     tar -xf "$IPTABLES_DIR/$apk.apk" -C . 2>/dev/null || true
 done
+
+if [[ ! -x sbin/mkfs.ext4 ]]; then
+    echo "ERROR: mkfs.ext4 not present in initramfs" >&2
+    exit 1
+fi
+if [[ ! -x usr/sbin/resize2fs ]]; then
+    echo "ERROR: resize2fs not present in initramfs" >&2
+    exit 1
+fi
 
 # GNU tar is required by nerdctl cp and /build; busybox tar is not sufficient.
 # The Alpine tar/acl/attr apks (musl-linked) extracted above put GNU tar at
@@ -496,6 +515,9 @@ mountpoint -q /var/lib || {
             # for a dev VM where snapshot save/resume provides durability.
             if mount -t ext4 -o noatime,nobarrier,data=writeback,commit=60 "$blk" /var/lib 2>/dev/null; then
                 echo "[stage2] mounted $blk as /var/lib"
+                # Grow the fs if the host-side disk image was enlarged since
+                # the last boot (online resize; a no-op when sizes match).
+                /usr/sbin/resize2fs "$blk" >/dev/null 2>&1 || true
                 break
             fi
             # First boot: format the raw disk as ext4.

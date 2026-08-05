@@ -8,7 +8,7 @@
     download-ubuntu ubuntu-modules \
     guest-agent initramfs-agent initramfs-ubuntu initramfs-containerd \
     container-tools time-boot time-service validate \
-    bench bench-prepull harness harness-all prune clean-containers \
+    bench bench-prepull harness harness-all prune clean-containers disk-compact \
     release replace-release update-brew
 
 BINARY := .build/release/vz-runner
@@ -124,6 +124,26 @@ prune clean-containers:
 	@docker --context anvil volume prune -f >/dev/null 2>&1 || true
 	@docker --context anvil system prune -af --volumes >/dev/null 2>&1 || true
 	@echo "[anvil] pruned containers, volumes and images"
+
+# Reclaim host disk space from the containerd image. After `make prune` the
+# raw image keeps its allocated blocks; a sparse copy drops the zeroed
+# regions. The file's logical size and content stay identical, so the VM
+# snapshot remains valid. The daemon is stopped for the copy and restarted
+# afterwards.
+CONTAINERD_DISK := $(HOME)/.anvil-vz/containerd-disk.img
+
+disk-compact:
+	@$(MAKE) service-stop
+	@if [ -f "$(CONTAINERD_DISK)" ]; then \
+	    echo "[anvil] compacting $(CONTAINERD_DISK) ($$(du -h "$(CONTAINERD_DISK)" | cut -f1) allocated)..."; \
+	    /bin/dd if="$(CONTAINERD_DISK)" of="$(CONTAINERD_DISK).new" conv=sparse bs=16m 2>/dev/null; \
+	    mv "$(CONTAINERD_DISK).new" "$(CONTAINERD_DISK)"; \
+	    chmod 600 "$(CONTAINERD_DISK)"; \
+	    echo "[anvil] compacted: $$(du -h "$(CONTAINERD_DISK)" | cut -f1) allocated"; \
+	else \
+	    echo "[anvil] no containerd disk at $(CONTAINERD_DISK)"; \
+	fi
+	@$(MAKE) service-start
 
 clean:
 	rm -rf .build .download .venv
@@ -269,6 +289,12 @@ ALPINE_LIBXTABLES_URL := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch6
 ALPINE_TAR_URL      := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/tar-1.35-r2.apk
 ALPINE_LIBACL_URL   := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libacl-2.3.2-r0.apk
 ALPINE_LIBATTR_URL  := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libattr-2.5.2-r0.apk
+ALPINE_E2FSPROGS_URL      := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/e2fsprogs-1.47.0-r5.apk
+ALPINE_E2FSPROGS_EXTRA_URL := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/e2fsprogs-extra-1.47.0-r5.apk
+ALPINE_E2FSPROGS_LIBS_URL := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/e2fsprogs-libs-1.47.0-r5.apk
+ALPINE_LIBCOM_ERR_URL     := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libcom_err-1.47.0-r5.apk
+ALPINE_LIBBLKID_URL       := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libblkid-2.40.1-r1.apk
+ALPINE_LIBUUID_URL        := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libuuid-2.40.1-r1.apk
 
 $(ALPINE_IPTABLES_DIR):
 	mkdir -p $(ALPINE_IPTABLES_DIR)
@@ -294,6 +320,24 @@ alpine-iptables: $(ALPINE_IPTABLES_DIR)
 	fi
 	if [ ! -f $(ALPINE_IPTABLES_DIR)/libattr.apk ]; then \
 	    curl -L -o $(ALPINE_IPTABLES_DIR)/libattr.apk $(ALPINE_LIBATTR_URL); \
+	fi
+	if [ ! -f $(ALPINE_IPTABLES_DIR)/e2fsprogs.apk ]; then \
+	    curl -L -o $(ALPINE_IPTABLES_DIR)/e2fsprogs.apk $(ALPINE_E2FSPROGS_URL); \
+	fi
+	if [ ! -f $(ALPINE_IPTABLES_DIR)/e2fsprogs-extra.apk ]; then \
+	    curl -L -o $(ALPINE_IPTABLES_DIR)/e2fsprogs-extra.apk $(ALPINE_E2FSPROGS_EXTRA_URL); \
+	fi
+	if [ ! -f $(ALPINE_IPTABLES_DIR)/e2fsprogs-libs.apk ]; then \
+	    curl -L -o $(ALPINE_IPTABLES_DIR)/e2fsprogs-libs.apk $(ALPINE_E2FSPROGS_LIBS_URL); \
+	fi
+	if [ ! -f $(ALPINE_IPTABLES_DIR)/libcom_err.apk ]; then \
+	    curl -L -o $(ALPINE_IPTABLES_DIR)/libcom_err.apk $(ALPINE_LIBCOM_ERR_URL); \
+	fi
+	if [ ! -f $(ALPINE_IPTABLES_DIR)/libblkid.apk ]; then \
+	    curl -L -o $(ALPINE_IPTABLES_DIR)/libblkid.apk $(ALPINE_LIBBLKID_URL); \
+	fi
+	if [ ! -f $(ALPINE_IPTABLES_DIR)/libuuid.apk ]; then \
+	    curl -L -o $(ALPINE_IPTABLES_DIR)/libuuid.apk $(ALPINE_LIBUUID_URL); \
 	fi
 
 initramfs-containerd: extract-alpine-kernel alpine-virt-modules guest-agent container-tools alpine-iptables
