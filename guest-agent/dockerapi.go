@@ -468,6 +468,8 @@ func runDockerAPIServer() {
 			})
 		case path == "/images/load" && r.Method == http.MethodPost:
 			handleImageLoad(w, r)
+		case path == "/build" && r.Method == http.MethodPost:
+			handleBuild(w, r)
 		case path == "/images/get" && r.Method == http.MethodGet:
 			handleImagesGet(w, r)
 		case isGet && r.Method == http.MethodGet:
