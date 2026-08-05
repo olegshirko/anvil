@@ -370,6 +370,7 @@ func printUsage() {
     Usage:
       anvil start [--kernel <path>] [--initrd <path>] [--share <path>]
       anvil stop
+      anvil restart
       anvil status
       anvil daemon [--kernel <path>] [--initrd <path>] [--share <path>]
       anvil boot --kernel <path> --initrd <path> [--agent]
@@ -382,6 +383,7 @@ func printUsage() {
       start     Launch the daemon in the background, wait for ready,
                 switch Docker context to "anvil".
       stop      Stop the daemon, restore the previous Docker context.
+      restart   Stop + start.
       status    Show daemon status and Docker context.
 
     Daemon options (start / daemon):
@@ -418,6 +420,9 @@ case "stop":
     cmdStop(args: Array(arguments.dropFirst()))
 case "status":
     cmdStatus()
+case "restart":
+    cmdStop(args: [])
+    cmdStart(args: Array(arguments.dropFirst()))
 case "daemon":
     DaemonCommand.run(args: Array(arguments.dropFirst()))
 case "boot":
