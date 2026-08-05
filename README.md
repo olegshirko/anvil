@@ -61,9 +61,16 @@ talks to it:
 docker context use anvil        # done automatically by `anvil start`
 docker run --rm -p 8080:80 nginx
 docker compose up               # compose works: networks, volumes, events
-DOCKER_BUILDKIT=0 docker build .  # classic builder via in-VM buildkitd
+docker build -t myimg .         # buildx remote driver against in-VM buildkitd
 docker run -v $HOME/proj:/data alpine ls /data   # macOS bind mounts
 ```
+
+`anvil start` creates a buildx builder named `anvil-remote` (remote driver pointing
+at the VM's buildkitd through `~/.anvil-vz/buildkit.sock`) and selects it;
+`anvil stop` restores your previous builder. With the remote driver,
+`docker build` needs `--load` to import the result into the image store
+(compose does this automatically on `compose build`). The classic
+`DOCKER_BUILDKIT=0 docker build` path works too.
 
 Host ports of published containers are forwarded to `localhost` automatically.
 
@@ -150,8 +157,10 @@ Key design points (the full rationale lives in
 ## Current limitations
 
 - Apple Silicon only; no amd64 emulation yet (Rosetta support is planned).
-- The default buildx `docker-container` driver does not work — use
-  `DOCKER_BUILDKIT=0` (classic builder) for `docker build` / `compose build`.
+- With the remote buildx driver, plain `docker build` keeps the result in the
+  build cache — add `--load` to import it into the image store (compose does
+  this automatically). The buildx `docker-container` driver (which pulls a
+  moby/buildkit image) does not work.
 - Docker API is emulated, not complete: it covers what `docker` CLI and
   `docker compose` actually use. Swarm, plugins and some prune endpoints are
   out of scope.

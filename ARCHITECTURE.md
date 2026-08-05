@@ -100,6 +100,8 @@ Unix socket `~/.anvil-vz/control.sock`. Принимает length-prefixed JSON 
 
 Unix socket `~/.anvil-vz/docker.sock`. Принимает HTTP от Docker CLI, убирает префикс `/v1.XX`, пересылает raw bytes в vsock:1025, где работает HTTP-сервер guest-agent. Ответ возвращается обратно без парсинга протокола.
 
+Тот же класс (`DockerProxyServer` с параметром порта) обслуживает `~/.anvil-vz/buildkit.sock` → vsock:1026: сырой TCP-мост к unix-сокету buildkitd в госте. На него указывает buildx builder `anvil-remote` (remote driver), который создаётся/восстанавливается при старте демона (`anvil-service.sh` + `main.swift`). Через него работают `docker buildx build` и `docker compose build` без промежуточного buildkit-контейнера. buildkitd в госте стартует лениво — guest-agent поднимает его при первом подключении к порту 1026 или первом `nerdctl build`.
+
 ### 3.4 PortForwarder
 
 Guest-agent сканирует запущенные контейнеры и пушит в `vz-runner` полный список port mappings. `PortForwarder`:
@@ -143,6 +145,11 @@ HTTP/1.1 сервер, эмулирует подмножество Docker API, �
 - Docker container ID — детерминированный `sha256(namespace + "/" + containerdID)[:64]`, чтобы ID не менялся между сессиями.
 - `POST /containers/{id}/wait` отправляет HTTP-заголовки сразу (chunked encoding) и только потом блокируется до выхода контейнера. Это нужно, потому что Docker CLI вызывает `/wait` до `/start`, и если ответ не начать сразу, следующий `/start` встаёт в очередь на том же соединении и контейнер никогда не стартует.
 - `HostConfig.AutoRemove` не передаётся в `nerdctl create --rm`. Вместо этого guest-agent сам удаляет контейнер после того, как сохранил exit code, иначе `docker run --rm` не мог бы вернуть ненулевой код возврата.
+- На hijacked exec/attach-соединении stdin клиента — всегда сырой байтовый поток (мультиплексируется только вывод). Его нужно форвардить в процесс как есть: buildx docker-container driver гоняет gRPC через `buildctl dial-stdio` по этому каналу. При этом `cmd.Wait()` ждёт и копирование stdin, поэтому stdin-pipe закрывается по EOF выходных потоков — иначе клиент, держащий соединение открытым (buildx), дедлокает exec.
+
+### 4.3a buildkit bridge (порт 1026)
+
+`buildkit.go`: raw TCP-мост vsock:1026 ↔ `/run/buildkit/buildkitd.sock`. Первое входящее подключение (или `POST /build`) лениво стартует `buildkitd`. Порт проброшен на хост как `~/.anvil-vz/buildkit.sock` (см. §3.3).
 
 ### 4.4 Port scanner
 

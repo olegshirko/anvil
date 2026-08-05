@@ -9,6 +9,7 @@ import Virtualization
 /// The guest-agent implements the actual Docker REST endpoints.
 final class DockerProxyServer {
     private let socketPath: String
+    private let port: UInt32
     private let deviceProvider: () -> VZVirtioSocketDevice?
     private let resumeProvider: () -> Void
     private let debug: Bool
@@ -18,8 +19,9 @@ final class DockerProxyServer {
     var onClientConnect: (() -> Void)?
     var onClientDisconnect: (() -> Void)?
 
-    init(socketPath: String, deviceProvider: @escaping () -> VZVirtioSocketDevice?, resumeProvider: @escaping () -> Void = {}, debug: Bool = false) {
+    init(socketPath: String, port: UInt32 = dockerAPIPort, deviceProvider: @escaping () -> VZVirtioSocketDevice?, resumeProvider: @escaping () -> Void = {}, debug: Bool = false) {
         self.socketPath = socketPath
+        self.port = port
         self.deviceProvider = deviceProvider
         self.resumeProvider = resumeProvider
         self.debug = debug
@@ -121,7 +123,7 @@ final class DockerProxyServer {
         while vsockConn == nil, Date() < deadline {
             let sem = DispatchSemaphore(value: 0)
             DispatchQueue.main.async {
-                device.connect(toPort: dockerAPIPort) { result in
+                device.connect(toPort: self.port) { result in
                     if case .success(let conn) = result {
                         vsockConn = conn
                     }

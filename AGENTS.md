@@ -13,14 +13,17 @@ Docker-контейнеров на macOS (только Apple Silicon). Сист�
 - **`vz-runner`** (Swift, `Sources/vz-runner/`) — единственный долгоживущий
   host-процесс. Управляет Linux VM через `Virtualization.framework`
   (snapshot/resume, virtiofs, NAT-сеть), открывает unix-сокеты
-  `~/.anvil-vz/control.sock` (control plane) и `~/.anvil-vz/docker.sock`
-  (прокси Docker API), форвардит порты контейнеров на `localhost`.
+  `~/.anvil-vz/control.sock` (control plane), `~/.anvil-vz/docker.sock`
+  (прокси Docker API) и `~/.anvil-vz/buildkit.sock` (прокси buildkit API
+  для buildx remote driver), форвардит порты контейнеров на `localhost`.
 - **`guest-agent`** (Go, `guest-agent/`) — PID 1 внутри VM. Слушает vsock
   (порт 1024 — length-prefixed JSON control channel, порт 1025 — эмуляция
-  Docker API для `docker`/`docker compose`), сканирует containerd и пушит
+  Docker API для `docker`/`docker compose`, порт 1026 — мост к unix-сокету
+  buildkitd для buildx remote driver), сканирует containerd и пушит
   port mappings в vz-runner, запускает healthcheck'и, генерирует CNI-конфиги.
   Внутри VM работают containerd + nerdctl + runc + CNI plugins; systemd и SSH
-  нет.
+  нет. buildkitd стартует лениво — при первом подключении к порту 1026 или
+  первом `nerdctl build`.
 
 Пользователь работает обычным Docker CLI: `docker context use anvil` указывает
 на `~/.anvil-vz/docker.sock`, дальше HTTP-трафик проксируется в guest-agent
@@ -109,7 +112,8 @@ Docker-контейнеров на macOS (только Apple Silicon). Сист�
   control server, reaper зомби), `dockerapi.go` (HTTP-маршруты),
   `containers.go`, `images.go`, `networks.go`, `volumes.go`, `exec.go`,
   `archive.go`, `healthcheck.go`, `scanner.go` (port scanner/pusher),
-  `info.go`, `utils.go`.
+  `buildkit.go` (vsock:1026 bridge к buildkitd + ленивый старт),
+  `build.go` (`/build` через nerdctl), `info.go`, `utils.go`.
 - `scripts/` — сборка initramfs и сервисная обвязка
   (`build_initramfs_containerd.sh` — основной, внутри него `stage2.sh` и
   `myinit` генерируются inline).

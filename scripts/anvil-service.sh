@@ -228,6 +228,24 @@ cmd_start() {
     echo "[anvil-service] switching docker context to anvil..."
     docker context use anvil >/dev/null
 
+    # Point buildx at the in-VM buildkitd via the remote driver so plain
+    # `docker build` works without DOCKER_BUILDKIT=0. The previously selected
+    # builder is saved and restored on stop (same pattern as docker context).
+    if command -v docker >/dev/null && docker buildx version >/dev/null 2>&1; then
+        local current_builder
+        current_builder="$(docker buildx inspect 2>/dev/null | sed -n 's/^Name:\s*//p' | head -1)"
+        if [[ "$current_builder" != "anvil-remote" ]]; then
+            echo "${current_builder:-default}" > "$STATE_DIR/previous-buildx-builder"
+        fi
+        # Missing or wrong driver (stale docker-container builder): recreate.
+        if ! docker buildx inspect anvil-remote 2>/dev/null | grep -q 'Driver:.*remote'; then
+            docker buildx rm -f anvil-remote >/dev/null 2>&1 || true
+            docker buildx create --name anvil-remote --driver remote \
+                "unix://$STATE_DIR/buildkit.sock" >/dev/null 2>&1 || true
+        fi
+        docker buildx use anvil-remote >/dev/null 2>&1 || true
+    fi
+
     echo "[anvil-service] ready (pid $(cat "$PID_FILE"))"
 }
 
@@ -261,6 +279,18 @@ cmd_stop() {
         echo "[anvil-service] restoring docker context to $target..."
         docker context use "$target" >/dev/null 2>&1 || true
         rm -f "$PREV_CONTEXT_FILE"
+    fi
+
+    # Restore the previously selected buildx builder if we switched it.
+    local current_builder
+    current_builder="$(docker buildx inspect 2>/dev/null | sed -n 's/^Name:\s*//p' | head -1)"
+    if [[ "$current_builder" == "anvil-remote" ]]; then
+        local prev_builder="default"
+        if [[ -f "$STATE_DIR/previous-buildx-builder" ]]; then
+            prev_builder="$(cat "$STATE_DIR/previous-buildx-builder")"
+        fi
+        docker buildx use "$prev_builder" >/dev/null 2>&1 || true
+        rm -f "$STATE_DIR/previous-buildx-builder"
     fi
 }
 

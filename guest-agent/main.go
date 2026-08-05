@@ -103,6 +103,9 @@ func main() {
 	// channel stays untouched.
 	go runDockerAPIServer()
 
+	// Buildkit bridge for the buildx remote driver (lazy buildkitd start).
+	go serveBuildkitBridge()
+
 	l, err := vsock.Listen(listenPort, nil)
 	if err != nil {
 		log.Fatalf("listen: %v", err)

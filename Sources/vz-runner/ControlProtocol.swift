@@ -2,11 +2,13 @@ import Foundation
 
 let controlPort: UInt32 = 1024
 let dockerAPIPort: UInt32 = 1025
+let buildkitAPIPort: UInt32 = 1026
 let stateDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".anvil-vz", isDirectory: true)
 let stateFile = stateDir.appendingPathComponent("run.json")
 let controlSocketPath = stateDir.appendingPathComponent("control.sock").path
 let dockerSocketPath = stateDir.appendingPathComponent("docker.sock").path
+let buildkitSocketPath = stateDir.appendingPathComponent("buildkit.sock").path
 
 struct RunState: Codable {
     let pid: Int32

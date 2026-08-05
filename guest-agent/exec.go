@@ -245,15 +245,11 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	if spec.AttachStdin || spec.Tty {
 		cmd.Stdin = stdinPipe
 		go func() {
-			// In TTY mode the client sends raw bytes; in non-TTY mode it sends
-			// multiplexed frames. For the first implementation we forward raw
-			// bytes only in TTY mode and discard stdin otherwise to avoid sending
-			// Docker frame headers to the container process.
-			if spec.Tty {
-				io.Copy(stdinWriter, conn)
-			} else {
-				io.Copy(io.Discard, conn)
-			}
+			// Docker's hijacked attach protocol: client->server stdin is a raw
+			// byte stream in both TTY and non-TTY modes (only the output
+			// direction is multiplexed), so forward it verbatim. buildx's
+			// `buildctl dial-stdio` relies on this bidirectional pipe.
+			io.Copy(stdinWriter, conn)
 			stdinWriter.Close()
 		}()
 	} else {
@@ -325,6 +321,18 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	go stream(stdout, 1)
 	go scanStderr(stderr)
 
+	// os/exec's Wait also blocks on the internal goroutine copying our stdin
+	// pipe into the child, which only ends when stdinWriter is closed. That
+	// normally happens on client disconnect, but clients like buildx keep the
+	// hijacked connection open while waiting for output — deadlocking Wait.
+	// Output EOF means the process exited, so close stdin at that point.
+	stdinDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		stdinWriter.Close()
+		close(stdinDone)
+	}()
+
 	exitCode := 0
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -340,7 +348,7 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	spec.setExit(exitCode)
 
-	wg.Wait()
+	<-stdinDone
 	bufrw.Flush()
 	time.Sleep(50 * time.Millisecond)
 }

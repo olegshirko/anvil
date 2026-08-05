@@ -176,17 +176,22 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
 
 ## 3. Функциональность
 
-1. **~~`docker build`~~ — сделано (классический путь).** В initramfs добавлен
-   buildkitd (v0.32.2) + buildctl; guest-agent реализует классический
-   `POST /build`: контекст распаковывается на persistent-диск
+1. **~~`docker build`~~ — сделано (классический путь + buildx remote
+   driver).** В initramfs добавлен buildkitd (v0.32.2) + buildctl (buildctl
+   нужен: nerdctl build вызывает его как subprocess); guest-agent реализует
+   классический `POST /build`: контекст распаковывается на persistent-диск
    (`/var/lib/anvil-build`), сборка через `nerdctl build`, прогресс — JSON
-   stream как у Docker. Работает `DOCKER_BUILDKIT=0 docker build` и
-   `DOCKER_BUILDKIT=0 docker compose build` (проверено: build→run по
-   короткому имени, compose build→up→logs).
+   stream как у Docker. buildkitd стартует лениво при первом билде (экономия
+   ~50 МБ RSS). Дополнительно buildkitd-сокет проброшен на хост:
+   `~/.anvil-vz/buildkit.sock` → vsock:1026 → `/run/buildkit/buildkitd.sock`;
+   `anvil start` создаёт buildx builder `anvil-remote` (remote driver) и делает его
+   активным (предыдущий builder сохраняется и восстанавливается на stop) —
+   дефолтный `docker build` (buildx) работает из коробки; для импорта в
+   image store нужен `--load` (compose делает это сам).
    Ограничения:
-   - Дефолтный buildx docker-container драйвер НЕ работает: buildx тянет
+   - buildx docker-container драйвер НЕ работает: buildx тянет
      moby/buildkit как контейнер и копирует файлы через `nerdctl cp`, а в
-     образе нет tar. Нужен `DOCKER_BUILDKIT=0` (или alias).
+     образе нет tar. Используется remote driver (либо `DOCKER_BUILDKIT=0`).
    - Попутно исправлено: `canonicalizeImageRef` не добавлял `:latest` к
      именам без тега (`docker run myimg` → мимо локального образа → pull);
      GNU tar в initramfs теперь из Alpine apk (musl), а не из build-VM

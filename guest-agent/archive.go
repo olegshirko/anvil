@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -170,6 +171,27 @@ func createContainerTar(ns, containerdID, srcPath string) (string, error) {
 
 // extractTarIntoContainer copies the host tar into the container and extracts it.
 func extractTarIntoContainer(ns, containerdID, hostTar, dstPath string) error {
+	if !isNerdctlContainerRunning(ns, containerdID) {
+		// nerdctl exec needs a running task, while nerdctl cp also works on
+		// stopped/created containers: extract the tar on the guest and copy
+		// the payload into the container rootfs. The buildx docker-container
+		// driver relies on this when it stages files into its buildkit
+		// container before starting it.
+		tmpDir := "/tmp/anvil-cp-in-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+		if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+			return err
+		}
+		defer os.RemoveAll(tmpDir)
+		if out, err := exec.Command("/bin/tar", "-xf", hostTar, "-C", tmpDir).CombinedOutput(); err != nil {
+			return fmt.Errorf("guest tar extract failed: %s", stripANSI(string(out)))
+		}
+		stdout, stderr, code, err := runNerdctl(ns, "cp", tmpDir+"/.", containerdID+":"+dstPath)
+		if err != nil || code != 0 {
+			return fmt.Errorf("nerdctl cp failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+		}
+		return nil
+	}
+
 	tmpGuest := "/tmp/anvil-cp-in-" + strconv.FormatInt(time.Now().UnixNano(), 10) + ".tar"
 	stdout, stderr, code, err := runNerdctl(ns, "cp", hostTar, containerdID+":"+tmpGuest)
 	if err != nil || code != 0 {

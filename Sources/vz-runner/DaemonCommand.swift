@@ -134,6 +134,7 @@ enum DaemonCommand {
         let idleSeconds: TimeInterval
         private var server: ControlServer?
         private var dockerProxyServer: DockerProxyServer?
+        private var buildkitProxyServer: DockerProxyServer?
         private var portForwarder: PortForwarder?
         private var idleTimer: Timer?
         private var isShuttingDown = false
@@ -213,6 +214,7 @@ enum DaemonCommand {
                     guard let self = self else { return }
                     self.server?.stop()
                     self.dockerProxyServer?.stop()
+                    self.buildkitProxyServer?.stop()
                     self.portForwarder?.stop()
                     self.manager.stopAndSave {
                         releaseDaemonLock()
@@ -277,6 +279,34 @@ enum DaemonCommand {
             dockerProxy.start()
             self.dockerProxyServer = dockerProxy
             print("[anvil] docker proxy socket: \(dockerSocketPath)")
+
+            // Buildkit bridge: buildx remote driver talks to this socket;
+            // guest-agent forwards it to buildkitd (started lazily).
+            let buildkitProxy = DockerProxyServer(
+                socketPath: buildkitSocketPath,
+                port: buildkitAPIPort,
+                deviceProvider: { [weak manager] in manager?.socketDevice },
+                resumeProvider: { [weak manager] in
+                    let sem = DispatchSemaphore(value: 0)
+                    manager?.ensureRunning { result in
+                        if case .failure(let error) = result {
+                            print("[buildkit-proxy] resume request failed: \(error)")
+                        }
+                        sem.signal()
+                    }
+                    _ = sem.wait(timeout: .now() + .seconds(15))
+                },
+                debug: manager.args.debug
+            )
+            buildkitProxy.onClientConnect = {
+                tracker.connect()
+            }
+            buildkitProxy.onClientDisconnect = {
+                tracker.disconnect()
+            }
+            buildkitProxy.start()
+            self.buildkitProxyServer = buildkitProxy
+            print("[anvil] buildkit proxy socket: \(buildkitSocketPath)")
 
             let forwarder = PortForwarder { [weak manager] in manager?.socketDevice }
             forwarder.start()

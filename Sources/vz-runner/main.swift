@@ -27,6 +27,7 @@ if ProcessInfo.processInfo.environment["ANVIL_EXIT_ON_PARENT_DEATH"] == "1" {
 
 private let daemonPIDFile = stateDir.appendingPathComponent("daemon.pid")
 private let prevContextFile = stateDir.appendingPathComponent("previous-docker-context")
+private let prevBuilderFile = stateDir.appendingPathComponent("previous-buildx-builder")
 private let daemonLogFile = stateDir.appendingPathComponent("daemon.log")
 
 func isDaemonRunning() -> Bool {
@@ -58,7 +59,7 @@ func saveDockerContext() {
 
 func restoreDockerContext() {
     let current = shell("docker", "context", "show").trimmingCharacters(in: .whitespacesAndNewlines)
-    guard current == "anvil" else { return }
+    guard current == "anvil-remote" else { return }
     let target: String
     if let ctx = try? String(contentsOf: prevContextFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
        !ctx.isEmpty {
@@ -68,6 +69,49 @@ func restoreDockerContext() {
     }
     _ = shell("docker", "context", "use", target)
     try? FileManager.default.removeItem(at: prevContextFile)
+    restoreBuildxBuilder()
+}
+
+// MARK: - buildx integration
+
+func currentBuildxBuilder() -> String {
+    // `docker buildx inspect` without arguments shows the active builder.
+    let out = shell("docker", "buildx", "inspect")
+    for line in out.split(separator: "\n") {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("Name:") {
+            return String(t.dropFirst("Name:".count)).trimmingCharacters(in: .whitespaces)
+        }
+    }
+    return "default"
+}
+
+// Point buildx at the buildkitd instance inside the VM through the remote
+// driver, so plain `docker build` works without DOCKER_BUILDKIT=0. The
+// previously selected builder is saved and restored on `anvil stop`.
+func setupBuildxBuilder() {
+    guard !shell("docker", "buildx", "version").isEmpty else { return }
+    let current = currentBuildxBuilder()
+    if current != "anvil-remote" {
+        try? current.write(toFile: prevBuilderFile.path, atomically: true, encoding: .utf8)
+    }
+    let inspect = shell("docker", "buildx", "inspect", "anvil-remote")
+    if inspect.isEmpty || !inspect.contains("Driver:") || !inspect.contains("remote") {
+        // Missing, or a stale builder with the wrong driver (e.g. an older
+        // docker-container one) — recreate it against the buildkit socket.
+        _ = shell("docker", "buildx", "rm", "-f", "anvil-remote")
+        _ = shell("docker", "buildx", "create", "--name", "anvil-remote",
+                  "--driver", "remote", "unix://\(buildkitSocketPath)")
+    }
+    _ = shell("docker", "buildx", "use", "anvil-remote")
+}
+
+func restoreBuildxBuilder() {
+    guard currentBuildxBuilder() == "anvil-remote" else { return }
+    let saved = (try? String(contentsOf: prevBuilderFile, encoding: .utf8))?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    _ = shell("docker", "buildx", "use", saved.isEmpty ? "default" : saved)
+    try? FileManager.default.removeItem(at: prevBuilderFile)
 }
 
 func shell(_ args: String...) -> String {
@@ -104,6 +148,7 @@ func cmdStart(args: [String]) {
         _ = shell("docker", "context", "rm", "-f", "anvil")
         _ = shell("docker", "context", "create", "anvil", "--docker", "host=unix://\(dockerSocketPath)")
         _ = shell("docker", "context", "use", "anvil")
+        setupBuildxBuilder()
         return
     }
 
@@ -222,6 +267,7 @@ func cmdStart(args: [String]) {
     _ = shell("docker", "context", "rm", "-f", "anvil")
     _ = shell("docker", "context", "create", "anvil", "--docker", "host=unix://\(dockerSocketPath)")
     _ = shell("docker", "context", "use", "anvil")
+    setupBuildxBuilder()
     print("[anvil] ready (pid \(proc.processIdentifier))")
 }
 

@@ -603,9 +603,9 @@ while [ $i -lt 75 ]; do
     i=$((i + 1))
 done
 
-# buildkitd for `docker build` (nerdctl build connects to the default socket).
-mkdir -p /var/lib/buildkit
-/opt/containerd/bin/buildkitd > /tmp/buildkitd.log 2>&1 &
+# buildkitd is started lazily by guest-agent on the first build request
+# (classic /build or the vsock:1026 buildx bridge) — it idles at ~50 MB RSS,
+# so booting it here would tax every user, including those who never build.
 
 # Cold boot only: per-container nerdctl state (/var/lib/nerdctl) is persisted
 # on disk. Restored containerd metadata would reference missing or stale state

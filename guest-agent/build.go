@@ -92,6 +92,12 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[docker-api] build ctx=%s tags=%q", ctxDir, q.Get("t"))
 
+	// nerdctl build shells out to buildkitd, which is started lazily.
+	if err := ensureBuildkitd(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
 	cmd := exec.Command("/opt/containerd/bin/nerdctl", args...)
 	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
 	cmd.Dir = ctxDir
