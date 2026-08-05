@@ -21,11 +21,11 @@ struct SnapshotManager {
             && FileManager.default.fileExists(atPath: configHashURL.path)
     }
 
-    func configHashMatches(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?) -> Bool {
+    func configHashMatches(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?, usersSharePath: String?) -> Bool {
         guard let stored = try? String(contentsOf: configHashURL, encoding: .utf8) else {
             return false
         }
-        let components = configHashComponents(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory, containerdDiskPath: containerdDiskPath)
+        let components = configHashComponents(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory, containerdDiskPath: containerdDiskPath, usersSharePath: usersSharePath)
         let current = components.hash
         let storedClean = stored.trimmingCharacters(in: .whitespacesAndNewlines)
         print("[anvil] stored config hash: \(storedClean)")
@@ -35,8 +35,8 @@ struct SnapshotManager {
     }
 
     @discardableResult
-    func writeConfigHash(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?) -> Bool {
-        let components = configHashComponents(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory, containerdDiskPath: containerdDiskPath)
+    func writeConfigHash(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?, usersSharePath: String?) -> Bool {
+        let components = configHashComponents(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory, containerdDiskPath: containerdDiskPath, usersSharePath: usersSharePath)
         print("[anvil] writing config hash: \(components.hash)")
         print("[anvil] hash inputs -> kernel:\(components.kernelSHA) initrd:\(components.initrdSHA) cpus:\(components.cpus) memory:\(components.memory) disk:\(components.diskToken)")
         do {
@@ -57,11 +57,14 @@ struct SnapshotManager {
         let hash: String
     }
 
-    private func configHashComponents(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?) -> HashComponents {
+    private func configHashComponents(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?, usersSharePath: String?) -> HashComponents {
         let kernelSHA = sha256OfFile(kernel) ?? "missing"
         let initrdSHA = sha256OfFile(initrd) ?? "missing"
         let diskToken = diskToken(for: containerdDiskPath)
-        let input = "\(kernelSHA):\(initrdSHA):\(cpus):\(memory):\(diskToken)"
+        // The share set is part of the device configuration: restoring a snapshot
+        // with a different virtiofs device list fails, so invalidate on change.
+        let sharesToken = usersSharePath ?? "nousers"
+        let input = "\(kernelSHA):\(initrdSHA):\(cpus):\(memory):\(diskToken):\(sharesToken)"
         let hash = SHA256.hash(data: Data(input.utf8)).compactMap { String(format: "%02x", $0) }.joined()
         return HashComponents(kernelSHA: kernelSHA, initrdSHA: initrdSHA, cpus: cpus, memory: memory, diskToken: diskToken, hash: hash)
     }

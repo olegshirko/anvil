@@ -1,6 +1,24 @@
 import Foundation
 import Virtualization
 
+/// Virtiofs tag for the host /Users share.
+let usersShareTag = "macusers"
+
+/// Host directory shared into the guest at the same absolute path (/Users),
+/// so `docker run -v $HOME/...:/path` bind mounts work like on Docker
+/// Desktop / Lima. Disable with ANVIL_SHARE_USERS=0.
+func usersSharePath() -> String? {
+    if ProcessInfo.processInfo.environment["ANVIL_SHARE_USERS"] == "0" {
+        return nil
+    }
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: "/Users", isDirectory: &isDir),
+          isDir.boolValue else {
+        return nil
+    }
+    return "/Users"
+}
+
 struct BootArgs {
     var kernelPath: String
     var initrdPath: String
@@ -131,7 +149,10 @@ func makeConfiguration(
     let socketConfig = VZVirtioSocketDeviceConfiguration()
     config.socketDevices = [socketConfig]
 
-    // M2: virtiofs shared directory.
+    // M2: virtiofs shared directories: the anvil state share (/mnt/anvil in
+    // the guest) plus the host /Users tree at the same absolute path, so
+    // bind mounts of macOS paths work unchanged.
+    var sharingDevices: [VZVirtioFileSystemDeviceConfiguration] = []
     if let sharePath = args.sharePath {
         let sharedDirectory = VZSharedDirectory(
             url: URL(fileURLWithPath: sharePath),
@@ -139,8 +160,18 @@ func makeConfiguration(
         )
         let fsConfig = VZVirtioFileSystemDeviceConfiguration(tag: args.mountTag)
         fsConfig.share = VZSingleDirectoryShare(directory: sharedDirectory)
-        config.directorySharingDevices = [fsConfig]
+        sharingDevices.append(fsConfig)
     }
+    if let usersPath = usersSharePath() {
+        let sharedDirectory = VZSharedDirectory(
+            url: URL(fileURLWithPath: usersPath),
+            readOnly: false
+        )
+        let fsConfig = VZVirtioFileSystemDeviceConfiguration(tag: usersShareTag)
+        fsConfig.share = VZSingleDirectoryShare(directory: sharedDirectory)
+        sharingDevices.append(fsConfig)
+    }
+    config.directorySharingDevices = sharingDevices
 
     // M5: vzNAT network device. The MAC address must be stable across
     // save/restore, otherwise restore fails with invalid argument.

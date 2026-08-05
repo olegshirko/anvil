@@ -500,6 +500,12 @@ mountpoint -q /sys/fs/cgroup || mount -t cgroup2 cgroup2 /sys/fs/cgroup
 mkdir -p /mnt/anvil
 mountpoint -q /mnt/anvil || mount -t virtiofs anvil /mnt/anvil 2>/dev/null || true
 
+# Host /Users tree at the same absolute path, so docker -v /Users/...:...
+# bind mounts work unchanged (like Docker Desktop / Lima). Absent when the
+# host disabled it (ANVIL_SHARE_USERS=0).
+mkdir -p /Users
+mountpoint -q /Users || mount -t virtiofs macusers /Users 2>/dev/null || true
+
 # Persistent state: mount the virtio-blk disk (or virtiofs share) over /var/lib
 # so both containerd root (/var/lib/containerd) and nerdctl metadata/volumes
 # (/var/lib/nerdctl) survive reboots and resume, instead of filling tmpfs root.

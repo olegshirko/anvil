@@ -40,6 +40,7 @@ type dockerCreateRequest struct {
 
 type dockerHostConfig struct {
 	Binds           []string                    `json:"Binds"`
+	Mounts          []dockerMount               `json:"Mounts"`
 	NetworkMode     string                      `json:"NetworkMode"`
 	PortBindings    map[string][]dockerHostPort `json:"PortBindings"`
 	RestartPolicy   dockerRestartPolicy         `json:"RestartPolicy"`
@@ -51,6 +52,13 @@ type dockerHostConfig struct {
 type dockerHostPort struct {
 	HostIp   string `json:"HostIp"`
 	HostPort string `json:"HostPort"`
+}
+
+type dockerMount struct {
+	Type     string `json:"Type"`
+	Source   string `json:"Source"`
+	Target   string `json:"Target"`
+	ReadOnly bool   `json:"ReadOnly"`
 }
 
 type dockerRestartPolicy struct {
@@ -466,6 +474,24 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 		args = append(args, "--restart", req.HostConfig.RestartPolicy.Name)
 	}
 
+	// Bind mounts and named volumes. Host paths under /Users are visible in
+	// the guest at the same absolute path via the "macusers" virtiofs share,
+	// so binds pass through unchanged (like Docker Desktop). Paths outside
+	// the shared trees refer to the guest's own filesystem.
+	for _, bind := range req.HostConfig.Binds {
+		args = append(args, "-v", bind)
+	}
+	for _, m := range req.HostConfig.Mounts {
+		if m.Type == "tmpfs" || m.Source == "" || m.Target == "" {
+			continue
+		}
+		spec := m.Source + ":" + m.Target
+		if m.ReadOnly {
+			spec += ":ro"
+		}
+		args = append(args, "-v", spec)
+	}
+
 	// Port bindings: containerPort/proto -> [{HostIp, HostPort}]
 	for cportSpec, hostPorts := range req.HostConfig.PortBindings {
 		proto := "tcp"
@@ -770,6 +796,24 @@ func deleteDockerContainer(id string, force bool) error {
 	stopHealthCheck(did)
 	unmarkAutoRemove(did)
 	takeContainerExitCode(did)
+	return nil
+}
+
+// renameDockerContainer implements POST /containers/{id}/rename. Compose
+// uses it in the recreate flow: the replacement is created under a temporary
+// name and renamed once the old container is removed.
+func renameDockerContainer(id string, newName string) error {
+	ns, _, name, err := resolveDockerID(id)
+	if err != nil {
+		return err
+	}
+	if newName == "" {
+		return fmt.Errorf("name is required")
+	}
+	stdout, stderr, code, err := runNerdctl(ns, "rename", name, newName)
+	if err != nil || code != 0 {
+		return fmt.Errorf("nerdctl rename failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	}
 	return nil
 }
 

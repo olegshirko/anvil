@@ -158,7 +158,8 @@ final class VMLifecycleManager: NSObject {
                 initrd: self.args.initrdPath,
                 cpus: self.args.cpuCount,
                 memory: self.args.memoryGiB,
-                containerdDiskPath: self.args.containerdDiskPath
+                containerdDiskPath: self.args.containerdDiskPath,
+                usersSharePath: usersSharePath()
             )
             print("[anvil] snapshot saved in \(String(format: "%.3f", duration))s")
             completion?(nil)
@@ -193,7 +194,8 @@ final class VMLifecycleManager: NSObject {
                 initrd: self.args.initrdPath,
                 cpus: self.args.cpuCount,
                 memory: self.args.memoryGiB,
-                containerdDiskPath: self.args.containerdDiskPath
+                containerdDiskPath: self.args.containerdDiskPath,
+                usersSharePath: usersSharePath()
             )
             print("[anvil] snapshot exists=\(self.snapshot.hasSnapshot) hashMatches=\(hashMatches)")
 
@@ -243,7 +245,8 @@ final class VMLifecycleManager: NSObject {
             initrd: args.initrdPath,
             cpus: args.cpuCount,
             memory: args.memoryGiB,
-            containerdDiskPath: args.containerdDiskPath
+            containerdDiskPath: args.containerdDiskPath,
+            usersSharePath: usersSharePath()
         )
         let canRestore = args.useAgent
             && !args.fresh

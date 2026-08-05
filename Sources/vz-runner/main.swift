@@ -374,6 +374,8 @@ func printUsage() {
       anvil daemon [--kernel <path>] [--initrd <path>] [--share <path>]
       anvil boot --kernel <path> --initrd <path> [--agent]
       anvil exec <command> [args...]
+      anvil doctor
+      anvil logs [daemon|console|guest]
       anvil docker-socket-path
 
     Service commands:
@@ -427,6 +429,10 @@ case "exec":
         exit(1)
     }
     ControlClient.exec(command: cmdArgs)
+case "doctor":
+    cmdDoctor()
+case "logs":
+    cmdLogs(args: Array(arguments.dropFirst()))
 case "docker-socket-path":
     print(dockerSocketPath)
     exit(0)

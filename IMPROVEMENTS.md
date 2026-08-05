@@ -194,8 +194,18 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
    - `/build/prune` по-прежнему заглушка.
 2. **Rosetta для x86_64** (`VZRosettaDirectoryShare`, macOS 13+) — запуск
    amd64-образов почти нативно, как у Lima.
-3. **Bind-mounts произвольных host-путей** — сейчас один virtiofs share.
-   Список дополнительных шар в `VMConfig` (учесть инвалидацию снапшота).
+3. **~~Bind-mounts произвольных host-путей~~ — сделано.** vz-runner
+   шарит host-директорию `/Users` вторым virtiofs-устройством (tag
+   `macusers`), stage2 монтирует её в госте по тому же абсолютному пути
+   `/Users` — `docker run -v $HOME/proj:/data` и compose `volumes:` с
+   относительными путями работают без переписывания путей, как в Docker
+   Desktop. Отключается `ANVIL_SHARE_USERS=0`. Набор шар входит в хеш
+   снапшота (добавление устройства ломает restore) → один cold boot после
+   апгрейда. Попутно: guest-agent раньше молча игнорировал
+   `HostConfig.Binds`/`Mounts` — теперь пробрасывает в `nerdctl -v`
+   (включая named volumes); реализован `GET /events` (стрим task-events
+   containerd в формате Docker: create/start/die с exitCode/destroy),
+   без него `docker compose up` получал 404.
 4. **Догнать заглушки**: dangling images prune и build cache prune возвращают
    пустое (`dockerapi.go:447,457`).
 
@@ -215,8 +225,11 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
 
 ## 5. DX и релиз
 
-1. **`anvil doctor` / `anvil logs`** — проверка entitlement, состояния
-   снапшота, docker context, портов; доступ к логам одной командой.
+1. ~~**`anvil doctor` / `anvil logs`**~~ — сделано: `doctor` проверяет
+   гипервизор, entitlement, наличие kernel/initramfs/диска, свободное место,
+   демон, docker context и ответ API на `/_ping`, шару `/Users`
+   (exit code ≠ 0 при ошибках); `logs [daemon|console|guest]` показывает
+   хвосты логов одной командой.
 2. **Ротация `guest-agent.log`** — в debug-режиме растёт без ограничений.
 3. **Developer ID + нотаризация** — сейчас `spctl` отклоняет бинарник;
    для brew неважно, но ручное скачивание tarball упирается в Gatekeeper.

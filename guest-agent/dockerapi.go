@@ -322,6 +322,7 @@ func runDockerAPIServer() {
 		execCreateID, isExecCreate := containerSubresource("/containers/", "/exec")
 		killID, isKill := containerSubresource("/containers/", "/kill")
 		restartID, isRestart := containerSubresource("/containers/", "/restart")
+		renameID, isRename := containerSubresource("/containers/", "/rename")
 		archiveID, isArchive := containerSubresource("/containers/", "/archive")
 		execStartID, isExecStart := containerSubresource("/exec/", "/start")
 		execInspectID, isExecInspect := containerSubresource("/exec/", "/json")
@@ -468,6 +469,8 @@ func runDockerAPIServer() {
 			})
 		case path == "/images/load" && r.Method == http.MethodPost:
 			handleImageLoad(w, r)
+		case path == "/events" && r.Method == http.MethodGet:
+			handleEvents(w, r)
 		case path == "/build" && r.Method == http.MethodPost:
 			handleBuild(w, r)
 		case path == "/images/get" && r.Method == http.MethodGet:
@@ -638,6 +641,13 @@ func runDockerAPIServer() {
 			w.WriteHeader(http.StatusNoContent)
 		case isWait && r.Method == http.MethodPost:
 			handleContainerWait(w, r, waitID)
+		case isRename && r.Method == http.MethodPost:
+			newName := strings.TrimPrefix(r.URL.Query().Get("name"), "/")
+			if err := renameDockerContainer(renameID, newName); err != nil {
+				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 		case isAttach && r.Method == http.MethodPost:
 			handleAttach(w, r, attachID)
 		case isLogs && r.Method == http.MethodGet:
