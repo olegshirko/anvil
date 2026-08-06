@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -111,4 +112,28 @@ func proxyBuildkitConn(conn net.Conn) {
 		}
 	}()
 	io.Copy(conn, target)
+}
+
+// pruneBuildCache drops the whole buildkit cache and returns the reclaimed
+// bytes. It deliberately does not start buildkitd just to prune: without a
+// running daemon there is no cache to reclaim.
+func pruneBuildCache() (int64, error) {
+	if !buildkitUp() {
+		return 0, nil
+	}
+	cmd := exec.Command("/opt/containerd/bin/buildctl", "--addr", "unix://"+buildkitSocket, "prune")
+	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("buildctl prune: %v: %s", err, stripANSI(string(out)))
+	}
+	// buildctl prune ends with a "Total: <size>" summary line.
+	var reclaimed int64
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Total:") {
+			reclaimed = parseHumanSize(strings.TrimSpace(strings.TrimPrefix(line, "Total:")))
+		}
+	}
+	return reclaimed, nil
 }

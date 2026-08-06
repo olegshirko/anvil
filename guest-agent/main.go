@@ -58,6 +58,7 @@ type PortMapState struct {
 
 func main() {
 	log.SetPrefix("[guest-agent] ")
+	setupDebugLogRotation()
 
 	if len(os.Args) > 1 && os.Args[1] == "cni-gen" {
 		ns := "default"

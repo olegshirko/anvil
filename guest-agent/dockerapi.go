@@ -460,12 +460,20 @@ func runDockerAPIServer() {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode([]map[string]string{{"Deleted": rmiName}})
 		case path == "/images/prune" && r.Method == http.MethodPost:
-			// Dangling image prune is not implemented; return empty so docker system prune
-			// does not fail with 404.
+			filters := parseDockerFilters(r.URL.Query().Get("filters"))
+			dangling := true
+			if filters["dangling"]["false"] {
+				dangling = false
+			}
+			deleted, reclaimed, err := pruneDockerImages(dangling)
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"ImagesDeleted":  []string{},
-				"SpaceReclaimed": 0,
+				"ImagesDeleted":  deleted,
+				"SpaceReclaimed": reclaimed,
 			})
 		case path == "/images/load" && r.Method == http.MethodPost:
 			handleImageLoad(w, r)
@@ -478,12 +486,15 @@ func runDockerAPIServer() {
 		case isGet && r.Method == http.MethodGet:
 			handleImageGet(w, r, getName)
 		case path == "/build/prune" && r.Method == http.MethodPost:
-			// Build cache prune is not implemented; return empty so docker system prune
-			// does not fail with 404.
+			reclaimed, err := pruneBuildCache()
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"CachesDeleted":  []string{},
-				"SpaceReclaimed": 0,
+				"SpaceReclaimed": reclaimed,
 			})
 		case isImageInspect && r.Method == http.MethodGet:
 			log.Printf("[docker-api] image inspect %q (resolved ns=%q)", imageInspectName, findImageNamespace(imageInspectName))

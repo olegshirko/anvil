@@ -98,9 +98,9 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
 3. **~~Права на сокеты и state-директорию~~ — сделано.** `control.sock` и
    `docker.sock` — 0600, `~/.anvil-vz` — 0700, `containerd-disk.img` — 0600
    (chmod после bind/создания, применяется при каждом старте).
-4. **Устаревший комментарий в Makefile** (target `prune`): «docker run --rm
-   is not yet implemented» — AutoRemove давно реализован
-   (`guest-agent/containers.go:489`).
+4. ~~**Устаревший комментарий в Makefile** (target `prune`): «docker run --rm
+   is not yet implemented»~~ — уже вычищен при одной из итераций; AutoRemove
+   давно реализован (`guest-agent/containers.go:489`).
 5. **~~Флаки первого `docker run` после холодного старта~~ — исправлено.**
    Корень был не в «первом запросе», а в `--rm`: AutoRemove удалял контейнер
    (и его json-file логи) сразу после выхода, пока attach ещё реплеил вывод
@@ -210,8 +210,12 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
    (включая named volumes); реализован `GET /events` (стрим task-events
    containerd в формате Docker: create/start/die с exitCode/destroy),
    без него `docker compose up` получал 404.
-4. **Догнать заглушки**: dangling images prune и build cache prune возвращают
-   пустое (`dockerapi.go:447,457`).
+4. ~~**Догнать заглушки**: dangling images prune и build cache prune~~ —
+   сделано. `/images/prune` удаляет dangling-образы по умолчанию и все
+   неиспользуемые при `dangling=false` (`docker system prune -a`), считает
+   SpaceReclaimed по размерам из `listDockerImages`. `/build/prune` гоняет
+   `buildctl prune` по buildkit-сокету (buildkitd при этом НЕ стартует — нет
+   демона, нет и кеша) и парсит reclaimed из строки `Total:`.
 
 ## 4. Тесты и CI
 
@@ -234,7 +238,11 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
    демон, docker context и ответ API на `/_ping`, шару `/Users`
    (exit code ≠ 0 при ошибках); `logs [daemon|console|guest]` показывает
    хвосты логов одной командой.
-2. **Ротация `guest-agent.log`** — в debug-режиме растёт без ограничений.
+2. ~~**Ротация `guest-agent.log`**~~ — сделано: в debug-режиме guest-agent
+   сам управляет файлом на шаре (`logrotate.go`): dup3 stdout/stderr на
+   свой дескриптор и ротация по размеру — при превышении 50 МиБ текущий лог
+   уходит в `guest-agent.log.1` (один бэкап), проверка раз в минуту. Максимум
+   на хосте ~100 МиБ независимо от длины debug-сессии.
 3. **Developer ID + нотаризация** — сейчас `spctl` отклоняет бинарник;
    для brew неважно, но ручное скачивание tarball упирается в Gatekeeper.
    Требует платного Apple Developer.

@@ -480,6 +480,56 @@ func removeDockerImage(name string) error {
 	return nil
 }
 
+// pruneDockerImages removes images and returns Docker's /images/prune
+// response shape. With dangling=true only untagged images go; with
+// dangling=false (`docker system prune -a`) every image not referenced by a
+// container goes.
+func pruneDockerImages(dangling bool) ([]map[string]string, int64, error) {
+	images, err := listDockerImages()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	used := map[string]bool{}
+	if containers, err := listDockerContainers(nil); err == nil {
+		for _, c := range containers {
+			if c.Image != "" {
+				used[c.Image] = true
+			}
+			if c.ImageID != "" {
+				used[c.ImageID] = true
+			}
+		}
+	}
+
+	deleted := []map[string]string{}
+	var reclaimed int64
+	for _, img := range images {
+		tag := ""
+		if len(img.RepoTags) > 0 {
+			tag = img.RepoTags[0]
+		}
+		isDangling := tag == "" || strings.HasPrefix(tag, "<none>")
+		if dangling && !isDangling {
+			continue
+		}
+		if !dangling && used[tag] {
+			continue
+		}
+		ref := tag
+		if isDangling {
+			ref = img.Id
+		}
+		if err := removeDockerImage(ref); err != nil {
+			log.Printf("[docker-api] prune image %s: %v", ref, err)
+			continue
+		}
+		deleted = append(deleted, map[string]string{"Deleted": img.Id})
+		reclaimed += img.Size
+	}
+	return deleted, reclaimed, nil
+}
+
 // inspectDockerImage returns a Docker-compatible image inspect payload,
 // searching all namespaces for the image.
 func inspectDockerImage(name string) (map[string]interface{}, error) {
