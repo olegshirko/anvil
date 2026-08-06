@@ -188,14 +188,13 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
    активным (предыдущий builder сохраняется и восстанавливается на stop) —
    дефолтный `docker build` (buildx) работает из коробки; для импорта в
    image store нужен `--load` (compose делает это сам).
+   Работают оба пути: remote driver (`docker buildx build`) и
+   docker-container driver (голый `docker build` на desktop CLI тянет
+   moby/buildkit как контейнер — для этого починены `PUT
+   /containers/{id}/archive` на остановленном контейнере и два бага stdin в
+   exec: дедлок `cmd.Wait()` и выброшенный stdin, ломавший `buildctl
+   dial-stdio`).
    Ограничения:
-   - buildx docker-container драйвер НЕ работает: buildx тянет
-     moby/buildkit как контейнер и копирует файлы через `nerdctl cp`, а в
-     образе нет tar. Используется remote driver (либо `DOCKER_BUILDKIT=0`).
-   - Попутно исправлено: `canonicalizeImageRef` не добавлял `:latest` к
-     именам без тега (`docker run myimg` → мимо локального образа → pull);
-     GNU tar в initramfs теперь из Alpine apk (musl), а не из build-VM
-     (glibc tar из Ubuntu не запускался).
    - `/build/prune` по-прежнему заглушка.
 2. **Rosetta для x86_64** (`VZRosettaDirectoryShare`, macOS 13+) — запуск
    amd64-образов почти нативно, как у Lima.
