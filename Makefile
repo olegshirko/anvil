@@ -447,8 +447,13 @@ update-brew:
 	@echo "[update-brew] downloading tar.gz and computing sha256..."
 	@SHA_TAR=$$(curl -sL "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz" | shasum -a 256 | cut -d' ' -f1); \
 		echo "[update-brew] sha256=$$SHA_TAR"; \
+		perl -0pi -e 's/\n  bottle do\n.*?  end\n/\n/s' "$(HOMEBREW_TAP_DIR)/anvil.rb"; \
 		sed -i '' 's|version ".*"|version "$(VERSION)"|' "$(HOMEBREW_TAP_DIR)/anvil.rb"; \
 		sed -i '' 's|url ".*anvil-darwin-arm64.tar.gz"|url "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz"|' "$(HOMEBREW_TAP_DIR)/anvil.rb"; \
 		sed -i '' 's|sha256 ".*"|sha256 "'$$SHA_TAR'"|' "$(HOMEBREW_TAP_DIR)/anvil.rb"; \
 		cd "$(HOMEBREW_TAP_DIR)" && git add anvil.rb && git commit -m "v$(VERSION)" && git push; \
-		echo "[update-brew] done."
+		echo "[update-brew] done. Run 'make bottle VERSION=$(VERSION)' to build and publish a bottle."
+
+bottle:
+	@test -n "$(VERSION)" || { echo "Usage: make bottle VERSION=x.y.z"; exit 1; }
+	scripts/make_bottle.sh "$(VERSION)" "$(HOMEBREW_TAP_DIR)"

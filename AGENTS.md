@@ -173,6 +173,11 @@ CI — `.github/workflows/go.yml` (macos-15): проверка сборки на
 при пуше тега `v*` — сборка, codesign, публикация
 `anvil-darwin-arm64.tar.gz` в GitHub Releases. Затем
 `make update-brew VERSION=x.y.z` обновляет формулу в соседнем репозитории
-`homebrew-tap`. Установка пользователями — через Homebrew (`vz-runner` в
+`homebrew-tap` (заодно вычищает устаревший bottle-блок), и
+`make bottle VERSION=x.y.z` (`scripts/make_bottle.sh`) собирает bottle
+(`brew install --build-bottle` + `brew bottle`), загружает tarball в тот же
+GitHub release (имя файла с одинарным дефисом — `brew bottle` создаёт с
+двойным, а brew ищет с одинарным) и прописывает bottle-блок в формулу.
+Установка пользователями — через Homebrew (`vz-runner` в
 PATH + assets в `share/anvil`); LaunchAgent —
 `scripts/com.olegshirko.anvil.plist` (`make service-install`).

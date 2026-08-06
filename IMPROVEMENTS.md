@@ -238,8 +238,17 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
 3. **Developer ID + нотаризация** — сейчас `spctl` отклоняет бинарник;
    для brew неважно, но ручное скачивание tarball упирается в Gatekeeper.
    Требует платного Apple Developer.
-4. **Homebrew bottle** вместо source-формулы — быстрее установка, надёжнее
-   под zerobrew-подобными менеджерами.
+4. ~~**Homebrew bottle** вместо source-формулы~~ — сделано: в формуле
+   bottle-блок (`root_url` на GitHub release, `cellar: :any_skip_relocation`,
+   тег `arm64_tahoe`), bottle-тарболл публикуется ассетом релиза. Автоматизация:
+   `make bottle VERSION=x.y.z` (`scripts/make_bottle.sh`) — переустанавливает
+   формулу с `--build-bottle`, гоняет `brew bottle`, переименовывает tarball
+   (brew ищет ассет с одинарным дефисом `anvil-1.0.x...`, а `brew bottle`
+   создаёт с двойным), заливает в release через `gh`, обновляет bottle-блок
+   и пушит tap. `make update-brew` при бампе версии вычищает устаревший
+   bottle-блок (иначе rebuild инкрементируется от старого). На macOS старше
+   tahoe тег бутылки не совпадёт — brew молча вернётся на source-формулу,
+   что работает идентично (та же распаковка файлов).
 5. ~~**Компакция containerd-диска**~~ — сделано (§5.5): дефолтный размер
    поднят 16→64 ГиБ (sparse, настраивается `ANVIL_DISK_GB`), существующий
    образ автоматически расширяется при старте (хеш снапшота включает размер
