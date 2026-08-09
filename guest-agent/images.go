@@ -376,9 +376,11 @@ func findImageNamespace(ref string) string {
 	}
 	log.Printf("[images] findImageNamespace ref=%q namespaces=%v", ref, nss)
 
-	// Normalize ref: strip tag if present.
+	// Normalize ref: strip tag if present (a ":" before the last slash is a
+	// registry port, not a tag).
 	repo := ref
-	if idx := strings.LastIndex(ref, ":"); idx != -1 {
+	slash := strings.LastIndex(ref, "/")
+	if idx := strings.LastIndex(ref, ":"); idx != -1 && idx > slash {
 		repo = ref[:idx]
 	}
 
@@ -402,6 +404,18 @@ func findImageNamespace(ref string) string {
 				short = strings.TrimPrefix(name, "docker.io/")
 			}
 			if short == ref || short == repo {
+				return ns
+			}
+			// Match a tagless ref ("foo") against a tagged image
+			// ("docker.io/library/foo:latest") — docker save defaults
+			// to :latest. Only strip a tag after the last slash so a
+			// registry port ("host:5000/foo") is not mistaken for one.
+			shortRepo := short
+			slash := strings.LastIndex(shortRepo, "/")
+			if idx := strings.LastIndex(shortRepo, ":"); idx != -1 && idx > slash {
+				shortRepo = shortRepo[:idx]
+			}
+			if shortRepo == ref || shortRepo == repo {
 				return ns
 			}
 		}

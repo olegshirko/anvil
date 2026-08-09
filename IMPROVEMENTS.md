@@ -89,12 +89,20 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
    Обычные записи любого размера чанка (4 КБ–4 МБ, с fsync и без) чисты.
    Вывод: для экспортов использовать `nerdctl save` (другой, надёжный путь —
    им и реализован `docker save`), `ctr images export` в шару не
-   использовать. Отдельный фоллоу-ап: обновить containerd/nerdctl в образе
-   (сейчас 2.0.0/2.0.4) и/или завести issue upstream.
+   использовать. Отдельный фоллоу-ап: ~~обновить containerd/nerdctl в образе
+   (сейчас 2.0.0/2.0.4)~~ — сделано: containerd 2.3.3, nerdctl 2.3.5,
+   runc 1.5.1, CNI plugins 1.9.1. Апгрейд вскрыл две регрессии, обе
+   исправлены: nerdctl 2.2+ убрал label `nerdctl/ports` (порты теперь читаются
+   из networkstore — `/var/lib/nerdctl/*/containers/<ns>/<id>/network-config.json`,
+   fallback в `guest-agent/scanner.go`) и в госте не хватало busybox-апплета
+   `find` (boot-cleanup name-store молча не работал — добавлен в initramfs).
 2. **~~`docker save` не реализован~~ — сделано.** `GET /images/{name}/get` и
    `/images/get?names=...` стримят `nerdctl save` (docker-формат, надёжный
    путь в отличие от `ctr images export` — см. п.1). Проверен round-trip
-   save → load.
+   save → load. Позже починен резолв имени без тега (`docker save foo`
+   матчится на `docker.io/library/foo:latest`, а `:` в `host:5000/foo`
+   больше не принимается за тег) — `findImageNamespace` в
+   `guest-agent/images.go`.
 3. **~~Права на сокеты и state-директорию~~ — сделано.** `control.sock` и
    `docker.sock` — 0600, `~/.anvil-vz` — 0700, `containerd-disk.img` — 0600
    (chmod после bind/создания, применяется при каждом старте).
@@ -109,7 +117,10 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
    attach ждёт выхода контейнера из `created` (attach приходит до start).
    Проверено: 10/10 warm и 2/2 cold выводят корректно. Отдельно замечен
    редкий транзиент `nerdctl start failed (1): <id>` (~1/17 быстрых
-   последовательных запусков, shim-уровень) — в backlog.
+   последовательных запусков, shim-уровень) — на текущем стеке
+   (containerd 2.3.3 / nerdctl 2.3.5 / runc 1.5.1) не воспроизводится:
+   ~440 прогонов (последовательные, параллельные, burst после resume)
+   чистые. Оставлено под наблюдением.
 6. **~~Resume compose up регресс в бенче (5567 мс)~~ — исправлено.** Корнем
    оказался дедлок в `runExec` (guest-agent): stdout и stderr дочернего
    процесса дренились последовательно — как только `nerdctl compose up`

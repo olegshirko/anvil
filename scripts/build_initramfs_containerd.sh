@@ -104,7 +104,7 @@ for applet in mount umount mkdir mknod sleep sh insmod modprobe \
               uname id cat ls ps echo printf chmod chown \
               kill killall pwd whoami hostname udhcpc ifconfig \
               ip grep ntpd switch_root cp rm mv head mountpoint \
-              tar gzip gunzip dirname sync du date awk touch; do
+              tar gzip gunzip dirname sync du date awk touch find; do
     ln -sf busybox "bin/$applet"
 done
 
@@ -634,7 +634,9 @@ done
 
 # ctr rm does not clean nerdctl's name-store files. Stale name-to-ID mappings
 # survive on the persisted disk and block docker compose from reusing names.
-# Name files live at /var/lib/nerdctl/<datastore>/<namespace>/<name>.
+# Name files live at /var/lib/nerdctl/<datastore>/<namespace>/<name> and, for
+# nerdctl >= 2.2, /var/lib/nerdctl/<datastore>/names/<namespace>/<name> — both
+# sit at depth 4 and are covered by this find.
 find /var/lib/nerdctl -mindepth 4 -maxdepth 4 -type f 2>/dev/null | while read f; do
     rm -f "$f"
 done

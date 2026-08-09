@@ -160,7 +160,7 @@ HTTP/1.1 сервер, эмулирует подмножество Docker API, �
 
 ### 4.5 Healthcheck
 
-`nerdctl` 2.0.4 не поддерживает `--health-cmd`. Guest-agent сохраняет healthcheck-конфиг из `POST /containers/create` и сам запускает периодические `nerdctl exec` проверки. Статус `(healthy)`/`(unhealthy)`/`(starting)` возвращается в `docker ps` и `docker inspect`, что позволяет `docker compose` использовать `depends_on: condition: service_healthy`.
+Guest-agent сохраняет healthcheck-конфиг из `POST /containers/create` и сам запускает периодические `nerdctl exec` проверки. Статус `(healthy)`/`(unhealthy)`/`(starting)` возвращается в `docker ps` и `docker inspect`, что позволяет `docker compose` использовать `depends_on: condition: service_healthy`. Изначально так было сделано, потому что `nerdctl` 2.0.4 не поддерживал `--health-cmd`; в 2.3.5 флаги появились, но собственный раннер оставлен — он уже проверен и не зависит от особенностей nerdctl.
 
 ### 4.6 CNI / per-project networking
 

@@ -115,11 +115,11 @@ jobs:
       - name: Download container tools
         run: |
           mkdir -p .download/container-tools
-          curl -L -o .download/container-tools/containerd.tgz https://github.com/containerd/containerd/releases/download/v2.0.0/containerd-static-2.0.0-linux-arm64.tar.gz
-          curl -L -o .download/container-tools/nerdctl.tgz https://github.com/containerd/nerdctl/releases/download/v2.0.4/nerdctl-2.0.4-linux-arm64.tar.gz
-          curl -L -o .download/container-tools/runc https://github.com/opencontainers/runc/releases/download/v1.2.0/runc.arm64
+          curl -L -o .download/container-tools/containerd.tgz https://github.com/containerd/containerd/releases/download/v2.3.3/containerd-static-2.3.3-linux-arm64.tar.gz
+          curl -L -o .download/container-tools/nerdctl.tgz https://github.com/containerd/nerdctl/releases/download/v2.3.5/nerdctl-2.3.5-linux-arm64.tar.gz
+          curl -L -o .download/container-tools/runc https://github.com/opencontainers/runc/releases/download/v1.5.1/runc.arm64
           chmod +x .download/container-tools/runc
-          curl -L -o .download/container-tools/cni-plugins.tgz https://github.com/containernetworking/plugins/releases/download/v1.6.0/cni-plugins-linux-arm64-v1.6.0.tgz
+          curl -L -o .download/container-tools/cni-plugins.tgz https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-arm64-v1.9.1.tgz
           curl -L -o .download/container-tools/buildkit.tgz https://github.com/moby/buildkit/releases/download/v0.32.2/buildkit-v0.32.2.linux-arm64.tar.gz
 
       - name: Download Alpine iptables

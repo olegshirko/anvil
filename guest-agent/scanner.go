@@ -34,9 +34,10 @@ type cniPortMapping struct {
 	HostIP        string `json:"hostIP"`
 }
 
-// getNerdctlPortsLabel returns the nerdctl/ports JSON from container labels or,
-// as a fallback, from the container's OCI spec annotations. nerdctl stores port
-// mappings in spec annotations for containers attached to non-default networks.
+// getNerdctlPortsLabel returns the container's port mappings as the legacy
+// nerdctl/ports label JSON. Sources, in order: the label itself, the OCI spec
+// annotations (containers on non-default networks), and — since nerdctl 2.2
+// (PR #4290) deprecated the label — the nerdctl network store on disk.
 func getNerdctlPortsLabel(c client.Container, nsCtx context.Context) string {
 	if labels, err := c.Labels(nsCtx); err == nil && labels != nil {
 		if v := labels["nerdctl/ports"]; v != "" {
@@ -48,6 +49,40 @@ func getNerdctlPortsLabel(c client.Container, nsCtx context.Context) string {
 	if spec, err = c.Spec(nsCtx); err == nil && spec != nil {
 		if v := spec.Annotations["nerdctl/ports"]; v != "" {
 			return v
+		}
+	}
+	if ns, ok := namespaces.Namespace(nsCtx); ok {
+		if v := readNetworkStorePorts(ns, c.ID()); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// nerdctlNetworkConfig mirrors nerdctl's networkstore.NetworkConfig.
+type nerdctlNetworkConfig struct {
+	PortMappings []cniPortMapping `json:"portMappings"`
+}
+
+// readNetworkStorePorts reads the port mappings nerdctl >= 2.2 persists in
+// <dataRoot>/<addrHash>/containers/<ns>/<id>/network-config.json and renders
+// them as the legacy label JSON so callers keep a single parse path. The
+// addrHash directory (sha256 of the containerd socket address) is located by
+// glob — only one exists in practice.
+func readNetworkStorePorts(ns, id string) string {
+	matches, _ := filepath.Glob(filepath.Join("/var/lib/nerdctl", "*", "containers", ns, id, "network-config.json"))
+	for _, path := range matches {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var conf nerdctlNetworkConfig
+		if err := json.Unmarshal(data, &conf); err != nil || len(conf.PortMappings) == 0 {
+			continue
+		}
+		out, err := json.Marshal(conf.PortMappings)
+		if err == nil {
+			return string(out)
 		}
 	}
 	return ""

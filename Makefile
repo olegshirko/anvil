@@ -234,10 +234,10 @@ boot-ubuntu: boot
 # Containerd initramfs (M3)
 # -----------------------------------------------------------------------------
 CONTAINER_TOOLS_DIR := .download/container-tools
-CONTAINERD_URL := https://github.com/containerd/containerd/releases/download/v2.0.0/containerd-static-2.0.0-linux-arm64.tar.gz
-NERDCTL_URL := https://github.com/containerd/nerdctl/releases/download/v2.0.4/nerdctl-2.0.4-linux-arm64.tar.gz
-RUNC_URL := https://github.com/opencontainers/runc/releases/download/v1.2.0/runc.arm64
-CNI_PLUGINS_URL := https://github.com/containernetworking/plugins/releases/download/v1.6.0/cni-plugins-linux-arm64-v1.6.0.tgz
+CONTAINERD_URL := https://github.com/containerd/containerd/releases/download/v2.3.3/containerd-static-2.3.3-linux-arm64.tar.gz
+NERDCTL_URL := https://github.com/containerd/nerdctl/releases/download/v2.3.5/nerdctl-2.3.5-linux-arm64.tar.gz
+RUNC_URL := https://github.com/opencontainers/runc/releases/download/v1.5.1/runc.arm64
+CNI_PLUGINS_URL := https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-arm64-v1.9.1.tgz
 BUILDKIT_URL := https://github.com/moby/buildkit/releases/download/v0.32.2/buildkit-v0.32.2.linux-arm64.tar.gz
 DOCKER_URL := https://download.docker.com/linux/static/stable/aarch64/docker-29.6.1.tgz
 
