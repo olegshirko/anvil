@@ -205,8 +205,6 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
    /containers/{id}/archive` на остановленном контейнере и два бага stdin в
    exec: дедлок `cmd.Wait()` и выброшенный stdin, ломавший `buildctl
    dial-stdio`).
-   Ограничения:
-   - `/build/prune` по-прежнему заглушка.
 2. **Rosetta для x86_64** (`VZRosettaDirectoryShare`, macOS 13+) — запуск
    amd64-образов почти нативно, как у Lima.
 3. **~~Bind-mounts произвольных host-путей~~ — сделано.** vz-runner
@@ -276,5 +274,8 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
    e2fsprogs/e2fsprogs-extra, а не glibc-копии из build-VM). Для возврата
    места на хосте после `make prune` добавлен `make disk-compact`
    (sparse-копия через `dd conv=sparse`, содержимое и логический размер не
-   меняются — снапшот остаётся валидным). Осталось опционально: `fstrim`
-   в госте по расписанию.
+   меняются — снапшот остаётся валидным). Плюс автоматика: virtio-blk в VZ
+   поддерживает discard, поэтому guest-agent раз в сутки гоняет
+   `fstrim /var/lib/containerd` (`periodicFstrim` в `main.go`, апплет busybox
+   добавлен в initramfs) — дырки в sparse-образе пробиваются сами, без
+   остановки демона.

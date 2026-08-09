@@ -104,7 +104,7 @@ for applet in mount umount mkdir mknod sleep sh insmod modprobe \
               uname id cat ls ps echo printf chmod chown \
               kill killall pwd whoami hostname udhcpc ifconfig \
               ip grep ntpd switch_root cp rm mv head mountpoint \
-              tar gzip gunzip dirname sync du date awk touch find; do
+              tar gzip gunzip dirname sync du date awk touch find fstrim; do
     ln -sf busybox "bin/$applet"
 done
 

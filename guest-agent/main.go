@@ -97,6 +97,10 @@ func main() {
 	// frozen at pause time; sync it from the host-written time file.
 	syncClockFromShare()
 
+	// Discard unused blocks on the containerd ext4 once a day so the sparse
+	// disk image on the host can return space after image prune.
+	go periodicFstrim()
+
 	scanner := newPortScanner()
 	go scanner.run()
 
@@ -396,6 +400,24 @@ func findHostPortConflict(ports []int) (*PortMapping, error) {
 		}
 	}
 	return nil, nil
+}
+
+// periodicFstrim runs fstrim on the containerd filesystem once a day. The
+// virtio-blk disk reports discard support, so trimmed blocks punch holes in
+// the sparse image on the host and `make disk-compact` becomes unnecessary
+// for routine prune cleanup. Failures are logged and ignored.
+func periodicFstrim() {
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		out, err := exec.Command("fstrim", "-v", "/var/lib/containerd").CombinedOutput()
+		msg := strings.TrimSpace(string(out))
+		if err != nil {
+			log.Printf("fstrim failed: %v (%s)", err, msg)
+		} else {
+			log.Printf("fstrim: %s", msg)
+		}
+	}
 }
 
 // reapZombies runs for the lifetime of the process and reaps orphaned
