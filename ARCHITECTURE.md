@@ -322,16 +322,16 @@ let attachment = try VZDiskImageStorageDeviceAttachment(
 транзакция metadata. Для dev-VM приемлемо; production-нагрузки этот режим не
 подходит. Долговечность обеспечивается snapshot save/resume в штатном сценарии.
 
-#### Preallocated raw disk + ext4 / virtio-blk tuning
+#### Sparse raw disk + ext4 / virtio-blk tuning
 
 Изначально использовался `.dmg` (UDIF sparse-образ). На random writes APFS
-добавляет overhead на выделение блоков за EOF. Перешли на raw image,
-созданный полным заполнением нулями:
-
-```bash
-dd if=/dev/zero of="$HOME/.anvil-vz/containerd-disk.img" bs=1m count=16384
-limactl shell anvil -- sudo mkfs.ext4 -F "$HOME/.anvil-vz/containerd-disk.img"
-```
+добавляет overhead на выделение блоков за EOF. Перешли на raw image —
+сначала preallocated (полное заполнение нулями через `dd`), затем sparse:
+образ создаётся пустым и сразу `truncate`'ится до целевого размера
+(`main.swift`, дефолт 64 ГиБ, `ANVIL_DISK_GB`). Sparse на APFS не отличается
+по скорости от preallocated (блоки выделяются при первой записи в любом
+случае), но не занимает место на хосте, пока данные реально не записаны,
+и позволяет возвращать место через discard (см. §7.3).
 
 Stage2 монтирует его с опциями, минимизирующими metadata-задержки:
 
@@ -383,54 +383,26 @@ echo 2 > /sys/block/vda/queue/nomerges
 
 **Диск containerd.**
 
-Диск — preallocated raw image (`containerd-disk.img`) с одним ext4-разделом
-внутри. Raw выбран вместо UDIF sparse-образа, чтобы APFS не тратил ресурсы
-на выделение блоков за EOF при каждой записи containerd metadata.
-Увеличить его in-place нельзя, поэтому безопасный путь — создать новый raw
-большего размера и скопировать данные.
+Диск — sparse raw image (`containerd-disk.img`), ext4 без таблицы разделов.
+Создаётся автоматически при первом старте (дефолт 64 ГиБ, настраивается
+`ANVIL_DISK_GB`), на хосте занимает только реально записанные блоки.
 
-Сохранить данные:
+Увеличение — автоматическое, только вверх: при старте vz-runner сравнивает
+целевой размер (`ANVIL_DISK_GB`) с текущим и делает `truncate` в большую
+сторону (`main.swift`). Размер файла входит в хеш снапшота, поэтому
+следующий запуск — cold boot, а stage2 догоняет ext4 online-`resize2fs`
+сразу после монтирования. Уменьшение не поддерживается (образ никогда не
+сжимается — иначе можно потерять данные ext4).
 
-```bash
-make service-stop
-# Создать новый preallocated raw image (32 GB пример)
-dd if=/dev/zero of="$HOME/.anvil-vz/containerd-disk-new.img" bs=1m count=32768
-limactl start anvil
-limactl shell anvil
+Возврат места на хосте после удаления образов (`make prune`):
 
-sudo mkdir -p /tmp/anvil-old /tmp/anvil-new
-OLD_DEV=$(sudo losetup -f --show "$HOME/.anvil-vz/containerd-disk.img")
-NEW_DEV=$(sudo losetup -f --show "$HOME/.anvil-vz/containerd-disk-new.img")
-
-sudo e2fsck -f "$OLD_DEV"
-sudo mkfs.ext4 -F "$NEW_DEV"
-sudo mount -t ext4 "$OLD_DEV" /tmp/anvil-old
-sudo mount -t ext4 "$NEW_DEV" /tmp/anvil-new
-sudo cp -a /tmp/anvil-old/. /tmp/anvil-new/
-sudo umount /tmp/anvil-old /tmp/anvil-new
-sudo losetup -d "$OLD_DEV" "$NEW_DEV"
-exit
-
-mv "$HOME/.anvil-vz/containerd-disk-new.img" "$HOME/.anvil-vz/containerd-disk.img"
-limactl stop anvil
-make service-start
-```
-
-Если данные не нужны, пересоздайте пустой диск и отформатируйте его в ext4:
-
-```bash
-make service-stop
-# 16 GB preallocated raw image
-dd if=/dev/zero of="$HOME/.anvil-vz/containerd-disk.img" bs=1m count=16384
-limactl start anvil
-limactl shell anvil
-DEV=$(sudo losetup -f --show "$HOME/.anvil-vz/containerd-disk.img")
-sudo mkfs.ext4 -F "$DEV"
-sudo losetup -d "$DEV"
-exit
-limactl stop anvil
-make service-start
-```
+- **Автоматически**: virtio-blk в VZ поддерживает discard, guest-agent раз в
+  сутки гоняет `fstrim /var/lib/containerd` (`periodicFstrim` в
+  `guest-agent/main.go`) — освобождённые блоки пробивают дырки в
+  sparse-образе без остановки демона.
+- **Вручную и сразу**: `make disk-compact` — sparse-копия образа через
+  `dd conv=sparse` (демон останавливается и запускается снова; логический
+  размер и содержимое не меняются, снапшот остаётся валидным).
 
 Если диск не указан, stage2 использует fallback `/mnt/anvil/var-lib` на
 virtiofs share — он медленнее, но не требует ручного создания образа.
