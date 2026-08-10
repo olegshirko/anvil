@@ -34,7 +34,7 @@ if [[ -z "${IN_CONTAINER:-}" ]]; then
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
             alpine:3.20 \
-            sh -c 'apk add --no-cache bash cpio zstd binutils && exec bash /scripts/build_initramfs_containerd.sh'
+            sh -c 'apk add --no-cache bash cpio zstd binutils upx && exec bash /scripts/build_initramfs_containerd.sh'
         exit 0
     fi
 fi
@@ -129,6 +129,36 @@ tar -xzf "$TOOLS_DIR/buildkit.tgz" -C opt/containerd/bin --strip-components=1 2>
 chmod +x opt/containerd/bin/*
 # Drop unused containerd tools (~19 MB): stress tester and rootless helpers.
 rm -f opt/containerd/bin/containerd-stress opt/containerd/bin/containerd-rootless*.sh
+
+# Slim down buildkit, the largest part of the initramfs (~150 MB unpacked):
+# - qemu emulators are only needed for cross-platform `docker build
+#   --platform`; keep x86_64 (and 32-bit arm) on an arm64 VM, drop the rest;
+# - buildkit's bundled runc duplicates the system one — symlink it;
+# - UPX-pack the remaining build-only binaries (buildkitd/buildctl/qemu).
+#   They run once per build, so exec-time decompression is irrelevant —
+#   unlike the hot-path containerd/nerdctl/runc/shim, which stay unpacked.
+for q in opt/containerd/bin/buildkit-qemu-*; do
+    case "$(basename "$q")" in
+        buildkit-qemu-x86_64|buildkit-qemu-arm) ;;
+        *) rm -f "$q" ;;
+    esac
+done
+rm -f opt/containerd/bin/buildkit-runc
+ln -sf /opt/containerd/bin/runc opt/containerd/bin/buildkit-runc
+# UPX lives in PATH in CI (apk add upx); the offline Lima build VM has no
+# package network access, so fall back to the prebuilt static binary fetched
+# into .download/upx (make download-upx).
+UPX_BIN="$(command -v upx || true)"
+if [[ -z "$UPX_BIN" && -x "$DOWNLOAD_DIR/upx/upx" ]]; then
+    UPX_BIN="$DOWNLOAD_DIR/upx/upx"
+fi
+if [[ -n "$UPX_BIN" ]]; then
+    "$UPX_BIN" -q --best opt/containerd/bin/buildkitd opt/containerd/bin/buildctl \
+        opt/containerd/bin/buildkit-qemu-* 2>/dev/null || \
+        echo "WARNING: upx packing failed, shipping unpacked buildkit binaries" >&2
+else
+    echo "WARNING: upx not found, shipping unpacked buildkit binaries" >&2
+fi
 cat > bin/nerdctl <<'NERDCTLEOF'
 #!/bin/sh
 # Thin wrapper that ensures a per-project CNI bridge exists and is used
@@ -215,6 +245,17 @@ for plugin in opt/cni/bin/*; do
         bridge|host-local|loopback|portmap|firewall|tuning) ;;
         *) rm -f "$plugin" ;;
     esac
+done
+# buildkit ships its own copies of the same CNI plugins (buildkit-cni-*);
+# replace them with symlinks to the system plugins extracted above.
+for p in opt/containerd/bin/buildkit-cni-*; do
+    [ -e "$p" ] || continue
+    cni_name="$(basename "$p")"
+    cni_name="${cni_name#buildkit-cni-}"
+    if [[ -s "opt/cni/bin/$cni_name" ]]; then
+        rm -f "$p"
+        ln -sf "/opt/cni/bin/$cni_name" "$p"
+    fi
 done
 
 # iptables + libraries required by CNI plugins; GNU tar for nerdctl cp and

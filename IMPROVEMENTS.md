@@ -96,6 +96,12 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
    из networkstore — `/var/lib/nerdctl/*/containers/<ns>/<id>/network-config.json`,
    fallback в `guest-agent/scanner.go`) и в госте не хватало busybox-апплета
    `find` (boot-cleanup name-store молча не работал — добавлен в initramfs).
+   Третья регрессия всплыла позже: nerdctl 2.3.x `inspect --format json`
+   печатает одиночный объект вместо массива — `nerdctlContainerStatus`/
+   `isNerdctlContainerRunning` молча вернули "" / false, и attach до старта
+   контейнера крутил все 100 итераций ожидания (каждый `docker run` с
+   attach — +7 с). Парсер теперь принимает оба формата
+   (`containerStateFromInspect` в `guest-agent/containers.go`).
 2. **~~`docker save` не реализован~~ — сделано.** `GET /images/{name}/get` и
    `/images/get?names=...` стримят `nerdctl save` (docker-формат, надёжный
    путь в отличие от `ctr images export` — см. п.1). Проверен round-trip

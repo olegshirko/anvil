@@ -340,7 +340,17 @@ alpine-iptables: $(ALPINE_IPTABLES_DIR)
 	    curl -L -o $(ALPINE_IPTABLES_DIR)/libuuid.apk $(ALPINE_LIBUUID_URL); \
 	fi
 
-initramfs-containerd: extract-alpine-kernel alpine-virt-modules guest-agent container-tools alpine-iptables
+# Prebuilt static UPX (linux/arm64) for packing the buildkit binaries during
+# the initramfs build; the Lima build VM has no package network access.
+download-upx:
+	@if [ ! -x .download/upx/upx ]; then \
+	    mkdir -p .download/upx; \
+	    curl -L -o /tmp/anvil-upx.tar.xz https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-arm64_linux.tar.xz; \
+	    tar -xJf /tmp/anvil-upx.tar.xz -C .download/upx --strip-components=1; \
+	    rm -f /tmp/anvil-upx.tar.xz; \
+	fi
+
+initramfs-containerd: extract-alpine-kernel alpine-virt-modules guest-agent container-tools alpine-iptables download-upx
 	@if command -v limactl >/dev/null 2>&1 && limactl list anvil --format '{{.Status}}' 2>/dev/null | grep -q Running; then \
 	    echo "Building initramfs inside Lima VM 'anvil'..."; \
 	    limactl shell anvil -- bash $(CURDIR)/scripts/build_initramfs_containerd.sh; \

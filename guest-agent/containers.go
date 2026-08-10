@@ -342,6 +342,28 @@ func runNerdctl(ns string, args ...string) (stdout, stderr string, exitCode int,
 	return outBuf.String(), errBuf.String(), exitCode, err
 }
 
+// containerStateFromInspect parses `nerdctl inspect --format json` output.
+// nerdctl >= 2.1 prints a single JSON object; older versions printed an
+// array with one element. Accept both.
+func containerStateFromInspect(stdout string) (running bool, status string, ok bool) {
+	type containerState struct {
+		Running bool   `json:"Running"`
+		Status  string `json:"Status"`
+	}
+	type containerInfo struct {
+		State containerState `json:"State"`
+	}
+	var arr []containerInfo
+	if err := json.Unmarshal([]byte(stdout), &arr); err == nil && len(arr) > 0 {
+		return arr[0].State.Running, arr[0].State.Status, true
+	}
+	var single containerInfo
+	if err := json.Unmarshal([]byte(stdout), &single); err == nil && single.State.Status != "" {
+		return single.State.Running, single.State.Status, true
+	}
+	return false, "", false
+}
+
 // isNerdctlContainerRunning reports whether the named container is currently
 // running, using nerdctl inspect.
 // nerdctlContainerStatus returns the container's status string ("created",
@@ -351,15 +373,8 @@ func nerdctlContainerStatus(ns, name string) string {
 	if err != nil || code != 0 {
 		return ""
 	}
-	var infos []struct {
-		State struct {
-			Status string `json:"Status"`
-		} `json:"State"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &infos); err != nil || len(infos) == 0 {
-		return ""
-	}
-	return infos[0].State.Status
+	_, status, _ := containerStateFromInspect(stdout)
+	return status
 }
 
 func isNerdctlContainerRunning(ns, name string) bool {
@@ -367,16 +382,8 @@ func isNerdctlContainerRunning(ns, name string) bool {
 	if err != nil || code != 0 {
 		return false
 	}
-	var infos []struct {
-		State struct {
-			Running bool   `json:"Running"`
-			Status  string `json:"Status"`
-		} `json:"State"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &infos); err != nil || len(infos) == 0 {
-		return false
-	}
-	return infos[0].State.Running || infos[0].State.Status == "running"
+	running, status, ok := containerStateFromInspect(stdout)
+	return ok && (running || status == "running")
 }
 
 // findContainerByName returns the Docker ID of a container with the given name

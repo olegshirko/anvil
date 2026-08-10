@@ -53,7 +53,10 @@ Docker-контейнеров на macOS (только Apple Silicon). Сист�
   `.download/alpine/guest-agent`.
 - `make initramfs-containerd` — собрать initramfs с containerd/nerdctl/CNI
   (скрипт `scripts/build_initramfs_containerd.sh`, собирается внутри Linux-
-  контейнера — в Lima VM `anvil`, либо через локальный Docker).
+  контейнера — в Lima VM `anvil`, либо через локальный Docker). buildkit-
+  бинарники пакуются UPX: в CI ставится из apk, для офлайн-сборки в Lima
+  используется статический бинарник из `.download/upx` (target
+  `download-upx`, входит в зависимости).
 - `make rebuild-all` — бинарник + guest-agent + initramfs одной командой.
 - `make service-start` / `service-stop` / `service-restart` / `service-status` —
   управление демоном через `scripts/anvil-service.sh` (сохраняет и
