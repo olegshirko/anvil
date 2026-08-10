@@ -126,13 +126,18 @@ func shell(_ args: String...) -> String {
     return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
 }
 
-func waitForControlSocket(timeout: TimeInterval = 60) -> Bool {
+func waitForControlSocket(timeout: TimeInterval = 60, process: Process? = nil) -> Bool {
     let sockPath = controlSocketPath
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: sockPath, isDirectory: &isDir), !isDir.boolValue {
             return true
+        }
+        // The daemon dying before becoming ready (e.g. invalid kernel) would
+        // otherwise burn the whole timeout.
+        if let process = process, !process.isRunning {
+            return false
         }
         Thread.sleep(forTimeInterval: 0.1)
     }
@@ -263,10 +268,16 @@ func cmdStart(args: [String]) {
     }
     print("[anvil] starting daemon (pid \(proc.processIdentifier))...")
 
-    // Wait for the control socket to appear.
-    guard waitForControlSocket() else {
-        print("[anvil] error: daemon did not become ready within 60s")
-        proc.terminate()
+    // Wait for the control socket to appear; if the daemon dies before
+    // becoming ready (e.g. it cannot open the kernel), fail fast with a
+    // pointer at the log instead of burning the whole timeout.
+    guard waitForControlSocket(process: proc) else {
+        if !proc.isRunning {
+            print("[anvil] error: daemon exited during startup; see \(daemonLogFile.path)")
+        } else {
+            print("[anvil] error: daemon did not become ready within 60s")
+            proc.terminate()
+        }
         exit(1)
     }
 
@@ -409,7 +420,10 @@ func unpackBundledKernel(stateDir: URL, stateBinDir: URL, brewAssets: String?) -
     // gunzip exits 2 on warnings (e.g. "trailing garbage ignored") although
     // the payload decoded fine; only a fully empty output is a real failure.
     guard (proc.terminationStatus == 0 || proc.terminationStatus == 2), !data.isEmpty else { return nil }
-    FileManager.default.createFile(atPath: dest, contents: data)
+    // On a fresh install the state dir does not exist yet (cmdStart creates
+    // it later), so create it here; a failed write must not look like success.
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    guard FileManager.default.createFile(atPath: dest, contents: data) else { return nil }
     chmod(dest, 0o600)
     return dest
 }
