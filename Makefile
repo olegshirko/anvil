@@ -405,7 +405,7 @@ release: sign
 	git push origin "v$(VERSION)"
 	@echo "[release] waiting for CI to publish release..."
 	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
-	i=0; while [ $$i -lt 40 ]; do \
+	i=0; while [ $$i -lt 80 ]; do \
 		sleep 15; \
 		curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
 		i=$$((i + 1)); printf "."; \
@@ -428,7 +428,7 @@ replace-release: sign
 	git push origin "v$(VERSION)"
 	@echo "[replace-release] waiting for CI to publish release..."
 	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
-	i=0; while [ $$i -lt 40 ]; do \
+	i=0; while [ $$i -lt 80 ]; do \
 		sleep 15; \
 		curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
 		i=$$((i + 1)); printf "."; \
