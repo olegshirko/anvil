@@ -153,7 +153,9 @@ if [[ -z "$UPX_BIN" && -x "$DOWNLOAD_DIR/upx/upx" ]]; then
     UPX_BIN="$DOWNLOAD_DIR/upx/upx"
 fi
 if [[ -n "$UPX_BIN" ]]; then
-    "$UPX_BIN" -q --best opt/containerd/bin/buildkitd opt/containerd/bin/buildctl \
+    # -9, not --best: --best selects LZMA, which takes tens of minutes on
+    # 70+ MB binaries under the QEMU-emulated CI build container.
+    "$UPX_BIN" -q -9 opt/containerd/bin/buildkitd opt/containerd/bin/buildctl \
         opt/containerd/bin/buildkit-qemu-* 2>/dev/null || \
         echo "WARNING: upx packing failed, shipping unpacked buildkit binaries" >&2
 else
