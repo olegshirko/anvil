@@ -4,10 +4,13 @@
 # Usage: scripts/make_bottle.sh <version> [tap-dir]
 #
 # Flow: reinstall the formula from the tap with --build-bottle, run
-# `brew bottle`, upload the tarball to the GitHub release (brew fetches
-# bottles with a single dash between name and version, while `brew bottle`
-# writes a double dash — the asset is renamed), insert/replace the bottle
-# block in the formula, commit and push the tap.
+# `brew bottle --no-rebuild` (rebuild must stay 0 — update-brew pushes the
+# cleaned formula first, so brew's origin/HEAD comparison would bump it,
+# and nonzero rebuild breaks zerobrew's URL scheme), upload the tarball to
+# the GitHub release (brew fetches bottles with a single dash between name
+# and version, while `brew bottle` writes a double dash — the asset is
+# renamed), upload the same tarball under the other supported macOS tags,
+# insert/replace the bottle block in the formula, commit and push the tap.
 set -euo pipefail
 
 VERSION="${1:?usage: make_bottle.sh <version> [tap-dir]}"
@@ -31,9 +34,13 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 echo "[bottle] running brew bottle..."
-( cd "$WORK" && brew bottle --json "$FORMULA_REF" > bottle-out.txt )
+# --no-rebuild: brew bottle otherwise sets rebuild = upstream(origin/HEAD)
+# rebuild + 1, and because update-brew pushes the cleaned formula before
+# bottling, upstream matches and every release got rebuild 1. Nonzero
+# rebuild breaks zerobrew, which uses its own incompatible URL scheme.
+( cd "$WORK" && brew bottle --json --no-rebuild "$FORMULA_REF" > bottle-out.txt )
 
-BUILT="$(ls "$WORK"/anvil--*.bottle* | head -1)"
+BUILT="$(ls "$WORK"/anvil--*.bottle*.tar.gz | head -1)"
 # anvil--1.0.37.arm64_tahoe.bottle.1.tar.gz -> anvil-1.0.37.arm64_tahoe.bottle.1.tar.gz
 PUBLISH_NAME="$(basename "$BUILT" | sed 's/^anvil--/anvil-/')"
 TAG="$(basename "$BUILT" | sed -E 's/^anvil--[0-9.]+\.([a-z0-9_]+)\.bottle.*$/\1/')"
@@ -56,10 +63,25 @@ if [ "$REBUILD" != "0" ]; then
   gh release upload "v$VERSION" "$WORK/$ALIAS_NAME" --repo "$REPO" --clobber
 fi
 
+# The bottle is cellar :any_skip_relocation and contains no per-OS build
+# artifacts, so the same tarball serves every supported macOS tag. Publish
+# it under the other tags too — older macOS releases (and zerobrew, which
+# has no source fallback on a bottle miss) otherwise 404. When a new macOS
+# version appears, add its tag here.
+EXTRA_LINES=""
+for EXTRA_TAG in arm64_sequoia arm64_sonoma; do
+  [ "$EXTRA_TAG" = "$TAG" ] && continue
+  EXTRA_NAME="$(echo "$PUBLISH_NAME" | sed "s/\.${TAG}\./.${EXTRA_TAG}./")"
+  echo "[bottle] uploading $EXTRA_TAG alias $EXTRA_NAME..."
+  cp "$BUILT" "$WORK/$EXTRA_NAME"
+  gh release upload "v$VERSION" "$WORK/$EXTRA_NAME" --repo "$REPO" --clobber
+  EXTRA_LINES="${EXTRA_LINES}    sha256 cellar: :any_skip_relocation, $EXTRA_TAG: \"$SHA256\"\n"
+done
+
 echo "[bottle] updating bottle block in $FORMULA..."
 REBUILD_LINE=""
 [ "$REBUILD" != "0" ] && REBUILD_LINE="    rebuild $REBUILD\n"
-BLOCK="  bottle do\n    root_url \"https://github.com/olegshirko/anvil/releases/download/v$VERSION\"\n${REBUILD_LINE}    sha256 cellar: :any_skip_relocation, $TAG: \"$SHA256\"\n  end\n"
+BLOCK="  bottle do\n    root_url \"https://github.com/olegshirko/anvil/releases/download/v$VERSION\"\n${REBUILD_LINE}    sha256 cellar: :any_skip_relocation, $TAG: \"$SHA256\"\n${EXTRA_LINES}  end\n"
 if grep -q "^  bottle do" "$FORMULA"; then
   BLOCK="$BLOCK" perl -0pi -e 'my $b = $ENV{BLOCK}; $b =~ s/\\n/\n/g; s/  bottle do\n.*?  end\n/$b/s' "$FORMULA"
 else

@@ -175,22 +175,23 @@ CI — `.github/workflows/go.yml` (macos-15): проверка сборки на
 `make update-brew VERSION=x.y.z` обновляет формулу в соседнем репозитории
 `homebrew-tap` (заодно вычищает устаревший bottle-блок), и
 `make bottle VERSION=x.y.z` (`scripts/make_bottle.sh`) собирает bottle
-(`brew install --build-bottle` + `brew bottle`), загружает tarball в тот же
-GitHub release (имя файла с одинарным дефисом — `brew bottle` создаёт с
-двойным, а brew ищет с одинарным) и прописывает bottle-блок в формулу.
-Скрипт сначала делает `brew update` — иначе бутылка строится из
-закешированной старой формулы и `brew bottle` инкрементирует `rebuild`
-вместо 0; если `rebuild` всё же не 0, дополнительно заливается
-rebuild-less алиас (`*.bottle.tar.gz`) — клиенты вроде zerobrew строят URL
-без rebuild-суффикса и без него получают 404. Более того, при `rebuild > 0`
-zerobrew использует свою схему имени `<name>-<version>.<rebuild>.<tag>.bottle.tar.gz`
-(несовместимую с Homebrew — у него rebuild после тега), поэтому rebuild
-обязан оставаться 0; для v1.0.38 такие алиасы залиты вручную. Bottle —
-`cellar :any_skip_relocation` и не содержит платформенно-специфичных
-артефактов, поэтому один tarball обслуживает все macOS-теги: при выходе
-новой версии macOS дописывайте sha-строку для нового тега в bottle-блок
-и заливайте тот же tarball под именем с этим тегом (см. коммит «v1.0.38:
-add arm64_sequoia/arm64_sonoma bottles» в homebrew-tap).
+(`brew install --build-bottle` + `brew bottle --no-rebuild`), загружает
+tarball в тот же GitHub release (имя файла с одинарным дефисом — `brew
+bottle` создаёт с двойным, а brew ищет с одинарным), заливает тот же
+tarball под остальные поддерживаемые macOS-теги и прописывает bottle-блок
+со всеми тегами в формулу. Два инварианта, которые нельзя ломать:
+
+- **`rebuild` обязан быть 0.** `brew bottle` без `--no-rebuild` выставляет
+  rebuild = (rebuild формулы на origin/HEAD) + 1, а т.к. update-brew уже
+  запушил очищенную формулу, upstream совпадает и rebuild становится 1.
+  При rebuild > 0 zerobrew строит URL по своей несовместимой схеме
+  `<name>-<version>.<rebuild>.<tag>.bottle.tar.gz` (у Homebrew rebuild
+  после тега) и получает 404 — у него нет fallback на source.
+- **Теги всех поддерживаемых macOS.** Bottle — `cellar
+  :any_skip_relocation` и не содержит платформенно-специфичных
+  артефактов, поэтому один tarball обслуживает все теги; они перечислены
+  в цикле `EXTRA_TAGS` в `make_bottle.sh` — при выходе новой версии macOS
+  добавьте её тег туда.
 Установка пользователями — через Homebrew (`vz-runner` в
 PATH + assets в `share/anvil`); LaunchAgent —
 `scripts/com.olegshirko.anvil.plist` (`make service-install`).
