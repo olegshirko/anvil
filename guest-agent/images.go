@@ -700,6 +700,15 @@ func handleImageLoad(w http.ResponseWriter, r *http.Request) {
 	// unpacks via containerd's snapshotter.
 	for _, img := range imgs {
 		_ = client.NewImage(cl, img).Unpack(nsCtx, "native")
+		// Archives may carry raw, unnormalized names (e.g. "myapp:1"), but
+		// nerdctl canonicalizes short names (docker.io/library/myapp:1) on
+		// inspect/run, so a raw-only record is invisible to it and clients
+		// fall back to a registry pull. Register the canonical alias too.
+		if canonical := canonicalizeImageRef(img.Name); canonical != img.Name {
+			if err := putImage(cl, nsCtx, images.Image{Name: canonical, Target: img.Target, Labels: img.Labels}); err != nil {
+				log.Printf("[docker-api] canonical alias %s -> %s failed: %v", img.Name, canonical, err)
+			}
+		}
 	}
 
 	// Docker CLI prints every "status" line from the response stream. Report

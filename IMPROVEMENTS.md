@@ -154,7 +154,12 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
   аннотаций имени (типичный `buildx --output type=oci` без `-t`) раньше
   «загружались» молча, но образ был недоступен по имени и `docker run`
   уходил в registry pull — теперь таким манифестам выдаётся ref по дайджесту
-  (`docker.io/imported/anvil-image:<digest12>`).
+  (`docker.io/imported/anvil-image:<digest12>`). Архивы с сырым именем
+  (`myapp:1` без registry-префикса) регистрировались as-is, а nerdctl на
+  inspect/run канонизирует короткие имена в `docker.io/library/...` →
+  `GET /images/{name}/json` падал с «no such image», и CLI/compose уходили
+  в pull (офлайн — фатально). Теперь при load дополнительно регистрируется
+  канонический алиас (тот же target, тот же namespace).
 - `anvil-service.sh`: в source-дереве свежие assets из `.download` и свежий
   бинарник `.build/release/vz-runner` теперь приоритетнее копий в
   `~/.anvil-vz` и PATH — иначе после `make rebuild-all` сервис продолжал
