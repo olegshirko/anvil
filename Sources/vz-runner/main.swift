@@ -162,10 +162,16 @@ func cmdStart(args: [String]) {
     if let brewAssets = brewAssets {
         kernelCandidates.append("\(brewAssets)/vmlinuz-raw")
     }
-    let kernel = findArg(args, "--kernel")
+    var kernel = findArg(args, "--kernel")
         ?? findFile(kernelCandidates,
                     fallback: findProjectRoot().map { "\($0)/.download/alpine/vmlinuz-raw" }
                         ?? findProjectRoot().map { "\($0)/.download/ubuntu/vmlinuz-raw" })
+    // Releases/bottles ship the kernel gzipped and the service script
+    // normally unpacks it; when `anvil start` runs directly (e.g. under
+    // zerobrew, which has no services), unpack it ourselves.
+    if kernel == nil {
+        kernel = unpackBundledKernel(stateDir: stateDir, stateBinDir: stateBinDir, brewAssets: brewAssets)
+    }
 
     // Resolve initrd path: flag > stateDir > brew assets > project root
     var initrdCandidates = [stateDir.appendingPathComponent("initramfs-containerd").path,
@@ -375,6 +381,37 @@ func findFile(_ candidates: [String], fallback: String?) -> String? {
         return fallback
     }
     return nil
+}
+
+/// Unpack the gzipped kernel shipped in release tarballs/bottles into the
+/// state dir. Returns the unpacked path, or nil when no gzipped kernel is
+/// available anywhere.
+func unpackBundledKernel(stateDir: URL, stateBinDir: URL, brewAssets: String?) -> String? {
+    var candidates = [stateDir.appendingPathComponent("vmlinuz-raw.gz").path,
+                      stateBinDir.appendingPathComponent("vmlinuz-raw.gz").path]
+    if let brewAssets = brewAssets {
+        candidates.append("\(brewAssets)/vmlinuz-raw.gz")
+    }
+    guard let gz = candidates.first(where: { FileManager.default.isReadableFile(atPath: $0) }) else {
+        return nil
+    }
+    let dest = stateDir.appendingPathComponent("vmlinuz-raw").path
+    print("[anvil] unpacking bundled kernel \(gz) -> \(dest)")
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/gunzip")
+    proc.arguments = ["-c", gz]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = FileHandle.nullDevice
+    guard (try? proc.run()) != nil else { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    proc.waitUntilExit()
+    // gunzip exits 2 on warnings (e.g. "trailing garbage ignored") although
+    // the payload decoded fine; only a fully empty output is a real failure.
+    guard (proc.terminationStatus == 0 || proc.terminationStatus == 2), !data.isEmpty else { return nil }
+    FileManager.default.createFile(atPath: dest, contents: data)
+    chmod(dest, 0o600)
+    return dest
 }
 
 func findProjectRoot() -> String? {
