@@ -224,9 +224,9 @@ jobs:
           chmod +x vz-runner-darwin-arm64
           cp ../scripts/anvil-service.sh .
           cp ../scripts/com.olegshirko.anvil.plist .
-          # Artifacts keep their .download/<dir>/ structure; flatten them.
-          cp .download/alpine/vmlinuz-raw .
-          cp .download/ubuntu/initramfs-containerd .
+          # upload-artifact strips the common .download/ ancestor; flatten.
+          cp alpine/vmlinuz-raw .
+          cp ubuntu/initramfs-containerd .
           # Ship the kernel gzipped (~10 MB instead of ~34 MB raw);
           # anvil-service.sh unpacks it once on first start.
           gzip -9 -n -c vmlinuz-raw > vmlinuz-raw.gz
