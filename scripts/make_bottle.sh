@@ -19,6 +19,10 @@ REPO="olegshirko/anvil"
 test -f "$FORMULA" || { echo "[bottle] error: $FORMULA not found"; exit 1; }
 command -v gh >/dev/null || { echo "[bottle] error: gh CLI required"; exit 1; }
 
+echo "[bottle] refreshing taps (a stale tap cache bottles the OLD formula"
+echo "[bottle] and brew bottle then bumps rebuild instead of starting at 0)..."
+brew update >/dev/null
+
 echo "[bottle] reinstalling $FORMULA_REF with --build-bottle..."
 brew uninstall "$FORMULA_REF" 2>/dev/null || true
 brew install --build-bottle "$FORMULA_REF"
@@ -43,6 +47,14 @@ cp "$BUILT" "$WORK/$PUBLISH_NAME"
 gh release upload "v$VERSION" "$WORK/$PUBLISH_NAME" --repo "$REPO" --clobber
 # Drop a stale double-dash asset from a previous manual upload, if any.
 gh release delete-asset "v$VERSION" "$(basename "$BUILT")" --repo "$REPO" --yes 2>/dev/null || true
+# Clients that ignore the rebuild field (e.g. zerobrew) build the bottle URL
+# without the rebuild suffix; publish a rebuild-less alias of the same tarball.
+if [ "$REBUILD" != "0" ]; then
+  ALIAS_NAME="$(echo "$PUBLISH_NAME" | sed -E 's/\.bottle\.[0-9]+\.tar\.gz$/.bottle.tar.gz/')"
+  echo "[bottle] uploading rebuild-less alias $ALIAS_NAME..."
+  cp "$BUILT" "$WORK/$ALIAS_NAME"
+  gh release upload "v$VERSION" "$WORK/$ALIAS_NAME" --repo "$REPO" --clobber
+fi
 
 echo "[bottle] updating bottle block in $FORMULA..."
 REBUILD_LINE=""

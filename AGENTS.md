@@ -178,6 +178,16 @@ CI — `.github/workflows/go.yml` (macos-15): проверка сборки на
 (`brew install --build-bottle` + `brew bottle`), загружает tarball в тот же
 GitHub release (имя файла с одинарным дефисом — `brew bottle` создаёт с
 двойным, а brew ищет с одинарным) и прописывает bottle-блок в формулу.
+Скрипт сначала делает `brew update` — иначе бутылка строится из
+закешированной старой формулы и `brew bottle` инкрементирует `rebuild`
+вместо 0; если `rebuild` всё же не 0, дополнительно заливается
+rebuild-less алиас (`*.bottle.tar.gz`) — клиенты вроде zerobrew строят URL
+без rebuild-суффикса и без него получают 404. Bottle —
+`cellar :any_skip_relocation` и не содержит платформенно-специфичных
+артефактов, поэтому один tarball обслуживает все macOS-теги: при выходе
+новой версии macOS дописывайте sha-строку для нового тега в bottle-блок
+и заливайте тот же tarball под именем с этим тегом (см. коммит «v1.0.38:
+add arm64_sequoia/arm64_sonoma bottles» в homebrew-tap).
 Установка пользователями — через Homebrew (`vz-runner` в
 PATH + assets в `share/anvil`); LaunchAgent —
 `scripts/com.olegshirko.anvil.plist` (`make service-install`).
