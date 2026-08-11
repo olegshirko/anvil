@@ -92,6 +92,10 @@ final class VMLifecycleManager: NSObject {
 
     /// Resume the VM.
     func resume(completion: @escaping (Result<Void, Error>) -> Void) {
+        // Refresh the host time file so the guest re-syncs its clock after
+        // resume: while paused the guest clock is frozen, and the file from
+        // start() is stale by the whole paused interval.
+        writeHostTimeFile()
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let vm = self.vm else {
                 completion(.success(()))
