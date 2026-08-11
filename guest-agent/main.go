@@ -93,6 +93,14 @@ func main() {
 	// itself is on tmpfs and disappears on reboot.
 	restoreNetworkConfigs()
 
+	// The cold-boot metadata cleanup in stage2 removes containers bypassing
+	// nerdctl rm, leaving their network-store entries behind; prune them once
+	// containerd is reachable.
+	go func() {
+		time.Sleep(2 * time.Second)
+		pruneStaleNetworkStore()
+	}()
+
 	// VZ does not guarantee a sane RTC and snapshot resume leaves the clock
 	// frozen at pause time; sync it from the host-written time file.
 	syncClockFromShare()
@@ -217,7 +225,7 @@ func runExec(args []string) Response {
 		if ports, err := parsePublishHostPorts(args); err != nil {
 			return Response{Error: fmt.Sprintf("invalid publish spec: %v", err), ExitCode: 1}
 		} else if len(ports) > 0 {
-			if conflict, err := findHostPortConflict(ports); err != nil {
+			if conflict, err := findHostPortConflict(ports, ""); err != nil {
 				return Response{Error: fmt.Sprintf("host port conflict check failed: %v", err), ExitCode: 1}
 			} else if conflict != nil {
 				return Response{
@@ -342,7 +350,8 @@ func parsePublishHostPorts(args []string) ([]int, error) {
 
 // findHostPortConflict checks whether any requested host port is already used
 // by a running container in any namespace. It returns the first conflict found.
-func findHostPortConflict(ports []int) (*PortMapping, error) {
+// The container excludeID is skipped: it is the one being started.
+func findHostPortConflict(ports []int, excludeID string) (*PortMapping, error) {
 	cl, err := client.New(containerdSocket)
 	if err != nil {
 		return nil, err
@@ -367,6 +376,9 @@ func findHostPortConflict(ports []int) (*PortMapping, error) {
 			continue
 		}
 		for _, c := range containers {
+			if excludeID != "" && c.ID() == excludeID {
+				continue
+			}
 			labels, err := c.Labels(nsCtx)
 			if err != nil {
 				continue

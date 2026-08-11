@@ -10,10 +10,11 @@ import (
 )
 
 const (
-	listenPort       = 1024
-	dockerAPIPort    = 1025
-	containerdSocket = "/run/containerd/containerd.sock"
-	cniConfDir       = "/etc/cni/net.d"
+	listenPort        = 1024
+	dockerAPIPort     = 1025
+	hostPortCheckPort = 1027
+	containerdSocket  = "/run/containerd/containerd.sock"
+	cniConfDir        = "/etc/cni/net.d"
 )
 
 var debugMode = os.Getenv("ANVIL_DEBUG") == "1" || os.Getenv("ANVIL_DEBUG") == "true"

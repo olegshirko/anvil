@@ -146,6 +146,9 @@ enum DaemonCommand {
             self.idleSeconds = idleSeconds
             self.cacheManager = ContainerdCacheManager(sharePath: manager.args.sharePath)
             manager.delegate = self
+            manager.portCheckServer = PortCheckServer { [weak self] port in
+                self?.portForwarder?.holdsTCP(port: port) ?? false
+            }
         }
 
         /// Shared counter for control-socket and docker-socket clients. Both must
@@ -227,6 +230,11 @@ enum DaemonCommand {
         // MARK: - VMLifecycleManagerDelegate
 
         func vmLifecycleManagerDidBecomeReady(_ manager: VMLifecycleManager) {
+            // Host-port availability endpoint for the guest-agent; install
+            // before opening the docker proxy so early container creates
+            // are checked.
+            manager.attachPortCheckServer()
+
             let tracker = ClientTracker(
                 idleSeconds: idleSeconds,
                 scheduleIdle: { [weak self] in self?.scheduleIdleTimer() },

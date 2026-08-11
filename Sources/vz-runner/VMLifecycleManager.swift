@@ -17,8 +17,19 @@ final class VMLifecycleManager: NSObject {
 
     weak var delegate: VMLifecycleManagerDelegate?
 
+    /// Optional host-port availability endpoint; attached to the VM's socket
+    /// device before every start/restore. Set by the daemon only.
+    var portCheckServer: PortCheckServer?
+
     var socketDevice: VZVirtioSocketDevice? {
         vm?.socketDevices.first as? VZVirtioSocketDevice
+    }
+
+    /// Install the port-check listener on the live socket device (the device
+    /// object exists only after the VM is created/started).
+    func attachPortCheckServer() {
+        guard let device = socketDevice else { return }
+        portCheckServer?.attach(to: device)
     }
 
     init(args: BootArgs) {

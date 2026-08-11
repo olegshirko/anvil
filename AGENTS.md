@@ -21,6 +21,13 @@ Docker-контейнеров на macOS (только Apple Silicon). Сист�
   Docker API для `docker`/`docker compose`, порт 1026 — мост к unix-сокету
   buildkitd для buildx remote driver), сканирует containerd и пушит
   port mappings в vz-runner, запускает healthcheck'и, генерирует CNI-конфиги.
+  При старте контейнера с `-p` запрашивает у vz-runner занятость
+  host-портов (guest диалит vsock-порт 1027, который слушает vz-runner —
+  `PortCheckServer`): если порт занят чужим процессом на хосте (Docker
+  Desktop, Lima, локальный postgres), start падает с Docker-стилем ошибкой
+  «port is already allocated», а не молча оставляет контейнер недоступным.
+  Проверка именно на start, а не на create: compose `--force-recreate`
+  создаёт замену, пока старый контейнер ещё держит порт.
   Внутри VM работают containerd + nerdctl + runc + CNI plugins; systemd и SSH
   нет. buildkitd стартует лениво — при первом подключении к порту 1026 или
   первом `nerdctl build`.
@@ -110,6 +117,7 @@ Docker-контейнеров на macOS (только Apple Silicon). Сист�
   `main.swift` (CLI: start/stop/status/daemon/boot/exec), `DaemonCommand`,
   `VMLifecycleManager`, `VMConfig`, `SnapshotManager`, `ControlServer` +
   `ControlClient` + `ControlProtocol`, `DockerProxyServer`, `PortForwarder`,
+  `PortCheckServer` (vsock 1027: ответы гостю о занятости host-портов),
   `GuestCacheDropper`, `ContainerdCacheManager`, `BootCommand`.
 - `guest-agent/` — Go-исходники по доменам Docker API: `main.go` (vsock
   control server, reaper зомби), `dockerapi.go` (HTTP-маршруты),

@@ -595,11 +595,109 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 }
 
 // startDockerContainer starts a container by Docker ID or name.
+// pruneStaleNetworkStore removes nerdctl network-store entries
+// (/var/lib/nerdctl/<hash>/containers/<ns>/<id>) whose container no longer
+// exists in containerd. The cold-boot metadata cleanup in stage2 removes
+// containers bypassing `nerdctl rm`, so their store entries would otherwise
+// accumulate forever on the persistent disk.
+func pruneStaleNetworkStore() {
+	cl, err := client.New(containerdSocket)
+	if err != nil {
+		return
+	}
+	defer cl.Close()
+
+	ctx := context.Background()
+	nss, err := cl.NamespaceService().List(ctx)
+	if err != nil {
+		return
+	}
+	live := make(map[string]map[string]bool, len(nss))
+	for _, ns := range nss {
+		containers, err := cl.Containers(namespaces.WithNamespace(ctx, ns))
+		if err != nil {
+			continue
+		}
+		live[ns] = make(map[string]bool, len(containers))
+		for _, c := range containers {
+			live[ns][c.ID()] = true
+		}
+	}
+
+	matches, _ := filepath.Glob("/var/lib/nerdctl/*/containers/*/*")
+	for _, dir := range matches {
+		parts := strings.Split(dir, "/")
+		if len(parts) < 2 {
+			continue
+		}
+		id := parts[len(parts)-1]
+		ns := parts[len(parts)-2]
+		if ids, ok := live[ns]; !ok || !ids[id] {
+			debugLog("pruning stale nerdctl store entry %s/%s", ns, id)
+			os.RemoveAll(dir)
+		}
+	}
+}
+
+// containerHostPorts returns the TCP host ports published by the container,
+// read from the nerdctl port-mapping metadata.
+func containerHostPorts(ns, containerdID string) []int {
+	cl, err := client.New(containerdSocket)
+	if err != nil {
+		return nil
+	}
+	defer cl.Close()
+	nsCtx := namespaces.WithNamespace(context.Background(), ns)
+	c, err := cl.LoadContainer(nsCtx, containerdID)
+	if err != nil {
+		return nil
+	}
+	portsJSON := getNerdctlPortsLabel(c, nsCtx)
+	if portsJSON == "" {
+		return nil
+	}
+	var mapped []cniPortMapping
+	if err := json.Unmarshal([]byte(portsJSON), &mapped); err != nil {
+		return nil
+	}
+	var ports []int
+	for _, m := range mapped {
+		if m.HostPort <= 0 {
+			continue
+		}
+		if m.Protocol != "" && m.Protocol != "tcp" {
+			continue
+		}
+		ports = append(ports, m.HostPort)
+	}
+	return ports
+}
+
 func startDockerContainer(id string) error {
 	ns, containerdID, _, err := resolveDockerID(id)
 	if err != nil {
 		return err
 	}
+
+	// Enforce host-port availability at start, like Docker does (create must
+	// NOT check: compose --force-recreate creates the replacement while the
+	// old container still holds the port). Two cases: the port is published
+	// by another running container, or it is bound on the host by a foreign
+	// process (Docker Desktop, Lima, a local postgres) — the port forwarder
+	// can only log that bind failure, leaving the container silently
+	// unreachable on localhost.
+	if ports := containerHostPorts(ns, containerdID); len(ports) > 0 {
+		if conflict, err := findHostPortConflict(ports, containerdID); err == nil && conflict != nil {
+			log.Printf("[portcheck] start %s: host port %d already published by container %q (%s) in ns %q",
+				containerdID, conflict.HostPort, conflict.Name, conflict.ContainerID, conflict.Namespace)
+			return fmt.Errorf("Bind for 0.0.0.0:%d failed: port is already allocated", conflict.HostPort)
+		}
+		if busy := busyForeignHostPorts(ports); len(busy) > 0 {
+			log.Printf("[portcheck] start %s: host port %d bound by a foreign host process", containerdID, busy[0])
+			return fmt.Errorf("Bind for 0.0.0.0:%d failed: port is already allocated", busy[0])
+		}
+	}
+
 	stdout, stderr, code, err := runNerdctl(ns, "start", containerdID)
 	if err != nil || code != 0 {
 		return fmt.Errorf("nerdctl start failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
@@ -800,6 +898,13 @@ func deleteDockerContainer(id string, force bool) error {
 		return fmt.Errorf("nerdctl rm failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
 	}
 	removeNerdctlNameStore(ns, containerdID)
+	// nerdctl rm does not always remove the container's network-store entry;
+	// drop it so stale port mappings do not accumulate on the persistent disk.
+	if matches, _ := filepath.Glob("/var/lib/nerdctl/*/containers/" + ns + "/" + containerdID); len(matches) > 0 {
+		for _, dir := range matches {
+			os.RemoveAll(dir)
+		}
+	}
 	stopHealthCheck(did)
 	unmarkAutoRemove(did)
 	takeContainerExitCode(did)

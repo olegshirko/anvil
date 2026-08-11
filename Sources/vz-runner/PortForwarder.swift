@@ -175,6 +175,15 @@ final class PortForwarder {
         return nil
     }
 
+    /// Whether a host TCP port is currently bound by one of our own listeners.
+    func holdsTCP(port: Int) -> Bool {
+        listenersLock.lock()
+        defer { listenersLock.unlock() }
+        return listeners.values.contains {
+            $0.mapping.hostPort == port && ($0.mapping.protocol ?? "tcp") == "tcp"
+        }
+    }
+
     private func stopListener(key: String) {
         listenersLock.lock()
         guard let listener = listeners.removeValue(forKey: key) else {

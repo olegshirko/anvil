@@ -174,6 +174,36 @@ guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
   8.8.8.8 — берётся DNS из DHCP (VZ NAT-шлюз проксирует резолвер хоста,
   работает в VPN/ограниченных сетях), 8.8.8.8 только как запасной. Раньше
   на сетях с заблокированным внешним DNS pull'ы висли бессимптомно.
+- **Громкий фейл при занятом host-порту.** Раньше, если localhost-порт уже
+  держал чужой процесс (Docker Desktop с тем же compose-проектом, Lima с
+  автофорвардом гостевых портов, локальный postgres из brew), PortForwarder
+  писал «bind/listen failed: Address already in use» только в daemon.log,
+  а контейнер стартовал «успешно» — недоступный с хоста, с непонятными
+  падениями приложений (таймауты пула соединений). Теперь guest-agent при
+  старте контейнера с `-p` спрашивает vz-runner о занятости портов
+  (guest диалит vsock-порт 1027, `PortCheckServer`; занятым считается порт,
+  который не держит наш форвардер и не удаётся probe-bind'нуть — probe
+  идёт в обоих семействах, т.к. IPv4-only оккупант не мешает dual-stack
+  bind'у на macOS), плюс проверяется конфликт с уже запущенными
+  контейнерами anvil — start падает с Docker-стилем ошибкой
+  `Bind for 0.0.0.0:<port> failed: port is already allocated`.
+  Проверка именно на start, а не на create: Docker проверяет порты при
+  старте, а compose `--force-recreate` создаёт замену под временным именем
+  `<id>_<name>`, пока старый контейнер ещё держит порт. Порты нашего
+  форвардера не считаются занятыми (слушатель старого контейнера может ещё
+  сниматься, когда стартует новый).
+- **Прунинг network-store nerdctl.** Cold-boot очистка в stage2 удаляет
+  контейнеры в обход `nerdctl rm`, а `nerdctl rm` сам не всегда убирает
+  запись — файлы `/var/lib/nerdctl/<hash>/containers/<ns>/<id>/`
+  (network-config.json и пр.) копились на persistent-диске бесконечно.
+  Теперь запись удаляется при `docker rm`, а при старте guest-agent
+  вычищаются все записи без живого контейнера в containerd.
+- Известное ограничение (не от anvil): у nerdctl собственная проверка
+  host-портов на create, поэтому `compose up --force-recreate` поверх ЖИВЫХ
+  контейнеров (compose создаёт замену до остановки старого) может падать
+  с «bind for :<port> failed: port is already allocated» — рассинхрон
+  семантики nerdctl (create) и Docker (start). Стандартный поток
+  `compose down && up` (как в make-таргетах) не затронут.
 - `/images/load`: добавлен `client.WithSkipMissing()` — одноплатформенные
   экспорты с мультиархитектурным индексом (без чужих блобов) больше не
   падают с «content digest ... not found».

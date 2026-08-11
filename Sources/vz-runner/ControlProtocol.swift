@@ -3,6 +3,8 @@ import Foundation
 let controlPort: UInt32 = 1024
 let dockerAPIPort: UInt32 = 1025
 let buildkitAPIPort: UInt32 = 1026
+// Host-listening port: the guest dials it to check host port availability.
+let portCheckPort: UInt32 = 1027
 let stateDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".anvil-vz", isDirectory: true)
 let stateFile = stateDir.appendingPathComponent("run.json")
