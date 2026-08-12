@@ -474,7 +474,7 @@ func printUsage() {
       anvil exec <command> [args...]
       anvil doctor
       anvil logs [daemon|console|guest]
-      anvil images request --docker <image:tag>
+      anvil images [list|check|request] --docker <image:tag>
       anvil docker-socket-path
 
     Service commands:
