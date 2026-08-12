@@ -420,17 +420,17 @@ func runDockerAPIServer() {
 				http.Error(w, `{"message":"missing fromImage"}`, http.StatusBadRequest)
 				return
 			}
-			stdout, stderr, err := pullDockerImage(image)
+			status, err := pullDockerImage(image)
 			w.Header().Set("Content-Type", "application/json")
 			if err != nil {
 				// Docker CLI expects a stream of progress objects; send one error line.
 				json.NewEncoder(w).Encode(map[string]string{
-					"status": fmt.Sprintf("error pulling %s: %s%s", image, stdout, stderr),
+					"status": fmt.Sprintf("error pulling %s: %s", image, err.Error()),
 				})
 				return
 			}
 			json.NewEncoder(w).Encode(map[string]string{
-				"status": fmt.Sprintf("Downloaded newer image for %s", image),
+				"status": status,
 			})
 		case isTag && r.Method == http.MethodPost:
 			target := r.URL.Query().Get("repo")

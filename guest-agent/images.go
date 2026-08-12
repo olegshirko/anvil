@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -137,6 +138,95 @@ func canonicalizeImageRef(ref string) string {
 	return result
 }
 
+// dockerMirrorRepo hosts Docker images mirrored as image-arm64.tar.zst on
+// GitHub releases, keyed by tag <safe-name>-<tag>-arm64. Used as a fallback
+// when the upstream registry is unreachable.
+const dockerMirrorRepo = "olegshirko/docker-mirror"
+
+// errMirrorNotFound signals that the image has not been mirrored: a clean 404
+// from the release-asset URL. Callers fall through to the original pull error
+// instead of reporting a noisy download failure.
+var errMirrorNotFound = errors.New("image not found in docker-mirror")
+
+// splitImageTag splits a user image ref into name and tag. Digest refs
+// ("repo@sha256:...") are not mirrorable (ok=false). A ref without an explicit
+// tag gets ":latest", matching Docker semantics and the mirror release naming.
+// A ":" before the last "/" is a registry port, not a tag.
+func splitImageTag(ref string) (name, tag string, ok bool) {
+	if strings.Contains(ref, "@") {
+		return "", "", false
+	}
+	slash := strings.LastIndex(ref, "/")
+	colon := strings.LastIndex(ref, ":")
+	if colon == -1 || colon < slash {
+		return ref, "latest", true
+	}
+	return ref[:colon], ref[colon+1:], true
+}
+
+// loadFromMirror downloads an image archive from the docker-mirror GitHub
+// release and imports it into containerd. The release tag is derived from the
+// ref (<safe-name>-<tag>-arm64, where safe-name replaces "/" with "-"), so no
+// GitHub API call is made and the unauthenticated release-asset download never
+// hits API rate limits. Returns errMirrorNotFound when the image has not been
+// mirrored, so callers can distinguish "mirror it first" from a real failure.
+func loadFromMirror(ref, ns string) error {
+	name, tag, ok := splitImageTag(ref)
+	if !ok {
+		return errMirrorNotFound
+	}
+	safeName := strings.ReplaceAll(name, "/", "-")
+	url := fmt.Sprintf("https://github.com/%s/releases/download/%s-%s-arm64/image-arm64.tar.zst",
+		dockerMirrorRepo, safeName, tag)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("mirror download: %w", err)
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return errMirrorNotFound
+	case resp.StatusCode != http.StatusOK:
+		return fmt.Errorf("mirror download %s: %s", url, resp.Status)
+	}
+
+	cl, err := client.New(containerdSocket)
+	if err != nil {
+		return fmt.Errorf("containerd client: %w", err)
+	}
+	defer cl.Close()
+
+	nsCtx := namespaces.WithNamespace(context.Background(), ns)
+	ds, err := compression.DecompressStream(resp.Body)
+	if err != nil {
+		return fmt.Errorf("decompress: %w", err)
+	}
+	defer ds.Close()
+
+	log.Printf("[images] loading %q from docker-mirror (%s)", ref, url)
+	imgs, err := cl.Import(nsCtx, ds,
+		client.WithDigestRef(func(d digest.Digest) string {
+			return "docker.io/imported/anvil-image:" + d.Encoded()[:12]
+		}),
+		client.WithSkipDigestRef(func(name string) bool { return name != "" }),
+		client.WithSkipMissing(),
+	)
+	if err != nil {
+		return fmt.Errorf("import: %s", stripANSI(err.Error()))
+	}
+	for _, img := range imgs {
+		_ = client.NewImage(cl, img).Unpack(nsCtx, "native")
+		if canonical := canonicalizeImageRef(img.Name); canonical != img.Name {
+			if err := putImage(cl, nsCtx, images.Image{Name: canonical, Target: img.Target, Labels: img.Labels}); err != nil {
+				log.Printf("[images] mirror canonical alias %s -> %s: %v", img.Name, canonical, err)
+			}
+		}
+	}
+	log.Printf("[images] loaded %q from docker-mirror into ns=%s", ref, ns)
+	return nil
+}
+
 // ensureImageInNamespace makes sure an image reference exists in the target
 // namespace. If the image already exists there, it returns nil. If it exists
 // in another namespace, the image is streamed into the target namespace
@@ -206,7 +296,18 @@ func ensureImageInNamespace(ref, targetNs string) error {
 	log.Printf("[images] pulling %q (canonical %q) into namespace %s", ref, canonicalRef, targetNs)
 	stdout, stderr, code, err := runNerdctl(targetNs, "pull", ref)
 	if err != nil || code != 0 {
-		return fmt.Errorf("nerdctl pull failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+		pullErr := fmt.Errorf("nerdctl pull failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+		// Fallback: docker-mirror GitHub release (used when the registry is
+		// unreachable or rate-limited but a mirror exists). Only silent on a
+		// clean 404 ("not mirrored yet"); other download errors are logged.
+		if mErr := loadFromMirror(ref, targetNs); mErr == nil {
+			if _, err := cl.GetImage(targetCtx, canonicalRef); err == nil {
+				return nil
+			}
+		} else if !errors.Is(mErr, errMirrorNotFound) {
+			log.Printf("[images] mirror fallback for %q: %v", ref, mErr)
+		}
+		return pullErr
 	}
 	log.Printf("[images] pulled %q into namespace %s", ref, targetNs)
 	return nil
@@ -636,14 +737,22 @@ func pushDockerImage(name string, w io.Writer) error {
 	return nil
 }
 
-// pullDockerImage pulls an image via nerdctl into the default namespace.
-func pullDockerImage(image string) (string, string, error) {
+// pullDockerImage pulls an image via nerdctl into the default namespace. When
+// the registry pull fails it falls back to the docker-mirror GitHub release
+// and returns a status line describing which path produced the image.
+func pullDockerImage(image string) (string, error) {
 	ns := "default"
 	stdout, stderr, code, err := runNerdctl(ns, "pull", image)
-	if err != nil || code != 0 {
-		return stdout, stderr, fmt.Errorf("nerdctl pull failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	if err == nil && code == 0 {
+		return fmt.Sprintf("Downloaded newer image for %s", image), nil
 	}
-	return stdout, stderr, nil
+	pullErr := fmt.Errorf("nerdctl pull failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	if mErr := loadFromMirror(image, ns); mErr == nil {
+		return fmt.Sprintf("Loaded image: %s (from docker-mirror)", image), nil
+	} else if !errors.Is(mErr, errMirrorNotFound) {
+		log.Printf("[images] mirror fallback for %q: %v", image, mErr)
+	}
+	return "", pullErr
 }
 
 // handleImageLoad implements POST /images/load — streams a Docker/OCI tar

@@ -474,6 +474,7 @@ func printUsage() {
       anvil exec <command> [args...]
       anvil doctor
       anvil logs [daemon|console|guest]
+      anvil images request --docker <image:tag>
       anvil docker-socket-path
 
     Service commands:
@@ -535,6 +536,8 @@ case "doctor":
     cmdDoctor()
 case "logs":
     cmdLogs(args: Array(arguments.dropFirst()))
+case "images":
+    cmdImages(args: Array(arguments.dropFirst()))
 case "docker-socket-path":
     print(dockerSocketPath)
     exit(0)
