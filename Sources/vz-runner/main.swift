@@ -114,6 +114,27 @@ func restoreBuildxBuilder() {
     try? FileManager.default.removeItem(at: prevBuilderFile)
 }
 
+// setupBuildxBuilderAsync launches the buildx setup as a detached child
+// process (the internal `_setup-buildx` subcommand) so `anvil start` does not
+// block on the 5-8 slow docker/buildx calls. The child ignores SIGHUP so a
+// terminal hangup during the ~2s window does not abort it. On any failure to
+// spawn, it falls back to a synchronous setup.
+func setupBuildxBuilderAsync() {
+    // Disown via nohup + `&` so the child survives the parent and terminal
+    // hangups during the ~2s window the buildx dance takes.
+    let wrapper = Process()
+    wrapper.executableURL = URL(fileURLWithPath: "/bin/sh")
+    wrapper.arguments = ["-c", "nohup \"\(currentExecutablePath())\" _setup-buildx >/dev/null 2>&1 &"]
+    wrapper.standardOutput = FileHandle.nullDevice
+    wrapper.standardError = FileHandle.nullDevice
+    do {
+        try wrapper.run()
+    } catch {
+        // Fallback: synchronous, so buildx still gets configured.
+        setupBuildxBuilder()
+    }
+}
+
 func shell(_ args: String...) -> String {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -153,7 +174,7 @@ func cmdStart(args: [String]) {
         _ = shell("docker", "context", "rm", "-f", "anvil")
         _ = shell("docker", "context", "create", "anvil", "--docker", "host=unix://\(dockerSocketPath)")
         _ = shell("docker", "context", "use", "anvil")
-        setupBuildxBuilder()
+        setupBuildxBuilderAsync()
         return
     }
 
@@ -284,7 +305,11 @@ func cmdStart(args: [String]) {
     _ = shell("docker", "context", "rm", "-f", "anvil")
     _ = shell("docker", "context", "create", "anvil", "--docker", "host=unix://\(dockerSocketPath)")
     _ = shell("docker", "context", "use", "anvil")
-    setupBuildxBuilder()
+    // buildx setup talks to docker/buildx 5-8 times (~3-4s with Docker Desktop
+    // installed) and is only needed for `docker buildx build` — plain `docker
+    // build` goes through the guest-agent /build endpoint. Run it detached so
+    // `anvil start` returns immediately; buildx is ready a couple seconds later.
+    setupBuildxBuilderAsync()
     print("[anvil] ready (pid \(proc.processIdentifier))")
 }
 
@@ -540,6 +565,13 @@ case "images":
     cmdImages(args: Array(arguments.dropFirst()))
 case "docker-socket-path":
     print(dockerSocketPath)
+    exit(0)
+case "_setup-buildx":
+    // Internal, detached: invoked by setupBuildxBuilderAsync so `anvil start`
+    // does not block on slow docker/buildx calls. Ignore SIGHUP to survive a
+    // terminal hangup during the ~2s the buildx setup takes.
+    signal(SIGHUP, SIG_IGN)
+    setupBuildxBuilder()
     exit(0)
 case "--help", "-h":
     printUsage()
