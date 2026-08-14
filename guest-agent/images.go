@@ -477,14 +477,15 @@ func findImageNamespace(ref string) string {
 	}
 	log.Printf("[images] findImageNamespace ref=%q namespaces=%v", ref, nss)
 
-	// Normalize ref: strip tag if present (a ":" before the last slash is a
-	// registry port, not a tag).
-	repo := ref
-	slash := strings.LastIndex(ref, "/")
-	if idx := strings.LastIndex(ref, ":"); idx != -1 && idx > slash {
-		repo = ref[:idx]
-	}
-
+	// Strict matching: the requested ref canonicalized to a fully-qualified
+	// name (which appends ":latest" for tagless refs and keeps registry
+	// ports/digests intact), plus the raw ref for images imported from OCI
+	// archives under an unnormalized name. A tagless ref must NOT match an
+	// image with a different tag: a namespace holding only "nginx:alpine"
+	// does not satisfy a request for "nginx" (= nginx:latest), and returning
+	// it would make the subsequent nerdctl inspect in that namespace fail
+	// with "no such image".
+	canonical := canonicalizeImageRef(ref)
 	for _, ns := range nss {
 		nsCtx := namespaces.WithNamespace(ctx, ns)
 		images, err := cl.ListImages(nsCtx)
@@ -494,29 +495,7 @@ func findImageNamespace(ref string) string {
 		}
 		for _, img := range images {
 			name := img.Name()
-			if name == ref || name == repo {
-				return ns
-			}
-			// Also match short names like "nginx" against "docker.io/library/nginx".
-			short := name
-			if strings.HasPrefix(name, "docker.io/library/") {
-				short = strings.TrimPrefix(name, "docker.io/library/")
-			} else if strings.HasPrefix(name, "docker.io/") {
-				short = strings.TrimPrefix(name, "docker.io/")
-			}
-			if short == ref || short == repo {
-				return ns
-			}
-			// Match a tagless ref ("foo") against a tagged image
-			// ("docker.io/library/foo:latest") — docker save defaults
-			// to :latest. Only strip a tag after the last slash so a
-			// registry port ("host:5000/foo") is not mistaken for one.
-			shortRepo := short
-			slash := strings.LastIndex(shortRepo, "/")
-			if idx := strings.LastIndex(shortRepo, ":"); idx != -1 && idx > slash {
-				shortRepo = shortRepo[:idx]
-			}
-			if shortRepo == ref || shortRepo == repo {
+			if name == canonical || name == ref {
 				return ns
 			}
 		}
