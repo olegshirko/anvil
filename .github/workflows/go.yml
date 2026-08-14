@@ -202,6 +202,17 @@ jobs:
             exit 1
           }
 
+      - name: Docker API integration tests (docker CLI + compose against the daemon)
+        run: |
+          .build/release/vz-runner start
+          python3 scripts/integration_tests.py || {
+            .build/release/vz-runner stop || true
+            echo "=== daemon.log ==="
+            tail -40 ~/.anvil-vz/daemon.log 2>/dev/null
+            exit 1
+          }
+          .build/release/vz-runner stop
+
   release:
     needs: [build, guestbuild]
     runs-on: ubuntu-latest
