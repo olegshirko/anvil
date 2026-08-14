@@ -1,8 +1,10 @@
-# Anvil vz-runner: архитектура и ключевые решения
+# Anvil vz-runner: architecture and key decisions
 
-Этот документ описывает, из каких компонентов состоит система, почему выбраны именно эти технологии, и как всё ведёт себя при старте, перезапуске и остановке.
+This document describes what components the system consists of, why exactly
+these technologies were chosen, and how everything behaves on start, restart
+and shutdown.
 
-## 1. Высокоуровневая картина
+## 1. High-level picture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -18,7 +20,7 @@
 │         │                 │                      │              │
 │  ┌──────▼─────────────────▼──────────────────────▼───────────┐  │
 │  │              DockerProxyServer / ControlServer            │  │
-│  │                    (внутри vz-runner)                     │  │
+│  │                    (inside vz-runner)                     │  │
 │  └──────┬─────────────────────────────┬────────────────────┘  │
 │         │ vsock:1024                  │ vsock:1025            │
 │         │ control channel             │ Docker API channel    │
@@ -37,102 +39,143 @@
 │  │  ┌────────────────────▼────────────────────────────┐   │  │
 │  │  │  containerd + nerdctl + CNI plugins             │   │  │
 │  │  │  /var/lib (containerd + nerdctl volumes)        │   │  │
-│  │  │  на virtio-blk диске                            │   │  │
+│  │  │  on a virtio-blk disk                           │   │  │
 │  │  └─────────────────────────────────────────────────┘   │  │
 │  └─────────────────────────────────────────────────────────┘  │
 │                          │                                     │
 │              VZVirtioFileSystemDeviceConfiguration            │
 │                          │ /mnt/anvil                          │
 │         ┌────────────────┴────────────────┐                   │
-│         │   virtiofs share (host dir)       │                   │
-│         │   • guest-agent.log (debug)       │                   │
-│         │   • networks/<name>.json          │                   │
-│         │   • containerd-cache fallback     │                   │
-│         └───────────────────────────────────┘                   │
+│         │   virtiofs share (host dir)     │                   │
+│         │   • guest-agent.log (debug)     │                   │
+│         │   • networks/<name>.json        │                   │
+│         │   • containerd-cache fallback   │                   │
+│         └─────────────────────────────────┘                   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-`vz-runner` — единственный долгоживущий host-процесс. Он:
+`vz-runner` is the single long-lived host process. It:
 
-- создаёт и управляет Linux VM через `Virtualization.framework`;
-- открывает unix socket для control plane и Docker API proxy;
-- слушает vsock с guest-agent;
-- открывает TCP-listener'ы на `localhost:<hostPort>` для проброски портов контейнеров;
-- сохраняет и восстанавливает VM-снапшот.
+- creates and manages the Linux VM via `Virtualization.framework`;
+- opens unix sockets for the control plane and the Docker API proxy;
+- listens on vsock together with the guest-agent;
+- opens TCP listeners on `localhost:<hostPort>` to forward container ports;
+- saves and restores the VM snapshot.
 
-`guest-agent` — единственный процесс внутри VM после `stage2`. Он:
+`guest-agent` is the only process inside the VM after `stage2`. It:
 
-- принимает команды от `vz-runner` по vsock (exec, статус, sync);
-- эмулирует Docker API для Docker CLI / docker compose;
-- сканирует containerd и пушит в `vz-runner` актуальные port mappings;
-- сам запускает healthcheck'и, потому что `nerdctl` не поддерживает Docker-флаги `--health-cmd`;
-- генерирует CNI-конфиги для per-project bridge-сетей.
+- receives commands from `vz-runner` over vsock (exec, status, sync);
+- emulates the Docker API for Docker CLI / docker compose;
+- scans containerd and pushes the current port mappings to `vz-runner`;
+- runs healthchecks itself, because `nerdctl` does not support the Docker
+  `--health-cmd` flags;
+- generates CNI configs for per-project bridge networks.
 
-## 2. Почему не Lima / Docker Desktop / OrbStack
+## 2. Why not Lima / Docker Desktop / OrbStack
 
-Изначально Anvil использовал Lima. Lima хороша для прототипов, но для продукта даёт много лишнего: SSH-демон, systemd, cloud-init, guest-agent Lima, слой gvisor-tap-vsock. Это замедляет cold boot и усложняет snapshot.
+Originally Anvil used Lima. Lima is good for prototyping, but for a product
+it brings a lot of extra weight: an SSH daemon, systemd, cloud-init, Lima's
+own guest agent, and the gvisor-tap-vsock layer. All of that slows down the
+cold boot and complicates snapshotting.
 
-Решение — свой минимальный guest rootfs и собственный host-раннер:
+The decision: a minimal custom guest rootfs and a custom host runner:
 
-- **Нет systemd.** Init — busybox shell, stage2 запускает containerd и guest-agent напрямую.
-- **Нет SSH.** Управление идёт через vsock, а не TCP/SSH.
-- **Нет gvisor-tap-vsock.** Сеть — встроенный `VZNATNetworkDeviceAttachment` от Apple.
-- **Single shared VM.** Все проекты пользователя живут в одной VM, но изолированы через containerd namespaces и отдельные CNI bridge.
+- **No systemd.** The init is a busybox shell; stage2 starts containerd and
+  the guest-agent directly.
+- **No SSH.** Management goes over vsock, not TCP/SSH.
+- **No gvisor-tap-vsock.** Networking is Apple's built-in
+  `VZNATNetworkDeviceAttachment`.
+- **Single shared VM.** All of the user's projects live in one VM, isolated
+  via containerd namespaces and separate CNI bridges.
 
-## 3. Host-сторона: vz-runner
+## 3. Host side: vz-runner
 
 ### 3.1 VMLifecycleManager
 
-Отвечает за весь жизненный цикл VM:
+Owns the whole VM lifecycle:
 
-- **cold boot** — создаёт `VZVirtualMachineConfiguration`, стартует VM, ждёт guest-agent;
-- **resume** — `restoreMachineStateFromURL` из `~/.anvil-vz/snapshots/default.vzstate`;
-- **pause + save** — при idle timeout или SIGTERM: pause VM, сброс page cache в guest, сохранение state;
-- **snapshot invalidation** — перед restore вычисляется хеш от kernel, initrd, CPU, RAM, disk path/size. Если конфигурация изменилась — cold boot и пересоздание снапшота.
+- **cold boot** — creates the `VZVirtualMachineConfiguration`, starts the
+  VM, waits for the guest-agent;
+- **resume** — `restoreMachineStateFromURL` from
+  `~/.anvil-vz/snapshots/default.vzstate`;
+- **pause + save** — on idle timeout or SIGTERM: pause the VM, drop the
+  guest page cache, save the state;
+- **snapshot invalidation** — before a restore, a hash of the kernel,
+  initrd, CPU, RAM, disk path/size is computed. If the configuration has
+  changed — cold boot and snapshot re-creation.
 
 ### 3.2 ControlServer
 
-Unix socket `~/.anvil-vz/control.sock`. Принимает length-prefixed JSON от CLI и пересылает его в guest-agent через vsock:1024. Используется для `vz-runner exec`, `vz-runner status`, sync containerd cache. При `--debug` печатает команду и exit code каждого запроса.
+Unix socket `~/.anvil-vz/control.sock`. Accepts length-prefixed JSON from
+the CLI and forwards it to the guest-agent over vsock:1024. Used for
+`vz-runner exec`, `vz-runner status`, containerd cache sync. With `--debug`
+it prints the command and exit code of every request.
 
-`DockerProxyServer` раньше шёл мимо ControlServer напрямую к vsock, из-за чего при idle-pause Docker CLI получал `EOF`. Теперь DockerProxyServer тоже вызывает `ensureRunning`, чтобы возобновить VM перед принятием docker-запроса.
+`DockerProxyServer` used to bypass the ControlServer and talk to vsock
+directly, so on an idle-pause the Docker CLI got an `EOF`. Now the
+DockerProxyServer also calls `ensureRunning` to resume the VM before
+accepting a docker request.
 
 ### 3.3 DockerProxyServer
 
-Unix socket `~/.anvil-vz/docker.sock`. Принимает HTTP от Docker CLI, убирает префикс `/v1.XX`, пересылает raw bytes в vsock:1025, где работает HTTP-сервер guest-agent. Ответ возвращается обратно без парсинга протокола.
+Unix socket `~/.anvil-vz/docker.sock`. Accepts HTTP from the Docker CLI,
+strips the `/v1.XX` prefix, forwards raw bytes to vsock:1025 where the
+guest-agent's HTTP server runs. The response is passed back without any
+protocol parsing.
 
-Тот же класс (`DockerProxyServer` с параметром порта) обслуживает `~/.anvil-vz/buildkit.sock` → vsock:1026: сырой TCP-мост к unix-сокету buildkitd в госте. На него указывает buildx builder `anvil-remote` (remote driver), который создаётся/восстанавливается при старте демона (`anvil-service.sh` + `main.swift`). Через него работают `docker buildx build` и `docker compose build` без промежуточного buildkit-контейнера. buildkitd в госте стартует лениво — guest-agent поднимает его при первом подключении к порту 1026 или первом `nerdctl build`.
+The same class (`DockerProxyServer` parameterized by port) also serves
+`~/.anvil-vz/buildkit.sock` → vsock:1026: a raw TCP bridge to the buildkitd
+unix socket in the guest. The buildx builder `anvil-remote` (remote driver)
+points at it; the builder is created/restored at daemon startup
+(`anvil-service.sh` + `main.swift`). Through it, `docker buildx build` and
+`docker compose build` work without an intermediate buildkit container.
+buildkitd in the guest starts lazily — the guest-agent brings it up on the
+first connection to port 1026 or the first `nerdctl build`.
 
 ### 3.4 PortForwarder
 
-Guest-agent сканирует запущенные контейнеры и пушит в `vz-runner` полный список port mappings. `PortForwarder`:
+The guest-agent scans running containers and pushes the full list of port
+mappings to `vz-runner`. `PortForwarder`:
 
-- открывает `listen 0.0.0.0:<hostPort>`;
-- форвардит TCP на `<guestIP>:<hostPort>` (не на container port, а на published host port внутри guest);
-- при каждом пуше делает full-state replace: новые порты открываются, исчезнувшие закрываются;
-- при попытке открыть уже занятый порт логирует конфликт.
+- opens `listen 0.0.0.0:<hostPort>`;
+- forwards TCP to `<guestIP>:<hostPort>` (to the published host port inside
+  the guest, not to the container port);
+- on every push does a full-state replace: new ports are opened, gone ports
+  are closed;
+- logs a conflict when it fails to open an already taken port.
 
-Выбраны POSIX sockets, а не `NWListener`, потому что нужен простой TCP proxy loop без TLS/path monitoring/event-loop overhead Network.framework.
+POSIX sockets were chosen over `NWListener` because all that is needed is a
+plain TCP proxy loop without the TLS/path-monitoring/event-loop overhead of
+Network.framework.
 
 ### 3.5 SnapshotManager
 
-Сохраняет/восстанавливает `default.vzstate`. Перед сохранением `GuestCacheDropper` запускает в guest `sync; echo 3 > /proc/sys/vm/drop_caches`, чтобы снапшот не тащил page cache образов.
+Saves/restores `default.vzstate`. Before saving, `GuestCacheDropper` runs
+`sync; echo 3 > /proc/sys/vm/drop_caches` in the guest so the snapshot does
+not drag along the page cache of images.
 
-## 4. Guest-сторона: guest-agent
+## 4. Guest side: guest-agent
 
-### 4.1 Запуск и роль PID 1
+### 4.1 Startup and the PID 1 role
 
-`stage2.sh` делает `exec /bin/guest-agent`. Процесс становится PID 1, поэтому:
+`stage2.sh` does `exec /bin/guest-agent`. The process becomes PID 1,
+therefore:
 
-- запущен фоновый reaper `SIGCHLD` через `syscall.Wait4(-1, WNOHANG)`, иначе завершившиеся `containerd-shim`/`runc`/`nerdctl` превращаются в зомби и дедлокают containerd;
-- guest-agent не должен неожиданно падать — иначе VM остаётся без управления.
+- a background `SIGCHLD` reaper via `syscall.Wait4(-1, WNOHANG)` must run,
+  otherwise finished `containerd-shim`/`runc`/`nerdctl` processes turn into
+  zombies and deadlock containerd;
+- the guest-agent must not crash unexpectedly — otherwise the VM is left
+  without management.
 
-### 4.2 vsock control channel (порт 1024)
+### 4.2 vsock control channel (port 1024)
 
-Простой length-prefixed JSON. Команды: `exec`, `status`, `sync`. Ответ содержит stdout/stderr/exit_code. Используется как CLI control plane.
+Simple length-prefixed JSON. Commands: `exec`, `status`, `sync`. The
+response contains stdout/stderr/exit_code. Used as the CLI control plane.
 
-### 4.3 Docker API server (порт 1025)
+### 4.3 Docker API server (port 1025)
 
-HTTP/1.1 сервер, эмулирует подмножество Docker API, необходимое для `docker` и `docker compose`:
+An HTTP/1.1 server emulating the subset of the Docker API needed by
+`docker` and `docker compose`:
 
 - `/_ping`, `/version`;
 - `/containers/*` create/start/stop/wait/rm/attach/logs/exec/inspect/archive;
@@ -140,167 +183,224 @@ HTTP/1.1 сервер, эмулирует подмножество Docker API, �
 - `/networks/*` create/inspect/list/rm/prune;
 - `/volumes/*` create/inspect/list/rm/prune.
 
-Особенности:
+Notable details:
 
-- Docker container ID — детерминированный `sha256(namespace + "/" + containerdID)[:64]`, чтобы ID не менялся между сессиями.
-- `POST /containers/{id}/wait` отправляет HTTP-заголовки сразу (chunked encoding) и только потом блокируется до выхода контейнера. Это нужно, потому что Docker CLI вызывает `/wait` до `/start`, и если ответ не начать сразу, следующий `/start` встаёт в очередь на том же соединении и контейнер никогда не стартует.
-- `HostConfig.AutoRemove` не передаётся в `nerdctl create --rm`. Вместо этого guest-agent сам удаляет контейнер после того, как сохранил exit code, иначе `docker run --rm` не мог бы вернуть ненулевой код возврата.
-- На hijacked exec/attach-соединении stdin клиента — всегда сырой байтовый поток (мультиплексируется только вывод). Его нужно форвардить в процесс как есть: buildx docker-container driver гоняет gRPC через `buildctl dial-stdio` по этому каналу. При этом `cmd.Wait()` ждёт и копирование stdin, поэтому stdin-pipe закрывается по EOF выходных потоков — иначе клиент, держащий соединение открытым (buildx), дедлокает exec.
+- The Docker container ID is a deterministic
+  `sha256(namespace + "/" + containerdID)[:64]`, so the ID does not change
+  between sessions.
+- `POST /containers/{id}/wait` sends the HTTP headers immediately (chunked
+  encoding) and only then blocks until the container exits. This is needed
+  because the Docker CLI calls `/wait` before `/start`, and if the response
+  is not started right away, the following `/start` queues on the same
+  connection and the container never starts.
+- `HostConfig.AutoRemove` is not passed to `nerdctl create --rm`. Instead
+  the guest-agent removes the container itself after the exit code has been
+  saved — otherwise `docker run --rm` could not return a non-zero exit
+  code.
+- On a hijacked exec/attach connection the client's stdin is always a raw
+  byte stream (only the output is multiplexed). It must be forwarded to the
+  process as is: the buildx docker-container driver runs gRPC through
+  `buildctl dial-stdio` over this channel. `cmd.Wait()` also waits for the
+  stdin copy, so the stdin pipe is closed on EOF of the output streams —
+  otherwise a client that keeps the connection open (buildx) deadlocks
+  exec.
 
-### 4.3a buildkit bridge (порт 1026)
+### 4.3a buildkit bridge (port 1026)
 
-`buildkit.go`: raw TCP-мост vsock:1026 ↔ `/run/buildkit/buildkitd.sock`. Первое входящее подключение (или `POST /build`) лениво стартует `buildkitd`. Порт проброшен на хост как `~/.anvil-vz/buildkit.sock` (см. §3.3).
+`buildkit.go`: a raw TCP bridge vsock:1026 ↔
+`/run/buildkit/buildkitd.sock`. The first incoming connection (or
+`POST /build`) lazily starts `buildkitd`. The port is forwarded to the host
+as `~/.anvil-vz/buildkit.sock` (see §3.3).
 
 ### 4.4 Port scanner
 
-Подключается к containerd через `/run/containerd/containerd.sock`, периодически читает задачи и их labels. При изменении портов:
+Connects to containerd via `/run/containerd/containerd.sock`, periodically
+reads tasks and their labels. When ports change:
 
-- при старте и после resume — пушит full state;
-- при обычных изменениях — debounce 150 мс, затем пушит итоговое состояние.
+- on start and after a resume — pushes the full state;
+- on regular changes — a 150 ms debounce, then pushes the resulting state.
 
 ### 4.5 Healthcheck
 
-Guest-agent сохраняет healthcheck-конфиг из `POST /containers/create` и сам запускает периодические `nerdctl exec` проверки. Статус `(healthy)`/`(unhealthy)`/`(starting)` возвращается в `docker ps` и `docker inspect`, что позволяет `docker compose` использовать `depends_on: condition: service_healthy`. Изначально так было сделано, потому что `nerdctl` 2.0.4 не поддерживал `--health-cmd`; в 2.3.5 флаги появились, но собственный раннер оставлен — он уже проверен и не зависит от особенностей nerdctl.
+The guest-agent saves the healthcheck config from
+`POST /containers/create` and runs periodic `nerdctl exec` checks itself.
+The `(healthy)`/`(unhealthy)`/`(starting)` status is returned in
+`docker ps` and `docker inspect`, which lets `docker compose` use
+`depends_on: condition: service_healthy`. This was originally done because
+`nerdctl` 2.0.4 did not support `--health-cmd`; the flags appeared in 2.3.5,
+but the custom runner stayed — it is battle-tested and does not depend on
+nerdctl quirks.
 
 ### 4.6 CNI / per-project networking
 
-Каждый Docker Compose project получает свой namespace и bridge-сеть:
+Every Docker Compose project gets its own namespace and bridge network:
 
-- subnet детерминированный: `10.10.<hash(project) % 250 + 1>.0/24`;
-- bridge `br-<sanitized-project>`;
-- CNI conflist `/etc/cni/net.d/nerdctl-<name>.conflist` генерируется guest-agent перед созданием контейнера или сети.
+- the subnet is deterministic: `10.10.<hash(project) % 250 + 1>.0/24`;
+- the bridge is `br-<sanitized-project>`;
+- the CNI conflist
+  `/etc/cni/net.d/nerdctl-<name>.conflist` is generated by the guest-agent
+  before creating a container or a network.
 
-Compose-метки (`com.docker.compose.project`, `com.docker.compose.network` и др.) сохраняются в `/mnt/anvil/networks/<name>.json`, потому что `nerdctl network inspect` для bridge-сетей не возвращает labels. Эти labels мерджатся в ответы `GET /networks`, а при старте guest-agent восстанавливает CNI conflist из сохранённых labels — иначе после cold boot Compose считает сеть "external" и отказывается её использовать.
+Compose labels (`com.docker.compose.project`,
+`com.docker.compose.network`, etc.) are persisted in
+`/mnt/anvil/networks/<name>.json`, because `nerdctl network inspect` does
+not return labels for bridge networks. These labels are merged into
+`GET /networks` responses, and at startup the guest-agent restores the CNI
+conflist from the saved labels — otherwise after a cold boot Compose
+considers the network "external" and refuses to use it.
 
 ### 4.7 Image canonicalization
 
-Docker CLI часто передаёт неполные refs (`postgres:15.5`). `nerdctl` хранит образы под полным именем (`docker.io/library/postgres:15.5`). Guest-agent канонизирует ref перед pull/lookup, чтобы `docker compose` не получал `no such image`.
+The Docker CLI often passes incomplete refs (`postgres:15.5`). `nerdctl`
+stores images under the full name
+(`docker.io/library/postgres:15.5`). The guest-agent canonicalizes the ref
+before pull/lookup so that `docker compose` does not get
+`no such image`.
 
-## 5. Initramfs и stage2
+## 5. Initramfs and stage2
 
-### 5.1 Структура
+### 5.1 Structure
 
-База — Alpine initramfs-virt. Внутри Linux-контейнера (`alpine:3.20`) собирается rootfs:
+The base is the Alpine initramfs-virt. Inside a Linux container
+(`alpine:3.20`) the rootfs is assembled with:
 
-- busybox + базовые applets;
+- busybox + basic applets;
 - containerd, nerdctl, runc, CNI plugins;
 - guest-agent;
-- Ubuntu kernel modules: vsock, virtiofs, overlayfs, bridge, veth, netfilter/xt/nft модули;
+- Ubuntu kernel modules: vsock, virtiofs, overlayfs, bridge, veth,
+  netfilter/xt/nft modules;
 - iptables + libmnl/libnftnl/libxtables;
-- GNU tar + libacl/libattr для `nerdctl cp`.
+- GNU tar + libacl/libattr for `nerdctl cp`.
 
-### 5.2 Почему switch_root, а не bind/pivot
+### 5.2 Why switch_root, not bind/pivot
 
-Ранее делались bind-mount'ы в `/newroot`, но `pivot_root` нельзя вызвать из initramfs pseudo-fs `rootfs`. `switch_root` (busybox) делает `mount --move` + `chroot` + `exec`, что корректно переносит init в tmpfs root.
+Bind mounts into `/newroot` were used before, but `pivot_root` cannot be
+called from the initramfs pseudo-fs `rootfs`. busybox `switch_root` does
+`mount --move` + `chroot` + `exec`, which correctly moves init into the
+tmpfs root.
 
 ### 5.3 stage2
 
-`stage2.sh` после `switch_root`:
+`stage2.sh` after `switch_root`:
 
-1. Проверяет/перемонтирует proc/sys/dev/cgroup;
-2. Монтирует virtiofs share в `/mnt/anvil`;
-3. Монтирует `/var/lib` целиком:
-   - первый приоритет — virtio-blk диск `/dev/vda` (ext4);
-   - второй — bind-mount `/mnt/anvil/var-lib` (fallback);
-   - третий — tmpfs (последний fallback).
+1. Checks/remounts proc/sys/dev/cgroup;
+2. Mounts the virtiofs share at `/mnt/anvil`;
+3. Mounts `/var/lib` as a whole:
+   - first priority — the virtio-blk disk `/dev/vda` (ext4);
+   - second — a bind mount of `/mnt/anvil/var-lib` (fallback);
+   - third — tmpfs (last fallback).
 
-   Это важно: раньше диск монтировался только на `/var/lib/containerd`, а
-   `/var/lib/nerdctl` (volumes, metadata) и `/var/lib/cni` оставались на
-   tmpfs-root. При заполнении volumes (например, PostgreSQL) tmpfs
-   заканчивалась, и `docker ps` тормозил из-за переполненного/фрагментированного
-   `nerdctl`-state. Теперь весь `/var/lib` persistent.
-4. Загружает netfilter/bridge/veth модули;
-5. Добавляет iptables MASQUERADE для DNATed TCP (исправляет asymmetric routing при VZ NAT);
-6. Стартует containerd;
-7. Чистит orphaned контейнеры через low-level `ctr` (не `nerdctl rm`, чтобы не ждать зависший shim);
-8. Стартует guest-agent.
+   This matters: previously the disk was mounted only at
+   `/var/lib/containerd`, while `/var/lib/nerdctl` (volumes, metadata) and
+   `/var/lib/cni` stayed on the tmpfs root. When volumes filled up (e.g.
+   PostgreSQL), tmpfs ran out and `docker ps` slowed down because of an
+   overflowing/fragmented `nerdctl` state. Now all of `/var/lib` is
+   persistent.
+4. Loads the netfilter/bridge/veth modules;
+5. Adds an iptables MASQUERADE rule for DNATed TCP (fixes asymmetric
+   routing under VZ NAT);
+6. Starts containerd;
+7. Cleans orphaned containers via low-level `ctr` (not `nerdctl rm`, to
+   avoid waiting on a hung shim);
+8. Starts the guest-agent.
 
-## 6. Поведение при перезапуске
+## 6. Restart behavior
 
-### 6.1 Сервисный запуск
+### 6.1 Service launch
 
 `scripts/anvil-service.sh`:
 
-- сохраняет текущий docker context (если он не `anvil`);
-- запускает `vz-runner daemon` с нужными путями к kernel/initrd/disk/share;
-- передаёт `--debug`, если `DEBUG=1`;
-- ждёт появления `~/.anvil-vz/control.sock`;
-- делает `docker context use anvil`;
-- предупреждает, если в окружении установлен `http_proxy`, а `NO_PROXY` не содержит `localhost/127.0.0.1` (иначе `curl localhost:<port>` и интеграционные тесты могут уйти на прокси).
+- saves the current docker context (if it is not `anvil`);
+- starts `vz-runner daemon` with the right kernel/initrd/disk/share paths;
+- passes `--debug` when `DEBUG=1` is set;
+- waits for `~/.anvil-vz/control.sock` to appear;
+- runs `docker context use anvil`;
+- warns when the environment has `http_proxy` set but `NO_PROXY` does not
+  contain `localhost/127.0.0.1` (otherwise `curl localhost:<port>` and
+  integration tests may go through the proxy).
 
-#### Debug-режим
+#### Debug mode
 
-`DEBUG=1 make service-start` включает debug-логи только host-стороны
-(`vz-runner`), потому что `service-start` делает **resume** из снапшота.
-Guest-agent внутри снапшота — это старый процесс, который стартовал без
-`ANVIL_DEBUG=1` и не перечитывает `.anvil-debug` при resume. Поэтому
-`guest-agent.log` не обновляется.
+`DEBUG=1 make service-start` enables debug logs only on the host side
+(`vz-runner`), because `service-start` does a **resume** from the snapshot.
+The guest-agent inside the snapshot is the old process that started without
+`ANVIL_DEBUG=1` and does not re-read `.anvil-debug` on resume. That is why
+`guest-agent.log` is not updated.
 
-Чтобы получить debug-логи guest-agent:
+To get guest-agent debug logs:
 
 ```bash
-make service-debug       # stop + удалить снапшот + cold boot с DEBUG=1
+make service-debug       # stop + delete the snapshot + cold boot with DEBUG=1
 ```
 
-На cold boot `stage2.sh` видит `/mnt/anvil/.anvil-debug` и запускает
-`guest-agent` с `ANVIL_DEBUG=1`, пишет в `<share>/guest-agent.log`.
-Последующие `make service-start`/`service-stop` будут resume'ить VM уже в
-debug-состоянии, пока не будет создан новый снапшот без debug.
+On a cold boot `stage2.sh` sees `/mnt/anvil/.anvil-debug` and starts the
+`guest-agent` with `ANVIL_DEBUG=1`, writing to `<share>/guest-agent.log`.
+Subsequent `make service-start`/`service-stop` will resume the VM already
+in the debug state, until a new snapshot without debug is created.
 
-При остановке:
+On shutdown:
 
-- SIGTERM демону;
-- восстановление предыдущего docker context.
+- SIGTERM to the daemon;
+- the previous docker context is restored.
 
 ### 6.2 Cold boot
 
-1. `vz-runner` не находит snapshot или хеш не совпадает — cold boot.
-2. VM стартует с kernel + initramfs.
+1. `vz-runner` finds no snapshot or the hash does not match — cold boot.
+2. The VM starts with kernel + initramfs.
 3. `myinit` → `switch_root` → `stage2`.
-4. Containerd поднимается с persistent disk.
-5. Guest-agent стартует, восстанавливает CNI conflists из `/mnt/anvil/networks/`.
-6. Guest-agent пушит full port state (пока пустой).
-7. `vz-runner` сохраняет снапшот.
+4. Containerd comes up with the persistent disk.
+5. The guest-agent starts, restoring CNI conflists from
+   `/mnt/anvil/networks/`.
+6. The guest-agent pushes the full port state (still empty).
+7. `vz-runner` saves the snapshot.
 
 ### 6.3 Resume
 
-1. `vz-runner` находит валидный snapshot.
-2. `restoreMachineStateFromURL` — обычно < 1 с.
-3. VM продолжает выполнение с того места, где была пауза.
-4. Guest-agent переподключается к vsock и пушит full port state.
-5. `PortForwarder` заново открывает нужные listener'ы.
+1. `vz-runner` finds a valid snapshot.
+2. `restoreMachineStateFromURL` — usually < 1 s.
+3. The VM continues execution from where it was paused.
+4. The guest-agent reconnects to vsock and pushes the full port state.
+5. `PortForwarder` reopens the needed listeners.
 
 ### 6.4 SIGTERM / idle timeout
 
-1. `vz-runner` получает SIGTERM или idle timer срабатывает.
-2. Запускается `ContainerdCacheManager.sync()` на фоновой очереди (раньше блокировал main queue).
-3. `GuestCacheDropper` дропает page cache в guest.
+1. `vz-runner` receives SIGTERM or the idle timer fires.
+2. `ContainerdCacheManager.sync()` runs on a background queue (it used to
+   block the main queue).
+3. `GuestCacheDropper` drops the page cache in the guest.
 4. VM pause + `saveMachineStateToURL`.
-5. Процесс завершается.
+5. The process exits.
 
-### 6.5 Перезапуск демона
+### 6.5 Daemon restart
 
-Если `vz-runner` перезапустился, а VM не была сохранена, происходит cold boot. Если snapshot сохранён — resume. Serial port в daemon mode перенаправлен в `~/.anvil-vz/console.log`, чтобы `VZFileHandleSerialPortAttachment` на stdio не ломал restore из-за новых FD нового процесса.
+If `vz-runner` was restarted while the VM was not saved, a cold boot
+happens. If the snapshot was saved — a resume. In daemon mode the serial
+port is redirected to `~/.anvil-vz/console.log`, so that
+`VZFileHandleSerialPortAttachment` on stdio does not break the restore due
+to the new FDs of the new process.
 
-## 7. Постоянное хранилище
+## 7. Persistent storage
 
 ### 7.1 Containerd root
 
-Используется virtio-blk диск `~/.anvil-vz/containerd-disk.img` (ext4). Почему:
+A virtio-blk disk `~/.anvil-vz/containerd-disk.img` (ext4) is used. Why:
 
-- **tmpfs** — образы жили в RAM, снапшот раздувался, cold boot требовал tarball restore;
-- **loop-файл на virtiofs** — давал `input/output error` на `meta.db` и медленную запись (1.7 GB tarball ~23 с);
-- **virtio-blk** — нормальная файловая система, образы переживают reboot, resume быстрый.
+- **tmpfs** — images lived in RAM, the snapshot ballooned, cold boot needed
+  a tarball restore;
+- **a loop file on virtiofs** — produced `input/output error` on `meta.db`
+  and slow writes (a 1.7 GB tarball took ~23 s);
+- **virtio-blk** — a real file system, images survive a reboot, resume is
+  fast.
 
-#### Writeback cache и synchronization mode
+#### Writeback cache and synchronization mode
 
-По умолчанию `VZDiskImageStorageDeviceAttachment` работает в режиме `.full`:
-каждый guest fsync вызывает flush на хосте. Для `nerdctl`/containerd, которые
-постоянно пишут мелкие metadata-операции, это приводит к тому, что
-`docker stop`/`docker compose down` занимают по 10 с (graceful timeout),
-а `docker run --rm alpine` — 4+ с.
+By default `VZDiskImageStorageDeviceAttachment` works in `.full` mode:
+every guest fsync triggers a flush on the host. For nerdctl/containerd,
+which constantly issue small metadata writes, this resulted in
+`docker stop`/`docker compose down` taking the full graceful timeout of 10 s
+each, and `docker run --rm alpine` — 4+ s.
 
-Решение — включить хостовый writeback cache и отключить guest-fsync:
+The fix — enable the host writeback cache and drop guest-fsync propagation:
 
 ```swift
 let attachment = try VZDiskImageStorageDeviceAttachment(
@@ -311,35 +411,36 @@ let attachment = try VZDiskImageStorageDeviceAttachment(
 )
 ```
 
-После этого:
+After that:
 
 - `docker ps` — ~0.06 s;
 - `docker images` — ~0.04 s;
 - `docker run --rm alpine echo hi` — ~2.0 s;
-- `make run_tests_locally` в `pprb_uzp_efficiency` — ~50 s.
+- `make run_tests_locally` in `pprb_uzp_efficiency` — ~50 s.
 
-Риск: при kill -9 демона или panic на хосте может потеряться последняя
-транзакция metadata. Для dev-VM приемлемо; production-нагрузки этот режим не
-подходит. Долговечность обеспечивается snapshot save/resume в штатном сценарии.
+The risk: on a kill -9 of the daemon or a host panic the last metadata
+transaction can be lost. Acceptable for a dev VM; this mode does not fit
+production workloads. Durability in the normal scenario is provided by
+snapshot save/resume.
 
 #### Sparse raw disk + ext4 / virtio-blk tuning
 
-Изначально использовался `.dmg` (UDIF sparse-образ). На random writes APFS
-добавляет overhead на выделение блоков за EOF. Перешли на raw image —
-сначала preallocated (полное заполнение нулями через `dd`), затем sparse:
-образ создаётся пустым и сразу `truncate`'ится до целевого размера
-(`main.swift`, дефолт 64 ГиБ, `ANVIL_DISK_GB`). Sparse на APFS не отличается
-по скорости от preallocated (блоки выделяются при первой записи в любом
-случае), но не занимает место на хосте, пока данные реально не записаны,
-и позволяет возвращать место через discard (см. §7.3).
+Initially a `.dmg` (UDIF sparse image) was used. On random writes APFS adds
+block-allocation overhead beyond EOF. We moved to a raw image — first
+preallocated (zero-filled with `dd`), then sparse: the image is created
+empty and immediately truncated to the target size (`main.swift`, default
+64 GiB, `ANVIL_DISK_GB`). Sparse is not faster than preallocated on APFS
+(blocks are allocated on first write either way), but it does not consume
+host space until data is actually written, and it allows returning space
+via discard (see §7.3).
 
-Stage2 монтирует его с опциями, минимизирующими metadata-задержки:
+Stage2 mounts it with options that minimize metadata latency:
 
 ```bash
 mount -t ext4 -o noatime,nobarrier,data=writeback,commit=60 /dev/vda /var/lib
 ```
 
-И тюнит блочное устройство:
+And tunes the block device:
 
 ```bash
 echo none > /sys/block/vda/queue/scheduler
@@ -348,68 +449,80 @@ echo 256 > /sys/block/vda/queue/nr_requests
 echo 2 > /sys/block/vda/queue/nomerges
 ```
 
-Результат по сравнению с `.none` без tuning:
+The result compared to `.none` without tuning:
 
-- `docker ps` — ~0.01 s (было ~0.06 s);
-- `docker images` — ~0.03 s (было ~0.04 s);
-- `docker run --rm alpine echo hi` — ~1.2 s (было ~2.0 s);
-- `make run_tests_locally` — ~40 s (было ~50 s).
+- `docker ps` — ~0.01 s (was ~0.06 s);
+- `docker images` — ~0.03 s (was ~0.04 s);
+- `docker run --rm alpine echo hi` — ~1.2 s (was ~2.0 s);
+- `make run_tests_locally` — ~40 s (was ~50 s).
 
-> **Multiqueue virtio-blk** — в текущем Virtualization.framework SDK
-> (`VZVirtioBlockDeviceConfiguration.h`, macOS 14/15) public property для
-> количества очередей отсутствует, поэтому этот пункт не применим без
-> обновления Xcode/SDK.
+> **Multiqueue virtio-blk** — in the current Virtualization.framework SDK
+> (`VZVirtioBlockDeviceConfiguration.h`, macOS 14/15) there is no public
+> property for the queue count, so this item is not applicable without
+> upgrading Xcode/SDK.
 
 ### 7.2 Virtiofs share
 
-`/mnt/anvil` на хостовой директории проекта. Используется для:
+`/mnt/anvil` on the host project directory. Used for:
 
-- debug-лога guest-agent;
+- the guest-agent debug log;
 - persisted network labels (`/mnt/anvil/networks/`);
-- fallback `/var/lib` (`/mnt/anvil/var-lib`), если virtio-blk диск не указан;
-- one-time миграции старого tarball cache в `/mnt/anvil/var-lib/containerd`.
+- the `/var/lib` fallback (`/mnt/anvil/var-lib`) when no virtio-blk disk is
+  configured;
+- a one-time migration of the old tarball cache into
+  `/mnt/anvil/var-lib/containerd`.
 
-### 7.3 Как изменить память или размер диска
+### 7.3 How to change memory or disk size
 
-**Память.**
+**Memory.**
 
-1. Остановить сервис: `make service-stop`.
-2. Задать желаемое значение (ГБ) и перезапустить:
+1. Stop the service: `make service-stop`.
+2. Set the desired value (GB) and start again:
    ```bash
    export ANVIL_MEMORY=4
    make service-start
    ```
-   Хеш снапшота включает размер памяти, поэтому при смене произойдёт cold boot и снапшот пересоздастся автоматически.
+   The snapshot hash includes the memory size, so changing it triggers a
+   cold boot and the snapshot is re-created automatically.
 
-**Диск containerd.**
+**Containerd disk.**
 
-Диск — sparse raw image (`containerd-disk.img`), ext4 без таблицы разделов.
-Создаётся автоматически при первом старте (дефолт 64 ГиБ, настраивается
-`ANVIL_DISK_GB`), на хосте занимает только реально записанные блоки.
+The disk is a sparse raw image (`containerd-disk.img`), ext4 without a
+partition table. It is created automatically on first start (default 64
+GiB, configurable via `ANVIL_DISK_GB`) and occupies only the blocks
+actually written on the host.
 
-Увеличение — автоматическое, только вверх: при старте vz-runner сравнивает
-целевой размер (`ANVIL_DISK_GB`) с текущим и делает `truncate` в большую
-сторону (`main.swift`). Размер файла входит в хеш снапшота, поэтому
-следующий запуск — cold boot, а stage2 догоняет ext4 online-`resize2fs`
-сразу после монтирования. Уменьшение не поддерживается (образ никогда не
-сжимается — иначе можно потерять данные ext4).
+Growing is automatic and upward-only: at startup vz-runner compares the
+target size (`ANVIL_DISK_GB`) with the current one and truncates upward
+(`main.swift`). The file size is part of the snapshot hash, so the next
+launch is a cold boot, and stage2 catches the ext4 up with an online
+`resize2fs` right after mounting. Shrinking is not supported (the image is
+never compacted — otherwise ext4 data could be lost).
 
-Возврат места на хосте после удаления образов (`make prune`):
+Returning host space after deleting images (`make prune`):
 
-- **Автоматически**: virtio-blk в VZ поддерживает discard, guest-agent раз в
-  сутки гоняет `fstrim /var/lib/containerd` (`periodicFstrim` в
-  `guest-agent/main.go`) — освобождённые блоки пробивают дырки в
-  sparse-образе без остановки демона.
-- **Вручную и сразу**: `make disk-compact` — sparse-копия образа через
-  `dd conv=sparse` (демон останавливается и запускается снова; логический
-  размер и содержимое не меняются, снапшот остаётся валидным).
+- **Automatically**: virtio-blk in VZ supports discard, and the guest-agent
+  runs `fstrim /var/lib/containerd` once a day (`periodicFstrim` in
+  `guest-agent/main.go`) — freed blocks punch holes in the sparse image
+  without stopping the daemon.
+- **Manually and immediately**: `make disk-compact` — a sparse copy of the
+  image via `dd conv=sparse` (the daemon is stopped and started again; the
+  logical size and contents do not change, the snapshot stays valid).
 
-Если диск не указан, stage2 использует fallback `/mnt/anvil/var-lib` на
-virtiofs share — он медленнее, но не требует ручного создания образа.
+If no disk is configured, stage2 uses the `/mnt/anvil/var-lib` fallback on
+the virtiofs share — slower, but requires no manual image creation.
 
-## 8. Известные компромиссы
+## 8. Known trade-offs
 
-- **Snapshot size floor.** Даже с block disk и `drop_caches` снапшот после pull образов ~1 GB из-за активной памяти containerd. Дальнейшее уменьшение возможно только через более агрессивное управление кэшем containerd или уменьшение RAM.
-- **Docker API partial.** Реализовано только подмножество Docker API, достаточное для `docker`/`docker compose` повседневного использования. Часть редких endpoint'ов возвращает `404`.
-- **Single VM.** Все проекты в одной VM. Если VM падает — останавливаются все проекты. Изоляция — логическая (containerd namespace + CNI bridge), не аппаратная.
-- **macOS only.** `Virtualization.framework` доступен только на Apple Silicon macOS.
+- **Snapshot size floor.** Even with the block disk and `drop_caches`, the
+  snapshot after pulling images is ~1 GB because of containerd's active
+  memory. Reducing it further is only possible with more aggressive
+  containerd cache management or less RAM.
+- **Partial Docker API.** Only the subset of the Docker API sufficient for
+  day-to-day `docker`/`docker compose` usage is implemented. Some rare
+  endpoints return `404`.
+- **Single VM.** All projects live in one VM. If the VM dies, all projects
+  stop. Isolation is logical (containerd namespace + CNI bridge), not
+  hardware.
+- **macOS only.** `Virtualization.framework` is available only on Apple
+  Silicon macOS.

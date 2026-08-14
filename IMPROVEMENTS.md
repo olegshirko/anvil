@@ -1,325 +1,354 @@
-# План улучшений Anvil
+# Anvil improvement plan
 
-Приоритеты: 1) скорость запуска, 2) баги и надёжность, 3) функциональность,
-4) тесты и CI, 5) DX и релиз. Внутри разделов — по убыванию эффекта.
+Priorities: 1) startup speed, 2) bugs and reliability, 3) functionality,
+4) tests and CI, 5) DX and release. Within sections — ordered by impact.
 
-## 1. Скорость запуска
+## 1. Startup speed
 
-Базовые замеры (daemon.log / console.log, июль 2026):
+Baseline measurements (daemon.log / console.log, July 2026):
 
-- Холодный старт до готовности ≈ 8.3 с: VM start 0.12 с → guest-agent ready
-  5.76 с → сохранение снапшота 2.44 с (инлайн, до объявления готовности).
-- Resume из снапшота ≈ 1 с.
+- Cold start to readiness ≈ 8.3 s: VM start 0.12 s → guest-agent ready
+  5.76 s → snapshot save 2.44 s (inline, before declaring readiness).
+- Resume from snapshot ≈ 1 s.
 
-**Результат после первой итерации (сделано, bench-harness): холодный старт
-daemon ready 1339 мс (честный cold boot, для сравнения OrbStack 1560 мс,
-Docker Desktop 2175 мс), resume 568 мс (Colima 13301 мс, Lima 9114 мс),
-guest-agent ready 1.16 с после VM start (было 5.4–5.8 с), initramfs
-109 → 51 МБ, idle RSS 2766 → ~700 МБ.**
+**Result after the first iteration (done, bench-harness): cold start to
+daemon-ready 1339 ms (a real cold boot; for comparison OrbStack 1560 ms,
+Docker Desktop 2175 ms), resume 568 ms (Colima 13301 ms, Lima 9114 ms),
+guest-agent ready 1.16 s after VM start (was 5.4–5.8 s), initramfs
+109 → 51 MB, idle RSS 2766 → ~700 MB.**
 
-Сделано:
+Done:
 
-1. **Честные замеры.** `cmdStatus` выходил с кодом 0 всегда — теперь != 0,
-   пока демон не поднялся и control-цепочка (daemon → control server →
-   guest-agent health) не отвечает (`main.swift`). В bench-harness добавлен
-   хук `backend_cold_reset` (удаляет снапшот vz-runner перед фазой cold
-   start) — раньше «cold start» в бенче на деле был resume.
-2. **Ленивый снапшот (−2.4 с на холодный старт).** `VMLifecycleManager`
-   больше не делает pause → save → resume до `didBecomeReady`; снапшот
-   сохраняется на idle-таймауте и при штатной остановке, как раньше.
-3. **Кеш sha256 ассетов.** Хеш kernel+initrd (~172 МБ) считался дважды за
-   запуск; теперь persistent-кеш по (path, size, mtime) в
-   `~/.anvil-vz/asset-hashes.json` (`SnapshotManager.swift`).
-4. **Гостевая загрузка.** Убран блокирующий `ntpd` (фон, RTC от VZ
-   достаточно); `udhcpc -n -q` вместо опроса 0.5 с; poll `containerd.sock`
-   0.5 → 0.1 с; `sleep 1` после killall — только если были убиты процессы.
-5. **Похудение initramfs 109 → 51 МБ:** выкинуты `containerd-stress` и
-   rootless-скрипты (−19 МБ), оставлены 6 нужных CNI-плагинов (−56 МБ),
-   упаковка `gzip -9` → `zstd -19` (распаковка initrd 0.63 → 0.2 с),
-   guest-agent с `-ldflags="-s -w"`.
-6. **Прочее:** `random.trust_cpu=on` в cmdline (crng init был на ~81 с),
-   быстрые опросы сокетов на хосте (0.5 → 0.1 с), `anvil-service.sh` без
-   `python3` в циклах ожидания.
-7. **Размер скачивания 126 → ~86 МБ:** ядро пакуется в релизный tarball
-   сжатым (`vmlinuz-raw.gz`, 18.5 МБ вместо 59 МБ) и распаковывается один
-   раз при первом старте в `~/.anvil-vz` (переупаковывается, когда gz из
-   пакета новее — т.е. при апгрейде).
+1. **Honest measurements.** `cmdStatus` always exited with code 0 — now it
+   is != 0 until the daemon is up and the control chain (daemon → control
+   server → guest-agent health) answers (`main.swift`). bench-harness got a
+   `backend_cold_reset` hook (deletes the vz-runner snapshot before the
+   cold-start phase) — previously the "cold start" in the benchmark was in
+   fact a resume.
+2. **Lazy snapshot (−2.4 s on cold start).** `VMLifecycleManager` no longer
+   does pause → save → resume before `didBecomeReady`; the snapshot is
+   saved on the idle timeout and on a clean shutdown, as before.
+3. **Asset sha256 cache.** The hash of kernel+initrd (~172 MB) was computed
+   twice per launch; now there is a persistent cache keyed by (path, size,
+   mtime) in `~/.anvil-vz/asset-hashes.json` (`SnapshotManager.swift`).
+4. **Guest boot.** Removed the blocking `ntpd` (background; the VZ RTC is
+   good enough); `udhcpc -n -q` instead of a 0.5 s poll; containerd.sock
+   poll 0.5 → 0.1 s; the `sleep 1` after killall — only when processes
+   were actually killed.
+5. **Initramfs slimming 109 → 51 MB:** dropped `containerd-stress` and the
+   rootless scripts (−19 MB), kept only the 6 needed CNI plugins (−56 MB),
+   repacked `gzip -9` → `zstd -19` (initrd decompression 0.63 → 0.2 s),
+   guest-agent built with `-ldflags="-s -w"`.
+6. **Misc:** `random.trust_cpu=on` in the cmdline (crng init used to land
+   at ~81 s), fast socket polling on the host (0.5 → 0.1 s),
+   `anvil-service.sh` without `python3` in wait loops.
+7. **Download size 126 → ~86 MB:** the kernel is packed into the release
+   tarball compressed (`vmlinuz-raw.gz`, 18.5 MB instead of 59 MB) and
+   unpacked once on first start into `~/.anvil-vz` (re-unpacked when the
+   gz from the package is newer — i.e. on upgrade).
 
-Осталось (отложено):
+Remaining (postponed):
 
-7. **Копия rootfs в tmpfs + switch_root (~0.3–0.5 с).** myinit копирует
-   ~165 МБ в /newroot, т.к. rootfs initramfs — не отдельный mount и runc
-   pivot_root ломается. Пока оставлено (рискованно), частично компенсировано
-   похудением образа.
-8. **(дорого, опционально) Alpine linux-virt ядро** вместо Ubuntu generic:
-   образ в разы меньше, инициализация быстрее. Нужно подобрать набор модулей
-   (ext4, vsock, virtiofs, bridge, netfilter).
+7. **Rootfs copy into tmpfs + switch_root (~0.3–0.5 s).** myinit copies
+   ~165 MB into /newroot, because the initramfs rootfs is not a separate
+   mount and runc's pivot_root breaks. Left as is for now (risky),
+   partially compensated by the image slimming.
+8. **(expensive, optional) Alpine linux-virt kernel** instead of the Ubuntu
+   generic one: the image is several times smaller and initialization is
+   faster. Requires picking the module set (ext4, vsock, virtiofs, bridge,
+   netfilter).
 
-## 1а. Переход на Alpine linux-virt (сделано)
+## 1a. Migration to Alpine linux-virt (done)
 
-- Ядро и модули берутся из **одного apk** `linux-virt-<ver>` (vermagic
-  совпадает по построению; netboot-образы Alpine отстают от репо, поэтому
-  ядро из netboot использовать нельзя). Ubuntu generic (59 МБ raw, 87 МБ
-  modules.deb, хантинг версии по `strings`) полностью удалён из pipeline;
-  ядро raw 59 → 34.4 МБ (~10 МБ в gzip), сборка детерминирована.
-- Подводные камни linux-virt vs Ubuntu generic (все закрыты):
-  - `CONFIG_VIRTIO_BLK/NET/FS/PACKET=m` (у Ubuntu — built-in): нужны модули
+- The kernel and modules now come from a **single apk** `linux-virt-<ver>`
+  (vermagic matches by construction; Alpine netboot images lag behind the
+  repo, so the netboot kernel cannot be used). The Ubuntu generic kernel
+  (59 MB raw, 87 MB modules.deb, version hunting via `strings`) is fully
+  removed from the pipeline; the raw kernel went from 59 → 34.4 MB (~10 MB
+  gzipped), the build is deterministic.
+- Pitfalls of linux-virt vs Ubuntu generic (all closed):
+  - `CONFIG_VIRTIO_BLK/NET/FS/PACKET=m` (Ubuntu has them built-in): the
     `virtio_blk`, `virtio_net` (+`failover`/`net_failover`), `fuse`,
-    `af_packet` (иначе нет диска, сети, шары и DHCP).
-  - `libcrc32c` требует `crc32c` (softdep, busybox modprobe его не
-    разрешает) → грузим `crc32c_generic` явно; без него не работают и
-    nf_conntrack, и ext4 (metadata_csum).
-  - Нет `RANDOM_TRUST_CPU` и virtio-rng в VZ: crng init занимал ~10 с.
-    Решено сидированием из хоста: vz-runner пишет 64 байта в
-    `.anvil-host-entropy`, guest-agent кредитит пул через RNDADDENTROPY.
-- Загрузка модулей переведена с явных `insmod`-списков на `modprobe`
-  (modules.dep из apk) — dependency-цепочки больше не ломаются.
-- Итог: guest-agent ready 1.14 с (как у Ubuntu), вся матрица (DHCP, ext4,
-  шара, порты, pull, save/load, compose, resume) зелёная.
+    `af_packet` modules are required (otherwise no disk, no network, no
+    share, no DHCP).
+  - `libcrc32c` requires `crc32c` (a softdep that busybox modprobe does not
+    resolve) → we load `crc32c_generic` explicitly; without it neither
+    nf_conntrack nor ext4 (metadata_csum) work.
+  - No `RANDOM_TRUST_CPU` and no virtio-rng in VZ: crng init took ~10 s.
+    Solved by seeding from the host: vz-runner writes 64 bytes into
+    `.anvil-host-entropy`, the guest-agent credits the pool via
+    RNDADDENTROPY.
+- Module loading moved from explicit `insmod` lists to `modprobe`
+  (modules.dep from the apk) — dependency chains no longer break.
+- Result: guest-agent ready in 1.14 s (same as Ubuntu), the whole matrix
+  (DHCP, ext4, share, ports, pull, save/load, compose, resume) is green.
 
-## 2. Баги и надёжность
+## 2. Bugs and reliability
 
-1. **~~virtiofs обрезает большие записи из гостя в шару~~ — расследовано,
-   это не virtiofs.** Корень — гонка в transfer-service containerd 2.0.0 при
-   `ctr images export`: в логе containerd видно
-   `error copying stream: write ...: file already closed` — стрим закрывается
-   до конца записи, файл обрезается в случайном месте хвоста, а exit code
-   остаётся 0 (молчаливая порча данных). На tmpfs гонка почти не видна
-   (0/12), на virtiofs проявляется из-за более медленных записей (2/2).
-   Обычные записи любого размера чанка (4 КБ–4 МБ, с fsync и без) чисты.
-   Вывод: для экспортов использовать `nerdctl save` (другой, надёжный путь —
-   им и реализован `docker save`), `ctr images export` в шару не
-   использовать. Отдельный фоллоу-ап: ~~обновить containerd/nerdctl в образе
-   (сейчас 2.0.0/2.0.4)~~ — сделано: containerd 2.3.3, nerdctl 2.3.5,
-   runc 1.5.1, CNI plugins 1.9.1. Апгрейд вскрыл две регрессии, обе
-   исправлены: nerdctl 2.2+ убрал label `nerdctl/ports` (порты теперь читаются
-   из networkstore — `/var/lib/nerdctl/*/containers/<ns>/<id>/network-config.json`,
-   fallback в `guest-agent/scanner.go`) и в госте не хватало busybox-апплета
-   `find` (boot-cleanup name-store молча не работал — добавлен в initramfs).
-   Третья регрессия всплыла позже: nerdctl 2.3.x `inspect --format json`
-   печатает одиночный объект вместо массива — `nerdctlContainerStatus`/
-   `isNerdctlContainerRunning` молча вернули "" / false, и attach до старта
-   контейнера крутил все 100 итераций ожидания (каждый `docker run` с
-   attach — +7 с). Парсер теперь принимает оба формата
-   (`containerStateFromInspect` в `guest-agent/containers.go`).
-2. **~~`docker save` не реализован~~ — сделано.** `GET /images/{name}/get` и
-   `/images/get?names=...` стримят `nerdctl save` (docker-формат, надёжный
-   путь в отличие от `ctr images export` — см. п.1). Проверен round-trip
-   save → load. Позже починен резолв имени без тега (`docker save foo`
-   матчится на `docker.io/library/foo:latest`, а `:` в `host:5000/foo`
-   больше не принимается за тег) — `findImageNamespace` в
-   `guest-agent/images.go`.
-3. **~~Права на сокеты и state-директорию~~ — сделано.** `control.sock` и
-   `docker.sock` — 0600, `~/.anvil-vz` — 0700, `containerd-disk.img` — 0600
-   (chmod после bind/создания, применяется при каждом старте).
-4. ~~**Устаревший комментарий в Makefile** (target `prune`): «docker run --rm
-   is not yet implemented»~~ — уже вычищен при одной из итераций; AutoRemove
-   давно реализован (`guest-agent/containers.go:489`).
-5. **~~Флаки первого `docker run` после холодного старта~~ — исправлено.**
-   Корень был не в «первом запросе», а в `--rm`: AutoRemove удалял контейнер
-   (и его json-file логи) сразу после выхода, пока attach ещё реплеил вывод
-   → короткоживущие контейнеры (`echo ...`) теряли stdout с гонкой. Теперь
-   attach трекается (attachBegin/End) и удаление ждёт drain до 30 с; плюс
-   attach ждёт выхода контейнера из `created` (attach приходит до start).
-   Проверено: 10/10 warm и 2/2 cold выводят корректно. Отдельно замечен
-   редкий транзиент `nerdctl start failed (1): <id>` (~1/17 быстрых
-   последовательных запусков, shim-уровень) — на текущем стеке
-   (containerd 2.3.3 / nerdctl 2.3.5 / runc 1.5.1) не воспроизводится:
-   ~440 прогонов (последовательные, параллельные, burst после resume)
-   чистые. Оставлено под наблюдением.
-6. **~~Resume compose up регресс в бенче (5567 мс)~~ — исправлено.** Корнем
-   оказался дедлок в `runExec` (guest-agent): stdout и stderr дочернего
-   процесса дренились последовательно — как только `nerdctl compose up`
-   выдавал в stderr больше pipe-буфера (64 КБ) при открытом stdout, ребёнок
-   навсегда висел в `pipe_write`. Теперь оба потока дренируются
-   конкурентно. Побочно починен и запуск `vz-runner exec` для «шумных»
-   команд. После фикса resume compose up ~1.3 с.
-7. **Сборка initramfs в Lima не зависит от сети.** Раньше скрипт внутри
-   Lima VM перезапускал себя во вложенном docker и делал `apk add` (нужен
-   доступ к Alpine CDN) — при сломанной/ограниченной сети сборка умирала.
-   Теперь на Linux-хосте (Lima) сборка идёт напрямую: пакеты ставятся только
-   если отсутствуют, рабочие директории — в mktemp вместо корня ФС.
+1. **~~virtiofs truncates large writes from the guest into the share~~ —
+   investigated, it is not virtiofs.** The root cause is a race in the
+   containerd 2.0.0 transfer service during `ctr images export`: the
+   containerd log shows
+   `error copying stream: write ...: file already closed` — the stream is
+   closed before the write finishes, the file is truncated at a random
+   point in the tail, while the exit code stays 0 (silent data
+   corruption). On tmpfs the race is nearly invisible (0/12); on virtiofs
+   it shows up because of slower writes (2/2). Regular writes of any chunk
+   size (4 KB–4 MB, with and without fsync) are clean. Conclusion: use
+   `nerdctl save` for exports (a different, reliable path — that is what
+   `docker save` uses); do not use `ctr images export` into the share.
+   Follow-up: ~~upgrade containerd/nerdctl in the image (was
+   2.0.0/2.0.4)~~ — done: containerd 2.3.3, nerdctl 2.3.5, runc 1.5.1,
+   CNI plugins 1.9.1. The upgrade exposed two regressions, both fixed:
+   nerdctl 2.2+ dropped the `nerdctl/ports` label (ports are now read from
+   the networkstore —
+   `/var/lib/nerdctl/*/containers/<ns>/<id>/network-config.json`,
+   fallback in `guest-agent/scanner.go`) and the guest lacked the busybox
+   `find` applet (boot-time name-store cleanup silently did nothing —
+   added to the initramfs). A third regression surfaced later: nerdctl
+   2.3.x `inspect --format json` prints a single object instead of an
+   array — `nerdctlContainerStatus`/`isNerdctlContainerRunning`
+   silently returned "" / false, and attach before container start spun
+   through all 100 wait iterations (every `docker run` with attach was
+   +7 s). The parser now accepts both formats
+   (`containerStateFromInspect` in `guest-agent/containers.go`).
+2. **~~`docker save` not implemented~~ — done.** `GET /images/{name}/get`
+   and `/images/get?names=...` stream `nerdctl save` (docker format, the
+   reliable path unlike `ctr images export` — see item 1). The save → load
+   round-trip is verified. Later, resolving a name without a tag was also
+   fixed (`docker save foo` matches `docker.io/library/foo:latest`, and a
+   `:` in `host:5000/foo` is no longer mistaken for a tag) —
+   `findImageNamespace` in `guest-agent/images.go`.
+3. **~~Socket and state-dir permissions~~ — done.** `control.sock` and
+   `docker.sock` are 0600, `~/.anvil-vz` is 0700, `containerd-disk.img`
+   is 0600 (chmod after bind/creation, applied on every start).
+4. ~~**Stale comment in the Makefile** (target `prune`): "docker run --rm
+   is not yet implemented"~~ — already cleaned up during one of the
+   iterations; AutoRemove has long been implemented
+   (`guest-agent/containers.go:489`).
+5. **~~Flakiness of the first `docker run` after a cold start~~ —
+   fixed.** The root cause was not the "first request" but `--rm`:
+   AutoRemove deleted the container (and its json-file logs) right after
+   exit while attach was still replaying output → short-lived containers
+   (`echo ...`) lost stdout nondeterministically. Now attach is tracked
+   (attachBegin/End) and removal waits for the drain up to 30 s; also,
+   attach waits for the container to leave `created` (attach arrives
+   before start). Verified: 10/10 warm and 2/2 cold produce correct
+   output. Separately, a rare transient `nerdctl start failed (1): <id>`
+   (~1/17 rapid consecutive runs, shim level) was noticed — not
+   reproducible on the current stack (containerd 2.3.3 / nerdctl 2.3.5 /
+   runc 1.5.1): ~440 runs (sequential, parallel, burst after resume) are
+   clean. Left under observation.
+6. **~~Resume compose-up regression in the benchmark (5567 ms)~~ —
+   fixed.** The root cause was a deadlock in `runExec` (guest-agent):
+   stdout and stderr of the child process were drained sequentially — as
+   soon as `nerdctl compose up` wrote more than the pipe buffer (64 KB) to
+   stderr with stdout open, the child hung forever in `pipe_write`. Now
+   both streams are drained concurrently. As a side effect, `vz-runner
+   exec` for "noisy" commands was fixed too. After the fix, resume
+   compose-up is ~1.3 s.
+7. **Initramfs build in Lima no longer depends on the network.**
+   Previously the script inside the Lima VM re-executed itself in nested
+   docker and ran `apk add` (requiring access to the Alpine CDN) — with a
+   broken or restricted network the build died. Now on a Linux host (Lima)
+   the build runs directly: packages are installed only when missing,
+   working directories live in mktemp instead of the filesystem root.
 
-Сделано в ходе расследования `docker load` и итерации скорости (июль 2026,
-уже в коде):
+Done while investigating `docker load` and during the speed iteration
+(July 2026, already in the code):
 
-- `DockerProxyServer.swift`: дозапись буфера циклом в обоих направлениях —
-  раньше частичный `write()` молча ронял хвост 64-КБ чанка.
-- `canonicalizeImageRef` (`guest-agent/images.go`): короткое имя с тегом
-  (`myimg:1`) ошибочно считалось registry-qualified из-за проверки `":"` в
-  первом сегменте — нормализация до `docker.io/library/...` не срабатывала,
-  `ensureImageInNamespace` не находил локальный образ и шёл в `nerdctl pull`.
-  При доступном registry это был скрытый лишний pull на каждый `docker run`
-  (латентность), без registry — падение создания контейнера. Добавлен и
-  fallback на сырое имя (образы из OCI-архивов с сырым `ref.name` теперь
-  алиасятся на каноническое имя).
-- `/images/load` переписан на containerd Go-client (`client.Import`): тело
-  стримится без временного файла — tar ~430 МБ раньше убивал tmpfs гостя
-  («no space left on device»). gzip/zstd определяются автоматически. Ответ
-  содержит строки `Loaded image: <ref>`, как у настоящего Docker. Архивы без
-  аннотаций имени (типичный `buildx --output type=oci` без `-t`) раньше
-  «загружались» молча, но образ был недоступен по имени и `docker run`
-  уходил в registry pull — теперь таким манифестам выдаётся ref по дайджесту
-  (`docker.io/imported/anvil-image:<digest12>`). Архивы с сырым именем
-  (`myapp:1` без registry-префикса) регистрировались as-is, а nerdctl на
-  inspect/run канонизирует короткие имена в `docker.io/library/...` →
-  `GET /images/{name}/json` падал с «no such image», и CLI/compose уходили
-  в pull (офлайн — фатально). Теперь при load дополнительно регистрируется
-  канонический алиас (тот же target, тот же namespace).
-- `anvil-service.sh`: в source-дереве свежие assets из `.download` и свежий
-  бинарник `.build/release/vz-runner` теперь приоритетнее копий в
-  `~/.anvil-vz` и PATH — иначе после `make rebuild-all` сервис продолжал
-  грузить старый initramfs со старым guest-agent и старый brew-бинарник.
-- DNS в госте: myinit больше не затирает `/etc/resolv.conf` хардкодом
-  8.8.8.8 — берётся DNS из DHCP (VZ NAT-шлюз проксирует резолвер хоста,
-  работает в VPN/ограниченных сетях), 8.8.8.8 только как запасной. Раньше
-  на сетях с заблокированным внешним DNS pull'ы висли бессимптомно.
-- **Громкий фейл при занятом host-порту.** Раньше, если localhost-порт уже
-  держал чужой процесс (Docker Desktop с тем же compose-проектом, Lima с
-  автофорвардом гостевых портов, локальный postgres из brew), PortForwarder
-  писал «bind/listen failed: Address already in use» только в daemon.log,
-  а контейнер стартовал «успешно» — недоступный с хоста, с непонятными
-  падениями приложений (таймауты пула соединений). Теперь guest-agent при
-  старте контейнера с `-p` спрашивает vz-runner о занятости портов
-  (guest диалит vsock-порт 1027, `PortCheckServer`; занятым считается порт,
-  который не держит наш форвардер и не удаётся probe-bind'нуть — probe
-  идёт в обоих семействах, т.к. IPv4-only оккупант не мешает dual-stack
-  bind'у на macOS), плюс проверяется конфликт с уже запущенными
-  контейнерами anvil — start падает с Docker-стилем ошибкой
-  `Bind for 0.0.0.0:<port> failed: port is already allocated`.
-  Проверка именно на start, а не на create: Docker проверяет порты при
-  старте, а compose `--force-recreate` создаёт замену под временным именем
-  `<id>_<name>`, пока старый контейнер ещё держит порт. Порты нашего
-  форвардера не считаются занятыми (слушатель старого контейнера может ещё
-  сниматься, когда стартует новый).
-- **Прунинг network-store nerdctl.** Cold-boot очистка в stage2 удаляет
-  контейнеры в обход `nerdctl rm`, а `nerdctl rm` сам не всегда убирает
-  запись — файлы `/var/lib/nerdctl/<hash>/containers/<ns>/<id>/`
-  (network-config.json и пр.) копились на persistent-диске бесконечно.
-  Теперь запись удаляется при `docker rm`, а при старте guest-agent
-  вычищаются все записи без живого контейнера в containerd.
-- Известное ограничение (не от anvil): у nerdctl собственная проверка
-  host-портов на create, поэтому `compose up --force-recreate` поверх ЖИВЫХ
-  контейнеров (compose создаёт замену до остановки старого) может падать
-  с «bind for :<port> failed: port is already allocated» — рассинхрон
-  семантики nerdctl (create) и Docker (start). Стандартный поток
-  `compose down && up` (как в make-таргетах) не затронут.
-- `/images/load`: добавлен `client.WithSkipMissing()` — одноплатформенные
-  экспорты с мультиархитектурным индексом (без чужих блобов) больше не
-  падают с «content digest ... not found».
-- **Корневой баг «docker run/compose тянет из registry после docker load»**:
-  containerd content store — namespace'нутый. `ensureImageInNamespace`
-  копировал только метаданные образа в проектный namespace compose, и запись
-  указывала на невидимые блобы → nerdctl уходил в pull (HEAD на registry) →
-  падение без доступа к registry (а с сетью — скрытый pull на каждый
-  compose up). Теперь образ стримится между namespace'ами
-  (`nerdctl save | ctr images import -`) — работает полностью офлайн
-  (проверено с пустым resolv.conf).
-- **Часы гостя**: VZ не гарантирует RTC — загрузка начиналась с 1970-01-01 и
-  TLS падал («certificate is not yet valid»). Процессы myinit не переживают
-  switch_root, поэтому ntpd из myinit не спасал. Теперь vz-runner пишет epoch
-  в `<share>/.anvil-host-time` при старте VM, myinit ставит часы из файла,
-  ntpd — только фоновая коррекция дрейфа в stage2, guest-agent перечитывает
-  файл при старте и на каждый subscribe (покрывает resume со «замороженными»
-  часами). Дополнительно: vz-runner переписывает файл и в `resume()` —
-  иначе после idle-pause демона файл оставался вчерашним и guest-agent
-  на каждом subscribe возвращал часы на момент паузы (часы «замерзали»
-  на всё время простоя).
-- `anvil-service.sh`: для brew-установок assets пакета приоритетнее копий в
-  `~/.anvil-vz` (иначе старый initramfs молча перекрывал каждый апгрейд),
-  плюс warning об игнорируемых shadow-файлах.
+- `DockerProxyServer.swift`: buffer writes loop in both directions — a
+  partial `write()` used to silently drop the tail of a 64-KB chunk.
+- `canonicalizeImageRef` (`guest-agent/images.go`): a short name with a
+  tag (`myimg:1`) was mistakenly treated as registry-qualified because of
+  the `":"` check in the first segment — normalization to
+  `docker.io/library/...` did not kick in, `ensureImageInNamespace` did
+  not find the local image and fell through to `nerdctl pull`. With a
+  reachable registry this was a hidden extra pull on every `docker run`
+  (latency); without one — container creation failed. A raw-name fallback
+  was added (images from OCI archives with a raw `ref.name` now get
+  aliased to the canonical name).
+- `/images/load` rewritten onto the containerd Go client
+  (`client.Import`): the body is streamed without a temp file — a ~430 MB
+  tar used to kill the guest tmpfs ("no space left on device"). gzip/zstd
+  are detected automatically. The response contains `Loaded image: <ref>`
+  lines like real Docker. Archives without name annotations (typical
+  `buildx --output type=oci` without `-t`) used to "load" silently but the
+  image was unreachable by name and `docker run` went to a registry pull —
+  now such manifests get a digest-based ref
+  (`docker.io/imported/anvil-image:<digest12>`). Archives with a raw name
+  (`myapp:1` without a registry prefix) were registered as-is, while
+  nerdctl canonicalizes short names to `docker.io/library/...` on
+  inspect/run → `GET /images/{name}/json` failed with "no such image" and
+  the CLI/compose fell back to pull (fatal offline). Now a canonical alias
+  is registered at load time too (same target, same namespace).
+- `anvil-service.sh`: in the source tree, fresh assets from `.download`
+  and the fresh `.build/release/vz-runner` binary now take priority over
+  the copies in `~/.anvil-vz` and PATH — otherwise after
+  `make rebuild-all` the service kept loading the old initramfs with the
+  old guest-agent and the old brew binary.
+- DNS in the guest: myinit no longer overwrites `/etc/resolv.conf` with a
+  hardcoded 8.8.8.8 — DNS comes from DHCP (the VZ NAT gateway proxies the
+  host resolver, works in VPN/restricted networks), 8.8.8.8 only as a
+  backup. Previously, on networks with blocked external DNS, pulls hung
+  without any symptom.
+- **Loud failure on a taken host port.** Previously, when a localhost port
+  was already held by someone else's process (Docker Desktop with the same
+  compose project, Lima with auto-forwarded guest ports, a local brew
+  postgres), PortForwarder wrote "bind/listen failed: Address already in
+  use" only into daemon.log while the container started "successfully" —
+  unreachable from the host, with confusing application failures
+  (connection-pool timeouts). Now the guest-agent, when starting a
+  container with `-p`, asks vz-runner whether the ports are taken (the
+  guest dials vsock port 1027, `PortCheckServer`; a port counts as taken
+  when it is not held by our forwarder and cannot be probe-bound — the
+  probe runs in both families, since an IPv4-only squatter does not
+  prevent a dual-stack bind on macOS), plus conflicts with already
+  running anvil containers are checked — start fails with the Docker-style
+  error `Bind for 0.0.0.0:<port> failed: port is already allocated`. The
+  check is deliberately on start, not on create: Docker checks ports at
+  start, and compose `--force-recreate` creates the replacement under a
+  temporary name `<id>_<name>` while the old container still holds the
+  port. Ports held by our own forwarder do not count as taken (the old
+  container's listener may still be coming down when the new one starts).
+- **nerdctl network-store pruning.** The cold-boot cleanup in stage2
+  removes containers bypassing `nerdctl rm`, and `nerdctl rm` itself does
+  not always remove the record — the files
+  `/var/lib/nerdctl/<hash>/containers/<ns>/<id>/` (network-config.json
+  etc.) accumulated on the persistent disk forever. Now the record is
+  deleted on `docker rm`, and at startup the guest-agent cleans out all
+  records without a live container in containerd.
+- Known limitation (not anvil's fault): nerdctl runs its own host-port
+  check on create, so `compose up --force-recreate` over LIVE containers
+  (compose creates the replacement before stopping the old one) can fail
+  with "bind for :<port> failed: port is already allocated" — a mismatch
+  between nerdctl's semantics (create) and Docker's (start). The standard
+  `compose down && up` flow (as in the make targets) is not affected.
+- `/images/load`: added `client.WithSkipMissing()` — single-platform
+  exports with a multi-arch index (without foreign blobs) no longer fail
+  with "content digest ... not found".
+- **The root bug of "docker run/compose pulls from the registry after
+  docker load"**: the containerd content store is namespaced.
+  `ensureImageInNamespace` copied only the image metadata into the
+  compose project's namespace, and the record pointed at invisible blobs
+  → nerdctl went to pull (HEAD against the registry) → failure without
+  registry access (and with a network — a hidden pull on every compose
+  up). Now the image is streamed between namespaces
+  (`nerdctl save | ctr images import -`) — works fully offline (verified
+  with an empty resolv.conf).
+- **Guest clock**: VZ does not guarantee the RTC — the boot started at
+  1970-01-01 and TLS failed ("certificate is not yet valid"). myinit
+  processes do not survive switch_root, so ntpd from myinit did not help.
+  Now vz-runner writes the epoch into `<share>/.anvil-host-time` at VM
+  start, myinit sets the clock from the file, ntpd in stage2 is only a
+  background drift correction, and the guest-agent re-reads the file at
+  startup and on every subscribe (covering resume with "frozen" clocks).
+  Additionally: vz-runner rewrites the file in `resume()` as well —
+  otherwise after an idle-pause of the daemon the file stayed from
+  yesterday and the guest-agent returned the clock as of the pause moment
+  on every subscribe (the clock "froze" for the whole idle period).
+- `anvil-service.sh`: for brew installations, package assets take
+  priority over the copies in `~/.anvil-vz` (otherwise an old initramfs
+  silently shadowed every upgrade), plus a warning about ignored shadow
+  files.
 
-## 3. Функциональность
+## 3. Functionality
 
-1. **~~`docker build`~~ — сделано (классический путь + buildx remote
-   driver).** В initramfs добавлен buildkitd (v0.32.2) + buildctl (buildctl
-   нужен: nerdctl build вызывает его как subprocess); guest-agent реализует
-   классический `POST /build`: контекст распаковывается на persistent-диск
-   (`/var/lib/anvil-build`), сборка через `nerdctl build`, прогресс — JSON
-   stream как у Docker. buildkitd стартует лениво при первом билде (экономия
-   ~50 МБ RSS). Дополнительно buildkitd-сокет проброшен на хост:
-   `~/.anvil-vz/buildkit.sock` → vsock:1026 → `/run/buildkit/buildkitd.sock`;
-   `anvil start` создаёт buildx builder `anvil-remote` (remote driver) и делает его
-   активным (предыдущий builder сохраняется и восстанавливается на stop) —
-   дефолтный `docker build` (buildx) работает из коробки; для импорта в
-   image store нужен `--load` (compose делает это сам).
-   Работают оба пути: remote driver (`docker buildx build`) и
-   docker-container driver (голый `docker build` на desktop CLI тянет
-   moby/buildkit как контейнер — для этого починены `PUT
-   /containers/{id}/archive` на остановленном контейнере и два бага stdin в
-   exec: дедлок `cmd.Wait()` и выброшенный stdin, ломавший `buildctl
-   dial-stdio`).
-2. **Rosetta для x86_64** (`VZRosettaDirectoryShare`, macOS 13+) — запуск
-   amd64-образов почти нативно, как у Lima.
-3. **~~Bind-mounts произвольных host-путей~~ — сделано.** vz-runner
-   шарит host-директорию `/Users` вторым virtiofs-устройством (tag
-   `macusers`), stage2 монтирует её в госте по тому же абсолютному пути
-   `/Users` — `docker run -v $HOME/proj:/data` и compose `volumes:` с
-   относительными путями работают без переписывания путей, как в Docker
-   Desktop. Отключается `ANVIL_SHARE_USERS=0`. Набор шар входит в хеш
-   снапшота (добавление устройства ломает restore) → один cold boot после
-   апгрейда. Попутно: guest-agent раньше молча игнорировал
-   `HostConfig.Binds`/`Mounts` — теперь пробрасывает в `nerdctl -v`
-   (включая named volumes); реализован `GET /events` (стрим task-events
-   containerd в формате Docker: create/start/die с exitCode/destroy),
-   без него `docker compose up` получал 404.
-4. ~~**Догнать заглушки**: dangling images prune и build cache prune~~ —
-   сделано. `/images/prune` удаляет dangling-образы по умолчанию и все
-   неиспользуемые при `dangling=false` (`docker system prune -a`), считает
-   SpaceReclaimed по размерам из `listDockerImages`. `/build/prune` гоняет
-   `buildctl prune` по buildkit-сокету (buildkitd при этом НЕ стартует — нет
-   демона, нет и кеша) и парсит reclaimed из строки `Total:`.
+1. **~~`docker build`~~ — done (classic path + buildx remote driver).**
+   buildkitd (v0.32.2) + buildctl were added to the initramfs (buildctl is
+   needed: nerdctl build invokes it as a subprocess); the guest-agent
+   implements the classic `POST /build`: the context is unpacked onto the
+   persistent disk (`/var/lib/anvil-build`), the build runs via
+   `nerdctl build`, progress is streamed as a JSON stream like Docker's.
+   buildkitd starts lazily on the first build (saving ~50 MB RSS).
+   Additionally the buildkitd socket is forwarded to the host:
+   `~/.anvil-vz/buildkit.sock` → vsock:1026 →
+   `/run/buildkit/buildkitd.sock`; `anvil start` creates the buildx
+   builder `anvil-remote` (remote driver) and makes it active (the
+   previous builder is saved and restored on stop) — the default
+   `docker build` (buildx) works out of the box; importing into the image
+   store needs `--load` (compose does that itself). Both paths work: the
+   remote driver (`docker buildx build`) and the docker-container driver
+   (bare `docker build` on a desktop CLI pulls moby/buildkit as a
+   container — for that, `PUT /containers/{id}/archive` on a stopped
+   container was fixed, plus two stdin bugs in exec: a `cmd.Wait()`
+   deadlock and dropped stdin that broke `buildctl dial-stdio`).
+2. **Rosetta for x86_64** (`VZRosettaDirectoryShare`, macOS 13+) — run
+   amd64 images almost natively, like Lima.
+3. **~~Bind mounts of arbitrary host paths~~ — done.** vz-runner shares
+   the host directory `/Users` via a second virtiofs device (tag
+   `macusers`); stage2 mounts it in the guest at the same absolute path
+   `/Users` — `docker run -v $HOME/proj:/data` and compose `volumes:`
+   with relative paths work without path rewriting, like in Docker
+   Desktop. Disabled with `ANVIL_SHARE_USERS=0`. The set of shares is part
+   of the snapshot hash (adding a device breaks restore) → one cold boot
+   after the upgrade. Along the way: the guest-agent used to silently
+   ignore `HostConfig.Binds`/`Mounts` — now they are passed to `nerdctl
+   -v` (including named volumes); `GET /events` is implemented (streams
+   containerd task events in Docker format: create/start/die with
+   exitCode/destroy), without it `docker compose up` got a 404.
+4. ~~**Fill in the stubs**: dangling-image prune and build-cache
+   prune~~ — done. `/images/prune` removes dangling images by default and
+   all unused ones with `dangling=false` (`docker system prune -a`),
+   computing SpaceReclaimed from the sizes in `listDockerImages`.
+   `/build/prune` runs `buildctl prune` over the buildkit socket
+   (buildkitd is NOT started for it — no daemon, no cache) and parses the
+   reclaimed value from the `Total:` line.
 
-## 4. Тесты и CI
+## 4. Tests and CI
 
-1. **CI-прогон robustness.** Job `validate` добавлен, но выяснилось, что
-   GitHub-hosted macos-15 раннеры не предоставляют гипервизор
-   (`VZErrorDomain Code=2 "Virtualization is not available on this
-   hardware"`) — boot-тесты там не работают принципиально. Поэтому validate
-   настроен на self-hosted Apple Silicon runner с запуском через
-   workflow_dispatch; release от него не зависит. Локально —
+1. **CI run of the robustness suite.** The `validate` job was added, but
+   it turned out that GitHub-hosted macos-15 runners provide no
+   hypervisor (`VZErrorDomain Code=2 "Virtualization is not available on
+   this hardware"`) — boot tests cannot work there in principle. So
+   validate is wired to a self-hosted Apple Silicon runner triggered via
+   workflow_dispatch; the release does not depend on it. Locally —
    `make validate`.
-2. **Go unit-тесты guest-agent** на инварианты из ARCHITECTURE.md §4.3:
-   детерминированный container ID, `/containers/{id}/wait` (заголовки до
-   блокировки), жизненный цикл AutoRemove. `httptest` по хендлерам.
-3. **Swift-тесты**: парсинг `ControlProtocol`, хеш снапшота.
+2. **Go unit tests for guest-agent** covering the invariants from
+   ARCHITECTURE.md §4.3: deterministic container ID,
+   `/containers/{id}/wait` (headers before blocking), the AutoRemove
+   lifecycle. `httptest` against the handlers.
+3. **Swift tests**: `ControlProtocol` parsing, the snapshot hash.
 
-## 5. DX и релиз
+## 5. DX and release
 
-1. ~~**`anvil doctor` / `anvil logs`**~~ — сделано: `doctor` проверяет
-   гипервизор, entitlement, наличие kernel/initramfs/диска, свободное место,
-   демон, docker context и ответ API на `/_ping`, шару `/Users`
-   (exit code ≠ 0 при ошибках); `logs [daemon|console|guest]` показывает
-   хвосты логов одной командой.
-2. ~~**Ротация `guest-agent.log`**~~ — сделано: в debug-режиме guest-agent
-   сам управляет файлом на шаре (`logrotate.go`): dup3 stdout/stderr на
-   свой дескриптор и ротация по размеру — при превышении 50 МиБ текущий лог
-   уходит в `guest-agent.log.1` (один бэкап), проверка раз в минуту. Максимум
-   на хосте ~100 МиБ независимо от длины debug-сессии.
-3. **Developer ID + нотаризация** — сейчас `spctl` отклоняет бинарник;
-   для brew неважно, но ручное скачивание tarball упирается в Gatekeeper.
-   Требует платного Apple Developer.
-4. ~~**Homebrew bottle** вместо source-формулы~~ — сделано: в формуле
-   bottle-блок (`root_url` на GitHub release, `cellar: :any_skip_relocation`,
-   тег `arm64_tahoe`), bottle-тарболл публикуется ассетом релиза. Автоматизация:
-   `make bottle VERSION=x.y.z` (`scripts/make_bottle.sh`) — переустанавливает
-   формулу с `--build-bottle`, гоняет `brew bottle`, переименовывает tarball
-   (brew ищет ассет с одинарным дефисом `anvil-1.0.x...`, а `brew bottle`
-   создаёт с двойным), заливает в release через `gh`, обновляет bottle-блок
-   и пушит tap. `make update-brew` при бампе версии вычищает устаревший
-   bottle-блок (иначе rebuild инкрементируется от старого). На macOS старше
-   tahoe тег бутылки не совпадёт — brew молча вернётся на source-формулу,
-   что работает идентично (та же распаковка файлов).
-5. ~~**Компакция containerd-диска**~~ — сделано (§5.5): дефолтный размер
-   поднят 16→64 ГиБ (sparse, настраивается `ANVIL_DISK_GB`), существующий
-   образ автоматически расширяется при старте (хеш снапшота включает размер
-   файла → следующий запуск cold boot, stage2 догоняет ext4 через online
-   `resize2fs`; mkfs.ext4/resize2fs теперь musl-бинарники из Alpine apks
-   e2fsprogs/e2fsprogs-extra, а не glibc-копии из build-VM). Для возврата
-   места на хосте после `make prune` добавлен `make disk-compact`
-   (sparse-копия через `dd conv=sparse`, содержимое и логический размер не
-   меняются — снапшот остаётся валидным). Плюс автоматика: virtio-blk в VZ
-   поддерживает discard, поэтому guest-agent раз в сутки гоняет
-   `fstrim /var/lib/containerd` (`periodicFstrim` в `main.go`, апплет busybox
-   добавлен в initramfs) — дырки в sparse-образе пробиваются сами, без
-   остановки демона.
+1. ~~**`anvil doctor` / `anvil logs`**~~ — done: `doctor` checks the
+   hypervisor, the entitlement, the presence of kernel/initramfs/disk,
+   free space, the daemon, the docker context and the API answer on
+   `/_ping`, the `/Users` share (exit code ≠ 0 on errors);
+   `logs [daemon|console|guest]` shows log tails with one command.
+2. ~~**`guest-agent.log` rotation**~~ — done: in debug mode the
+   guest-agent manages the file on the share itself (`logrotate.go`):
+   dup3 of stdout/stderr onto its own descriptor and size-based rotation —
+   above 50 MiB the current log moves to `guest-agent.log.1` (one backup),
+   checked once a minute. At most ~100 MiB on the host regardless of the
+   debug-session length.
+3. **Developer ID + notarization** — for now `spctl` rejects the binary;
+   irrelevant for brew, but manual tarball downloads hit Gatekeeper.
+   Requires a paid Apple Developer account.
+4. ~~**Homebrew bottle** instead of a source formula~~ — done: the
+   formula carries a bottle block (`root_url` pointing at the GitHub
+   release, `cellar: :any_skip_relocation`, tag `arm64_tahoe`), the
+   bottle tarball is published as a release asset. Automation:
+   `make bottle VERSION=x.y.z` (`scripts/make_bottle.sh`) — reinstalls the
+   formula with `--build-bottle`, runs `brew bottle`, renames the tarball
+   (brew looks for an asset with a single dash `anvil-1.0.x...` while
+   `brew bottle` creates a double dash), uploads it to the release via
+   `gh`, updates the bottle block and pushes the tap. On a version bump
+   `make update-brew` cleans out the stale bottle block (otherwise rebuild
+   gets incremented from the old one). On macOS older than tahoe the
+   bottle tag will not match — brew silently falls back to the source
+   formula, which works identically (same file unpacking).
+5. ~~**Containerd disk compaction**~~ — done (§5.5): the default size was
+   raised 16→64 GiB (sparse, configurable via `ANVIL_DISK_GB`), an
+   existing image is grown automatically at startup (the snapshot hash
+   includes the file size → the next launch is a cold boot, stage2 catches
+   ext4 up via online `resize2fs`; mkfs.ext4/resize2fs are now musl
+   binaries from the Alpine apks e2fsprogs/e2fsprogs-extra, not glibc
+   copies from the build VM). To return host space after `make prune`,
+   `make disk-compact` was added (a sparse copy via `dd conv=sparse`,
+   contents and logical size unchanged — the snapshot stays valid). Plus
+   automation: virtio-blk in VZ supports discard, so the guest-agent runs
+   `fstrim /var/lib/containerd` once a day (`periodicFstrim` in `main.go`,
+   the busybox applet added to the initramfs) — holes in the sparse image
+   get punched on their own, without stopping the daemon.

@@ -1,208 +1,210 @@
 # AGENTS.md
 
-Этот файл — краткая инструкция для AI-агентов, работающих с репозиторием Anvil.
-Детальное описание архитектуры и причин ключевых решений — в `ARCHITECTURE.md`
-(обязательно к прочтению перед нетривиальными изменениями).
+This file is a brief guide for AI agents working on the Anvil repository.
+For a detailed description of the architecture and the rationale behind key
+decisions, see `ARCHITECTURE.md` (required reading before non-trivial changes).
 
-## Обзор проекта
+## Project overview
 
-Anvil — минимальная альтернатива Lima / Docker Desktop / OrbStack для запуска
-Docker-контейнеров на macOS (только Apple Silicon). Система состоит из двух
-компонентов:
+Anvil is a minimal alternative to Lima / Docker Desktop / OrbStack for running
+Docker containers on macOS (Apple Silicon only). The system consists of two
+components:
 
-- **`vz-runner`** (Swift, `Sources/vz-runner/`) — единственный долгоживущий
-  host-процесс. Управляет Linux VM через `Virtualization.framework`
-  (snapshot/resume, virtiofs, NAT-сеть), открывает unix-сокеты
+- **`vz-runner`** (Swift, `Sources/vz-runner/`) — the single long-lived host
+  process. It manages the Linux VM via `Virtualization.framework`
+  (snapshot/resume, virtiofs, NAT networking), opens the unix sockets
   `~/.anvil-vz/control.sock` (control plane), `~/.anvil-vz/docker.sock`
-  (прокси Docker API) и `~/.anvil-vz/buildkit.sock` (прокси buildkit API
-  для buildx remote driver), форвардит порты контейнеров на `localhost`.
-- **`guest-agent`** (Go, `guest-agent/`) — PID 1 внутри VM. Слушает vsock
-  (порт 1024 — length-prefixed JSON control channel, порт 1025 — эмуляция
-  Docker API для `docker`/`docker compose`, порт 1026 — мост к unix-сокету
-  buildkitd для buildx remote driver), сканирует containerd и пушит
-  port mappings в vz-runner, запускает healthcheck'и, генерирует CNI-конфиги.
-  При старте контейнера с `-p` запрашивает у vz-runner занятость
-  host-портов (guest диалит vsock-порт 1027, который слушает vz-runner —
-  `PortCheckServer`): если порт занят чужим процессом на хосте (Docker
-  Desktop, Lima, локальный postgres), start падает с Docker-стилем ошибкой
-  «port is already allocated», а не молча оставляет контейнер недоступным.
-  Проверка именно на start, а не на create: compose `--force-recreate`
-  создаёт замену, пока старый контейнер ещё держит порт.
-  Внутри VM работают containerd + nerdctl + runc + CNI plugins; systemd и SSH
-  нет. buildkitd стартует лениво — при первом подключении к порту 1026 или
-  первом `nerdctl build`.
+  (Docker API proxy) and `~/.anvil-vz/buildkit.sock` (buildkit API proxy for
+  the buildx remote driver), and forwards container ports to `localhost`.
+- **`guest-agent`** (Go, `guest-agent/`) — PID 1 inside the VM. It listens on
+  vsock (port 1024 — length-prefixed JSON control channel, port 1025 — Docker
+  API emulation for `docker`/`docker compose`, port 1026 — bridge to the
+  buildkitd unix socket for the buildx remote driver), scans containerd and
+  pushes port mappings to vz-runner, runs healthchecks, generates CNI configs.
+  When a container with `-p` starts, it asks vz-runner whether the host ports
+  are taken (the guest dials vsock port 1027, listened to by vz-runner —
+  `PortCheckServer`): if a port is held by someone else's process on the host
+  (Docker Desktop, Lima, a local postgres), start fails with a Docker-style
+  "port is already allocated" error instead of silently leaving the container
+  unreachable. The check happens on start, not on create: compose
+  `--force-recreate` creates the replacement while the old container still
+  holds the port. Inside the VM run containerd + nerdctl + runc + CNI plugins;
+  there is no systemd and no SSH. buildkitd starts lazily — on the first
+  connection to port 1026 or the first `nerdctl build`.
 
-Пользователь работает обычным Docker CLI: `docker context use anvil` указывает
-на `~/.anvil-vz/docker.sock`, дальше HTTP-трафик проксируется в guest-agent
-через vsock.
+The user works with the regular Docker CLI: `docker context use anvil` points
+at `~/.anvil-vz/docker.sock`, and HTTP traffic is proxied into the guest-agent
+over vsock.
 
-## Технологический стек и требования
+## Tech stack and requirements
 
-- macOS на Apple Silicon, Xcode/Swift toolchain, `swift-tools-version:5.9`,
+- macOS on Apple Silicon, Xcode/Swift toolchain, `swift-tools-version:5.9`,
   `platforms: [.macOS(.v14)]` (`Package.swift`).
-- Бинарник требует entitlement `com.apple.security.virtualization`
-  (`entitlements.plist`) — обязательна ad-hoc подпись (`make sign`).
-- Go-модуль `guest-agent` (`guest-agent/go.mod`, go 1.26); сборка кроссом:
-  `GOOS=linux GOARCH=arm64 CGO_ENABLED=0`.
-- Python 3 для вспомогательных скриптов (`scripts/*.py`), без зависимостей.
-- Внешние инструменты сборки: `limactl` (сборка initramfs внутри Lima VM
-  `anvil`; fallback — локальный Docker), Docker CLI, curl.
-- Скачанные артефакты (kernel, initramfs, container-tools) живут в
-  `.download/` и не коммитятся.
+- The binary requires the `com.apple.security.virtualization` entitlement
+  (`entitlements.plist`) — an ad-hoc signature is mandatory (`make sign`).
+- Go module `guest-agent` (`guest-agent/go.mod`, go 1.26); cross-compiled
+  with `GOOS=linux GOARCH=arm64 CGO_ENABLED=0`.
+- Python 3 for helper scripts (`scripts/*.py`), no dependencies.
+- External build tools: `limactl` (initramfs build inside the Lima VM
+  `anvil`; fallback — local Docker), Docker CLI, curl.
+- Downloaded artifacts (kernel, initramfs, container-tools) live in
+  `.download/` and are not committed.
 
-## Сборка и основные команды
+## Build and common commands
 
-Всё управляется через `Makefile`:
+Everything is driven through the `Makefile`:
 
-- `make sign` — собрать release-бинарник и подписать с entitlements
-  (генерирует `Sources/vz-runner/version.swift`, не редактировать вручную).
-- `make guest-agent` — собрать guest-agent (linux/arm64) в
+- `make sign` — build the release binary and sign it with entitlements
+  (generates `Sources/vz-runner/version.swift`; do not edit by hand).
+- `make guest-agent` — build the guest-agent (linux/arm64) into
   `.download/alpine/guest-agent`.
-- `make initramfs-containerd` — собрать initramfs с containerd/nerdctl/CNI
-  (скрипт `scripts/build_initramfs_containerd.sh`, собирается внутри Linux-
-  контейнера — в Lima VM `anvil`, либо через локальный Docker). buildkit-
-  бинарники пакуются UPX: в CI ставится из apk, для офлайн-сборки в Lima
-  используется статический бинарник из `.download/upx` (target
-  `download-upx`, входит в зависимости).
-- `make rebuild-all` — бинарник + guest-agent + initramfs одной командой.
+- `make initramfs-containerd` — build the initramfs with
+  containerd/nerdctl/CNI (script `scripts/build_initramfs_containerd.sh`;
+  built inside a Linux container — either the Lima VM `anvil` or local
+  Docker). buildkit binaries are packed with UPX: CI installs it from apk,
+  offline builds in Lima use the static binary from `.download/upx` (target
+  `download-upx`, included in the dependencies).
+- `make rebuild-all` — binary + guest-agent + initramfs in one command.
 - `make service-start` / `service-stop` / `service-restart` / `service-status` —
-  управление демоном через `scripts/anvil-service.sh` (сохраняет и
-  восстанавливает docker context).
-- `make service-debug` — stop + удаление снапшота + cold boot с `DEBUG=1`;
-  нужен именно cold boot, т.к. при resume guest-agent в снапшоте — старый
-  процесс без debug-логов (лог пишется в `<share>/guest-agent.log`).
-- `make service-debug-rebuild` — полная пересборка + debug-перезапуск.
-- `make boot-containerd` — разовый boot в foreground (initramfs не
-  пересобирается, чтобы не инвалидировать хеш снапшота).
-- `make prune` — очистить контейнеры/volumes/образы внутри VM.
-- `make disk-compact` — вернуть место на хосте после prune: sparse-копия
-  `~/.anvil-vz/containerd-disk.img` (демон останавливается и запускается
-  снова; логический размер и содержимое не меняются, снапшот остаётся
-  валидным).
-- `make clean` — удалить `.build`, `.download`, `.venv`.
+  daemon management via `scripts/anvil-service.sh` (saves and restores the
+  docker context).
+- `make service-debug` — stop + delete the snapshot + cold boot with
+  `DEBUG=1`; a cold boot is required, because on resume the guest-agent from
+  the snapshot is the old process without debug logs (the log is written to
+  `<share>/guest-agent.log`).
+- `make service-debug-rebuild` — full rebuild + debug restart.
+- `make boot-containerd` — one-off foreground boot (the initramfs is not
+  rebuilt, so the snapshot hash stays valid).
+- `make prune` — clean containers/volumes/images inside the VM.
+- `make disk-compact` — reclaim host space after prune: a sparse copy of
+  `~/.anvil-vz/containerd-disk.img` (the daemon is stopped and started again;
+  the logical size and contents do not change, the snapshot stays valid).
+- `make clean` — remove `.build`, `.download`, `.venv`.
 
-Переменные окружения: `DEBUG=1` (debug-логи), `ANVIL_MEMORY` (ГБ RAM VM),
-`ANVIL_DISK_GB` (размер containerd-диска, дефолт 64; существующий образ
-только расширяется, следующий запуск — cold boot + online resize2fs),
-`ANVIL_SHARE_USERS=0` (отключить virtiofs-шару host `/Users` в госте —
-по умолчанию `/Users` смонтирован в VM по тому же пути, поэтому bind-mounts
-`docker run -v $HOME/...:/path` и compose `volumes:` работают без
-переписывания путей),
-`VERSION` (подставляется в `version.swift`), `VZRUNNER_BIN` (путь к бинарнику
-для сервисных скриптов и bench-harness).
+Environment variables: `DEBUG=1` (debug logs), `ANVIL_MEMORY` (VM RAM in GB),
+`ANVIL_DISK_GB` (containerd disk size, default 64; an existing image is only
+grown, the next launch is a cold boot + online resize2fs), `ANVIL_SHARE_USERS=0`
+(disable the virtiofs share of host `/Users` into the guest — by default
+`/Users` is mounted in the VM at the same path, so bind mounts
+`docker run -v $HOME/...:/path` and compose `volumes:` work without path
+rewriting), `VERSION` (substituted into `version.swift`), `VZRUNNER_BIN`
+(path to the binary for service scripts and bench-harness).
 
-## Тестирование
+## Testing
 
-Автоматических unit-тестов нет (ни Swift, ни Go — `*_test.go` отсутствуют).
-Проверка — интеграционная, через скрипты и ручной прогон Docker CLI:
+There are no automated unit tests (neither Swift nor Go — no `*_test.go`).
+Verification is integration-style, via scripts and manual Docker CLI runs:
 
-- `make test` — smoke: сборка + `--help`.
-- `make time-boot` / `make time-service` — замеры времени загрузки
+- `make test` — smoke: build + `--help`.
+- `make time-boot` / `make time-service` — boot time measurements
   (`scripts/time_boot.py`, `scripts/time_service.py`).
-- `make validate` — набор robustness-проверок
-  (`scripts/validate_robustness.py`): save/resume циклы, resume с запущенным
-  контейнером, kill -9 без orphan-процессов, утечки FD, CNI cleanup,
-  изоляция двух проектов и конфликты портов.
+- `make validate` — a robustness suite (`scripts/validate_robustness.py`):
+  save/resume cycles, resume with a running container, kill -9 without
+  orphan processes, FD leaks, CNI cleanup, two-project isolation and port
+  conflicts.
 - `make harness` / `make bench-all` — bench-harness (`bench-harness/`):
-  сравнение cold start / resume / compose up с Lima, Colima, OrbStack,
-  Docker Desktop; результаты в `bench-harness/results/`.
+  cold start / resume / compose up compared against Lima, Colima, OrbStack,
+  Docker Desktop; results land in `bench-harness/results/`.
 
-Любое изменение guest-agent или vz-runner проверяется реальным прогоном:
-`make service-debug-rebuild`, затем `docker --context anvil run ...` /
-`docker compose up` на тестовом стеке.
+Any change to guest-agent or vz-runner is verified with a real run:
+`make service-debug-rebuild`, then `docker --context anvil run ...` /
+`docker compose up` on a test stack.
 
-## Организация кода
+## Code layout
 
-- `Sources/vz-runner/` — Swift-исходники, один файл ≈ один компонент:
+- `Sources/vz-runner/` — Swift sources, one file ≈ one component:
   `main.swift` (CLI: start/stop/status/daemon/boot/exec), `DaemonCommand`,
   `VMLifecycleManager`, `VMConfig`, `SnapshotManager`, `ControlServer` +
   `ControlClient` + `ControlProtocol`, `DockerProxyServer`, `PortForwarder`,
-  `PortCheckServer` (vsock 1027: ответы гостю о занятости host-портов),
-  `GuestCacheDropper`, `ContainerdCacheManager`, `BootCommand`.
-- `guest-agent/` — Go-исходники по доменам Docker API: `main.go` (vsock
-  control server, reaper зомби), `dockerapi.go` (HTTP-маршруты),
+  `PortCheckServer` (vsock 1027: answers the guest about host-port
+  occupancy), `GuestCacheDropper`, `ContainerdCacheManager`, `BootCommand`.
+- `guest-agent/` — Go sources organized by Docker API domain: `main.go`
+  (vsock control server, zombie reaper), `dockerapi.go` (HTTP routes),
   `containers.go`, `images.go`, `networks.go`, `volumes.go`, `exec.go`,
   `archive.go`, `healthcheck.go`, `scanner.go` (port scanner/pusher),
-  `buildkit.go` (vsock:1026 bridge к buildkitd + ленивый старт),
-  `build.go` (`/build` через nerdctl), `info.go`, `utils.go`.
-- `scripts/` — сборка initramfs и сервисная обвязка
-  (`build_initramfs_containerd.sh` — основной, внутри него `stage2.sh` и
-  `myinit` генерируются inline).
-- `bench-harness/` — бенчмарки (`run_bench.sh`, драйверы бэкендов в
-  `drivers/`, workload в `workloads/`).
-- `networks/`, `var-lib/`, `guest-agent.log`, `.download/` — runtime-артефакты
-  virtiofs share / состояния, не исходный код.
+  `buildkit.go` (vsock:1026 bridge to buildkitd + lazy start),
+  `build.go` (`/build` via nerdctl), `info.go`, `utils.go`.
+- `scripts/` — initramfs build and service wrapper
+  (`build_initramfs_containerd.sh` is the main one; `stage2.sh` and `myinit`
+  are generated inline inside it).
+- `bench-harness/` — benchmarks (`run_bench.sh`, backend drivers in
+  `drivers/`, workloads in `workloads/`).
+- `networks/`, `var-lib/`, `guest-agent.log`, `.download/` — runtime
+  artifacts of the virtiofs share / state, not source code.
 
-## Соглашения и важные инварианты
+## Conventions and important invariants
 
-- Язык документации — русский (`ARCHITECTURE.md`, плановые документы).
-  **Комментарии в коде — только английский** (`Sources/*.swift`,
-  `guest-agent/*.go`, `scripts/*.sh`, `Makefile`, CI-workflows): русских
-  комментариев в коде быть не должно, существующие переводим при касании.
-  Документацию (`*.md`) пишите на русском.
-- Swift: Foundation + Virtualization.framework, без сторонних зависимостей
-  (в `Package.swift` нет dependencies — не добавляйте без необходимости).
-  POSIX sockets вместо Network.framework — осознанное решение (см.
-  `ARCHITECTURE.md` §3.4).
-- Go: статический бинарник без CGO; guest-agent — PID 1, поэтому он **не
-  должен падать** и обязан reap'ить зомби (`reapZombies`).
-- Docker API эмулируется лишь частично — только то, что нужно `docker` и
-  `docker compose`. Есть нетривиальные инварианты, которые нельзя ломать
-  (подробности в `ARCHITECTURE.md` §4.3): детерминированный container ID
+- Documentation language is English (`ARCHITECTURE.md`, planning documents).
+  **Code comments are English-only** (`Sources/*.swift`, `guest-agent/*.go`,
+  `scripts/*.sh`, `Makefile`, CI workflows): there must be no Russian
+  comments in code; translate existing ones when touching them. Write
+  documentation (`*.md`) in English.
+- Swift: Foundation + Virtualization.framework, no third-party dependencies
+  (`Package.swift` has no dependencies — do not add any without a good
+  reason). POSIX sockets instead of Network.framework is a deliberate
+  decision (see `ARCHITECTURE.md` §3.4).
+- Go: static binary without CGO; guest-agent is PID 1, so it **must not
+  crash** and must reap zombies (`reapZombies`).
+- The Docker API is only partially emulated — just what `docker` and
+  `docker compose` need. There are non-trivial invariants that must not be
+  broken (details in `ARCHITECTURE.md` §4.3): deterministic container ID
   (`sha256(namespace + "/" + containerdID)[:64]`); `/containers/{id}/wait`
-  шлёт заголовки сразу (chunked) до блокировки; `AutoRemove` реализуется
-  самим guest-agent, а не `nerdctl --rm`.
-- Compose-network labels персистятся в `/mnt/anvil/networks/<name>.json`
-  (nerdctl их не возвращает) — при изменении `networks.go` не потеряйте
-  восстановление CNI conflist при cold boot.
-- Хеш снапшота включает kernel/initrd/CPU/RAM/диск — изменение `VMConfig`
-  или initramfs инвалидирует снапшот и приводит к cold boot; это ожидаемо,
-  но учитывайте при отладке.
-- Containerd-диск использует host writeback cache (`cachingMode: .cached`,
-  `synchronizationMode: .none`) — осознанный trade-off durability↔скорость
-  для dev-VM, не «исправляйте» без обсуждения (`ARCHITECTURE.md` §7.1).
-- `version.swift` генерируется Makefile'ом; руками не редактировать.
+  sends headers immediately (chunked) before blocking; `AutoRemove` is
+  implemented by the guest-agent itself, not by `nerdctl --rm`.
+- Compose-network labels are persisted in `/mnt/anvil/networks/<name>.json`
+  (nerdctl does not return them) — when changing `networks.go`, do not lose
+  the CNI conflist restoration on cold boot.
+- The snapshot hash includes kernel/initrd/CPU/RAM/disk — changing
+  `VMConfig` or the initramfs invalidates the snapshot and causes a cold
+  boot; this is expected, but keep it in mind while debugging.
+- The containerd disk uses the host writeback cache (`cachingMode: .cached`,
+  `synchronizationMode: .none`) — a deliberate durability-vs-speed trade-off
+  for a dev VM; do not "fix" it without a discussion (`ARCHITECTURE.md`
+  §7.1).
+- `version.swift` is generated by the Makefile; do not edit by hand.
 
-## Безопасность
+## Security
 
-- Демон хранит состояние в `~/.anvil-vz/` (снапшоты, диск containerd,
-  pid/логи, сохранённый docker context). Не удаляйте эти файлы молча —
-  снапшот и диск содержат пользовательские данные.
-- Control-сокет принимает команды `exec`, которые выполняются внутри VM с
-  правами root; сокет не аутентифицируется (рассчитан на локального
-  пользователя). Не выставляйте его наружу и не расширяйте протокол
-  бездумно.
-- `anvil-service.sh` предупреждает про `http_proxy` без `localhost` в
-  `NO_PROXY` — не убирайте эту проверку.
-- Релизы: `make release VERSION=x.y.z` (тег + GitHub Actions из
-  `.github/workflows/go.yml` + обновление Homebrew tap). Git-мутации
-  (tag/push) выполняются только по явной просьбе пользователя.
+- The daemon keeps its state in `~/.anvil-vz/` (snapshots, the containerd
+  disk, pid/logs, the saved docker context). Do not delete these files
+  silently — the snapshot and the disk contain user data.
+- The control socket accepts `exec` commands that run inside the VM as
+  root; the socket is unauthenticated (designed for the local user). Do not
+  expose it and do not extend the protocol thoughtlessly.
+- `anvil-service.sh` warns about `http_proxy` without `localhost` in
+  `NO_PROXY` — do not remove this check.
+- Releases: `make release VERSION=x.y.z` (tag + GitHub Actions from
+  `.github/workflows/go.yml` + Homebrew tap update). Git mutations
+  (tag/push) are performed only on the user's explicit request.
 
-## Деплой / релизный процесс
+## Deploy / release process
 
-CI — `.github/workflows/go.yml` (macos-15): проверка сборки на PR в `test`,
-при пуше тега `v*` — сборка, codesign, публикация
-`anvil-darwin-arm64.tar.gz` в GitHub Releases. Затем
-`make update-brew VERSION=x.y.z` обновляет формулу в соседнем репозитории
-`homebrew-tap` (заодно вычищает устаревший bottle-блок), и
-`make bottle VERSION=x.y.z` (`scripts/make_bottle.sh`) собирает bottle
-(`brew install --build-bottle` + `brew bottle --no-rebuild`), загружает
-tarball в тот же GitHub release (имя файла с одинарным дефисом — `brew
-bottle` создаёт с двойным, а brew ищет с одинарным), заливает тот же
-tarball под остальные поддерживаемые macOS-теги и прописывает bottle-блок
-со всеми тегами в формулу. Два инварианта, которые нельзя ломать:
+CI is `.github/workflows/go.yml` (macos-15): build check on PRs into `test`;
+on pushing a `v*` tag — build, codesign, publish
+`anvil-darwin-arm64.tar.gz` to GitHub Releases. Then
+`make update-brew VERSION=x.y.z` updates the formula in the neighboring
+`homebrew-tap` repository (also cleaning out the stale bottle block), and
+`make bottle VERSION=x.y.z` (`scripts/make_bottle.sh`) builds the bottle
+(`brew install --build-bottle` + `brew bottle --no-rebuild`), uploads the
+tarball to the same GitHub release (file name with a single dash — `brew
+bottle` creates a double dash, while brew looks for a single one), uploads
+the same tarball under the other supported macOS tags and writes the bottle
+block with all tags into the formula. Two invariants that must not be
+broken:
 
-- **`rebuild` обязан быть 0.** `brew bottle` без `--no-rebuild` выставляет
-  rebuild = (rebuild формулы на origin/HEAD) + 1, а т.к. update-brew уже
-  запушил очищенную формулу, upstream совпадает и rebuild становится 1.
-  При rebuild > 0 zerobrew строит URL по своей несовместимой схеме
-  `<name>-<version>.<rebuild>.<tag>.bottle.tar.gz` (у Homebrew rebuild
-  после тега) и получает 404 — у него нет fallback на source.
-- **Теги всех поддерживаемых macOS.** Bottle — `cellar
-  :any_skip_relocation` и не содержит платформенно-специфичных
-  артефактов, поэтому один tarball обслуживает все теги; они перечислены
-  в цикле `EXTRA_TAGS` в `make_bottle.sh` — при выходе новой версии macOS
-  добавьте её тег туда.
-Установка пользователями — через Homebrew (`vz-runner` в
-PATH + assets в `share/anvil`); LaunchAgent —
+- **`rebuild` must be 0.** `brew bottle` without `--no-rebuild` sets
+  rebuild = (formula's rebuild on origin/HEAD) + 1, and since update-brew
+  has already pushed the cleaned formula, upstream matches and rebuild
+  becomes 1. With rebuild > 0 zerobrew builds the URL using its own
+  incompatible scheme
+  `<name>-<version>.<rebuild>.<tag>.bottle.tar.gz` (Homebrew puts rebuild
+  after the tag) and gets a 404 — it has no fallback to source.
+- **Tags for all supported macOS versions.** The bottle is
+  `cellar :any_skip_relocation` and contains no platform-specific
+  artifacts, so one tarball serves all tags; they are listed in the
+  `EXTRA_TAGS` loop in `make_bottle.sh` — when a new macOS version ships,
+  add its tag there.
+
+Users install via Homebrew (`vz-runner` in PATH + assets in
+`share/anvil`); the LaunchAgent is
 `scripts/com.olegshirko.anvil.plist` (`make service-install`).
