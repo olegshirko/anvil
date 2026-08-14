@@ -157,6 +157,11 @@ unit-tests:
 	cd guest-agent && go vet ./... && go test ./...
 	swift test
 
+# Docker API integration tests against a running daemon (requires
+# `make service-start` first; pulls alpine/nginx/busybox on first run).
+integration:
+	python3 scripts/integration_tests.py
+
 time-boot: sign
 	python3 scripts/time_boot.py
 

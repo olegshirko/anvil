@@ -251,7 +251,14 @@ type dockerContainerConfig struct {
 }
 
 type dockerNetworkSettings struct {
-	IPAddress string `json:"IPAddress"`
+	IPAddress string                         `json:"IPAddress"`
+	Networks  map[string]dockerEndpointStats `json:"Networks,omitempty"`
+}
+
+type dockerEndpointStats struct {
+	IPAddress   string `json:"IPAddress"`
+	IPPrefixLen int    `json:"IPPrefixLen"`
+	MacAddress  string `json:"MacAddress,omitempty"`
 }
 
 // dockerPort matches the Docker API port binding shape.
@@ -967,6 +974,53 @@ func restartDockerContainer(id string, timeout int) error {
 
 // listDockerContainers scans all containerd namespaces and returns a
 // Docker-compatible summary for each container.
+// matchesContainerFilters applies the ps filters Docker CLI sends: keys are
+// AND-ed, values within a key are OR-ed. Supported: label (see
+// matchesLabelFilters), name (substring), id (prefix), status (exact).
+func matchesContainerFilters(s dockerContainerSummary, filters map[string]map[string]bool) bool {
+	if !matchesLabelFilters(s.Labels, filters) {
+		return false
+	}
+	if pats := filters["name"]; len(pats) > 0 {
+		name := strings.TrimPrefix(s.Names[0], "/")
+		matched := false
+		for pat := range pats {
+			if pat != "" && strings.Contains(name, pat) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	if pats := filters["id"]; len(pats) > 0 {
+		matched := false
+		for pat := range pats {
+			if strings.HasPrefix(s.Id, pat) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	if statuses := filters["status"]; len(statuses) > 0 {
+		matched := false
+		for st := range statuses {
+			if st == s.State {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
 func listDockerContainers(filters map[string]map[string]bool) ([]dockerContainerSummary, error) {
 	cl, err := client.New(containerdSocket)
 	if err != nil {
@@ -1056,7 +1110,7 @@ func listDockerContainers(filters map[string]map[string]bool) ([]dockerContainer
 				State:   state,
 				Status:  formatHealthStatus(did, status),
 			}
-			if matchesLabelFilters(summary.Labels, filters) {
+			if matchesContainerFilters(summary, filters) {
 				result = append(result, summary)
 			}
 		}
@@ -1137,6 +1191,10 @@ func inspectDockerContainer(prefix string) (*dockerContainerInspect, error) {
 			}
 
 			did := dockerID(ns, c.ID())
+			networks, containerIP := containerNetworkInfo(ns, c.ID(), name)
+			if containerIP == "" {
+				containerIP = detectGuestIP()
+			}
 			return &dockerContainerInspect{
 				Id:    did,
 				Name:  "/" + name,
@@ -1152,10 +1210,54 @@ func inspectDockerContainer(prefix string) (*dockerContainerInspect, error) {
 					Healthcheck: getHealthcheckConfig(did),
 				},
 				NetworkSettings: dockerNetworkSettings{
-					IPAddress: detectGuestIP(),
+					IPAddress: containerIP,
+					Networks:  networks,
 				},
 			}, nil
 		}
 	}
 	return nil, fmt.Errorf("No such container: %s", prefix)
+}
+
+// containerNetworkInfo returns the container's per-network endpoints for
+// docker inspect (NetworkSettings.Networks) and its primary IP. nerdctl's own
+// inspect knows the CNI-assigned address, but keys the map by interface name
+// ("unknown-eth0") — the real network name comes from HostConfig.NetworkMode.
+type nerdctlInspectNetInfo struct {
+	HostConfig struct {
+		NetworkMode string `json:"NetworkMode"`
+	} `json:"HostConfig"`
+	NetworkSettings struct {
+		IPAddress   string `json:"IPAddress"`
+		IPPrefixLen int    `json:"IPPrefixLen"`
+		MacAddress  string `json:"MacAddress"`
+		Networks    map[string]struct {
+			IPAddress   string `json:"IPAddress"`
+			IPPrefixLen int    `json:"IPPrefixLen"`
+			MacAddress  string `json:"MacAddress"`
+		} `json:"Networks"`
+	} `json:"NetworkSettings"`
+}
+
+func containerNetworkInfo(ns, containerdID, name string) (map[string]dockerEndpointStats, string) {
+	stdout, _, code, err := runNerdctl(ns, "inspect", "--format", "json", containerdID)
+	if err != nil || code != 0 {
+		return nil, ""
+	}
+	var info nerdctlInspectNetInfo
+	if err := json.Unmarshal([]byte(stdout), &info); err != nil {
+		return nil, ""
+	}
+
+	primary := dockerEndpointStats{
+		IPAddress:   info.NetworkSettings.IPAddress,
+		IPPrefixLen: info.NetworkSettings.IPPrefixLen,
+		MacAddress:  info.NetworkSettings.MacAddress,
+	}
+	networkName := info.HostConfig.NetworkMode
+	if networkName == "" || networkName == "default" || networkName == "bridge" {
+		networkName = "bridge"
+	}
+	networks := map[string]dockerEndpointStats{networkName: primary}
+	return networks, primary.IPAddress
 }

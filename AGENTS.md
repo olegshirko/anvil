@@ -104,6 +104,13 @@ Unit tests exist for both components and run on the dev host (no VM needed):
 
 Integration verification is script-driven and manual:
 
+- `make integration` — Docker API integration tests
+  (`scripts/integration_tests.py`): the real `docker` CLI against a running
+  daemon — run/attach/exit codes, port forwarding, host-port conflicts,
+  ps filters, inspect, logs/exec/cp, bind mounts, volumes, images,
+  save/load, networks, healthchecks, events, compose (incl. two-project
+  isolation) and both build paths (classic /build, buildx remote --load).
+  Requires `make service-start` first; pulls alpine/nginx/busybox.
 - `make time-boot` / `make time-service` — boot time measurements
   (`scripts/time_boot.py`, `scripts/time_service.py`).
 - `make validate` — a robustness suite (`scripts/validate_robustness.py`):
