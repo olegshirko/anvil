@@ -279,8 +279,6 @@ func cmdStart(args: [String]) {
     proc.arguments = cmdArgs
     proc.standardOutput = FileHandle(forWritingAtPath: daemonLogFile.path)
     proc.standardError = proc.standardOutput
-    // Detach from the controlling terminal.
-    proc.qualityOfService = .background
     do {
         try proc.run()
     } catch {
