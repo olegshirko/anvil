@@ -8,6 +8,11 @@ let package = Package(
         .executableTarget(
             name: "vz-runner",
             path: "Sources/vz-runner"
+        ),
+        .testTarget(
+            name: "vz-runner-tests",
+            dependencies: ["vz-runner"],
+            path: "Tests/vz-runner-tests"
         )
     ]
 )

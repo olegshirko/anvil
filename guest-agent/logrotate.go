@@ -4,8 +4,6 @@ import (
 	"log"
 	"os"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // In debug mode (ANVIL_DEBUG=1) stage2 appends guest-agent's stdout/stderr to
@@ -54,13 +52,13 @@ func rotateDebugLog() error {
 	if err != nil {
 		return err
 	}
-	// linux/arm64 has no dup2 syscall; dup3 with flags=0 is equivalent. The
-	// log package and runtime panics write to fds 1/2, so this covers both.
-	if err := unix.Dup3(int(f.Fd()), int(os.Stdout.Fd()), 0); err != nil {
+	// The log package and runtime panics write to fds 1/2, so dup covers
+	// both (see dupfd_*.go — dup3 on linux, dup2 elsewhere).
+	if err := dupFD(int(f.Fd()), int(os.Stdout.Fd())); err != nil {
 		f.Close()
 		return err
 	}
-	if err := unix.Dup3(int(f.Fd()), int(os.Stderr.Fd()), 0); err != nil {
+	if err := dupFD(int(f.Fd()), int(os.Stderr.Fd())); err != nil {
 		f.Close()
 		return err
 	}

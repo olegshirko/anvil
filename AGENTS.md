@@ -92,10 +92,18 @@ rewriting), `VERSION` (substituted into `version.swift`), `VZRUNNER_BIN`
 
 ## Testing
 
-There are no automated unit tests (neither Swift nor Go — no `*_test.go`).
-Verification is integration-style, via scripts and manual Docker CLI runs:
+Unit tests exist for both components and run on the dev host (no VM needed):
 
-- `make test` — smoke: build + `--help`.
+- `make unit-tests` — `go vet` + `go test` for guest-agent pure helpers
+  (deterministic IDs, ref canonicalization, inspect parser, AutoRemove/wait
+  invariants from `ARCHITECTURE.md` §4.3) and `swift test` for
+  ControlProtocol framing and the snapshot config hash. The guest-agent
+  package must keep compiling on darwin: Linux-only syscalls live in
+  `*_linux.go` files behind build tags (see `dupfd_*`, `entropy_*`).
+- `make test` — unit tests + smoke: build + `--help`.
+
+Integration verification is script-driven and manual:
+
 - `make time-boot` / `make time-service` — boot time measurements
   (`scripts/time_boot.py`, `scripts/time_service.py`).
 - `make validate` — a robustness suite (`scripts/validate_robustness.py`):

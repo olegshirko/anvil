@@ -148,8 +148,14 @@ disk-compact:
 clean:
 	rm -rf .build .download .venv
 
-test: sign
+test: sign unit-tests
 	$(BINARY) --help || true
+
+# Unit tests: pure-Go guest-agent helpers (darwin-hostable) and Swift
+# ControlProtocol/snapshot-hash tests.
+unit-tests:
+	cd guest-agent && go vet ./... && go test ./...
+	swift test
 
 time-boot: sign
 	python3 scripts/time_boot.py

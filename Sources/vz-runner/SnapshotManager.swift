@@ -7,8 +7,8 @@ struct SnapshotManager {
     let machineIDURL: URL
     let networkConfigURL: URL
 
-    init(name: String = "default") {
-        let dir = stateDir.appendingPathComponent("snapshots", isDirectory: true)
+    init(name: String = "default", directory: URL? = nil) {
+        let dir = directory ?? stateDir.appendingPathComponent("snapshots", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         snapshotURL = dir.appendingPathComponent("\(name).vzstate")
         configHashURL = dir.appendingPathComponent("\(name).config-hash")
