@@ -41,6 +41,20 @@ brew install olegshirko/tap/anvil
 anvil start        # first run is a cold boot (~1.5 s), then a snapshot is saved
 ```
 
+### zerobrew
+
+The same tap works with zerobrew:
+
+```sh
+zerobrew install olegshirko/tap/anvil
+anvil start
+```
+
+zerobrew has no `brew services`, so the LaunchAgent for autostart at login is
+not installed automatically — run `anvil start` after login instead. `anvil
+start` also unpacks the gzipped kernel itself when the service wrapper has
+not done it, so no extra steps are needed.
+
 ### From source
 
 ```sh
