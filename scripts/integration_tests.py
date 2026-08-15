@@ -466,7 +466,9 @@ def test_classic_build() -> None:
             proc = subprocess.run(["docker", "build", "-t", tag, str(ctx)],
                                   capture_output=True, text=True, timeout=600.0, env=env)
             if proc.returncode != 0:
-                raise RuntimeError(f"build failed: {proc.stderr.strip()[-500:]}")
+                raise RuntimeError(f"build failed rc={proc.returncode}: "
+                                   f"stdout={proc.stdout.strip()[-400:]} "
+                                   f"stderr={proc.stderr.strip()[-400:]}")
             out = docker("run", "--rm", tag)
             if "built-by-anvil" not in out.stdout:
                 raise RuntimeError(f"built image output: {out.stdout!r}")
@@ -478,7 +480,19 @@ def test_classic_build() -> None:
 
 def test_buildx_remote_load() -> None:
     """docker buildx build --load via the anvil-remote builder imports the
-    result into the image store."""
+    result into the image store. The builder is selected explicitly: the
+    async setup after `anvil start` may still be in flight, and the default
+    builder here is the docker-container driver (moby/buildkit in a
+    container) which pulls every layer from the registry."""
+    docker("buildx", "use", "anvil-remote")
+    for _ in range(30):
+        insp = docker("buildx", "inspect", "--bootstrap", "anvil-remote",
+                      timeout=60.0, check=False)
+        if insp.returncode == 0:
+            break
+        time.sleep(1.0)
+    else:
+        raise RuntimeError("anvil-remote builder not ready: see daemon.log")
     tag = f"{PREFIX}-bx:1"
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "Dockerfile").write_text('FROM alpine\nCMD ["echo", "bx-ok"]\n')

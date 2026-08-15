@@ -218,12 +218,24 @@ Done while investigating `docker load` and during the speed iteration
   etc.) accumulated on the persistent disk forever. Now the record is
   deleted on `docker rm`, and at startup the guest-agent cleans out all
   records without a live container in containerd.
-- Known limitation (not anvil's fault): nerdctl runs its own host-port
-  check on create, so `compose up --force-recreate` over LIVE containers
-  (compose creates the replacement before stopping the old one) can fail
-  with "bind for :<port> failed: port is already allocated" — a mismatch
-  between nerdctl's semantics (create) and Docker's (start). The standard
-  `compose down && up` flow (as in the make targets) is not affected.
+- ~~Known limitation: nerdctl runs its own host-port check on create, so
+  `compose up` over LIVE containers (compose creates the replacement before
+  stopping the old one) failed with "bind for :<port> failed: port is
+  already allocated"~~ — fixed: `-p` flags are no longer passed to nerdctl
+  at all. nerdctl reserves host ports at CREATE time with an inherited
+  listener fd, which is incompatible with Docker's check-at-start
+  semantics. Port mappings are persisted in nerdctl's network store
+  (metadata for ps/inspect/scanner), publishing goes through the guest-side
+  port proxy (single TCP port, header describes the CNI target), and
+  conflicts are enforced by our own start-time checks. Same fix removed the
+  compose-run CLI panic: `docker inspect` now returns HostConfig
+  (AutoRemove/PortBindings) and Config Tty/Env/Cmd — the CLI nil-derefs
+  HostConfig.AutoRemove in `container.RunStart` otherwise.
+- buildkitd now runs with the containerd worker (namespace `default`) instead
+  of the default OCI worker: `FROM` resolves from the local image store, so
+  builds no longer request OAuth tokens from Docker Hub when every base
+  image is already local (a broken/restricted network used to fail the
+  build even with local images).
 - `/images/load`: added `client.WithSkipMissing()` — single-platform
   exports with a multi-arch index (without foreign blobs) no longer fail
   with "content digest ... not found".

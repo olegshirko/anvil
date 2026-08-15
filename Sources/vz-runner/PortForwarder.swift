@@ -2,6 +2,11 @@ import Foundation
 import Virtualization
 import Darwin
 
+/// The guest-agent TCP port the port proxy listens on (see portproxy.go in
+/// guest-agent). The forwarder connects here and sends a length-prefixed
+/// JSON header describing the real target (containerIP:containerPort).
+let guestPortProxyPort: Int = 39131
+
 struct PortMapping: Codable, Hashable {
     let namespace: String
     let containerID: String
@@ -10,6 +15,7 @@ struct PortMapping: Codable, Hashable {
     let containerPort: Int
     let `protocol`: String?
     let guestIP: String
+    let containerIP: String?
 
     enum CodingKeys: String, CodingKey {
         case namespace
@@ -19,6 +25,7 @@ struct PortMapping: Codable, Hashable {
         case containerPort = "container_port"
         case `protocol`
         case guestIP = "guest_ip"
+        case containerIP = "container_ip"
     }
 
     /// Listener identity key. A single host-side listener is bound per exposed host port.
@@ -159,7 +166,11 @@ final class PortForwarder {
         listener.start { [weak self] in
             self?.stopListener(key: mapping.listenerKey)
         }
-        print("[port-forwarder] forwarding localhost:\(mapping.hostPort) -> \(mapping.guestIP):\(mapping.hostPort)")
+        if let target = mapping.containerIP, !target.isEmpty {
+            print("[port-forwarder] forwarding localhost:\(mapping.hostPort) -> proxy -> \(target):\(mapping.containerPort)")
+        } else {
+            print("[port-forwarder] forwarding localhost:\(mapping.hostPort) -> \(mapping.guestIP):\(mapping.hostPort)")
+        }
     }
 
     private func existingListener(for mapping: PortMapping) -> PortMapping? {
@@ -317,8 +328,40 @@ private final class Listener {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return -1 }
 
+        // Preferred path: the guest-side port proxy. The forwarder connects
+        // to a single well-known port and names the real target
+        // (containerIP:containerPort) in a length-prefixed JSON header —
+        // user host ports are never bound inside the guest, so nerdctl's
+        // create-time port reservation cannot conflict with live containers.
+        // Fallback (containers created before the proxy existed / snapshots
+        // from older guests): dial guestIP:hostPort directly, where CNI DNAT
+        // still answers.
+        let useProxy = containerProxyTarget()
+
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
+        if let proxy = useProxy {
+            addr.sin_port = in_port_t(guestPortProxyPort).bigEndian
+            guard mapping.guestIP.withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1 else {
+                close(fd)
+                return -1
+            }
+            let connected = withUnsafePointer(to: &addr) { ptr -> Bool in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+                }
+            }
+            guard connected else {
+                close(fd)
+                return -1
+            }
+            guard sendPortProxyHeader(fd, target: proxy) else {
+                close(fd)
+                return -1
+            }
+            return fd
+        }
+
         addr.sin_port = in_port_t(mapping.hostPort).bigEndian
         guard mapping.guestIP.withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1 else {
             close(fd)
@@ -335,6 +378,45 @@ private final class Listener {
             return -1
         }
         return fd
+    }
+
+    /// The proxy target when the mapping carries a container IP (the CNI
+    /// address, reachable only from inside the guest).
+    private func containerProxyTarget() -> (ip: String, port: Int)? {
+        guard let ip = mapping.containerIP, !ip.isEmpty, mapping.containerPort > 0 else {
+            return nil
+        }
+        return (ip, mapping.containerPort)
+    }
+
+    /// Sends the port-proxy handshake: 4-byte big-endian body length + JSON.
+    private func sendPortProxyHeader(_ fd: Int32, target: (ip: String, port: Int)) -> Bool {
+        let header = "{\"container_ip\":\"\(target.ip)\",\"container_port\":\(target.port)}"
+        let body = Array(header.utf8)
+
+        var length = UInt32(body.count).bigEndian
+        let lengthSent = withUnsafeBytes(of: &length) { ptr -> Int in
+            var total = 0
+            while total < 4 {
+                let n = write(fd, ptr.baseAddress!.advanced(by: total), 4 - total)
+                if n <= 0 { return -1 }
+                total += n
+            }
+            return total
+        }
+        guard lengthSent == 4 else { return false }
+
+        var mutableBody = body
+        let bodySent = mutableBody.withUnsafeMutableBufferPointer { ptr -> Int in
+            var total = 0
+            while total < body.count {
+                let n = write(fd, ptr.baseAddress!.advanced(by: total), body.count - total)
+                if n <= 0 { return -1 }
+                total += n
+            }
+            return total
+        }
+        return bodySent == body.count
     }
 
     private func relay(group: DispatchGroup, from: Int32, to: Int32) {

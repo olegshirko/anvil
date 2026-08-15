@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -98,20 +99,6 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cmd := exec.Command("/opt/containerd/bin/nerdctl", args...)
-	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-	cmd.Dir = ctxDir
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
@@ -127,29 +114,61 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Forward builder output line by line as Docker progress stream frames.
-	lineBuf := make([]byte, 0, 4096)
-	tmp := make([]byte, 4096)
-	for {
-		n, readErr := stdout.Read(tmp)
-		for _, b := range tmp[:n] {
-			if b == '\n' {
-				writeStream(string(lineBuf))
-				lineBuf = lineBuf[:0]
-			} else if b != '\r' {
-				lineBuf = append(lineBuf, b)
+	// runBuild starts the nerdctl build and streams its output to the
+	// client. Returns the command error and whether the output mentioned a
+	// missing content digest — stale buildkit cache records referencing
+	// blobs removed by `docker rmi` fail this way; the caller prunes and
+	// retries once.
+	runBuild := func() (err error, digestMissing bool) {
+		buildCmd := exec.Command("/opt/containerd/bin/nerdctl", args...)
+		buildCmd.Env = append(buildCmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+			"BUILDKIT_HOST=unix://"+buildkitSocket)
+		buildCmd.Dir = ctxDir
+		stdout, _ := buildCmd.StdoutPipe()
+		if pipeErr := buildCmd.Start(); pipeErr != nil {
+			return pipeErr, false
+		}
+		buildCmd.Stderr = buildCmd.Stdout
+
+		lineBuf := make([]byte, 0, 4096)
+		tmp := make([]byte, 4096)
+		for {
+			n, readErr := stdout.Read(tmp)
+			for _, b := range tmp[:n] {
+				if b == '\n' {
+					writeStream(string(lineBuf))
+					if bytes.Contains(lineBuf, []byte("not found")) {
+						digestMissing = true
+					}
+					lineBuf = lineBuf[:0]
+				} else if b != '\r' {
+					lineBuf = append(lineBuf, b)
+				}
+			}
+			if readErr != nil {
+				break
 			}
 		}
-		if readErr != nil {
-			break
+		if len(lineBuf) > 0 {
+			writeStream(string(lineBuf))
+			if bytes.Contains(lineBuf, []byte("not found")) {
+				digestMissing = true
+			}
 		}
-	}
-	if len(lineBuf) > 0 {
-		writeStream(string(lineBuf))
+		return buildCmd.Wait(), digestMissing
 	}
 
-	if err := cmd.Wait(); err != nil {
-		msg := fmt.Sprintf("build failed: %v", err)
+	buildErr, digestMissing := runBuild()
+	if buildErr != nil && digestMissing {
+		writeStream("[anvil] stale buildkit cache detected, pruning and retrying")
+		if pruneErr := exec.Command("/opt/containerd/bin/buildctl", "prune", "--all").Run(); pruneErr != nil {
+			log.Printf("[docker-api] build retry prune: %v", pruneErr)
+		}
+		buildErr, _ = runBuild()
+	}
+
+	if buildErr != nil {
+		msg := fmt.Sprintf("build failed: %v", buildErr)
 		payload, _ := json.Marshal(map[string]interface{}{
 			"error":       msg,
 			"errorDetail": map[string]string{"message": msg},

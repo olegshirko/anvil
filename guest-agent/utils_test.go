@@ -49,11 +49,11 @@ func TestDockerIDMatchesSpec(t *testing.T) {
 
 func TestNamespaceFromNetwork(t *testing.T) {
 	cases := map[string]string{
-		"":              "default",
-		"default":       "default",
-		"bridge":        "default",
+		"":               "default",
+		"default":        "default",
+		"bridge":         "default",
 		"myproj_default": "myproj",
-		"custom":        "custom",
+		"custom":         "custom",
 	}
 	for in, want := range cases {
 		if got := namespaceFromNetwork(in); got != want {
