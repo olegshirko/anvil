@@ -9,13 +9,9 @@ backend_is_available() {
 }
 
 backend_cold_reset() {
-    # A previously failed run can leave workload containers behind in a
-    # broken state ("RWLayer of container ... is unexpectedly nil"), which
-    # makes the next compose up fail forever. Force-remove leftovers by the
-    # compose project label and the shared network.
-    docker --context desktop-linux ps -aq --filter label=com.docker.compose.project=workloads 2>/dev/null \
-        | xargs -r docker --context desktop-linux rm -f >/dev/null 2>&1 || true
-    docker --context desktop-linux network rm workloads_default >/dev/null 2>&1 || true
+    # Runs while the backend is stopped, so the actual container cleanup
+    # happens in backend_start once the API is reachable (see there).
+    return 0
 }
 
 backend_start() {
@@ -24,19 +20,26 @@ backend_start() {
     # And a single successful call is not enough: right after ServerVersion
     # appears, /_ping can still answer 500 while the API warms up. Require
     # sustained clean round-trips before declaring readiness.
-    if wait_for "docker desktop ready" 90 docker_desktop_stable; then
-        return 0
+    if ! wait_for "docker desktop ready" 90 docker_desktop_stable; then
+        # Docker Desktop 4.86 on macOS 26 beta: after a quit/open cycle its
+        # Linux VM sometimes never boots (apiproxy: "no route to host" to
+        # 192.168.65.7 forever). Recover with a hard kill + fresh start; the
+        # measured time then still reflects what a user experiences.
+        echo "!! docker desktop VM stuck, hard-restarting" >&2
+        pkill -9 -f "com.docker.backend" 2>/dev/null || true
+        pkill -9 -f "Docker Desktop" 2>/dev/null || true
+        pkill -9 -f "com.docker.virtualmachine" 2>/dev/null || true
+        sleep 3
+        open -a Docker
+        wait_for "docker desktop ready (after hard reset)" 180 docker_desktop_stable || return 1
     fi
-    # Docker Desktop 4.86 on macOS 26 beta: after a quit/open cycle its
-    # Linux VM sometimes never boots (apiproxy: "no route to host" to
-    # 192.168.65.7 forever). Recover with a hard kill + fresh start; the
-    # measured time then still reflects what a user experiences.
-    echo "!! docker desktop VM stuck, hard-restarting" >&2
-    pkill -9 -f "com.docker.backend" 2>/dev/null || true
-    pkill -9 -f "Docker Desktop" 2>/dev/null || true
-    sleep 3
-    open -a Docker
-    wait_for "docker desktop ready (after hard reset)" 180 docker_desktop_stable
+    # A previously failed run can leave workload containers behind in a
+    # broken state ("RWLayer of container ... is unexpectedly nil"), which
+    # makes the next compose up fail forever. Force-remove leftovers by the
+    # compose project label and the shared network.
+    docker --context desktop-linux ps -aq --filter label=com.docker.compose.project=workloads 2>/dev/null \
+        | xargs -r docker --context desktop-linux rm -f >/dev/null 2>&1 || true
+    docker --context desktop-linux network rm workloads_default >/dev/null 2>&1 || true
 }
 
 docker_desktop_stable() {
@@ -58,19 +61,24 @@ docker_desktop_probe() {
 }
 
 backend_stop() {
+    # Ask for a graceful quit first (data safety), give it 10s, then ALWAYS
+    # hard-kill. On Docker Desktop 4.86 / macOS 26 beta the quit/open cycle
+    # is broken both ways: a lingering backend makes the relaunched one skip
+    # engine start entirely, and even a fully graceful quit can leave state
+    # that keeps the next VM from booting (apiproxy: no route to host
+    # forever). Starting from a hard-killed state is the only reliably
+    # working path (~2s to API), so normalize on it.
     osascript -e 'quit app "Docker"' 2>/dev/null || true
-    # Wait for the backend to actually exit. Docker Desktop corrupts its
-    # state when relaunched mid-shutdown (API answers 500 on /_ping forever,
-    # observed repeatedly); a hard kill after the graceful quit window
-    # avoids that.
     local i
-    for i in $(seq 1 30); do
-        ps aux | grep -q "[c]om.docker.backend" || return 0
+    for i in $(seq 1 10); do
+        ps aux | grep -q "[c]om.docker.backend" || break
         sleep 1
     done
     pkill -9 -f "com.docker.backend" 2>/dev/null || true
     pkill -9 -f "Docker Desktop" 2>/dev/null || true
+    pkill -9 -f "com.docker.virtualmachine" 2>/dev/null || true
     sleep 2
+    return 0
 }
 
 backend_stop_keep_snapshot() {
