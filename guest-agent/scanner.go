@@ -70,7 +70,7 @@ type nerdctlNetworkConfig struct {
 // addrHash directory (sha256 of the containerd socket address) is located by
 // glob — only one exists in practice.
 func readNetworkStorePorts(ns, id string) string {
-	matches, _ := filepath.Glob(filepath.Join("/var/lib/nerdctl", "*", "containers", ns, id, "network-config.json"))
+	matches, _ := filepath.Glob(filepath.Join(nerdctlStoreRoot, "*", "containers", ns, id, "network-config.json"))
 	for _, path := range matches {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -93,12 +93,34 @@ type portScanner struct {
 	current     []PortMapping
 	subscribers map[chan PortMapState]struct{}
 	guestIP     string
+	// containerIPs caches (namespace, containerd id) -> {task pid, CNI IP}
+	// so per-scan nerdctl inspects only run for new or restarted containers.
+	containerIPs map[string]containerIPEntry
+}
+
+type containerIPEntry struct {
+	pid uint32
+	ip  string
 }
 
 func newPortScanner() *portScanner {
 	return &portScanner{
-		subscribers: make(map[chan PortMapState]struct{}),
+		subscribers:  make(map[chan PortMapState]struct{}),
+		containerIPs: make(map[string]containerIPEntry),
 	}
+}
+
+// containerIPFor returns the container's CNI address, cached by task pid.
+func (s *portScanner) containerIPFor(ns, id string, pid uint32, name string) string {
+	key := ns + "/" + id
+	if e, ok := s.containerIPs[key]; ok && e.pid == pid && e.ip != "" {
+		return e.ip
+	}
+	_, ip := containerNetworkInfo(ns, id, name)
+	if ip != "" {
+		s.containerIPs[key] = containerIPEntry{pid: pid, ip: ip}
+	}
+	return ip
 }
 
 func (s *portScanner) run() {
@@ -258,6 +280,12 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 				continue
 			}
 
+			// The host forwarder reaches containers through the guest-side
+			// port proxy, so it needs the CNI address (10.10.x.y), not the
+			// guest NAT IP. nerdctl inspect costs ~100ms, so cache per
+			// (namespace, id) keyed by task pid — a restart gets a new pid.
+			containerIP := s.containerIPFor(ns, c.ID(), task.Pid(), labels["nerdctl/name"])
+
 			for _, p := range ports {
 				proto := p.Protocol
 				if proto == "" {
@@ -271,6 +299,7 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 					ContainerPort: p.ContainerPort,
 					Protocol:      proto,
 					GuestIP:       guestIP,
+					ContainerIP:   containerIP,
 				})
 			}
 		}

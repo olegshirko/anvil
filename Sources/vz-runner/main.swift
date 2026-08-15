@@ -499,6 +499,7 @@ func printUsage() {
       anvil logs [daemon|console|guest]
       anvil images [list|check|request] --docker <image:tag>
       anvil docker-socket-path
+      anvil --version
 
     Service commands:
       start     Launch the daemon in the background, wait for ready,
@@ -570,6 +571,9 @@ case "_setup-buildx":
     // terminal hangup during the ~2s the buildx setup takes.
     signal(SIGHUP, SIG_IGN)
     setupBuildxBuilder()
+    exit(0)
+case "--version", "-v":
+    print(appVersion)
     exit(0)
 case "--help", "-h":
     printUsage()

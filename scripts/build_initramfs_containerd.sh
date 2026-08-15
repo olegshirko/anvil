@@ -145,6 +145,21 @@ for q in opt/containerd/bin/buildkit-qemu-*; do
 done
 rm -f opt/containerd/bin/buildkit-runc
 ln -sf /opt/containerd/bin/runc opt/containerd/bin/buildkit-runc
+
+# buildkitd runs with the containerd worker (same store as nerdctl/docker
+# pull) so `FROM` resolves local images instead of hitting the registry
+# (an unreachable registry means OAuth token requests and a failed build
+# even when every base image is present). buildkitd reads this file from
+# its default path /etc/buildkit/buildkitd.toml.
+mkdir -p etc/buildkit
+cat > etc/buildkit/buildkitd.toml <<'BKTEOF'
+[worker.oci]
+  enabled = false
+
+[worker.containerd]
+  enabled = true
+  namespace = "default"
+BKTEOF
 # UPX lives in PATH in CI (apk add upx); the offline Lima build VM has no
 # package network access, so fall back to the prebuilt static binary fetched
 # into .download/upx (make download-upx).
@@ -483,6 +498,10 @@ if [ ! -s /etc/resolv.conf ]; then
     [ -n "$gw" ] && printf 'nameserver %s\n' "$gw" >> /etc/resolv.conf
     printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\n' >> /etc/resolv.conf
 fi
+# Serialize A/AAAA lookups: under load the VZ NAT DNS forwarder sporadically
+# drops one of the two parallel UDP queries, which Go resolvers (nerdctl,
+# buildkitd) surface as "lookup ... i/o timeout" after exhausting retries.
+grep -q "^options" /etc/resolv.conf || printf 'options single-request timeout:1 attempts:3\n' >> /etc/resolv.conf
 
 # containerd needs /etc/containerd and a state dir.
 mkdir -p /etc/containerd /run/containerd /var/lib/containerd

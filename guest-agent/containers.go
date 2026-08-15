@@ -235,6 +235,7 @@ type dockerContainerInspect struct {
 	Image           string                `json:"Image"`
 	State           dockerContainerState  `json:"State"`
 	Config          dockerContainerConfig `json:"Config"`
+	HostConfig      dockerHostConfig      `json:"HostConfig"`
 	NetworkSettings dockerNetworkSettings `json:"NetworkSettings"`
 }
 
@@ -248,7 +249,18 @@ type dockerContainerConfig struct {
 	Labels      map[string]string  `json:"Labels"`
 	Image       string             `json:"Image"`
 	Healthcheck *dockerHealthcheck `json:"Healthcheck,omitempty"`
+	Tty         bool               `json:"Tty,omitempty"`
+	OpenStdin   bool               `json:"OpenStdin,omitempty"`
+	Env         []string           `json:"Env,omitempty"`
+	Cmd         []string           `json:"Cmd,omitempty"`
+	Entrypoint  []string           `json:"Entrypoint,omitempty"`
 }
+
+// dockerHostConfig (defined above with the create request) doubles as the
+// inspect response shape: the docker CLI and compose dereference
+// HostConfig.AutoRemove / PortBindings on inspect (e.g.
+// cli/command/container/start.go — a missing object nil-panics the CLI).
+// dockerRestartPolicy likewise already exists with the create request.
 
 type dockerNetworkSettings struct {
 	IPAddress string                         `json:"IPAddress"`
@@ -507,6 +519,14 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 	}
 
 	// Port bindings: containerPort/proto -> [{HostIp, HostPort}]
+	// Ports are NOT passed to nerdctl: nerdctl reserves host ports at CREATE
+	// time with an inherited listener fd, which breaks the Docker flow where
+	// the check belongs to start (compose creates the replacement container
+	// before stopping the old one). We persist the mappings into nerdctl's
+	// network store instead — the same place nerdctl itself uses — so ps,
+	// inspect and the port scanner see them, while the guest-side port proxy
+	// + host PortForwarder own the actual publishing (see portproxy.go).
+	var portMappings []cniPortMapping
 	for cportSpec, hostPorts := range req.HostConfig.PortBindings {
 		proto := "tcp"
 		parts := strings.SplitN(cportSpec, "/", 2)
@@ -514,16 +534,25 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 		if len(parts) == 2 {
 			proto = parts[1]
 		}
+		cportNum, err := strconv.Atoi(cport)
+		if err != nil {
+			return "", fmt.Errorf("invalid container port %q", cport)
+		}
 		for _, hp := range hostPorts {
-			host := hp.HostPort
-			if host == "" {
+			host, err := strconv.Atoi(hp.HostPort)
+			if err != nil || host == 0 {
 				continue
 			}
-			spec := host + ":" + cport
-			if proto != "tcp" {
-				spec += "/" + proto
+			hostIP := hp.HostIp
+			if hostIP == "" {
+				hostIP = "0.0.0.0"
 			}
-			args = append(args, "-p", spec)
+			portMappings = append(portMappings, cniPortMapping{
+				HostPort:      host,
+				ContainerPort: cportNum,
+				Protocol:      proto,
+				HostIP:        hostIP,
+			})
 		}
 	}
 
@@ -580,6 +609,13 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 	}
 
 	dockerID := dockerID(ns, containerdID)
+	// Persist the port mappings into nerdctl's network store so list/ps and
+	// the port scanner (and nerdctl's own tooling) see the published ports.
+	if len(portMappings) > 0 {
+		if err := writeContainerPortMappings(ns, containerdID, portMappings); err != nil {
+			log.Printf("[docker-api] persist ports for %s: %v", containerdID, err)
+		}
+	}
 	// AutoRemove is handled by guest-agent after we capture the exit code.
 	// Passing --rm to nerdctl would delete the container immediately on exit
 	// and cause /wait to miss the exit status.
@@ -599,6 +635,52 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 	}
 	setHealthcheckConfig(dockerID, req.Healthcheck, containerUser)
 	return dockerID, nil
+}
+
+// nerdctlStoreRoot is the nerdctl data root (override in tests).
+var nerdctlStoreRoot = "/var/lib/nerdctl"
+
+// writeContainerPortMappings stores the published port mappings in nerdctl's
+// network store (network-config.json) — the same file nerdctl itself writes
+// for `-p` containers. We create containers without `-p` (nerdctl's
+// create-time host-port reservation breaks compose-style recreate), so this
+// is the authoritative record. The file is read-modify-written to preserve
+// any fields nerdctl stores alongside portMappings.
+func writeContainerPortMappings(ns, containerdID string, mappings []cniPortMapping) error {
+	// The datastore directory is /var/lib/nerdctl/<addrHash>; locate it by
+	// glob (only one exists in practice) or create it under the first
+	// datastore root found.
+	matches, _ := filepath.Glob(filepath.Join(nerdctlStoreRoot, "*", "containers"))
+	var dir string
+	if len(matches) > 0 {
+		dir = filepath.Join(matches[0], ns, containerdID)
+	} else {
+		roots, _ := filepath.Glob(nerdctlStoreRoot + "/*")
+		if len(roots) == 0 {
+			return fmt.Errorf("nerdctl datastore not found")
+		}
+		dir = filepath.Join(roots[0], "containers", ns, containerdID)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "network-config.json")
+
+	raw := map[string]interface{}{}
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &raw)
+	}
+	encoded, err := json.Marshal(mappings)
+	if err != nil {
+		return err
+	}
+	// Round-trip through json.RawMessage to keep the exact cni shape.
+	raw["portMappings"] = json.RawMessage(encoded)
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o644)
 }
 
 // startDockerContainer starts a container by Docker ID or name.
@@ -1191,7 +1273,17 @@ func inspectDockerContainer(prefix string) (*dockerContainerInspect, error) {
 			}
 
 			did := dockerID(ns, c.ID())
-			networks, containerIP := containerNetworkInfo(ns, c.ID(), name)
+			inspectDetails := inspectDetailsFor(ns, c.ID())
+			networkName := inspectDetails.HostConfig.NetworkMode
+			if networkName == "" || networkName == "default" || networkName == "bridge" {
+				networkName = "bridge"
+			}
+			endpoint := dockerEndpointStats{
+				IPAddress:   inspectDetails.NetworkSettings.IPAddress,
+				IPPrefixLen: inspectDetails.NetworkSettings.IPPrefixLen,
+				MacAddress:  inspectDetails.NetworkSettings.MacAddress,
+			}
+			containerIP := endpoint.IPAddress
 			if containerIP == "" {
 				containerIP = detectGuestIP()
 			}
@@ -1208,10 +1300,21 @@ func inspectDockerContainer(prefix string) (*dockerContainerInspect, error) {
 					Labels:      labels,
 					Image:       imageName,
 					Healthcheck: getHealthcheckConfig(did),
+					Tty:         inspectDetails.Config.Tty,
+					OpenStdin:   inspectDetails.Config.OpenStdin,
+					Env:         inspectDetails.Config.Env,
+					Cmd:         inspectDetails.Config.Cmd,
+					Entrypoint:  inspectDetails.Config.Entrypoint,
+				},
+				HostConfig: dockerHostConfig{
+					AutoRemove:    isAutoRemove(did),
+					NetworkMode:   inspectDetails.HostConfig.NetworkMode,
+					PortBindings:  portBindingsFromStore(ns, c.ID()),
+					RestartPolicy: dockerRestartPolicy{},
 				},
 				NetworkSettings: dockerNetworkSettings{
 					IPAddress: containerIP,
-					Networks:  networks,
+					Networks:  map[string]dockerEndpointStats{networkName: endpoint},
 				},
 			}, nil
 		}
@@ -1227,6 +1330,13 @@ type nerdctlInspectNetInfo struct {
 	HostConfig struct {
 		NetworkMode string `json:"NetworkMode"`
 	} `json:"HostConfig"`
+	Config struct {
+		Tty        bool     `json:"Tty"`
+		OpenStdin  bool     `json:"OpenStdin"`
+		Env        []string `json:"Env"`
+		Cmd        []string `json:"Cmd"`
+		Entrypoint []string `json:"Entrypoint"`
+	} `json:"Config"`
 	NetworkSettings struct {
 		IPAddress   string `json:"IPAddress"`
 		IPPrefixLen int    `json:"IPPrefixLen"`
@@ -1240,15 +1350,7 @@ type nerdctlInspectNetInfo struct {
 }
 
 func containerNetworkInfo(ns, containerdID, name string) (map[string]dockerEndpointStats, string) {
-	stdout, _, code, err := runNerdctl(ns, "inspect", "--format", "json", containerdID)
-	if err != nil || code != 0 {
-		return nil, ""
-	}
-	var info nerdctlInspectNetInfo
-	if err := json.Unmarshal([]byte(stdout), &info); err != nil {
-		return nil, ""
-	}
-
+	info := inspectDetailsFor(ns, containerdID)
 	primary := dockerEndpointStats{
 		IPAddress:   info.NetworkSettings.IPAddress,
 		IPPrefixLen: info.NetworkSettings.IPPrefixLen,
@@ -1261,3 +1363,50 @@ func containerNetworkInfo(ns, containerdID, name string) (map[string]dockerEndpo
 	networks := map[string]dockerEndpointStats{networkName: primary}
 	return networks, primary.IPAddress
 }
+
+// inspectDetailsFor returns the nerdctl inspect payload for a container
+// (network info plus Config fields like Tty/Env/Cmd). The unused `name`
+// parameter keeps call sites stable; nerdctl resolves by container ID.
+func inspectDetailsFor(ns, containerdID string) nerdctlInspectNetInfo {
+	stdout, _, code, err := runNerdctl(ns, "inspect", "--format", "json", containerdID)
+	if err != nil || code != 0 {
+		return nerdctlInspectNetInfo{}
+	}
+	var info nerdctlInspectNetInfo
+	_ = json.Unmarshal([]byte(stdout), &info)
+	return info
+}
+
+// portBindingsFromStore renders the persisted port mappings back into the
+// Docker HostConfig.PortBindings shape: "<containerPort>/<proto>" ->
+// [{HostIp, HostPort}].
+func portBindingsFromStore(ns, containerdID string) map[string][]dockerHostPort {
+	bindings := map[string][]dockerHostPort{}
+	portsJSON := readNetworkStorePorts(ns, containerdID)
+	if portsJSON == "" {
+		return bindings
+	}
+	var mappings []cniPortMapping
+	if err := json.Unmarshal([]byte(mappingsJSON(portsJSON)), &mappings); err != nil {
+		return bindings
+	}
+	for _, m := range mappings {
+		proto := m.Protocol
+		if proto == "" {
+			proto = "tcp"
+		}
+		key := fmt.Sprintf("%d/%s", m.ContainerPort, proto)
+		hostIP := m.HostIP
+		if hostIP == "" {
+			hostIP = "0.0.0.0"
+		}
+		bindings[key] = append(bindings[key], dockerHostPort{
+			HostIp:   hostIP,
+			HostPort: strconv.Itoa(m.HostPort),
+		})
+	}
+	return bindings
+}
+
+// mappingsJSON is a no-op cast keeping the call site readable.
+func mappingsJSON(s string) []byte { return []byte(s) }

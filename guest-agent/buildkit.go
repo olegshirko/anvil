@@ -46,6 +46,14 @@ func ensureBuildkitd() error {
 		return nil
 	}
 
+	// Kill stray buildkitd instances first: nerdctl build starts its own
+	// (with nerdctl's OCI-worker config) whenever its socket probe races a
+	// busy socket, and the strays either hold the socket with a
+	// registry-resolving worker or leak. One canonical instance with
+	// /etc/buildkit/buildkitd.toml (containerd worker, local FROM
+	// resolution) must own /run/buildkit.
+	killallStaleBuildkitd()
+
 	if err := os.MkdirAll("/var/lib/buildkit", 0o755); err != nil {
 		return err
 	}
@@ -69,6 +77,21 @@ func ensureBuildkitd() error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("buildkitd did not open %s in time", buildkitSocket)
+}
+
+// killallStaleBuildkitd SIGKILLs every running buildkitd except our own pid
+// tree member named in skipPID (0 = skip none). guest-agent is PID 1, so
+// "ours" are the ones it spawned; simplest robust policy: kill all — the
+// caller only runs this when the socket is dead, i.e. no usable instance
+// is serving.
+func killallStaleBuildkitd() {
+	out, err := exec.Command("/bin/sh", "-c",
+		"for p in /proc/[0-9]*; do c=$(tr '\\0' ' ' < $p/cmdline 2>/dev/null); case \"$c\" in *buildkitd*) kill -9 ${p#/proc/} 2>/dev/null;; esac; done").Output()
+	_ = out
+	if err == nil {
+		log.Printf("[buildkit] killed stale buildkitd processes")
+	}
+	time.Sleep(200 * time.Millisecond)
 }
 
 // serveBuildkitBridge listens on vsock:1026 and pumps each connection to the

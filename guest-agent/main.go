@@ -49,6 +49,7 @@ type PortMapping struct {
 	ContainerPort int    `json:"container_port"`
 	Protocol      string `json:"protocol,omitempty"`
 	GuestIP       string `json:"guest_ip"`
+	ContainerIP   string `json:"container_ip,omitempty"`
 }
 
 // PortMapState is the full snapshot pushed to vz-runner.
@@ -87,6 +88,7 @@ func main() {
 	// and containerd/runc may create short-lived hook/helper processes. Reap
 	// them so they do not accumulate as zombies and deadlock containerd-shim.
 	go reapZombies()
+	go servePortProxy()
 
 	// Recreate CNI conflists from the host share after a cold boot. nerdctl
 	// keeps network state on the persistent containerd disk, but the conflist

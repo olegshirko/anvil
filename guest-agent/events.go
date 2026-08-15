@@ -18,12 +18,12 @@ import (
 // Docker-compatible event. Compose subscribes to /events to track container
 // lifecycle (notably the die event's exitCode for --abort-on-container-exit).
 type dockerEvent struct {
-	Type    string           `json:"Type"`
-	Action  string           `json:"Action"`
-	Actor   dockerEventActor `json:"Actor"`
-	Scope   string           `json:"scope"`
-	Time    int64            `json:"time"`
-	TimeNano int64           `json:"timeNano"`
+	Type     string           `json:"Type"`
+	Action   string           `json:"Action"`
+	Actor    dockerEventActor `json:"Actor"`
+	Scope    string           `json:"scope"`
+	Time     int64            `json:"time"`
+	TimeNano int64            `json:"timeNano"`
 }
 
 type dockerEventActor struct {

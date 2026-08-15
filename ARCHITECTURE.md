@@ -138,11 +138,24 @@ The guest-agent scans running containers and pushes the full list of port
 mappings to `vz-runner`. `PortForwarder`:
 
 - opens `listen 0.0.0.0:<hostPort>`;
-- forwards TCP to `<guestIP>:<hostPort>` (to the published host port inside
-  the guest, not to the container port);
+- forwards TCP to the container through the guest-side port proxy
+  (guest-agent listens on a single well-known TCP port; the forwarder
+  sends `containerIP:containerPort` as a length-prefixed JSON header and
+  the proxy dials the CNI address from inside the guest, where it is
+  reachable — the host has no route into 10.10.x). Mappings from older
+  guests without a container IP fall back to dialing `guestIP:hostPort`;
 - on every push does a full-state replace: new ports are opened, gone ports
   are closed;
 - logs a conflict when it fails to open an already taken port.
+
+User host ports are deliberately never bound inside the guest: nerdctl
+reserves host ports at CREATE time (an inherited listener fd owned by the
+container process), which breaks the Docker flow where the check belongs to
+start — `docker compose up` over live containers creates the replacement
+before stopping the old one. Ports are therefore not passed to nerdctl at
+all; the mappings are persisted in nerdctl's network store
+(`network-config.json`) so ps/inspect/scanner see them, and our own
+start-time checks enforce conflicts.
 
 POSIX sockets were chosen over `NWListener` because all that is needed is a
 plain TCP proxy loop without the TLS/path-monitoring/event-loop overhead of
