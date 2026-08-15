@@ -420,6 +420,71 @@ def test_compose_up() -> None:
                            capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
 
 
+def test_compose_recreate_over_live() -> None:
+    """Regression: `compose up` over LIVE containers creates the replacement
+    before stopping the old one. nerdctl used to reserve host ports at create
+    time (inherited listener fd), so this always failed with 'port is already
+    allocated'. Docker checks ports at start; our port publishing must not
+    bind user host ports inside the guest at all."""
+    project = f"{PREFIX}-rc"
+    web_port = PORT_BASE + 13
+    with tempfile.TemporaryDirectory() as tmp:
+        compose_file = Path(tmp) / "compose.yml"
+        compose_file.write_text(_compose_file(web_port))
+        base = ["compose", "-p", project, "-f", str(compose_file)]
+        try:
+            docker(*base, "up", "-d", "--wait", timeout=300.0)
+            # up again over the live stack — recreate, not down+up.
+            for attempt in range(3):
+                proc = docker(*base, "up", "-d", "--wait", "--force-recreate",
+                              timeout=300.0, check=False)
+                if proc.returncode == 0:
+                    break
+            else:
+                raise RuntimeError(f"recreate failed: {proc.stderr.strip()[-400:]}")
+            code = curl_status(web_port)
+            if code != "200":
+                raise RuntimeError(f"web after recreate -> {code}")
+            record("compose recreate over live containers", "PASS",
+                   f"3x force-recreate over live ports, web still 200 on :{web_port}")
+        finally:
+            subprocess.run(["docker", *base, "down", "-v", "--timeout", "5"],
+                           capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
+
+
+def test_compose_run_one_off() -> None:
+    """Regression: `compose run --rm` nil-panicked the docker CLI
+    (container.RunStart dereferences inspect's HostConfig.AutoRemove, which
+    our inspect did not return). Also checks env+network wiring of one-off
+    containers — the exact user case that stayed silent."""
+    project = f"{PREFIX}-run"
+    web_port = PORT_BASE + 14
+    with tempfile.TemporaryDirectory() as tmp:
+        compose_file = Path(tmp) / "compose.yml"
+        compose_file.write_text(_compose_file(web_port))
+        base = ["compose", "-p", project, "-f", str(compose_file)]
+        try:
+            docker(*base, "up", "-d", "--wait", timeout=300.0)
+            proc = docker(*base, "run", "--rm", "app",
+                          "echo", "one-off-ok", "arg2",
+                          timeout=120.0, check=False)
+            if proc.returncode != 0:
+                tail = (proc.stderr + proc.stdout).strip()[-400:]
+                raise RuntimeError(f"compose run failed rc={proc.returncode}: {tail}")
+            if "one-off-ok" not in proc.stdout:
+                raise RuntimeError(f"one-off output: {proc.stdout!r}")
+            # Exit code of the one-off command must propagate.
+            rc = docker(*base, "run", "--rm", "app", "sh", "-c", "exit 5",
+                        timeout=120.0, check=False)
+            if rc.returncode != 5:
+                raise RuntimeError(f"one-off exit code = {rc.returncode}, want 5")
+            record("compose run --rm (one-off container)", "PASS",
+                   "output + exit code 5 propagated, no CLI panic")
+        finally:
+            subprocess.run(["docker", *base, "down", "-v", "--timeout", "5"],
+                           capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
+
+
 def test_compose_project_isolation() -> None:
     p1, p2 = f"{PREFIX}-p1", f"{PREFIX}-p2"
     port1, port2 = PORT_BASE + 11, PORT_BASE + 12
@@ -478,6 +543,68 @@ def test_classic_build() -> None:
             docker("rmi", "-f", tag, check=False, timeout=60.0)
 
 
+def test_classic_build_after_rmi() -> None:
+    """Regression: `docker rmi` of the base image leaves buildkit cache
+    records pointing at deleted blobs; the next classic build failed with
+    'content digest ... not found'. /build must self-heal (prune + retry)."""
+    tag = f"{PREFIX}-stale:1"
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = Path(tmp)
+        (ctx / "Dockerfile").write_text(
+            "FROM alpine\nCOPY marker2.txt /m.txt\nCMD [\"cat\", \"/m.txt\"]\n")
+        (ctx / "marker2.txt").write_text("stale-ok\n")
+        env = {**DOCKER_ENV, "DOCKER_BUILDKIT": "0"}
+        try:
+            # Warm the build cache.
+            subprocess.run(["docker", "build", "-t", tag, str(ctx)],
+                           capture_output=True, text=True, timeout=600.0, env=env)
+            docker("rmi", "-f", tag, timeout=60.0)
+            # Delete the base image the cache references, then build again.
+            docker("rmi", "-f", "alpine", timeout=120.0)
+            proc = subprocess.run(["docker", "build", "-t", tag, str(ctx)],
+                                  capture_output=True, text=True, timeout=600.0, env=env)
+            if proc.returncode != 0:
+                raise RuntimeError(f"build after rmi failed rc={proc.returncode}: "
+                                   f"stdout={proc.stdout.strip()[-400:]}")
+            out = docker("run", "--rm", tag)
+            if "stale-ok" not in out.stdout:
+                raise RuntimeError(f"rebuilt image output: {out.stdout!r}")
+            record("classic build after base-image rmi", "PASS",
+                   "self-healed from stale buildkit cache")
+        finally:
+            docker("rmi", "-f", tag, check=False, timeout=60.0)
+
+
+def test_buildx_builder_selection() -> None:
+    """Regression: on a fresh machine the async anvil-remote setup after
+    `anvil start` races the first user build; if the CLI is still on the
+    docker-container driver (or has no builder), every FROM went to Docker
+    Hub for OAuth. The builder must exist, be usable via an explicit name,
+    and resolve base images from the local store."""
+    insp = docker("buildx", "inspect", "anvil-remote", "--bootstrap", timeout=60.0)
+    if "Driver" not in insp.stdout or "Error" in insp.stdout:
+        raise RuntimeError(f"anvil-remote missing: {insp.stdout!r}")
+
+    # A build that names the builder explicitly must work even when another
+    # builder is currently selected (the docker-container driver would pull
+    # moby/buildkit and resolve FROM from the registry).
+    tag = f"{PREFIX}-sel:1"
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "Dockerfile").write_text('FROM alpine\nCMD ["echo", "sel-ok"]\n')
+        try:
+            proc = docker("buildx", "build", "--builder", "anvil-remote",
+                          "--load", "-t", tag, tmp, timeout=600.0, check=False)
+            if proc.returncode != 0:
+                raise RuntimeError(f"--builder anvil-remote failed: {proc.stderr.strip()[-400:]}")
+            out = docker("run", "--rm", tag)
+            if "sel-ok" not in out.stdout:
+                raise RuntimeError(f"output: {out.stdout!r}")
+            record("buildx explicit --builder anvil-remote", "PASS",
+                   "works regardless of the selected builder")
+        finally:
+            docker("rmi", "-f", tag, check=False, timeout=60.0)
+
+
 def test_buildx_remote_load() -> None:
     """docker buildx build --load via the anvil-remote builder imports the
     result into the image store. The builder is selected explicitly: the
@@ -526,8 +653,12 @@ TESTS = [
     ("healthcheck", test_healthcheck),
     ("events", test_events),
     ("compose up", test_compose_up),
+    ("compose recreate over live", test_compose_recreate_over_live),
+    ("compose run one-off", test_compose_run_one_off),
     ("compose isolation", test_compose_project_isolation),
     ("classic build", test_classic_build),
+    ("classic build after rmi", test_classic_build_after_rmi),
+    ("buildx builder selection", test_buildx_builder_selection),
     ("buildx remote --load", test_buildx_remote_load),
 ]
 
