@@ -21,21 +21,30 @@ import (
 
 // dockerCreateRequest mirrors the minimal parts of Docker's container creation body.
 type dockerCreateRequest struct {
-	Hostname     string             `json:"Hostname"`
-	Domainname   string             `json:"Domainname"`
-	User         string             `json:"User"`
-	AttachStdin  bool               `json:"AttachStdin"`
-	AttachStdout bool               `json:"AttachStdout"`
-	AttachStderr bool               `json:"AttachStderr"`
-	Tty          bool               `json:"Tty"`
-	OpenStdin    bool               `json:"OpenStdin"`
-	StdinOnce    bool               `json:"StdinOnce"`
-	Env          []string           `json:"Env"`
-	Cmd          []string           `json:"Cmd"`
-	Image        string             `json:"Image"`
-	Labels       map[string]string  `json:"Labels"`
-	HostConfig   dockerHostConfig   `json:"HostConfig"`
-	Healthcheck  *dockerHealthcheck `json:"Healthcheck,omitempty"`
+	Hostname         string                `json:"Hostname"`
+	Domainname       string                `json:"Domainname"`
+	User             string                `json:"User"`
+	AttachStdin      bool                  `json:"AttachStdin"`
+	AttachStdout     bool                  `json:"AttachStdout"`
+	AttachStderr     bool                  `json:"AttachStderr"`
+	Tty              bool                  `json:"Tty"`
+	OpenStdin        bool                  `json:"OpenStdin"`
+	StdinOnce        bool                  `json:"StdinOnce"`
+	Env              []string              `json:"Env"`
+	Cmd              []string              `json:"Cmd"`
+	Image            string                `json:"Image"`
+	Labels           map[string]string     `json:"Labels"`
+	NetworkingConfig *dockerNetworkingConf `json:"NetworkingConfig,omitempty"`
+	HostConfig       dockerHostConfig      `json:"HostConfig"`
+	Healthcheck      *dockerHealthcheck    `json:"Healthcheck,omitempty"`
+}
+
+type dockerNetworkingConf struct {
+	EndpointsConfig map[string]dockerEndpoint `json:"EndpointsConfig"`
+}
+
+type dockerEndpoint struct {
+	Aliases []string `json:"Aliases"`
 }
 
 type dockerHostConfig struct {
@@ -91,6 +100,32 @@ var autoRemoveContainers = struct {
 	ids map[string]struct{}
 }{
 	ids: make(map[string]struct{}),
+}
+
+// containerTTYFlags remembers which containers were created with Tty=true.
+// nerdctl's inspect does not report the flag, but attach needs it to pick
+// the raw (non-multiplexed) stream format, and inspect must return it.
+var containerTTYFlags = struct {
+	mu sync.RWMutex
+	m  map[string]bool
+}{
+	m: make(map[string]bool),
+}
+
+func setContainerTTY(dockerID string, tty bool) {
+	containerTTYFlags.mu.Lock()
+	if tty {
+		containerTTYFlags.m[dockerID] = true
+	} else {
+		delete(containerTTYFlags.m, dockerID)
+	}
+	containerTTYFlags.mu.Unlock()
+}
+
+func getContainerTTY(dockerID string) bool {
+	containerTTYFlags.mu.RLock()
+	defer containerTTYFlags.mu.RUnlock()
+	return containerTTYFlags.m[dockerID]
 }
 
 func markAutoRemove(dockerID string) {
@@ -176,6 +211,14 @@ func takeContainerExitCode(dockerID string) (int, bool) {
 	return code, ok
 }
 
+// peekContainerExitCode reads the cached exit code without consuming it.
+func peekContainerExitCode(dockerID string) (int, bool) {
+	containerExitCodes.mu.RLock()
+	defer containerExitCodes.mu.RUnlock()
+	code, ok := containerExitCodes.codes[dockerID]
+	return code, ok
+}
+
 // waitContainerTask blocks until the containerd task exits and returns its exit
 // code. It returns an error if the task does not appear or is already deleted.
 func waitContainerTask(ns, containerdID string) (int, error) {
@@ -206,11 +249,17 @@ func waitContainerTask(ns, containerdID string) (int, error) {
 
 	// Use nerdctl wait to reliably block until the task exits and returns its
 	// exit code. The containerd client task.Wait can race with short-lived tasks.
+	// A cached code (e.g. the mapped 137 from docker kill) wins over the
+	// task status, which reports 0 for signal deaths.
+	did := dockerID(ns, containerdID)
 	stdout, stderr, code, err := runNerdctl(ns, "wait", containerdID)
 	if err != nil || code != 0 {
 		return 0, fmt.Errorf("nerdctl wait failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
 	}
 	exit, _ := strconv.Atoi(strings.TrimSpace(stdout))
+	if cached, ok := takeContainerExitCode(did); ok && cached != 0 {
+		return cached, nil
+	}
 	return exit, nil
 }
 
@@ -240,9 +289,11 @@ type dockerContainerInspect struct {
 }
 
 type dockerContainerState struct {
-	Status  string             `json:"Status"`
-	Running bool               `json:"Running"`
-	Health  *dockerHealthState `json:"Health,omitempty"`
+	Status   string             `json:"Status"`
+	Running  bool               `json:"Running"`
+	Pid      int                `json:"Pid"`
+	ExitCode int                `json:"ExitCode"`
+	Health   *dockerHealthState `json:"Health,omitempty"`
 }
 
 type dockerContainerConfig struct {
@@ -264,6 +315,7 @@ type dockerContainerConfig struct {
 
 type dockerNetworkSettings struct {
 	IPAddress string                         `json:"IPAddress"`
+	Ports     map[string][]dockerHostPort    `json:"Ports,omitempty"`
 	Networks  map[string]dockerEndpointStats `json:"Networks,omitempty"`
 }
 
@@ -478,6 +530,11 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 	}
 	// json-file logger makes `nerdctl logs -f` reliable enough for attach.
 	args = append(args, "--log-driver", "json-file")
+	// TTY changes the stream contract: with -t, attach output must be raw
+	// bytes instead of the multiplexed docker stream format.
+	if req.Tty {
+		args = append(args, "-t")
+	}
 	if name != "" {
 		args = append(args, "--name", name)
 	}
@@ -534,25 +591,35 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 		if len(parts) == 2 {
 			proto = parts[1]
 		}
-		cportNum, err := strconv.Atoi(cport)
-		if err != nil {
-			return "", fmt.Errorf("invalid container port %q", cport)
-		}
 		for _, hp := range hostPorts {
-			host, err := strconv.Atoi(hp.HostPort)
-			if err != nil || host == 0 {
-				continue
-			}
 			hostIP := hp.HostIp
 			if hostIP == "" {
 				hostIP = "0.0.0.0"
 			}
-			portMappings = append(portMappings, cniPortMapping{
-				HostPort:      host,
-				ContainerPort: cportNum,
-				Protocol:      proto,
-				HostIP:        hostIP,
-			})
+			// Docker allows ranges ("8100-8101:80-81"): expand pairwise.
+			cPorts, err := expandPortRange(cport)
+			if err != nil {
+				return "", fmt.Errorf("invalid container port %q", cport)
+			}
+			hPorts, err := expandPortRange(hp.HostPort)
+			if err != nil || (len(hPorts) > 1 && len(hPorts) != len(cPorts)) {
+				return "", fmt.Errorf("invalid host port %q", hp.HostPort)
+			}
+			for i, c := range cPorts {
+				h := hPorts[0]
+				if len(hPorts) == len(cPorts) {
+					h = hPorts[i]
+				}
+				if h == 0 {
+					continue
+				}
+				portMappings = append(portMappings, cniPortMapping{
+					HostPort:      h,
+					ContainerPort: c,
+					Protocol:      proto,
+					HostIP:        hostIP,
+				})
+			}
 		}
 	}
 
@@ -616,6 +683,12 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 			log.Printf("[docker-api] persist ports for %s: %v", containerdID, err)
 		}
 	}
+	// Remember compose service aliases for the start-time /etc/hosts update.
+	if aliases := requestedNetworkAliases(req); len(aliases) > 0 {
+		setNetworkAliases(dockerID, aliases)
+	}
+	// Remember TTY for attach (raw stream) and inspect responses.
+	setContainerTTY(dockerID, req.Tty)
 	// AutoRemove is handled by guest-agent after we capture the exit code.
 	// Passing --rm to nerdctl would delete the container immediately on exit
 	// and cause /wait to miss the exit status.
@@ -639,6 +712,32 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 
 // nerdctlStoreRoot is the nerdctl data root (override in tests).
 var nerdctlStoreRoot = "/var/lib/nerdctl"
+
+// expandPortRange parses "80" or "80-81" into a list of port numbers.
+func expandPortRange(spec string) ([]int, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil, fmt.Errorf("empty port")
+	}
+	lo, hi, isRange := strings.Cut(spec, "-")
+	if !isRange {
+		p, err := strconv.Atoi(spec)
+		if err != nil || p < 1 || p > 65535 {
+			return nil, fmt.Errorf("bad port %q", spec)
+		}
+		return []int{p}, nil
+	}
+	l, err1 := strconv.Atoi(strings.TrimSpace(lo))
+	r, err2 := strconv.Atoi(strings.TrimSpace(hi))
+	if err1 != nil || err2 != nil || l < 1 || r < l || r > 65535 || r-l > 1000 {
+		return nil, fmt.Errorf("bad port range %q", spec)
+	}
+	out := make([]int, 0, r-l+1)
+	for p := l; p <= r; p++ {
+		out = append(out, p)
+	}
+	return out, nil
+}
 
 // writeContainerPortMappings stores the published port mappings in nerdctl's
 // network store (network-config.json) — the same file nerdctl itself writes
@@ -790,6 +889,13 @@ func startDockerContainer(id string) error {
 	stdout, stderr, code, err := runNerdctl(ns, "start", containerdID)
 	if err != nil || code != 0 {
 		return fmt.Errorf("nerdctl start failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	}
+	// Service-name DNS: append the container's compose aliases (e.g. "web")
+	// to the /etc/hosts bind mounts of every running container on the same
+	// network. nerdctl has no --network-alias, and compose resolves service
+	// dependencies by name (`db`, `web`), not by container name.
+	if len(pendingNetworkAliases(containerdID)) > 0 {
+		go applyNetworkAliases(ns, containerdID)
 	}
 	// Re-attach the health monitor after a stop/start cycle.
 	did := dockerID(ns, containerdID)
@@ -1033,6 +1139,12 @@ func killDockerContainer(id string, signal string) error {
 	if err != nil || code != 0 {
 		return fmt.Errorf("nerdctl kill failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
 	}
+	// Docker reports SIGKILL'd containers with exit code 137 (128+9);
+	// compose and the CLI rely on it in events and /wait. containerd's task
+	// status often reports 0 for signal deaths, so cache the mapped code.
+	if strings.EqualFold(signal, "SIGKILL") || signal == "9" || signal == "" {
+		cacheContainerExitCode(dockerID(ns, containerdID), 137)
+	}
 	return nil
 }
 
@@ -1274,6 +1386,12 @@ func inspectDockerContainer(prefix string) (*dockerContainerInspect, error) {
 
 			did := dockerID(ns, c.ID())
 			inspectDetails := inspectDetailsFor(ns, c.ID())
+			exitCode := inspectDetails.State.ExitCode
+			if exitCode == 0 && !running {
+				if cached, ok := peekContainerExitCode(did); ok {
+					exitCode = cached
+				}
+			}
 			networkName := inspectDetails.HostConfig.NetworkMode
 			if networkName == "" || networkName == "default" || networkName == "bridge" {
 				networkName = "bridge"
@@ -1292,15 +1410,17 @@ func inspectDockerContainer(prefix string) (*dockerContainerInspect, error) {
 				Name:  "/" + name,
 				Image: imageName,
 				State: dockerContainerState{
-					Status:  status,
-					Running: running,
-					Health:  getHealthState(did),
+					Status:   status,
+					Running:  running,
+					Pid:      inspectDetails.State.Pid,
+					ExitCode: exitCode,
+					Health:   getHealthState(did),
 				},
 				Config: dockerContainerConfig{
 					Labels:      labels,
 					Image:       imageName,
 					Healthcheck: getHealthcheckConfig(did),
-					Tty:         inspectDetails.Config.Tty,
+					Tty:         getContainerTTY(did),
 					OpenStdin:   inspectDetails.Config.OpenStdin,
 					Env:         inspectDetails.Config.Env,
 					Cmd:         inspectDetails.Config.Cmd,
@@ -1314,6 +1434,7 @@ func inspectDockerContainer(prefix string) (*dockerContainerInspect, error) {
 				},
 				NetworkSettings: dockerNetworkSettings{
 					IPAddress: containerIP,
+					Ports:     portBindingsFromStore(ns, c.ID()),
 					Networks:  map[string]dockerEndpointStats{networkName: endpoint},
 				},
 			}, nil
@@ -1337,6 +1458,10 @@ type nerdctlInspectNetInfo struct {
 		Cmd        []string `json:"Cmd"`
 		Entrypoint []string `json:"Entrypoint"`
 	} `json:"Config"`
+	State struct {
+		ExitCode int `json:"ExitCode"`
+		Pid      int `json:"Pid"`
+	} `json:"State"`
 	NetworkSettings struct {
 		IPAddress   string `json:"IPAddress"`
 		IPPrefixLen int    `json:"IPPrefixLen"`
