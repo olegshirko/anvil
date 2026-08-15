@@ -14,6 +14,12 @@ final class VMLifecycleManager: NSObject {
     private let snapshot: SnapshotManager
     private var vm: VZVirtualMachine?
     private var coldBootStart: Date?
+    /// True when the live VM was booted (not restored) with `args` — only
+    /// then may saveSnapshot stamp the config hash. Restored VMs must keep
+    /// the hash of the assets they actually booted with; recomputing it
+    /// from current files on every save made a rebuilt initramfs look
+    /// "matching" and restored a stale guest.
+    private var bootedWithCurrentArgs = false
 
     weak var delegate: VMLifecycleManagerDelegate?
 
@@ -168,14 +174,21 @@ final class VMLifecycleManager: NSObject {
                 completion?(error)
                 return
             }
-            self.snapshot.writeConfigHash(
-                kernel: self.args.kernelPath,
-                initrd: self.args.initrdPath,
-                cpus: self.args.cpuCount,
-                memory: self.args.memoryGiB,
-                containerdDiskPath: self.args.containerdDiskPath,
-                usersSharePath: usersSharePath()
-            )
+            // Stamp the config hash ONLY for a VM booted with these args.
+            // A restored VM keeps the hash it booted with — otherwise a
+            // rebuilt initramfs looks "matching" and restores a stale guest.
+            if self.bootedWithCurrentArgs {
+                self.snapshot.writeConfigHash(
+                    kernel: self.args.kernelPath,
+                    initrd: self.args.initrdPath,
+                    cpus: self.args.cpuCount,
+                    memory: self.args.memoryGiB,
+                    containerdDiskPath: self.args.containerdDiskPath,
+                    usersSharePath: usersSharePath()
+                )
+            } else {
+                print("[anvil] keeping stored config hash (VM was restored, not booted with current assets)")
+            }
             print("[anvil] snapshot saved in \(String(format: "%.3f", duration))s")
             completion?(nil)
         }
@@ -269,6 +282,7 @@ final class VMLifecycleManager: NSObject {
             && hashMatches
 
         if canRestore {
+            bootedWithCurrentArgs = false
             print("[anvil] restoring VM from snapshot...")
             let restoreStart = Date()
             vm.restoreMachineStateFrom(url: snapshot.snapshotURL) { [weak self] error in
@@ -305,6 +319,7 @@ final class VMLifecycleManager: NSObject {
 
     private func coldBoot(vm: VZVirtualMachine) {
         coldBootStart = Date()
+        bootedWithCurrentArgs = true
         vm.start { [weak self] result in
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }

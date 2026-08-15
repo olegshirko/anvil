@@ -267,6 +267,15 @@ func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
 	if follow {
 		args = append(args, "-f")
 	}
+	// tail=N: buffer the replayed output and emit only the last N lines.
+	// nerdctl has no --tail; implemented post-hoc on the replayed output
+	// (follow-mode streams everything that comes after, like Docker).
+	tail := 0
+	if v := r.URL.Query().Get("tail"); v != "" && v != "all" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			tail = n
+		}
+	}
 	args = append(args, name)
 
 	cmd := exec.Command("/opt/containerd/bin/nerdctl", args...)
@@ -291,19 +300,44 @@ func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	buf := make([]byte, 4096)
+	var pending []byte
+	var curLine []byte
+	lineDone := func(line []byte) {
+		if tail > 0 && !follow {
+			pending = append(pending, line...)
+			pending = append(pending, '\n')
+			return
+		}
+		writeDockerStream(w, 1, line)
+		writeDockerStream(w, 1, []byte("\n"))
+	}
 	for {
 		n, err := stdout.Read(buf)
-		if n > 0 {
-			if writeErr := writeDockerStream(w, 1, buf[:n]); writeErr != nil {
-				return
-			}
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
+		for _, b := range buf[:n] {
+			if b == '\n' {
+				lineDone(curLine)
+				curLine = curLine[:0]
+			} else {
+				curLine = append(curLine, b)
 			}
 		}
 		if err != nil {
 			break
 		}
+	}
+	if len(curLine) > 0 {
+		lineDone(curLine)
+	}
+	// Emit the tail: last N lines of the buffered replay.
+	if tail > 0 && !follow {
+		lines := strings.Split(strings.TrimSuffix(string(pending), "\n"), "\n")
+		if len(lines) > tail {
+			lines = lines[len(lines)-tail:]
+		}
+		writeDockerStream(w, 1, []byte(strings.Join(lines, "\n")+"\n"))
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
 	}
 }
 
@@ -338,9 +372,15 @@ func runDockerAPIServer() {
 		killID, isKill := containerSubresource("/containers/", "/kill")
 		restartID, isRestart := containerSubresource("/containers/", "/restart")
 		renameID, isRename := containerSubresource("/containers/", "/rename")
+		pauseID, isPause := containerSubresource("/containers/", "/pause")
+		unpauseID, isUnpause := containerSubresource("/containers/", "/unpause")
+		topID, isTop := containerSubresource("/containers/", "/top")
+		statsID, isStats := containerSubresource("/containers/", "/stats")
 		archiveID, isArchive := containerSubresource("/containers/", "/archive")
 		execStartID, isExecStart := containerSubresource("/exec/", "/start")
 		execInspectID, isExecInspect := containerSubresource("/exec/", "/json")
+		netConnectID, isNetConnect := containerSubresource("/networks/", "/connect")
+		netDisconnectID, isNetDisconnect := containerSubresource("/networks/", "/disconnect")
 
 		// Pre-compute image sub-resource names. Avoid matching /images/json and /images/create.
 		imageSubresource := func(prefix, suffix string) (string, bool) {
@@ -388,6 +428,31 @@ func runDockerAPIServer() {
 			})
 		case path == "/info" && r.Method == http.MethodGet:
 			handleDockerInfo(w, r)
+		case path == "/system/df" && r.Method == http.MethodGet:
+			handleSystemDF(w)
+		case path == "/system/prune" && r.Method == http.MethodPost:
+			// docker system prune = containers + networks + volumes(?) + images
+			// (volumes only with --volumes, sent as a filter).
+			filters := parseDockerFilters(r.URL.Query().Get("filters"))
+			withVolumes := false
+			if v, ok := filters["volumes"]["true"]; ok && v {
+				withVolumes = true
+			} // container prune: remove all stopped containers.
+			stopped, _, _ := pruneDockerContainers()
+			nets, _ := pruneDockerNetworks()
+			var vols []string
+			if withVolumes {
+				vols, _, _ = pruneDockerVolumes()
+			}
+			imgs, reclaimed, _ := pruneDockerImages(false)
+			_ = imgs
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"ContainersDeleted": stopped,
+				"NetworksDeleted":   nets,
+				"VolumesDeleted":    vols,
+				"SpaceReclaimed":    reclaimed,
+			})
 		case path == "/containers/json":
 			all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
 			filters := parseDockerFilters(r.URL.Query().Get("filters"))
@@ -556,6 +621,32 @@ func runDockerAPIServer() {
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
+		case isNetConnect && r.Method == http.MethodPost:
+			var req struct {
+				Container string `json:"Container"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Container == "" {
+				http.Error(w, `{"message":"missing Container"}`, http.StatusBadRequest)
+				return
+			}
+			if err := connectContainerNetwork(netConnectID, req.Container); err != nil {
+				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case isNetDisconnect && r.Method == http.MethodPost:
+			var req struct {
+				Container string `json:"Container"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Container == "" {
+				http.Error(w, `{"message":"missing Container"}`, http.StatusBadRequest)
+				return
+			}
+			if err := disconnectContainerNetwork(netDisconnectID, req.Container); err != nil {
+				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 		case path == "/networks/prune" && r.Method == http.MethodPost:
 			deleted, err := pruneDockerNetworks()
 			if err != nil {
@@ -674,6 +765,22 @@ func runDockerAPIServer() {
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
+		case isPause && r.Method == http.MethodPost:
+			if err := pauseDockerContainer(pauseID, true); err != nil {
+				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case isUnpause && r.Method == http.MethodPost:
+			if err := pauseDockerContainer(unpauseID, false); err != nil {
+				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case isTop && r.Method == http.MethodGet:
+			handleContainerTop(w, topID)
+		case isStats && r.Method == http.MethodGet:
+			handleContainerStats(w, statsID, r.URL.Query().Get("stream") == "1")
 		case isAttach && r.Method == http.MethodPost:
 			handleAttach(w, r, attachID)
 		case isLogs && r.Method == http.MethodGet:

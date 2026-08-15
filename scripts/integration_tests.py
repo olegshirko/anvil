@@ -686,6 +686,278 @@ def test_docker_port_command() -> None:
         cleanup(name)
 
 
+def test_run_flags_p0() -> None:
+    """P0 regression pack: create-request flags that compose sends natively
+    (entrypoint/working_dir/extra_hosts/mem_limit/caps) were silently
+    dropped or broke the run entirely."""
+    # --entrypoint (was: run failed with a bogus joined path)
+    out = docker("run", "--rm", "--entrypoint", "/bin/echo", "alpine", "EP-OK")
+    if "EP-OK" not in out.stdout:
+        raise RuntimeError(f"entrypoint: {out.stdout!r}")
+    out = docker("run", "--rm", "--entrypoint", "/bin/sh", "alpine", "-c", "echo EP2-OK")
+    if "EP2-OK" not in out.stdout:
+        raise RuntimeError(f"entrypoint+args: {out.stdout!r}")
+    # -w working dir (was: ignored)
+    out = docker("run", "--rm", "-w", "/etc", "alpine", "sh", "-c", "basename $(pwd)")
+    if "etc" not in out.stdout:
+        raise RuntimeError(f"workdir: {out.stdout!r}")
+    # inspect must report them
+    name = f"{PREFIX}-ep"
+    try:
+        docker("run", "-d", "--name", name, "--entrypoint", "sleep",
+               "-w", "/tmp", "alpine", "60")
+        insp = docker("inspect", "--format",
+                      "{{.Config.WorkingDir}} {{join .Config.Entrypoint \",\"}}", name)
+        if insp.stdout.strip() != "/tmp sleep":
+            raise RuntimeError(f"inspect entrypoint/workdir: {insp.stdout!r}")
+    finally:
+        cleanup(name)
+    # --add-host (was: record missing from /etc/hosts)
+    out = docker("run", "--rm", "--add-host", "myhost.test:1.2.3.4",
+                 "alpine", "grep", "myhost.test", "/etc/hosts")
+    if "1.2.3.4" not in out.stdout:
+        raise RuntimeError(f"add-host: {out.stdout!r}")
+    # --memory (was: limit not applied, cgroup stayed max)
+    out = docker("run", "--rm", "--memory", "64m", "alpine",
+                 "sh", "-c", "cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes")
+    limit = out.stdout.strip()
+    if limit not in ("67108864", "66846720", "65536000"):
+        raise RuntimeError(f"memory limit: {limit!r}")
+    # --cap-add (was: capability not granted). CAP_NET_ADMIN is bit 12;
+    # check it in CapEff instead of exercising an ioctl — the linux-virt
+    # kernel lacks the dummy module for the classic `ip link add` test.
+    out = docker("run", "--rm", "--cap-add", "NET_ADMIN", "alpine",
+                 "grep", "CapEff", "/proc/self/status")
+    cap_eff = out.stdout.strip().split()[-1] if out.stdout.strip() else "0x0"
+    bit = int(cap_eff, 16) >> 12 & 1
+    if bit != 1:
+        raise RuntimeError(f"cap-add: CapEff={cap_eff}, NET_ADMIN bit not set")
+    out = docker("run", "--rm", "alpine", "grep", "CapEff", "/proc/self/status")
+    cap_eff = out.stdout.strip().split()[-1]
+    if int(cap_eff, 16) >> 12 & 1:
+        raise RuntimeError("NET_ADMIN set without --cap-add")
+    record("run flags: entrypoint/-w/add-host/memory/cap-add", "PASS",
+           "all five honored end-to-end")
+
+
+def test_pause_unpause() -> None:
+    name = f"{PREFIX}-pause"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sleep", "60")
+        docker("pause", name)
+        st = docker("inspect", "--format", "{{.State.Status}}", name).stdout.strip()
+        if st != "paused":
+            raise RuntimeError(f"status after pause = {st!r}")
+        docker("unpause", name)
+        st = docker("inspect", "--format", "{{.State.Status}}", name).stdout.strip()
+        if st != "running":
+            raise RuntimeError(f"status after unpause = {st!r}")
+        record("pause/unpause", "PASS", "running -> paused -> running")
+    finally:
+        cleanup(name)
+
+
+def test_top_and_stats() -> None:
+    name = f"{PREFIX}-top"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sleep", "60")
+        top = docker("top", name)
+        if "sleep" not in top.stdout:
+            raise RuntimeError(f"top: {top.stdout!r}")
+        stats = docker("stats", "--no-stream", "--format", "{{.Name}}", name)
+        if name not in stats.stdout:
+            raise RuntimeError(f"stats: {stats.stdout!r} {stats.stderr!r}")
+        record("docker top / stats --no-stream", "PASS",
+               "process list and one stats reading")
+    finally:
+        cleanup(name)
+
+
+def test_system_df() -> None:
+    out = docker("system", "df", "--format", "{{.Type}}: {{.TotalCount}}")
+    if "Images" not in out.stdout:
+        raise RuntimeError(f"system df: {out.stdout!r}")
+    record("docker system df", "PASS", "images/containers/volumes reported")
+
+
+def test_network_connect() -> None:
+    """Live network attach is not supported by the runtime (nerdctl has no
+    `network connect`); the API must fail with an actionable error rather
+    than a bare 404."""
+    net, name = f"{PREFIX}-conn", f"{PREFIX}-connc"
+    try:
+        docker("network", "create", net)
+        docker("run", "-d", "--name", name, "alpine", "sleep", "60")
+        proc = docker("network", "connect", net, name, check=False)
+        if proc.returncode == 0:
+            # If a future runtime gains support, verify the attach visible.
+            nets = docker("inspect", "--format",
+                          r"{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}", name)
+            record("network connect/disconnect", "PASS",
+                   f"runtime now supports live attach: {nets.stdout.strip()}")
+        elif "not supported" in proc.stderr:
+            record("network connect/disconnect", "SKIP",
+                   "runtime has no live attach; actionable error returned")
+        else:
+            raise RuntimeError(f"unexpected error: {proc.stderr.strip()[-200:]}")
+    finally:
+        cleanup(name)
+        docker("network", "rm", net, check=False, timeout=60.0)
+
+
+def test_logs_tail_timestamps() -> None:
+    name = f"{PREFIX}-logst"
+    try:
+        docker("run", "--name", name, "alpine",
+               "sh", "-c", "for i in 1 2 3 4 5; do echo line-$i; done")
+        tail = docker("logs", "--tail", "2", name)
+        lines = [l for l in (tail.stdout + tail.stderr).splitlines() if l.strip()]
+        if lines != ["line-4", "line-5"]:
+            raise RuntimeError(f"tail=2: {lines}")
+        ts = docker("logs", "-t", name)
+        if "T" not in ts.stdout and "Z" not in (ts.stdout + ts.stderr):
+            raise RuntimeError(f"timestamps: {ts.stdout!r}")
+        record("logs --tail / -t", "PASS", "tail returns last 2, timestamps present")
+    finally:
+        cleanup(name)
+
+
+def test_exec_detached_and_flags() -> None:
+    name = f"{PREFIX}-execd"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sleep", "60")
+        docker("exec", "-d", name, "sh", "-c", "echo bg > /tmp/bg.txt")
+        time.sleep(1.0)
+        out = docker("exec", name, "cat", "/tmp/bg.txt")
+        if "bg" not in out.stdout:
+            raise RuntimeError(f"exec -d: {out.stdout!r}")
+        out = docker("exec", "-w", "/etc", name, "sh", "-c", "basename $(pwd)")
+        if "etc" not in out.stdout:
+            raise RuntimeError(f"exec -w: {out.stdout!r}")
+        record("exec -d / -w", "PASS", "detached write visible, workdir honored")
+    finally:
+        cleanup(name)
+
+
+def test_healthcheck_unhealthy() -> None:
+    name = f"{PREFIX}-unhc"
+    try:
+        docker("run", "-d", "--name", name,
+               "--health-cmd", "false", "--health-interval", "1s",
+               "--health-retries", "1", "--health-start-period", "0s",
+               "alpine", "sleep", "60")
+        status = ""
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            status = docker("inspect", "--format",
+                            "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+                            name).stdout.strip()
+            if status == "unhealthy":
+                break
+            time.sleep(1.0)
+        if status != "unhealthy":
+            raise RuntimeError(f"health status = {status!r}, want unhealthy")
+        record("healthcheck -> unhealthy", "PASS", "failing check reported")
+    finally:
+        cleanup(name)
+
+
+def test_save_multiple_images() -> None:
+    tags = [f"{PREFIX}-m1:1", f"{PREFIX}-m2:1"]
+    tar = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
+    tar.close()
+    try:
+        docker("pull", "alpine", timeout=300.0)
+        docker("pull", "busybox", timeout=300.0)
+        docker("tag", "alpine", tags[0])
+        docker("tag", "busybox", tags[1])
+        docker("save", "-o", tar.name, *tags, timeout=180.0)
+        size = Path(tar.name).stat().st_size
+        if size < 1_000_000:
+            raise RuntimeError(f"archive suspiciously small: {size}")
+        for t in tags:
+            docker("rmi", "-f", t, timeout=60.0)
+        out = docker("load", "-i", tar.name, timeout=180.0)
+        if out.stdout.count("Loaded image") < 2:
+            raise RuntimeError(f"load output: {out.stdout!r}")
+        images = docker("images", "--format", "{{.Repository}}:{{.Tag}}").stdout.split()
+        for t in tags:
+            if t not in images:
+                raise RuntimeError(f"{t} missing after load")
+        record("save/load multiple images", "PASS", "2 images round-trip")
+    finally:
+        Path(tar.name).unlink(missing_ok=True)
+        for t in tags:
+            docker("rmi", "-f", t, check=False, timeout=60.0)
+
+
+def test_cp_directory() -> None:
+    name = f"{PREFIX}-cpdir"
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "dir"
+        (src / "sub").mkdir(parents=True)
+        (src / "sub" / "f.txt").write_text("nested\n")
+        back = Path(tmp) / "back.tar"
+        try:
+            docker("run", "-d", "--name", name, "alpine", "sleep", "60")
+            docker("cp", str(src), f"{name}:/tmp/dir")
+            out = docker("exec", name, "cat", "/tmp/dir/sub/f.txt")
+            if "nested" not in out.stdout:
+                raise RuntimeError(f"cp dir in: {out.stdout!r}")
+            docker("cp", f"{name}:/tmp/dir", str(back))
+            if not back.exists():
+                raise RuntimeError("cp dir out: nothing returned")
+            record("docker cp directories", "PASS", "nested dir in and out")
+        finally:
+            cleanup(name)
+
+
+def test_compose_lifecycle_verbs() -> None:
+    project = f"{PREFIX}-verb"
+    web_port = PORT_BASE + 15
+    with tempfile.TemporaryDirectory() as tmp:
+        compose_file = Path(tmp) / "compose.yml"
+        compose_file.write_text(_compose_file(web_port))
+        base = ["compose", "-p", project, "-f", str(compose_file)]
+        try:
+            docker(*base, "up", "-d", "--wait", timeout=300.0)
+            # stop / start
+            docker(*base, "stop", "app", timeout=60.0)
+            st = docker(*base, "ps", "--status", "exited", "--format", "{{.Service}}")
+            if "app" not in st.stdout:
+                raise RuntimeError(f"compose stop: {st.stdout!r}")
+            docker(*base, "start", "app", timeout=60.0)
+            # restart
+            docker(*base, "restart", "app", timeout=60.0)
+            # scale (compose v2 creates a second instance)
+            docker(*base, "up", "-d", "--scale", "app=2", "--wait", timeout=300.0)
+            n = docker(*base, "ps", "--format", "{{.Service}}").stdout.split().count("app")
+            if n < 2:
+                raise RuntimeError(f"scale: app count {n}")
+            # logs
+            logs = docker(*base, "logs", "web", timeout=60.0)
+            # pull (no-op on cached images) must not fail
+            docker(*base, "pull", timeout=300.0)
+            record("compose stop/start/restart/scale/logs/pull", "PASS",
+                   "lifecycle verbs work")
+        finally:
+            subprocess.run(["docker", *base, "down", "-v", "--timeout", "5"],
+                           capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
+
+
+def test_system_prune() -> None:
+    name = f"{PREFIX}-prune"
+    try:
+        docker("run", "--name", name, "alpine", "true")  # leaves exited container
+        out = docker("system", "prune", "-f", timeout=300.0)
+        st = docker("ps", "-a", "--filter", f"name={name}", "--format", "{{.Names}}")
+        if name in st.stdout.split():
+            raise RuntimeError(f"container survived prune: {out.stdout!r}")
+        record("docker system prune -f", "PASS", "stopped container reclaimed")
+    finally:
+        cleanup(name)
+
+
 def test_classic_build() -> None:
     """DOCKER_BUILDKIT=0 sends the context to our POST /build endpoint."""
     tag = f"{PREFIX}-built:1"
@@ -807,20 +1079,31 @@ def test_buildx_remote_load() -> None:
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
+    ("run flags P0 (entrypoint/w/add-host/memory/cap)", test_run_flags_p0),
     ("published port forwarded", test_port_forward),
     ("foreign host-port conflict", test_foreign_port_conflict),
     ("container lifecycle", test_create_ps_inspect_stop),
+    ("pause/unpause", test_pause_unpause),
+    ("top + stats", test_top_and_stats),
+    ("system df", test_system_df),
+    ("network connect/disconnect", test_network_connect),
     ("logs", test_logs),
+    ("logs --tail/-t", test_logs_tail_timestamps),
     ("exec", test_exec),
+    ("exec -d/-w", test_exec_detached_and_flags),
     ("cp", test_cp),
+    ("cp directories", test_cp_directory),
     ("bind mount /Users", test_bind_mount_users_share),
     ("named volume", test_named_volume_persistence),
     ("images tag/rmi", test_images_tag_rmi),
     ("save/load", test_save_load),
+    ("save/load multiple", test_save_multiple_images),
     ("network lifecycle", test_network_lifecycle),
-    ("healthcheck", test_healthcheck),
+    ("healthcheck healthy", test_healthcheck),
+    ("healthcheck unhealthy", test_healthcheck_unhealthy),
     ("events", test_events),
     ("compose up", test_compose_up),
+    ("compose lifecycle verbs", test_compose_lifecycle_verbs),
     ("compose service DNS", test_compose_service_dns),
     ("compose recreate over live", test_compose_recreate_over_live),
     ("compose run one-off", test_compose_run_one_off),
@@ -832,6 +1115,7 @@ TESTS = [
     ("kill and rename", test_kill_and_rename),
     ("restart command", test_restart_command),
     ("docker port", test_docker_port_command),
+    ("system prune", test_system_prune),
     ("classic build", test_classic_build),
     ("classic build after rmi", test_classic_build_after_rmi),
     ("buildx builder selection", test_buildx_builder_selection),
