@@ -41,11 +41,24 @@ backend_start() {
         >/tmp/vz-runner-bench.log 2>&1 &
     echo $! > "$VZ_PID_FILE"
     wait_for "vz-runner daemon ready" 60 "$VZRUNNER_BIN" status
-    # Capture the VirtualMachine process spawned by this daemon. There may be
-    # leftover orphan VM processes from previous runs; pick the newest one.
+    # Capture the VirtualMachine process spawned by this daemon. Other VZ
+    # users may run at the same time (e.g. a Lima VM): picking by highest pid
+    # grabbed the wrong process and underreported RSS badly. Pick the VM
+    # process that started at/after the daemon itself (epoch start times).
+    local daemon_epoch p st_epoch
+    daemon_epoch="$(ps -o lstart= -p "$(cat "$VZ_PID_FILE")" 2>/dev/null \
+        | xargs -I{} date -j -f "%a %b %d %H:%M:%S %Y" "{}" +%s 2>/dev/null)"
+    [[ -n "$daemon_epoch" ]] || daemon_epoch="$(date +%s)"
     for _ in $(seq 1 50); do
-        local vm_pid
-        vm_pid="$(pgrep -f "com.apple.Virtualization.VirtualMachine" | tail -1)"
+        vm_pid=""
+        for p in $(pgrep -f "com.apple.Virtualization.VirtualMachine"); do
+            st_epoch="$(ps -o lstart= -p "$p" 2>/dev/null \
+                | xargs -I{} date -j -f "%a %b %d %H:%M:%S %Y" "{}" +%s 2>/dev/null)"
+            [[ -n "$st_epoch" ]] || continue
+            if (( st_epoch >= daemon_epoch )); then
+                vm_pid="$p"  # pgrep lists ascending pids; keep the last match
+            fi
+        done
         if [[ -n "$vm_pid" ]]; then
             echo "$vm_pid" > "$VZ_VM_PID_FILE"
             break

@@ -60,8 +60,32 @@ print(n)
     [[ "$unhealthy" == "0" ]]
 }
 
+_start_epoch_of() {
+    ps -o lstart= -p "$1" 2>/dev/null \
+        | xargs -I{} date -j -f "%a %b %d %H:%M:%S %Y" "{}" +%s 2>/dev/null
+}
+
 backend_idle_rss() {
-    # Sum RSS of Lima + VM backend (vz or qemu) processes on the host.
-    ps aux | grep -E 'limactl|Virtualization\.VirtualMachine|qemu-system' | grep -v grep \
-        | awk '{sum+=$6} END {printf "%.0f", sum/1024}'
+    # Sum RSS of THIS instance's processes: limactl hostagent/usernet mention
+    # the instance name, and the VZ VM process is disambiguated by start
+    # time (other VZ users — an anvil build VM, colima — may run in
+    # parallel; a bare grep would count them too).
+    local total=0 pid
+    for pid in $(pgrep -f "limactl.*${LIMA_INSTANCE}"); do
+        total=$(( total + $(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0) ))
+    done
+    local start
+    start="$(_start_epoch_of "$(pgrep -f "limactl hostagent.*${LIMA_INSTANCE}" | head -1)")"
+    if [[ -n "$start" ]]; then
+        for pid in $(pgrep -f "com.apple.Virtualization.VirtualMachine"); do
+            local st
+            st="$(_start_epoch_of "$pid")"
+            [[ -n "$st" ]] || continue
+            (( st >= start )) && total=$(( total + $(ps -o rss= -p "$pid" | tr -d ' ') ))
+        done
+    fi
+    for pid in $(pgrep -f "qemu-system.*${LIMA_INSTANCE}"); do
+        total=$(( total + $(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0) ))
+    done
+    echo $(( total / 1024 ))
 }
