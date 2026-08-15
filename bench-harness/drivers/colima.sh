@@ -99,9 +99,29 @@ print(n)
 }
 
 backend_idle_rss() {
-    # Sum RSS of all colima/limactl/Virtualization-related host processes.
-    # On Apple Silicon Colima uses limactl hostagent + usernet + the
-    # com.apple.Virtualization.VirtualMachine process.
-    ps aux | grep -E 'colima|limactl|qemu-system|Virtualization' | grep -v grep \
-        | awk '{sum+=$6} END {printf "%.0f", sum/1024}'
+    # Sum RSS of colima's own host processes: colima CLI daemon + limactl
+    # helpers under ~/.colima + the VZ VM process disambiguated by start
+    # time (a bare 'Virtualization' grep would also count unrelated VZ
+    # users running in parallel, e.g. an anvil or lima VM).
+    local total=0 pid
+    for pid in $(pgrep -f "colima"); do
+        total=$(( total + $(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0) ))
+    done
+    for pid in $(pgrep -f "limactl.*[.]colima"); do
+        total=$(( total + $(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0) ))
+    done
+    local start st
+    # Colima has no resident daemon process; the hostagent under ~/.colima
+    # is the anchor for the VM start-time comparison.
+    start="$(ps -o lstart= -p "$(pgrep -f 'limactl hostagent.*[.]colima' | head -1)" 2>/dev/null \
+        | xargs -I{} date -j -f "%a %b %d %H:%M:%S %Y" "{}" +%s 2>/dev/null)"
+    if [[ -n "$start" ]]; then
+        for pid in $(pgrep -f "com.apple.Virtualization.VirtualMachine"); do
+            st="$(ps -o lstart= -p "$pid" 2>/dev/null \
+                | xargs -I{} date -j -f "%a %b %d %H:%M:%S %Y" "{}" +%s 2>/dev/null)"
+            [[ -n "$st" ]] || continue
+            (( st >= start )) && total=$(( total + $(ps -o rss= -p "$pid" | tr -d ' ') ))
+        done
+    fi
+    echo $(( total / 1024 ))
 }

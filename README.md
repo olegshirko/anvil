@@ -13,11 +13,11 @@ ok        # ~0.5s after the VM has ever been started once
 
 | Metric | **anvil** | colima | lima | orbstack | docker-desktop |
 |---|---|---|---|---|---|
-| Cold start (daemon ready) | **1355 ms** | 10292 ms | 7161 ms | 1560 ms | 6699 ms |
-| Cold start: compose up (all healthy) | **938 ms** | 1488 ms | 1520 ms | 4380 ms | 1716 ms |
-| Resume (daemon ready) | **561 ms** | 13301 ms | 9114 ms | 1720 ms | 6376 ms |
-| Resume: compose up (all healthy) | **816 ms** | 1468 ms | 1524 ms | 4386 ms | 1560 ms |
-| Idle RSS | **241 MB** | 2066 MB | 2092 MB | 2219 MB | 1145 MB |
+| Cold start (daemon ready) | **1765 ms** | 11388 ms | 9339 ms | 1811 ms | 6177 ms |
+| Cold start: compose up (all healthy) | **963 ms** | 1529 ms | 1541 ms | 4608 ms | 1621 ms |
+| Resume (daemon ready) | **579 ms** | 10864 ms | 7162 ms | 1763 ms | 5936 ms |
+| Resume: compose up (all healthy) | **873 ms** | 1679 ms | 1604 ms | 4553 ms | 1557 ms |
+| Idle RSS | 1247 MB | 2198 MB | 2010 MB | 2208 MB | **1224 MB** |
 
 Full methodology and workloads: [bench-harness/](bench-harness/README.md).
 
