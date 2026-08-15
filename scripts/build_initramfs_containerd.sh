@@ -498,6 +498,12 @@ if [ ! -s /etc/resolv.conf ]; then
     [ -n "$gw" ] && printf 'nameserver %s\n' "$gw" >> /etc/resolv.conf
     printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\n' >> /etc/resolv.conf
 fi
+# A base /etc/hosts is required by nerdctl's --net host (its etchosts
+# generator opens the host file directly; without it `--network host`
+# containers fail with "filesystem error: open /etc/hosts").
+if [ ! -f /etc/hosts ]; then
+    printf '127.0.0.1\tlocalhost\n::1\t\tlocalhost\n' > /etc/hosts
+fi
 # Serialize A/AAAA lookups: under load the VZ NAT DNS forwarder sporadically
 # drops one of the two parallel UDP queries, which Go resolvers (nerdctl,
 # buildkitd) surface as "lookup ... i/o timeout" after exhausting retries.

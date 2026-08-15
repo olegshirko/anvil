@@ -958,6 +958,44 @@ def test_system_prune() -> None:
         cleanup(name)
 
 
+def test_run_flags_wave2() -> None:
+    """Second flag wave: --read-only, --stop-signal, --tmpfs opts, --pid host,
+    --network host."""
+    # read-only rootfs (compose read_only:) — write must fail
+    out = docker("run", "--rm", "--read-only", "alpine",
+                 "sh", "-c", "touch /x 2>/dev/null && echo ro-fail || echo ro-ok")
+    if "ro-ok" not in out.stdout:
+        raise RuntimeError(f"read-only: {out.stdout!r}")
+    # stop-signal stored and reported (compose stop_signal:)
+    name = f"{PREFIX}-sig"
+    try:
+        docker("run", "-d", "--name", name, "--stop-signal", "SIGUSR1",
+               "alpine", "sleep", "60")
+        sig = docker("inspect", "--format", "{{.Config.StopSignal}}", name).stdout.strip()
+        if sig != "SIGUSR1":
+            raise RuntimeError(f"stop-signal: {sig!r}")
+    finally:
+        cleanup(name)
+    # tmpfs with options: ro must forbid writes
+    out = docker("run", "--rm", "--tmpfs", "/x:ro", "alpine",
+                 "sh", "-c", "touch /x/f 2>/dev/null && echo tmp-fail || echo tmp-ro-ok")
+    if "tmp-ro-ok" not in out.stdout:
+        raise RuntimeError(f"tmpfs ro: {out.stdout!r}")
+    # pid host: sees host (guest) processes, not just own namespace
+    own = docker("run", "--rm", "alpine", "sh", "-c", "ls /proc | grep -c '^[0-9]'").stdout.strip()
+    host = docker("run", "--rm", "--pid", "host", "alpine",
+                  "sh", "-c", "ls /proc | grep -c '^[0-9]'").stdout.strip()
+    if not (int(host) > int(own)):
+        raise RuntimeError(f"pid host: own={own} host={host}")
+    # network host: container shares the guest network (sees eth0 with an IP)
+    out = docker("run", "--rm", "--network", "host", "alpine",
+                 "sh", "-c", "ip -o -4 addr show eth0 | grep -c inet").stdout.strip()
+    if out != "1":
+        raise RuntimeError(f"network host: {out!r}")
+    record("run flags wave2: read-only/stop-signal/tmpfs-opts/pid/network host", "PASS",
+           "all honored")
+
+
 def test_classic_build() -> None:
     """DOCKER_BUILDKIT=0 sends the context to our POST /build endpoint."""
     tag = f"{PREFIX}-built:1"
@@ -1080,6 +1118,7 @@ TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
     ("run flags P0 (entrypoint/w/add-host/memory/cap)", test_run_flags_p0),
+    ("run flags wave2 (read-only/stop-signal/tmpfs/pid/net-host)", test_run_flags_wave2),
     ("published port forwarded", test_port_forward),
     ("foreign host-port conflict", test_foreign_port_conflict),
     ("container lifecycle", test_create_ps_inspect_stop),

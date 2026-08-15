@@ -34,6 +34,7 @@ type dockerCreateRequest struct {
 	Cmd              []string              `json:"Cmd"`
 	Entrypoint       []string              `json:"Entrypoint"`
 	WorkingDir       string                `json:"WorkingDir"`
+	StopSignal       string                `json:"StopSignal"`
 	Image            string                `json:"Image"`
 	Labels           map[string]string     `json:"Labels"`
 	NetworkingConfig *dockerNetworkingConf `json:"NetworkingConfig,omitempty"`
@@ -63,6 +64,9 @@ type dockerHostConfig struct {
 	NanoCpus        int64                       `json:"NanoCpus"`
 	CapAdd          []string                    `json:"CapAdd"`
 	CapDrop         []string                    `json:"CapDrop"`
+	ReadonlyRootfs  bool                        `json:"ReadonlyRootfs"`
+	PidMode         string                      `json:"PidMode"`
+	TmpFs           map[string]string           `json:"Tmpfs"`
 }
 
 type dockerHostPort struct {
@@ -122,12 +126,30 @@ var containerTTYFlags = struct {
 // containerEntryPoints remembers WorkingDir/Entrypoint per container for
 // inspect responses (nerdctl's inspect does not report them).
 var containerEntryPoints = struct {
-	mu   sync.RWMutex
-	dirs map[string]string
-	eps  map[string][]string
+	mu    sync.RWMutex
+	dirs  map[string]string
+	eps   map[string][]string
+	stops map[string]string
 }{
-	dirs: make(map[string]string),
-	eps:  make(map[string][]string),
+	dirs:  make(map[string]string),
+	eps:   make(map[string][]string),
+	stops: make(map[string]string),
+}
+
+func setContainerStopSignal(dockerID, sig string) {
+	containerEntryPoints.mu.Lock()
+	if sig != "" {
+		containerEntryPoints.stops[dockerID] = sig
+	} else {
+		delete(containerEntryPoints.stops, dockerID)
+	}
+	containerEntryPoints.mu.Unlock()
+}
+
+func getContainerStopSignal(dockerID string) string {
+	containerEntryPoints.mu.RLock()
+	defer containerEntryPoints.mu.RUnlock()
+	return containerEntryPoints.stops[dockerID]
 }
 
 func setContainerEntryPointInfo(dockerID, workdir string, entrypoint []string) {
@@ -347,6 +369,7 @@ type dockerContainerConfig struct {
 	Cmd         []string           `json:"Cmd,omitempty"`
 	Entrypoint  []string           `json:"Entrypoint,omitempty"`
 	WorkingDir  string             `json:"WorkingDir,omitempty"`
+	StopSignal  string             `json:"StopSignal,omitempty"`
 }
 
 // dockerHostConfig (defined above with the create request) doubles as the
@@ -629,6 +652,25 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 	for _, c := range req.HostConfig.CapDrop {
 		args = append(args, "--cap-drop", c)
 	}
+	if req.HostConfig.ReadonlyRootfs {
+		args = append(args, "--read-only")
+	}
+	// PID namespace sharing (docker --pid host / compose pid: host).
+	if mode := req.HostConfig.PidMode; mode != "" && mode != "private" {
+		args = append(args, "--pid", mode)
+	}
+	if req.StopSignal != "" {
+		args = append(args, "--stop-signal", req.StopSignal)
+	}
+	// tmpfs mounts with options (docker --tmpfs /x:ro,size=1m). nerdctl
+	// takes the same path:opts syntax via --tmpfs.
+	for path, opts := range req.HostConfig.TmpFs {
+		spec := path
+		if opts != "" {
+			spec += ":" + opts
+		}
+		args = append(args, "--tmpfs", spec)
+	}
 
 	// Bind mounts and named volumes. Host paths under /Users are visible in
 	// the guest at the same absolute path via the "macusers" virtiofs share,
@@ -638,6 +680,15 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 		args = append(args, "-v", bind)
 	}
 	for _, m := range req.HostConfig.Mounts {
+		// tmpfs-type Mounts (compose tmpfs:) become --tmpfs specs.
+		if m.Type == "tmpfs" && m.Target != "" {
+			spec := m.Target
+			if m.ReadOnly {
+				spec += ":ro"
+			}
+			args = append(args, "--tmpfs", spec)
+			continue
+		}
 		if m.Type == "tmpfs" || m.Source == "" || m.Target == "" {
 			continue
 		}
@@ -765,6 +816,7 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 	setContainerTTY(dockerID, req.Tty)
 	// Remember WorkingDir/Entrypoint for inspect responses.
 	setContainerEntryPointInfo(dockerID, req.WorkingDir, req.Entrypoint)
+	setContainerStopSignal(dockerID, req.StopSignal)
 	// AutoRemove is handled by guest-agent after we capture the exit code.
 	// Passing --rm to nerdctl would delete the container immediately on exit
 	// and cause /wait to miss the exit status.
@@ -1502,6 +1554,7 @@ func inspectDockerContainer(prefix string) (*dockerContainerInspect, error) {
 					Cmd:         inspectDetails.Config.Cmd,
 					Entrypoint:  getContainerEntrypoint(did),
 					WorkingDir:  getContainerWorkingDir(did),
+					StopSignal:  getContainerStopSignal(did),
 				},
 				HostConfig: dockerHostConfig{
 					AutoRemove:    isAutoRemove(did),
