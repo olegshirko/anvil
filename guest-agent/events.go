@@ -117,6 +117,13 @@ func translateDockerEvent(ctx context.Context, cl *client.Client, env *events.En
 	case *eventsapi.TaskExit:
 		containerdID = e.ContainerID
 		exitCode = strconv.Itoa(int(e.ExitStatus))
+		// containerd reports 0 for signal deaths; docker kill caches the
+		// Docker-conventional 128+N code — prefer it when present.
+		if e.ExitStatus == 0 {
+			if code, ok := peekContainerExitCode(dockerID(env.Namespace, containerdID)); ok && code != 0 {
+				exitCode = strconv.Itoa(code)
+			}
+		}
 	case *eventsapi.TaskDelete:
 		containerdID = e.ContainerID
 	default:

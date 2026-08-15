@@ -116,6 +116,14 @@ func matchesLabelFilters(labels map[string]string, filters map[string]map[string
 // and writes output as Docker multiplexed stream frames until the command exits
 // or the writer fails.
 func streamNerdctlLogsTo(out io.Writer, ns, name string, follow bool) {
+	streamNerdctlLogsToTTY(out, ns, name, follow, false)
+}
+
+// streamNerdctlLogsToTTY streams `nerdctl logs` output; with tty=true the
+// bytes go out raw (Docker sends TTY output unmultiplexed — a mux header
+// would corrupt the client terminal), otherwise in the 8-byte-header
+// multiplexed stream format.
+func streamNerdctlLogsToTTY(out io.Writer, ns, name string, follow bool, tty bool) {
 	flusher, _ := out.(http.Flusher)
 	buf := make([]byte, 4096)
 
@@ -142,7 +150,13 @@ func streamNerdctlLogsTo(out io.Writer, ns, name string, follow bool) {
 			n, err := stdout.Read(buf)
 			if n > 0 {
 				total += n
-				if writeErr := writeDockerStream(out, 1, buf[:n]); writeErr != nil {
+				var writeErr error
+				if tty {
+					_, writeErr = out.Write(buf[:n])
+				} else {
+					writeErr = writeDockerStream(out, 1, buf[:n])
+				}
+				if writeErr != nil {
 					cmd.Process.Kill()
 					cmd.Wait()
 					return total, writeErr
@@ -229,7 +243,8 @@ func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
 	}()
 
 	// Replay existing logs then follow if the container is still running.
-	streamNerdctlLogsTo(bufrw, ns, name, true)
+	// TTY containers stream raw bytes (no docker mux headers).
+	streamNerdctlLogsToTTY(bufrw, ns, name, true, getContainerTTY(did))
 
 	// Ensure all buffered output reaches the client before closing.
 	bufrw.Flush()

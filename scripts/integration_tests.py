@@ -518,6 +518,174 @@ def test_compose_project_isolation() -> None:
                                capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
 
 
+def test_compose_service_dns() -> None:
+    """Regression: compose resolves services by name (`http://web`), which
+    arrives as NetworkingConfig aliases in the create request. nerdctl has no
+    --network-alias, so guest-agent writes the aliases into the /etc/hosts
+    bind mounts of the project's containers."""
+    project = f"{PREFIX}-dns"
+    with tempfile.TemporaryDirectory() as tmp:
+        compose_file = Path(tmp) / "compose.yml"
+        compose_file.write_text(f"""services:
+  web:
+    image: nginx
+  client:
+    image: alpine
+    command: sleep 60
+    depends_on: [web]
+""")
+        base = ["compose", "-p", project, "-f", str(compose_file)]
+        try:
+            docker(*base, "up", "-d", "--wait", timeout=300.0)
+            # by service name (busybox wget lives in the alpine-based client
+            # image; use curl-less alpine with busybox wget)
+            out = docker(*base, "exec", "-T", "client",
+                         "sh", "-c", "wget -qO- --timeout=5 http://web | head -c 40",
+                         timeout=60.0)
+            if "<!DOCTYPE html>" not in out.stdout and "Welcome to nginx" not in out.stdout:
+                raise RuntimeError(f"service-name DNS failed: {out.stdout!r} {out.stderr!r}")
+            # by container name (nerdctl-native) must keep working; compose
+            # names containers <project>-<service>-1
+            out2 = docker(*base, "exec", "-T", "client",
+                          "sh", "-c", f"wget -qO- --timeout=5 http://{project}-web-1 | head -c 40",
+                          timeout=60.0, check=False)
+            if "<!DOCTYPE html>" not in out2.stdout and "Welcome to nginx" not in out2.stdout:
+                raise RuntimeError(f"container-name DNS failed: {out2.stdout!r}")
+            record("compose DNS by service name", "PASS",
+                   "http://web and http://web-1 both resolve")
+        finally:
+            subprocess.run(["docker", *base, "down", "-v", "--timeout", "5"],
+                           capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
+
+
+def test_tty_run() -> None:
+    """Regression: TTY attach used the 8-byte multiplexed header even in TTY
+    mode, where Docker streams raw bytes — the terminal showed garbage before
+    the output. The subprocess has no controlling terminal, so the CLI's
+    output for `-t` lands on stderr and may be empty — assert on the mux
+    header, the actual regression."""
+    proc = subprocess.run(["docker", "run", "--rm", "-t", "alpine", "echo", "tty-ok"],
+                          capture_output=True, timeout=120.0, env=DOCKER_ENV)
+    body = proc.stdout + proc.stderr
+    if b"tty-ok" not in body:
+        raise RuntimeError(f"tty output: stdout={proc.stdout!r} stderr={proc.stderr!r}")
+    # With TTY the payload must be raw: no mux header bytes around it.
+    if proc.stdout[:1] in (b"\x01", b"\x02") or b"\x00\x00\x00\x00\x00" in body:
+        raise RuntimeError(f"mux header leaked into tty stream: {body[:32]!r}")
+    record("docker run -t (raw TTY stream)", "PASS", "no mux header, clean output")
+
+
+def test_port_range_publishing() -> None:
+    """Regression: -p 18401-18402:80-81 was silently dropped (single-port
+    parsing only). Checks the metadata and that both host listeners exist
+    (nginx only serves :80, so :81 accepts and closes — that still proves
+    the forwarder listens)."""
+    name = f"{PREFIX}-range"
+    try:
+        docker("run", "-d", "--name", name, "-p", "18401-18402:80-81", "nginx")
+        c1 = curl_status(18401)
+        if c1 != "200":
+            raise RuntimeError(f"range port 18401 -> {c1}")
+        ports = docker("port", name)
+        if "18401" not in ports.stdout or "18402" not in ports.stdout:
+            raise RuntimeError(f"docker port output: {ports.stdout!r}")
+        ps_ports = docker("ps", "--filter", f"name={name}", "--format", "{{.Ports}}")
+        if "18402" not in ps_ports.stdout:
+            raise RuntimeError(f"ps ports: {ps_ports.stdout!r}")
+        import socket as _s
+        for port in (18401, 18402):
+            try:
+                with _s.create_connection(("localhost", port), timeout=5.0):
+                    pass
+            except OSError as e:
+                raise RuntimeError(f"host listener for {port} missing: {e}")
+        record("port range -p 18401-18402:80-81", "PASS",
+               "both ports listed and both host listeners accept")
+    finally:
+        cleanup(name)
+
+
+def test_kill_exit_code() -> None:
+    """Regression: docker kill reported exit code 0; Docker semantics are
+    137 (128+SIGKILL) in wait/inspect/events."""
+    name = f"{PREFIX}-kill"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sleep", "60")
+        docker("kill", name)
+        code = docker("inspect", "--format", "{{.State.ExitCode}}", name).stdout.strip()
+        if code != "137":
+            raise RuntimeError(f"exit code after kill = {code}, want 137")
+        record("docker kill -> exit code 137", "PASS", "inspect reports 137")
+    finally:
+        cleanup(name)
+
+
+def test_logs_follow() -> None:
+    name = f"{PREFIX}-logsf"
+    try:
+        docker("run", "-d", "--name", name, "alpine",
+               "sh", "-c", "echo line1; sleep 2; echo line2")
+        # -f must stream both the replayed and the follow-up line, then exit
+        # with the container.
+        proc = subprocess.Popen(["docker", "logs", "-f", name],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, env=DOCKER_ENV)
+        try:
+            out, _ = proc.communicate(timeout=30.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate()
+            raise RuntimeError("logs -f did not terminate with the container")
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        if "line1" not in lines or "line2" not in lines:
+            raise RuntimeError(f"logs -f output: {lines}")
+        record("docker logs -f (replay + follow)", "PASS", f"{lines}")
+    finally:
+        cleanup(name)
+
+
+def test_kill_and_rename() -> None:
+    name, renamed = f"{PREFIX}-kr", f"{PREFIX}-kr2"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sleep", "60")
+        docker("rename", name, renamed)
+        st = docker("ps", "--filter", f"name={renamed}", "--format", "{{.Names}}")
+        if renamed not in st.stdout.split():
+            raise RuntimeError(f"rename not visible: {st.stdout!r}")
+        record("docker rename", "PASS", "old name gone, new name listed")
+    finally:
+        cleanup(name)
+        cleanup(renamed)
+
+
+def test_restart_command() -> None:
+    name = f"{PREFIX}-rstcmd"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sleep", "60")
+        first = docker("inspect", "--format", "{{.State.Pid}}", name).stdout.strip()
+        docker("restart", "-t", "1", name)
+        second = docker("inspect", "--format", "{{.State.Pid}}", name).stdout.strip()
+        if first == second:
+            raise RuntimeError("container Pid unchanged after restart")
+        if docker("inspect", "--format", "{{.State.Running}}", name).stdout.strip() != "true":
+            raise RuntimeError("not running after restart")
+        record("docker restart", "PASS", f"pid {first} -> {second}, running")
+    finally:
+        cleanup(name)
+
+
+def test_docker_port_command() -> None:
+    name = f"{PREFIX}-portcmd"
+    try:
+        docker("run", "-d", "--name", name, "-p", "18405:80", "nginx")
+        out = docker("port", name, "80")
+        if "18405" not in out.stdout:
+            raise RuntimeError(f"docker port: {out.stdout!r}")
+        record("docker port", "PASS", f"{out.stdout.strip()}")
+    finally:
+        cleanup(name)
+
+
 def test_classic_build() -> None:
     """DOCKER_BUILDKIT=0 sends the context to our POST /build endpoint."""
     tag = f"{PREFIX}-built:1"
@@ -653,9 +821,17 @@ TESTS = [
     ("healthcheck", test_healthcheck),
     ("events", test_events),
     ("compose up", test_compose_up),
+    ("compose service DNS", test_compose_service_dns),
     ("compose recreate over live", test_compose_recreate_over_live),
     ("compose run one-off", test_compose_run_one_off),
     ("compose isolation", test_compose_project_isolation),
+    ("tty run", test_tty_run),
+    ("port range publishing", test_port_range_publishing),
+    ("kill exit code", test_kill_exit_code),
+    ("logs -f", test_logs_follow),
+    ("kill and rename", test_kill_and_rename),
+    ("restart command", test_restart_command),
+    ("docker port", test_docker_port_command),
     ("classic build", test_classic_build),
     ("classic build after rmi", test_classic_build_after_rmi),
     ("buildx builder selection", test_buildx_builder_selection),
