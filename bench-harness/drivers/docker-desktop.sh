@@ -8,16 +8,69 @@ backend_is_available() {
         mdfind "kMDItemCFBundleIdentifier == 'com.docker.docker'" 2>/dev/null | grep -q .
 }
 
+backend_cold_reset() {
+    # A previously failed run can leave workload containers behind in a
+    # broken state ("RWLayer of container ... is unexpectedly nil"), which
+    # makes the next compose up fail forever. Force-remove leftovers by the
+    # compose project label and the shared network.
+    docker --context desktop-linux ps -aq --filter label=com.docker.compose.project=workloads 2>/dev/null \
+        | xargs -r docker --context desktop-linux rm -f >/dev/null 2>&1 || true
+    docker --context desktop-linux network rm workloads_default >/dev/null 2>&1 || true
+}
+
 backend_start() {
     open -a Docker
     # `docker info` returns 0 without a server and shows only the Client.
-    # Wait for ServerVersion, which appears only when the daemon is ready.
-    wait_for "docker desktop ready" 180 docker --context desktop-linux info --format '{{.ServerVersion}}'
+    # And a single successful call is not enough: right after ServerVersion
+    # appears, /_ping can still answer 500 while the API warms up. Require
+    # sustained clean round-trips before declaring readiness.
+    if wait_for "docker desktop ready" 90 docker_desktop_stable; then
+        return 0
+    fi
+    # Docker Desktop 4.86 on macOS 26 beta: after a quit/open cycle its
+    # Linux VM sometimes never boots (apiproxy: "no route to host" to
+    # 192.168.65.7 forever). Recover with a hard kill + fresh start; the
+    # measured time then still reflects what a user experiences.
+    echo "!! docker desktop VM stuck, hard-restarting" >&2
+    pkill -9 -f "com.docker.backend" 2>/dev/null || true
+    pkill -9 -f "Docker Desktop" 2>/dev/null || true
+    sleep 3
+    open -a Docker
+    wait_for "docker desktop ready (after hard reset)" 180 docker_desktop_stable
+}
+
+docker_desktop_stable() {
+    # Each probe is time-boxed: on the broken-VM path docker ps hangs
+    # forever instead of failing, which would stall wait_for.
+    local i
+    for i in $(seq 1 10); do
+        docker_desktop_probe info >/dev/null 2>&1 || return 1
+        docker_desktop_probe ps >/dev/null 2>&1 || return 1
+        sleep 0.3
+    done
+}
+
+docker_desktop_probe() {
+    case "$1" in
+        info) perl -e 'alarm 5; exec @ARGV' docker --context desktop-linux info --format '{{.ServerVersion}}' ;;
+        ps)   perl -e 'alarm 5; exec @ARGV' docker --context desktop-linux ps ;;
+    esac
 }
 
 backend_stop() {
     osascript -e 'quit app "Docker"' 2>/dev/null || true
-    sleep 1
+    # Wait for the backend to actually exit. Docker Desktop corrupts its
+    # state when relaunched mid-shutdown (API answers 500 on /_ping forever,
+    # observed repeatedly); a hard kill after the graceful quit window
+    # avoids that.
+    local i
+    for i in $(seq 1 30); do
+        ps aux | grep -q "[c]om.docker.backend" || return 0
+        sleep 1
+    done
+    pkill -9 -f "com.docker.backend" 2>/dev/null || true
+    pkill -9 -f "Docker Desktop" 2>/dev/null || true
+    sleep 2
 }
 
 backend_stop_keep_snapshot() {
@@ -25,6 +78,8 @@ backend_stop_keep_snapshot() {
 }
 
 backend_resume() {
+    # Same quit/open fragility as backend_start: if the VM did not come
+    # back, hard-restart once and measure that (the user experience).
     backend_start
 }
 
