@@ -32,6 +32,8 @@ type dockerCreateRequest struct {
 	StdinOnce        bool                  `json:"StdinOnce"`
 	Env              []string              `json:"Env"`
 	Cmd              []string              `json:"Cmd"`
+	Entrypoint       []string              `json:"Entrypoint"`
+	WorkingDir       string                `json:"WorkingDir"`
 	Image            string                `json:"Image"`
 	Labels           map[string]string     `json:"Labels"`
 	NetworkingConfig *dockerNetworkingConf `json:"NetworkingConfig,omitempty"`
@@ -56,6 +58,11 @@ type dockerHostConfig struct {
 	AutoRemove      bool                        `json:"AutoRemove"`
 	Privileged      bool                        `json:"Privileged"`
 	PublishAllPorts bool                        `json:"PublishAllPorts"`
+	ExtraHosts      []string                    `json:"ExtraHosts"`
+	Memory          int64                       `json:"Memory"`
+	NanoCpus        int64                       `json:"NanoCpus"`
+	CapAdd          []string                    `json:"CapAdd"`
+	CapDrop         []string                    `json:"CapDrop"`
 }
 
 type dockerHostPort struct {
@@ -110,6 +117,40 @@ var containerTTYFlags = struct {
 	m  map[string]bool
 }{
 	m: make(map[string]bool),
+}
+
+// containerEntryPoints remembers WorkingDir/Entrypoint per container for
+// inspect responses (nerdctl's inspect does not report them).
+var containerEntryPoints = struct {
+	mu   sync.RWMutex
+	dirs map[string]string
+	eps  map[string][]string
+}{
+	dirs: make(map[string]string),
+	eps:  make(map[string][]string),
+}
+
+func setContainerEntryPointInfo(dockerID, workdir string, entrypoint []string) {
+	containerEntryPoints.mu.Lock()
+	containerEntryPoints.dirs[dockerID] = workdir
+	if len(entrypoint) > 0 {
+		containerEntryPoints.eps[dockerID] = entrypoint
+	} else {
+		delete(containerEntryPoints.eps, dockerID)
+	}
+	containerEntryPoints.mu.Unlock()
+}
+
+func getContainerWorkingDir(dockerID string) string {
+	containerEntryPoints.mu.RLock()
+	defer containerEntryPoints.mu.RUnlock()
+	return containerEntryPoints.dirs[dockerID]
+}
+
+func getContainerEntrypoint(dockerID string) []string {
+	containerEntryPoints.mu.RLock()
+	defer containerEntryPoints.mu.RUnlock()
+	return containerEntryPoints.eps[dockerID]
 }
 
 func setContainerTTY(dockerID string, tty bool) {
@@ -305,6 +346,7 @@ type dockerContainerConfig struct {
 	Env         []string           `json:"Env,omitempty"`
 	Cmd         []string           `json:"Cmd,omitempty"`
 	Entrypoint  []string           `json:"Entrypoint,omitempty"`
+	WorkingDir  string             `json:"WorkingDir,omitempty"`
 }
 
 // dockerHostConfig (defined above with the create request) doubles as the
@@ -556,6 +598,37 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 	if req.HostConfig.RestartPolicy.Name != "" {
 		args = append(args, "--restart", req.HostConfig.RestartPolicy.Name)
 	}
+	// Entrypoint override (docker run --entrypoint, compose entrypoint:).
+	// nerdctl's --entrypoint is a single binary path, while Docker allows a
+	// list ([bin, args...]). Translate: first element becomes --entrypoint,
+	// the rest are prepended to the command argv.
+	entrypointArgs := []string{}
+	if len(req.Entrypoint) > 0 {
+		args = append(args, "--entrypoint", req.Entrypoint[0])
+		entrypointArgs = req.Entrypoint[1:]
+	}
+	if req.WorkingDir != "" {
+		args = append(args, "-w", req.WorkingDir)
+	}
+	// /etc/hosts extras (docker run --add-host, compose extra_hosts:).
+	for _, h := range req.HostConfig.ExtraHosts {
+		args = append(args, "--add-host", h)
+	}
+	// Resource limits (compose mem_limit/cpus). nerdctl takes bytes and
+	// fractional CPUs; Docker sends Memory in bytes and NanoCpus (1e9 = 1 CPU).
+	if req.HostConfig.Memory > 0 {
+		args = append(args, "--memory", fmt.Sprintf("%db", req.HostConfig.Memory))
+	}
+	if req.HostConfig.NanoCpus > 0 {
+		cpus := float64(req.HostConfig.NanoCpus) / 1e9
+		args = append(args, "--cpus", strconv.FormatFloat(cpus, 'f', -1, 64))
+	}
+	for _, c := range req.HostConfig.CapAdd {
+		args = append(args, "--cap-add", c)
+	}
+	for _, c := range req.HostConfig.CapDrop {
+		args = append(args, "--cap-drop", c)
+	}
 
 	// Bind mounts and named volumes. Host paths under /Users are visible in
 	// the guest at the same absolute path via the "macusers" virtiofs share,
@@ -624,6 +697,7 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 	}
 
 	args = append(args, req.Image)
+	args = append(args, entrypointArgs...)
 	args = append(args, req.Cmd...)
 
 	stdout, stderr, code, err := runNerdctl(ns, args...)
@@ -689,6 +763,8 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 	}
 	// Remember TTY for attach (raw stream) and inspect responses.
 	setContainerTTY(dockerID, req.Tty)
+	// Remember WorkingDir/Entrypoint for inspect responses.
+	setContainerEntryPointInfo(dockerID, req.WorkingDir, req.Entrypoint)
 	// AutoRemove is handled by guest-agent after we capture the exit code.
 	// Passing --rm to nerdctl would delete the container immediately on exit
 	// and cause /wait to miss the exit status.
@@ -1424,7 +1500,8 @@ func inspectDockerContainer(prefix string) (*dockerContainerInspect, error) {
 					OpenStdin:   inspectDetails.Config.OpenStdin,
 					Env:         inspectDetails.Config.Env,
 					Cmd:         inspectDetails.Config.Cmd,
-					Entrypoint:  inspectDetails.Config.Entrypoint,
+					Entrypoint:  getContainerEntrypoint(did),
+					WorkingDir:  getContainerWorkingDir(did),
 				},
 				HostConfig: dockerHostConfig{
 					AutoRemove:    isAutoRemove(did),

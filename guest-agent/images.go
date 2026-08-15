@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -330,27 +331,39 @@ func putImage(cl *client.Client, nsCtx context.Context, img images.Image) error 
 // reference blobs the target namespace cannot see.
 func copyImageBetweenNamespaces(srcNs, ref, targetNs string) error {
 	env := append([]string{}, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-	save := exec.Command("/opt/containerd/bin/nerdctl", "--namespace", srcNs, "save", ref)
+	// nerdctl save writing to a pipe silently produces an empty stream in
+	// this build (stdout mode yields 0 bytes with exit 0), so round-trip
+	// through a temp file on the persistent disk instead.
+	tmp, err := os.CreateTemp("/var/lib", "anvil-img-copy-*.tar")
+	if err != nil {
+		return fmt.Errorf("temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+
+	save := exec.Command("/opt/containerd/bin/nerdctl", "--namespace", srcNs, "save", "-o", tmpPath, ref)
 	save.Env = env
-	imp := exec.Command("/opt/containerd/bin/ctr", "-n", targetNs, "images", "import", "--no-unpack", "-")
-	imp.Env = env
-	pipe, err := save.StdoutPipe()
+	var saveErr strings.Builder
+	save.Stderr = &saveErr
+	if err := save.Run(); err != nil {
+		return fmt.Errorf("save: %v: %s", err, saveErr.String())
+	}
+	if info, err := os.Stat(tmpPath); err != nil || info.Size() == 0 {
+		return fmt.Errorf("save produced empty archive for %s", ref)
+	}
+
+	f, err := os.Open(tmpPath)
 	if err != nil {
 		return err
 	}
-	imp.Stdin = pipe
-	var saveErr, impErr strings.Builder
-	save.Stderr = &saveErr
+	defer f.Close()
+	imp := exec.Command("/opt/containerd/bin/ctr", "-n", targetNs, "images", "import", "--no-unpack", "-")
+	imp.Env = env
+	imp.Stdin = f
+	var impErr strings.Builder
 	imp.Stderr = &impErr
-	if err := imp.Start(); err != nil {
-		return err
-	}
-	if err := save.Run(); err != nil {
-		_ = imp.Process.Kill()
-		_ = imp.Wait()
-		return fmt.Errorf("save: %v: %s", err, saveErr.String())
-	}
-	if err := imp.Wait(); err != nil {
+	if err := imp.Run(); err != nil {
 		return fmt.Errorf("import: %v: %s", err, impErr.String())
 	}
 	return nil
@@ -393,10 +406,14 @@ func listDockerImages() ([]dockerImageSummary, error) {
 			if img.ID == "" {
 				continue
 			}
-			if _, ok := seen[img.ID]; ok {
+			// Dedup by (ID, tag): the same image legitimately appears under
+			// several names (`docker tag alpine x` must stay visible), but
+			// namespace fan-out would otherwise list each name many times.
+			dedupKey := img.ID + "|" + img.Repository + ":" + img.Tag
+			if _, ok := seen[dedupKey]; ok {
 				continue
 			}
-			seen[img.ID] = struct{}{}
+			seen[dedupKey] = struct{}{}
 
 			created := int64(0)
 			if t, err := time.Parse("2006-01-02 15:04:05 +0000 UTC", img.CreatedAt); err == nil {
@@ -514,6 +531,14 @@ func tagDockerImage(source, target string) error {
 	if err != nil || code != 0 {
 		return fmt.Errorf("nerdctl tag failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
 	}
+	// Tags must be globally visible: mirror the new tag into the default
+	// namespace so multi-image operations (save a b) resolve every name in
+	// one namespace.
+	if ns != "default" {
+		if err := ensureImageInNamespace(target, "default"); err != nil {
+			log.Printf("[images] mirror tag %s to default: %v", target, err)
+		}
+	}
 	return nil
 }
 
@@ -548,17 +573,35 @@ func streamImageSave(w http.ResponseWriter, names []string) {
 	}
 
 	log.Printf("[docker-api] saving images %v from ns=%q", names, ns)
-	w.Header().Set("Content-Type", "application/x-tar")
-	args := append([]string{"--namespace", ns, "save"}, names...)
+	// nerdctl save with a pipe on stdout can silently produce an empty
+	// stream in this build; round-trip through a temp file and stream that.
+	tmp, err := os.CreateTemp("/var/lib", "anvil-save-*.tar")
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+
+	args := append([]string{"--namespace", ns, "save", "-o", tmpPath}, names...)
 	cmd := exec.Command("/opt/containerd/bin/nerdctl", args...)
 	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-	cmd.Stdout = w
 	var errBuf strings.Builder
 	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
-		// Headers are already sent; only log.
+	if err := cmd.Run(); err != nil || func() bool { i, e := os.Stat(tmpPath); return e != nil || i.Size() == 0 }() {
 		log.Printf("[docker-api] save %v failed: %v: %s", names, err, stripANSI(errBuf.String()))
+		http.Error(w, `{"message":"save failed"}`, http.StatusInternalServerError)
+		return
 	}
+	f, err := os.Open(tmpPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "application/x-tar")
+	io.Copy(w, f)
 }
 
 // removeDockerImage removes an image using nerdctl.
