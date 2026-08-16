@@ -107,6 +107,7 @@ func main() {
 	// VZ does not guarantee a sane RTC and snapshot resume leaves the clock
 	// frozen at pause time; sync it from the host-written time file.
 	syncClockFromShare()
+	go periodicClockSync()
 
 	// Discard unused blocks on the containerd ext4 once a day so the sparse
 	// disk image on the host can return space after image prune.
@@ -203,6 +204,50 @@ func syncClockFromShare() {
 		return
 	}
 	log.Printf("[clock] synced from host time file (%s)", epoch)
+}
+
+// periodicClockSync keeps the guest clock within ~1 s of the host: the VZ
+// RTC ticks unreliably and every idle-pause adds the paused interval as
+// drift. vz-runner refreshes the time file every 5 s while the VM runs;
+// we poll it and step the clock when the drift grows beyond the threshold.
+// Drifted timestamps break `docker events --until` (computed host-side) and
+// log timestamps.
+//
+// Only forward steps are applied: a backward step mid-connection breaks
+// TCP timers (seen as TLS handshakes to auth.docker.io timing out inside
+// buildkitd), and in practice the guest clock only ever runs behind (slow
+// RTC + frozen during pauses). When the guest is momentarily ahead (poll
+// racing the file refresh), no correction is needed — it falls behind on
+// its own within seconds.
+func periodicClockSync() {
+	const hostTimeFile = "/mnt/anvil/.anvil-host-time"
+	const minDrift = time.Second
+	corrected := 0
+	for {
+		time.Sleep(5 * time.Second)
+		data, err := os.ReadFile(hostTimeFile)
+		if err != nil {
+			continue
+		}
+		epoch, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+		if err != nil {
+			continue
+		}
+		hostTime := time.Unix(epoch, 0)
+		// How far the host time (per the file) is AHEAD of the guest clock.
+		ahead := hostTime.Sub(time.Now())
+		if ahead <= minDrift {
+			continue
+		}
+		if out, err := exec.Command("date", "-s", "@"+strconv.FormatInt(epoch, 10)).CombinedOutput(); err != nil {
+			log.Printf("[clock] periodic sync failed: %v: %s", err, out)
+			continue
+		}
+		corrected++
+		if corrected <= 3 || corrected%20 == 0 {
+			log.Printf("[clock] stepped clock forward to host time (was %s behind, correction #%d)", ahead, corrected)
+		}
+	}
 }
 
 func dispatch(req *Request) Response {

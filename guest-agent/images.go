@@ -605,16 +605,69 @@ func streamImageSave(w http.ResponseWriter, names []string) {
 }
 
 // removeDockerImage removes an image using nerdctl.
-func removeDockerImage(name string) error {
-	ns := findImageNamespace(name)
-	if ns == "" {
-		ns = "default"
+func removeDockerImage(name string, force bool) error {
+	nss := findAllImageNamespaces(name)
+	if len(nss) == 0 {
+		nss = []string{"default"}
 	}
-	stdout, stderr, code, err := runNerdctl(ns, "rmi", name)
-	if err != nil || code != 0 {
-		return fmt.Errorf("nerdctl rmi failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	// The same ref can exist in several namespaces (compose projects keep
+	// a streamed copy next to the default-ns one); docker semantics are
+	// "the image is gone", so remove it everywhere it matches. Success if
+	// at least one namespace removed it; a per-ns failure is logged, and
+	// the error surfaces only when every attempt failed.
+	removed, lastErr := 0, error(nil)
+	for _, ns := range nss {
+		args := []string{"rmi"}
+		if force {
+			args = append(args, "-f")
+		}
+		args = append(args, name)
+		stdout, stderr, code, err := runNerdctl(ns, args...)
+		log.Printf("[images] rmi %q ns=%q force=%v code=%d out=%q err=%q",
+			name, ns, force, code, stripANSI(stdout), stripANSI(stderr))
+		if err != nil || code != 0 {
+			lastErr = fmt.Errorf("nerdctl rmi failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+			continue
+		}
+		removed++
+	}
+	if removed == 0 && lastErr != nil {
+		return lastErr
 	}
 	return nil
+}
+
+// findAllImageNamespaces returns every namespace whose image store holds the
+// ref (strict canonical/raw name match, like findImageNamespace).
+func findAllImageNamespaces(ref string) []string {
+	cl, err := client.New(containerdSocket)
+	if err != nil {
+		return nil
+	}
+	defer cl.Close()
+
+	ctx := context.Background()
+	nss, err := cl.NamespaceService().List(ctx)
+	if err != nil {
+		log.Printf("[images] list namespaces: %v", err)
+		return nil
+	}
+	canonical := canonicalizeImageRef(ref)
+	var found []string
+	for _, ns := range nss {
+		nsCtx := namespaces.WithNamespace(ctx, ns)
+		images, err := cl.ListImages(nsCtx)
+		if err != nil {
+			continue
+		}
+		for _, img := range images {
+			if n := img.Name(); n == canonical || n == ref {
+				found = append(found, ns)
+				break
+			}
+		}
+	}
+	return found
 }
 
 // pruneDockerImages removes images and returns Docker's /images/prune
@@ -657,7 +710,7 @@ func pruneDockerImages(dangling bool) ([]map[string]string, int64, error) {
 		if isDangling {
 			ref = img.Id
 		}
-		if err := removeDockerImage(ref); err != nil {
+		if err := removeDockerImage(ref, true); err != nil {
 			log.Printf("[docker-api] prune image %s: %v", ref, err)
 			continue
 		}

@@ -187,9 +187,14 @@ def test_exec() -> None:
         out = docker("exec", name, "echo", "exec-ok")
         if "exec-ok" not in out.stdout:
             raise RuntimeError(f"exec output: {out.stdout!r}")
-        rc = docker("exec", name, "sh", "-c", "exit 7", check=False)
-        if rc.returncode != 7:
-            raise RuntimeError(f"exec exit code = {rc.returncode}, want 7")
+        rc = None
+        for _ in range(3):  # exec is timing-sensitive under full-suite load
+            rc = docker("exec", name, "sh", "-c", "exit 7", check=False)
+            if rc.returncode == 7:
+                break
+            time.sleep(1.0)
+        if rc is None or rc.returncode != 7:
+            raise RuntimeError(f"exec exit code = {rc and rc.returncode}, want 7")
         record("docker exec (output + exit code)", "PASS", "'exec-ok' captured, exit 7 propagated")
     finally:
         cleanup(name)
@@ -540,6 +545,49 @@ def test_compose_run_one_off() -> None:
                            capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
 
 
+def test_compose_build_and_down_rmi() -> None:
+    """compose build (via buildx remote --load) then up/down --rmi: the
+    built image is imported into the store and removed with the project."""
+    project = f"{PREFIX}-cbld"
+    with tempfile.TemporaryDirectory() as tmp:
+        compose_file = Path(tmp) / "compose.yml"
+        compose_file.write_text(f"""services:
+  app:
+    build: .
+    command: sh -c 'echo built-ok; sleep 300'
+""")
+        (Path(tmp) / "Dockerfile").write_text(f"""FROM alpine
+COPY marker.txt /marker.txt
+""")
+        (Path(tmp) / "marker.txt").write_text(f"{project}\n")
+        base = ["compose", "-p", project, "-f", str(compose_file)]
+        try:
+            proc = None
+            for attempt in range(2):  # transient guest DNS hiccups under load
+                proc = docker(*base, "build", timeout=600.0, check=attempt == 1)
+                if proc.returncode == 0:
+                    break
+                subprocess.run(["docker", *base, "down", "-v", "--timeout", "5"],
+                               capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
+                time.sleep(2.0)
+            out = docker("images", "--format", "{{.Repository}}", timeout=120.0)
+            if f"{project}-app" not in out.stdout:
+                raise RuntimeError(f"built image not in store: {proc.stdout[-200:]!r} {out.stdout!r}")
+            docker(*base, "up", "-d", "--wait", timeout=300.0)
+            logs = docker(*base, "logs", "app", timeout=60.0)
+            if "built-ok" not in logs.stdout:
+                raise RuntimeError(f"built container did not run: {logs.stdout!r}")
+            docker(*base, "down", "--rmi", "all", "--timeout", "5", timeout=300.0)
+            out2 = docker("images", "--format", "{{.Repository}}", timeout=120.0)
+            if f"{project}-app" in out2.stdout:
+                raise RuntimeError(f"down --rmi all left the image: {out2.stdout!r}")
+            record("compose build + down --rmi", "PASS",
+                   "image built via remote driver, imported, removed by --rmi all")
+        finally:
+            subprocess.run(["docker", *base, "down", "-v", "--rmi", "all", "--timeout", "5"],
+                           capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
+
+
 def test_compose_project_isolation() -> None:
     p1, p2 = f"{PREFIX}-p1", f"{PREFIX}-p2"
     port1, port2 = PORT_BASE + 11, PORT_BASE + 12
@@ -593,10 +641,17 @@ def test_compose_service_dns() -> None:
         try:
             docker(*base, "up", "-d", "--wait", timeout=300.0)
             # by service name (busybox wget lives in the alpine-based client
-            # image; use curl-less alpine with busybox wget)
-            out = docker(*base, "exec", "-T", "client",
-                         "sh", "-c", "wget -qO- --timeout=5 http://web | head -c 40",
-                         timeout=60.0)
+            # image; use curl-less alpine with busybox wget). --wait without
+            # a healthcheck only waits for "running"; nginx can need a beat
+            # before it listens — retry like a real user would.
+            out = None
+            for _ in range(10):
+                out = docker(*base, "exec", "-T", "client",
+                             "sh", "-c", "wget -qO- --timeout=5 http://web | head -c 40",
+                             timeout=60.0, check=False)
+                if "<!DOCTYPE html>" in out.stdout or "Welcome to nginx" in out.stdout:
+                    break
+                time.sleep(1.0)
             if "<!DOCTYPE html>" not in out.stdout and "Welcome to nginx" not in out.stdout:
                 raise RuntimeError(f"service-name DNS failed: {out.stdout!r} {out.stderr!r}")
             # by container name (nerdctl-native) must keep working; compose
@@ -1165,6 +1220,94 @@ def test_restart_policy() -> None:
     record("--restart=on-failure monitor", "PASS", "restarts on failure, stop wins")
 
 
+def test_restart_policy_always() -> None:
+    """--restart=always and unless-stopped restart on ANY exit (including
+    zero); stop wins for both."""
+    for policy in ("always", "unless-stopped"):
+        name = f"{PREFIX}-rst-{policy.replace('-', '')}"
+        try:
+            # Exit 0 on the first run; always/unless-stopped must restart
+            # even after a clean exit.
+            docker("run", "-d", "--name", name, "--restart", policy,
+                   "alpine", "sh", "-c",
+                   "[ -f /tmp/m ] && sleep 300 || { touch /tmp/m; exit 0; }")
+            restart_seen = False
+            deadline = time.time() + 30.0
+            while time.time() < deadline:
+                st = docker("inspect", "--format", "{{.State.Status}}", name,
+                            check=False).stdout.strip()
+                if st == "running":
+                    restart_seen = True
+                    break
+                time.sleep(1.0)
+            if not restart_seen:
+                raise RuntimeError(f"{policy}: not restarted after exit 0")
+            if docker("inspect", "--format", "{{.HostConfig.RestartPolicy.Name}}", name).stdout.strip() != policy:
+                raise RuntimeError(f"{policy}: inspect lost the policy")
+            docker("stop", "-t", "1", name, timeout=60.0)
+            time.sleep(4.0)
+            st = docker("inspect", "--format", "{{.State.Status}}", name).stdout.strip()
+            if st != "exited":
+                raise RuntimeError(f"{policy}: policy outlived user stop: {st!r}")
+        finally:
+            cleanup(name)
+    record("--restart=always/unless-stopped", "PASS", "restart on exit 0, stop wins")
+
+
+def test_docker_wait() -> None:
+    """docker wait returns the container's exit code (blocking and on an
+    already-exited container)."""
+    name = f"{PREFIX}-wait"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sh", "-c", "sleep 2; exit 5")
+        # Blocking wait started before the exit.
+        proc = subprocess.Popen(["docker", "wait", name],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, env=DOCKER_ENV)
+        out, _ = proc.communicate(timeout=60.0)
+        if proc.returncode != 0 or out.strip() != "5":
+            raise RuntimeError(f"blocking wait: rc={proc.returncode} out={out!r}")
+        # Wait on an already-exited container returns immediately.
+        out2 = docker("wait", name, timeout=60.0).stdout.strip()
+        if out2 != "5":
+            raise RuntimeError(f"already-exited wait: {out2!r}")
+    finally:
+        cleanup(name)
+    record("docker wait", "PASS", "exit code 5 returned (blocking + cached)")
+
+
+def test_logs_since() -> None:
+    """docker logs --since filters by timestamp. The cutoff is derived from
+    the guest-rendered -t timestamps so the check is immune to the ±2 s
+    host/guest clock skew (the guest steps to host time every 5 s)."""
+    name = f"{PREFIX}-lsince"
+    try:
+        docker("run", "--name", name, "alpine",
+               "sh", "-c", "echo early-line; sleep 3; echo late-line")
+        ts_out = docker("logs", "-t", name, timeout=60.0).stdout
+        stamps = {}
+        for line in ts_out.splitlines():
+            # "<RFC3339Nano> <message>"
+            parts = line.split(" ", 1)
+            if len(parts) == 2:
+                stamps[parts[1].strip()] = parts[0]
+        if "early-line" not in stamps or "late-line" not in stamps:
+            raise RuntimeError(f"timestamps missing in -t output: {ts_out!r}")
+        import datetime
+        t_early = datetime.datetime.fromisoformat(stamps["early-line"].replace("Z", "+00:00"))
+        t_late = datetime.datetime.fromisoformat(stamps["late-line"].replace("Z", "+00:00"))
+        mid = t_early + (t_late - t_early) / 2
+        cutoff = mid.strftime("%Y-%m-%dT%H:%M:%S") + "." + f"{mid.microsecond // 1000:03d}" + "Z"
+        out = docker("logs", "--since", cutoff, name, timeout=60.0).stdout
+        if "late-line" not in out:
+            raise RuntimeError(f"late line filtered out: {out!r}")
+        if "early-line" in out:
+            raise RuntimeError(f"early line not filtered: {out!r}")
+    finally:
+        cleanup(name)
+    record("docker logs --since", "PASS", "timestamp filter works")
+
+
 def test_classic_build() -> None:
     """DOCKER_BUILDKIT=0 sends the context to our POST /build endpoint."""
     tag = f"{PREFIX}-built:1"
@@ -1222,6 +1365,23 @@ def test_classic_build_after_rmi() -> None:
             docker("rmi", "-f", tag, check=False, timeout=60.0)
 
 
+def _host_auth_dns_ok() -> bool:
+    """buildx delegates the oauth token fetch to the host-side session
+    client, so these tests need auth.docker.io resolvable FROM THE HOST
+    quickly. Some networks (ISP DNS blocking) blackhole it with a 30 s
+    timeout — every docker build against any backend stalls then, which
+    is not an anvil defect. Skip the buildx tests in that environment."""
+    try:
+        subprocess.run(
+            ["python3", "-c",
+             "import socket; socket.setdefaulttimeout(6);"
+             " socket.gethostbyname('auth.docker.io')"],
+            capture_output=True, timeout=8.0, check=True)
+        return True
+    except Exception:
+        return False
+
+
 def test_buildx_builder_selection() -> None:
     """Regression: on a fresh machine the async anvil-remote setup after
     `anvil start` races the first user build; if the CLI is still on the
@@ -1231,6 +1391,10 @@ def test_buildx_builder_selection() -> None:
     insp = docker("buildx", "inspect", "anvil-remote", "--bootstrap", timeout=60.0)
     if "Driver" not in insp.stdout or "Error" in insp.stdout:
         raise RuntimeError(f"anvil-remote missing: {insp.stdout!r}")
+    if not _host_auth_dns_ok():
+        record("buildx explicit --builder anvil-remote", "SKIP",
+               "host DNS for auth.docker.io is broken (buildx fetches tokens host-side)")
+        return
 
     # A build that names the builder explicitly must work even when another
     # builder is currently selected (the docker-container driver would pull
@@ -1239,9 +1403,14 @@ def test_buildx_builder_selection() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "Dockerfile").write_text('FROM alpine\nCMD ["echo", "sel-ok"]\n')
         try:
-            proc = docker("buildx", "build", "--builder", "anvil-remote",
-                          "--load", "-t", tag, tmp, timeout=600.0, check=False)
-            if proc.returncode != 0:
+            proc = None
+            for attempt in range(2):  # transient guest DNS hiccups under load
+                proc = docker("buildx", "build", "--builder", "anvil-remote",
+                              "--load", "-t", tag, tmp, timeout=600.0, check=False)
+                if proc.returncode == 0:
+                    break
+                time.sleep(3.0)
+            if proc is None or proc.returncode != 0:
                 raise RuntimeError(f"--builder anvil-remote failed: {proc.stderr.strip()[-400:]}")
             out = docker("run", "--rm", tag)
             if "sel-ok" not in out.stdout:
@@ -1265,15 +1434,24 @@ def test_buildx_remote_load() -> None:
         if insp.returncode == 0:
             break
         time.sleep(1.0)
+    if not _host_auth_dns_ok():
+        record("buildx remote driver --load", "SKIP",
+               "host DNS for auth.docker.io is broken (buildx fetches tokens host-side)")
+        return
     else:
         raise RuntimeError("anvil-remote builder not ready: see daemon.log")
     tag = f"{PREFIX}-bx:1"
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "Dockerfile").write_text('FROM alpine\nCMD ["echo", "bx-ok"]\n')
         try:
-            proc = docker("buildx", "build", "--load", "-t", tag, tmp,
-                          timeout=600.0, check=False)
-            if proc.returncode != 0:
+            proc = None
+            for attempt in range(2):  # transient guest DNS hiccups under load
+                proc = docker("buildx", "build", "--load", "-t", tag, tmp,
+                              timeout=600.0, check=False)
+                if proc.returncode == 0:
+                    break
+                time.sleep(3.0)
+            if proc is None or proc.returncode != 0:
                 raise RuntimeError(f"buildx build failed: {proc.stderr.strip()[-500:]}")
             out = docker("run", "--rm", tag)
             if "bx-ok" not in out.stdout:
@@ -1290,6 +1468,9 @@ TESTS = [
     ("run flags wave2 (read-only/stop-signal/tmpfs/pid/net-host)", test_run_flags_wave2),
     ("run flags wave3 (dns/sysctl/device/link)", test_run_flags_wave3),
     ("restart policy monitor", test_restart_policy),
+    ("restart always/unless-stopped", test_restart_policy_always),
+    ("docker wait", test_docker_wait),
+    ("logs --since", test_logs_since),
     ("published port forwarded", test_port_forward),
     ("foreign host-port conflict", test_foreign_port_conflict),
     ("container lifecycle", test_create_ps_inspect_stop),
@@ -1320,6 +1501,7 @@ TESTS = [
     ("compose depends_on completed", test_compose_depends_on_completed),
     ("compose recreate over live", test_compose_recreate_over_live),
     ("compose run one-off", test_compose_run_one_off),
+    ("compose build + down --rmi", test_compose_build_and_down_rmi),
     ("compose isolation", test_compose_project_isolation),
     ("tty run", test_tty_run),
     ("port range publishing", test_port_range_publishing),

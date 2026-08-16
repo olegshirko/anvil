@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os/exec"
@@ -24,6 +25,18 @@ const dockerMinAPIVersion = "1.24"
 
 // writeDockerStream writes a Docker multiplexed stream frame.
 // streamType: 0=stdin, 1=stdout, 2=stderr.
+// unixToRFC3339 converts a unix-seconds timestamp (the form the docker CLI
+// sends for logs since/until) to RFC3339. Returns "" when the input is not
+// a plain number (RFC3339 or a relative duration pass through as is).
+func unixToRFC3339(raw string) string {
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return ""
+	}
+	sec, frac := math.Modf(f)
+	return time.Unix(int64(sec), int64(frac*1e9)).UTC().Format(time.RFC3339Nano)
+}
+
 func writeDockerStream(w io.Writer, streamType byte, data []byte) error {
 	header := make([]byte, 8)
 	header[0] = streamType
@@ -270,6 +283,20 @@ func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
 	follow := r.URL.Query().Get("follow") == "1" || r.URL.Query().Get("follow") == "true"
 	if follow {
 		args = append(args, "-f")
+	}
+	// since/until: the docker CLI sends unix timestamps (possibly with
+	// fractional seconds); nerdctl expects RFC3339 or a relative duration.
+	for param, flag := range map[string]string{"since": "--since", "until": "--until"} {
+		v := r.URL.Query().Get(param)
+		if v == "" {
+			continue
+		}
+		if rfc := unixToRFC3339(v); rfc != "" {
+			args = append(args, flag, rfc)
+		} else {
+			// Already a timestamp or a relative duration nerdctl understands.
+			args = append(args, flag, v)
+		}
 	}
 	// tail=N: buffer the replayed output and emit only the last N lines.
 	// nerdctl has no --tail; implemented post-hoc on the replayed output
@@ -545,7 +572,8 @@ func runDockerAPIServer() {
 				return
 			}
 		case isRMI:
-			if err := removeDockerImage(rmiName); err != nil {
+			// force=1 is docker rmi -f (compose down --rmi sends it).
+			if err := removeDockerImage(rmiName, r.URL.Query().Get("force") == "1"); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
 			}

@@ -306,6 +306,21 @@ Done while investigating `docker load` and during the speed iteration
    `/build/prune` runs `buildctl prune` over the buildkit socket
    (buildkitd is NOT started for it — no daemon, no cache) and parses the
    reclaimed value from the `Total:` line.
+5. ~~**Docker CLI compatibility waves**~~ — done (v1.0.51–v1.0.54).
+   Progressive hardening driven by the integration suite, in waves:
+   entrypoint/workdir/add-host/memory/caps; read-only/stop-signal/tmpfs/
+   pid:host/net:host; dns/sysctls/devices; `--link name:alias` (legacy
+   links are plain /etc/hosts records — applied at start via the same
+   mechanism as compose service aliases, since nerdctl has none);
+   `--restart` policies (guest-agent restart monitor over the containerd
+   task state — nerdctl's own supervisor races Docker semantics, so the
+   flag is never passed to nerdctl); UDP port publishing (`-p .../udp` via
+   a host-side datagram relay to `guestIP:hostPort`, where nerdctl arms
+   the persisted mapping with nft DNAT); `docker events` filters and
+   `--until`; `pause`/`top`/`stats`/`system df`. Along the way the API
+   handshake was fixed: `/_ping` now sends `Ostype`/`Api-Version` headers
+   (the CLI resolves the server OS from the ping header and downgrades to
+   the advertised version — must be >= 1.40 for compose).
 
 ## 4. Tests and CI
 

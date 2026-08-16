@@ -48,6 +48,7 @@ final class VMLifecycleManager: NSObject {
     /// Start the VM. Tries restore from snapshot first; falls back to cold boot.
     func start() {
         writeHostTimeFile()
+        startHostTimeRefresher()
         configureAndCreateVM { [weak self] result in
             guard let self = self else { return }
             switch result {
@@ -113,6 +114,7 @@ final class VMLifecycleManager: NSObject {
         // resume: while paused the guest clock is frozen, and the file from
         // start() is stale by the whole paused interval.
         writeHostTimeFile()
+        startHostTimeRefresher()
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let vm = self.vm else {
                 completion(.success(()))
@@ -212,6 +214,22 @@ final class VMLifecycleManager: NSObject {
             try? Data(entropy).write(to: shareURL.appendingPathComponent(".anvil-host-entropy"), options: .atomic)
         }
     }
+
+    /// Keep refreshing the host time file while the VM is alive: the guest
+    /// RTC ticks at an unreliable rate under VZ, and each idle-pause/resume
+    /// cycle adds the paused interval to the drift. The guest polls the file
+    /// every 5 s and steps its clock forward when it runs more than 1 s
+    /// behind; refreshing every 2 s bounds the residual drift to ~2 s.
+    private func startHostTimeRefresher() {
+        guard hostTimeTimer == nil else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.hostTimeTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+                self?.writeHostTimeFile()
+            }
+        }
+    }
+
+    private var hostTimeTimer: Timer?
 
     private func configureAndCreateVM(completion: @escaping (Result<VZVirtualMachine, Error>) -> Void) {
         DispatchQueue.main.async { [weak self] in

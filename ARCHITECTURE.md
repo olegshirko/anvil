@@ -144,6 +144,12 @@ mappings to `vz-runner`. `PortForwarder`:
   the proxy dials the CNI address from inside the guest, where it is
   reachable — the host has no route into 10.10.x). Mappings from older
   guests without a container IP fall back to dialing `guestIP:hostPort`;
+- for `udp` mappings opens a SOCK_DGRAM listener instead: datagrams are
+  relayed to `guestIP:hostPort` with one connected socket per client
+  endpoint (60 s idle reaping). No guest-side proxy is needed — nerdctl
+  arms the persisted portMappings at start (a reservation socket plus nft
+  DNAT hostPort→containerPort in the guest's root netns), and vzNAT
+  delivers host→guest UDP to the bound port;
 - on every push does a full-state replace: new ports are opened, gone ports
   are closed;
 - logs a conflict when it fails to open an already taken port.
@@ -190,17 +196,27 @@ response contains stdout/stderr/exit_code. Used as the CLI control plane.
 An HTTP/1.1 server emulating the subset of the Docker API needed by
 `docker` and `docker compose`:
 
-- `/_ping`, `/version`;
-- `/containers/*` create/start/stop/wait/rm/attach/logs/exec/inspect/archive;
-- `/images/*` create/json/inspect/tag/push/rmi;
-- `/networks/*` create/inspect/list/rm/prune;
-- `/volumes/*` create/inspect/list/rm/prune.
+- `/_ping`, `/version`, `/info`;
+- `/containers/*` create/start/stop/kill/restart/pause/unpause/wait/rm/
+  attach/logs/exec/inspect/rename/archive/top/stats;
+- `/images/*` create/json/inspect/tag/push/rmi/get/save/load/prune;
+- `/networks/*` create/inspect/list/connect/disconnect/rm/prune;
+- `/volumes/*` create/inspect/list/rm/prune;
+- `/build` (classic path via `nerdctl build`) and `/build/prune`;
+- `/events` (live stream with filters and `until`; no historical replay —
+  there is no event log);
+- `/system/df`, `/system/prune`.
 
 Notable details:
 
 - The Docker container ID is a deterministic
   `sha256(namespace + "/" + containerdID)[:64]`, so the ID does not change
   between sessions.
+- `/_ping` must return the `Ostype` and `Api-Version` headers: the docker
+  CLI reads the server OS from the ping header (without it, `docker run
+  --device` fails client-side with "unknown server OS"), and the client
+  downgrades to the advertised API version — which must be modern enough
+  for compose (>= 1.40). We advertise 1.51 with a minimum of 1.24.
 - `POST /containers/{id}/wait` sends the HTTP headers immediately (chunked
   encoding) and only then blocks until the container exits. This is needed
   because the Docker CLI calls `/wait` before `/start`, and if the response
@@ -210,6 +226,16 @@ Notable details:
   the guest-agent removes the container itself after the exit code has been
   saved — otherwise `docker run --rm` could not return a non-zero exit
   code.
+- `--restart` policies are NOT passed to nerdctl either: nerdctl/containerd
+  arm their own supervisor that races the Docker semantics (it re-starts
+  containers the user stopped, since stop looks like exit 143 =
+  failure). The guest-agent's restart monitor (`restart.go`) owns the
+  policy: it reads the authoritative task state from containerd (nerdctl's
+  inspect reports `Status:""`/`Restarting` for policy containers),
+  restarts with an exponential backoff that resets once the container is
+  observed running, and clears the policy on any user stop/kill/rm.
+  `docker inspect` reports `RestartPolicy`/`RestartCount` from the
+  monitor's registry.
 - On a hijacked exec/attach connection the client's stdin is always a raw
   byte stream (only the output is multiplexed). It must be forwarded to the
   process as is: the buildx docker-container driver runs gRPC through
