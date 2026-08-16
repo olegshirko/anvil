@@ -224,6 +224,10 @@ private final class Listener {
     func start(onFailure: @escaping () -> Void) {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
+            if (self.mapping.protocol ?? "tcp") == "udp" {
+                self.startUDP(onFailure: onFailure)
+                return
+            }
             let fd = socket(AF_INET6, SOCK_STREAM, 0)
             guard fd >= 0 else {
                 print("[listener :\(self.mapping.hostPort)] socket failed")
@@ -289,8 +293,201 @@ private final class Listener {
             fd = -1
         }
         lock.unlock()
+        udpClientsLock.lock()
+        for (_, c) in udpClients {
+            close(c.fd)
+        }
+        udpClients.removeAll()
+        udpClientsLock.unlock()
         // Closing the listener fd is enough to unblock accept; relay sockets will be
         // closed when the next read/write fails.
+    }
+
+    // MARK: - UDP relay
+
+    // One datagram socket per host port; for every distinct client endpoint
+    // a connected socket toward the guest target is created, and datagrams
+    // are pumped in both directions. VZ NAT passes host->guest UDP, and the
+    // target is the container's CNI address (containerIP:containerPort) —
+    // reachable from the host for UDP via the NAT gateway, unlike TCP, which
+    // needs the in-guest port proxy. Client sockets idle out after 60 s.
+    private struct UDPClient {
+        let fd: Int32
+        var lastUsed: Date
+    }
+
+    private var udpClients: [String: UDPClient] = [:]
+    private let udpClientsLock = NSLock()
+    private let udpIdleTimeout: TimeInterval = 60
+
+    /// Stable dictionary key for a client address: the raw socket bytes.
+    private func udpKey(_ addr: sockaddr_in6) -> String {
+        withUnsafeBytes(of: addr) { raw in
+            raw.map { String($0) }.joined(separator: ",")
+        }
+    }
+
+    private func startUDP(onFailure: @escaping () -> Void) {
+        // Published UDP ports are served by the guest itself: nerdctl arms
+        // the persisted portMappings (network-config.json) at start — a
+        // reservation socket plus nft DNAT hostPort -> containerPort in the
+        // guest's root netns. The host side therefore only needs a datagram
+        // listener forwarding to guestIP:hostPort, which vzNAT delivers.
+        guard !mapping.guestIP.isEmpty else {
+            print("[listener :\(mapping.hostPort)/udp] no guest IP; refusing to start")
+            onFailure()
+            return
+        }
+        let fd = socket(AF_INET6, SOCK_DGRAM, 0)
+        guard fd >= 0 else {
+            onFailure()
+            return
+        }
+        var off: Int32 = 0
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, socklen_t(MemoryLayout<Int32>.size))
+        var reuse: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        // Wake the recvfrom loop regularly so replies can be pumped even
+        // when no new client datagrams arrive.
+        var tv = timeval(tv_sec: 0, tv_usec: 250_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_in6()
+        addr.sin6_family = sa_family_t(AF_INET6)
+        addr.sin6_port = in_port_t(mapping.hostPort).bigEndian
+        addr.sin6_addr = in6addr_any
+        let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            print("[listener :\(mapping.hostPort)/udp] bind failed: \(String(cString: strerror(errno)))")
+            close(fd)
+            onFailure()
+            return
+        }
+        lock.lock()
+        self.fd = fd
+        lock.unlock()
+        let targetIP = mapping.guestIP
+        let targetPort = mapping.hostPort
+        print("[port-forwarder] forwarding localhost:\(mapping.hostPort)/udp -> \(targetIP):\(targetPort) (guest relay)")
+        udpRelayLoop(fd, targetIP: targetIP, targetPort: targetPort)
+    }
+
+    private func udpRelayLoop(_ fd: Int32, targetIP: String, targetPort: Int) {
+        var buffer = [UInt8](repeating: 0, count: 65536)
+        while isRunning {
+            var src = sockaddr_in6()
+            var srcLen = socklen_t(MemoryLayout<sockaddr_in6>.size)
+            let n = withUnsafeMutablePointer(to: &src) { ptr -> Int in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    recvfrom(fd, &buffer, buffer.count, 0, $0, &srcLen)
+                }
+            }
+            if n > 0 {
+                let clientFd = udpClientFd(for: src, targetIP: targetIP, targetPort: targetPort)
+                if clientFd >= 0 {
+                    _ = buffer.withUnsafeBufferPointer { ptr in
+                        send(clientFd, ptr.baseAddress, n, 0)
+                    }
+                }
+            } else if n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
+                break
+            }
+            pumpUDPReplies(fd: fd)
+            reapIdleUDPClients()
+        }
+    }
+
+    /// Drains pending inbound datagrams from every per-client guest socket
+    /// and sends them back to the remembered client via the shared socket.
+    private func pumpUDPReplies(fd: Int32) {
+        udpClientsLock.lock()
+        let clients = udpClients
+        let keysByFd = Dictionary(uniqueKeysWithValues: udpClients.map { ($0.value.fd, $0.key) })
+        udpClientsLock.unlock()
+        var buffer = [UInt8](repeating: 0, count: 65536)
+        for (key, c) in clients {
+            while true {
+                let n = recv(c.fd, &buffer, buffer.count, MSG_DONTWAIT)
+                if n <= 0 { break }
+                if let client = udpClientAddr(for: key) {
+                    _ = withUnsafePointer(to: client) { ptr in
+                        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                            sendto(fd, &buffer, n, 0, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+                        }
+                    }
+                }
+                markUDPActive(key)
+            }
+        }
+    }
+
+    /// Reconstructs a sockaddr_in6 from its dictionary key (inverse of udpKey).
+    private func udpClientAddr(for key: String) -> sockaddr_in6? {
+        var addr = sockaddr_in6()
+        let parts = key.split(separator: ",").compactMap { UInt8($0) }
+        guard parts.count == MemoryLayout<sockaddr_in6>.size else { return nil }
+        withUnsafeMutableBytes(of: &addr) { raw in
+            parts.withUnsafeBufferPointer { src in
+                raw.copyBytes(from: src)
+            }
+        }
+        return addr
+    }
+
+    /// Returns (creating if needed) a connected socket to the guest target
+    /// for the given client endpoint.
+    private func udpClientFd(for client: sockaddr_in6, targetIP: String, targetPort: Int) -> Int32 {
+        let key = udpKey(client)
+        udpClientsLock.lock()
+        if let c = udpClients[key], c.fd >= 0 {
+            udpClients[key]?.lastUsed = Date()
+            udpClientsLock.unlock()
+            return c.fd
+        }
+        udpClientsLock.unlock()
+
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { return -1 }
+        var target = sockaddr_in()
+        target.sin_family = sa_family_t(AF_INET)
+        target.sin_port = in_port_t(targetPort).bigEndian
+        guard targetIP.withCString({ inet_pton(AF_INET, $0, &target.sin_addr) }) == 1 else {
+            close(fd)
+            return -1
+        }
+        let connected = withUnsafePointer(to: &target) { ptr -> Bool in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+        guard connected else {
+            close(fd)
+            return -1
+        }
+        udpClientsLock.lock()
+        udpClients[key] = UDPClient(fd: fd, lastUsed: Date())
+        udpClientsLock.unlock()
+        return fd
+    }
+
+    private func markUDPActive(_ key: String) {
+        udpClientsLock.lock()
+        udpClients[key]?.lastUsed = Date()
+        udpClientsLock.unlock()
+    }
+
+    private func reapIdleUDPClients() {
+        udpClientsLock.lock()
+        let now = Date()
+        for (k, c) in udpClients where now.timeIntervalSince(c.lastUsed) > udpIdleTimeout {
+            close(c.fd)
+            udpClients.removeValue(forKey: k)
+        }
+        udpClientsLock.unlock()
     }
 
     private var isRunning: Bool {

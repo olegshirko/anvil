@@ -67,6 +67,10 @@ type dockerHostConfig struct {
 	ReadonlyRootfs  bool                        `json:"ReadonlyRootfs"`
 	PidMode         string                      `json:"PidMode"`
 	TmpFs           map[string]string           `json:"Tmpfs"`
+	Dns             []string                    `json:"Dns"`
+	Sysctls         map[string]string           `json:"Sysctls"`
+	Devices         []dockerDevice              `json:"Devices"`
+	Links           []string                    `json:"Links"`
 }
 
 type dockerHostPort struct {
@@ -79,6 +83,12 @@ type dockerMount struct {
 	Source   string `json:"Source"`
 	Target   string `json:"Target"`
 	ReadOnly bool   `json:"ReadOnly"`
+}
+
+type dockerDevice struct {
+	PathOnHost        string `json:"PathOnHost"`
+	PathInContainer   string `json:"PathInContainer"`
+	CgroupPermissions string `json:"CgroupPermissions"`
 }
 
 type dockerRestartPolicy struct {
@@ -349,6 +359,8 @@ type dockerContainerInspect struct {
 	Config          dockerContainerConfig `json:"Config"`
 	HostConfig      dockerHostConfig      `json:"HostConfig"`
 	NetworkSettings dockerNetworkSettings `json:"NetworkSettings"`
+	// Docker exposes RestartCount at the top level (not under State).
+	RestartCount int `json:"RestartCount"`
 }
 
 type dockerContainerState struct {
@@ -618,9 +630,10 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 	if req.HostConfig.Privileged {
 		args = append(args, "--privileged")
 	}
-	if req.HostConfig.RestartPolicy.Name != "" {
-		args = append(args, "--restart", req.HostConfig.RestartPolicy.Name)
-	}
+	// Restart policy is NOT passed to nerdctl: nerdctl/containerd arms its
+	// own supervisor that races our monitor and re-restarts containers the
+	// user stopped (on-failure sees exit 143 from stop). Our monitor in
+	// restart.go owns the policy; inspect reports it from the registry.
 	// Entrypoint override (docker run --entrypoint, compose entrypoint:).
 	// nerdctl's --entrypoint is a single binary path, while Docker allows a
 	// list ([bin, args...]). Translate: first element becomes --entrypoint,
@@ -670,6 +683,26 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 			spec += ":" + opts
 		}
 		args = append(args, "--tmpfs", spec)
+	}
+	// Custom DNS servers (docker --dns / compose dns:).
+	for _, d := range req.HostConfig.Dns {
+		args = append(args, "--dns", d)
+	}
+	// Namespaced kernel parameters (docker --sysctl / compose sysctls:).
+	for k, v := range req.HostConfig.Sysctls {
+		args = append(args, "--sysctl", k+"="+v)
+	}
+	// Device passthrough (docker --device). nerdctl uses the same
+	// host[:container] syntax.
+	for _, d := range req.HostConfig.Devices {
+		if d.PathOnHost == "" {
+			continue
+		}
+		spec := d.PathOnHost
+		if d.PathInContainer != "" && d.PathInContainer != d.PathOnHost {
+			spec += ":" + d.PathInContainer
+		}
+		args = append(args, "--device", spec)
 	}
 
 	// Bind mounts and named volumes. Host paths under /Users are visible in
@@ -811,6 +844,18 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 	// Remember compose service aliases for the start-time /etc/hosts update.
 	if aliases := requestedNetworkAliases(req); len(aliases) > 0 {
 		setNetworkAliases(dockerID, aliases)
+	}
+	// Remember docker --link specs for the start-time hosts update.
+	if len(req.HostConfig.Links) > 0 {
+		setContainerLinks(dockerID, req.HostConfig.Links)
+	}
+	// Register the restart policy with our monitor (nerdctl has none).
+	if spec := req.HostConfig.RestartPolicy.Name; spec != "" {
+		p := parseRestartPolicy(spec)
+		if p.max < 0 && req.HostConfig.RestartPolicy.MaximumRetryCount > 0 {
+			p.max = req.HostConfig.RestartPolicy.MaximumRetryCount
+		}
+		restarts.register(dockerID, p.name, p.max)
 	}
 	// Remember TTY for attach (raw stream) and inspect responses.
 	setContainerTTY(dockerID, req.Tty)
@@ -1014,6 +1059,14 @@ func startDockerContainer(id string) error {
 		}
 	}
 
+	// docker --link: append alias -> target-IP entries to THIS container's
+	// /etc/hosts BEFORE the task runs, so the very first lookup inside the
+	// container already resolves (legacy link semantics are plain /etc/hosts
+	// records). nerdctl prepares the hosts file at create; the post-start
+	// application below covers restarts and any nerdctl rewrites.
+	if links := pendingLinkEntries(dockerID(ns, containerdID)); len(links) > 0 {
+		applyLinkAliases(ns, containerdID, links)
+	}
 	stdout, stderr, code, err := runNerdctl(ns, "start", containerdID)
 	if err != nil || code != 0 {
 		return fmt.Errorf("nerdctl start failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
@@ -1024,6 +1077,11 @@ func startDockerContainer(id string) error {
 	// dependencies by name (`db`, `web`), not by container name.
 	if len(pendingNetworkAliases(containerdID)) > 0 {
 		go applyNetworkAliases(ns, containerdID)
+	}
+	// docker --link: append alias -> target-IP entries to THIS container's
+	// /etc/hosts (legacy link semantics are plain /etc/hosts records).
+	if links := pendingLinkEntries(dockerID(ns, containerdID)); len(links) > 0 {
+		go applyLinkAliases(ns, containerdID, links)
 	}
 	// Re-attach the health monitor after a stop/start cycle.
 	did := dockerID(ns, containerdID)
@@ -1059,6 +1117,10 @@ func stopDockerContainer(id string, timeout int) error {
 		return err
 	}
 	did := dockerID(ns, containerdID)
+	// A user stop wins over any restart policy: drop it before signalling
+	// so the restart monitor cannot race a restart between the exit and
+	// the cleanup below.
+	restarts.clear(did)
 	args := []string{"stop"}
 	if timeout > 0 {
 		args = append(args, "-t", strconv.Itoa(timeout))
@@ -1098,6 +1160,7 @@ func stopDockerContainer(id string, timeout int) error {
 	}
 
 	stopHealthCheck(did)
+	restarts.clear(did)
 	return nil
 }
 
@@ -1229,6 +1292,7 @@ func deleteDockerContainer(id string, force bool) error {
 		}
 	}
 	stopHealthCheck(did)
+	restarts.clear(did)
 	unmarkAutoRemove(did)
 	takeContainerExitCode(did)
 	return nil
@@ -1258,6 +1322,8 @@ func killDockerContainer(id string, signal string) error {
 	if err != nil {
 		return err
 	}
+	// A user signal wins over any restart policy (see stopDockerContainer).
+	restarts.clear(dockerID(ns, containerdID))
 	args := []string{"kill"}
 	if signal != "" {
 		args = append(args, "-s", signal)
@@ -1273,6 +1339,7 @@ func killDockerContainer(id string, signal string) error {
 	if strings.EqualFold(signal, "SIGKILL") || signal == "9" || signal == "" {
 		cacheContainerExitCode(dockerID(ns, containerdID), 137)
 	}
+	restarts.clear(dockerID(ns, containerdID))
 	return nil
 }
 
@@ -1544,6 +1611,7 @@ func inspectDockerContainer(prefix string) (*dockerContainerInspect, error) {
 					ExitCode: exitCode,
 					Health:   getHealthState(did),
 				},
+				RestartCount: restarts.countFor(did),
 				Config: dockerContainerConfig{
 					Labels:      labels,
 					Image:       imageName,
@@ -1557,10 +1625,12 @@ func inspectDockerContainer(prefix string) (*dockerContainerInspect, error) {
 					StopSignal:  getContainerStopSignal(did),
 				},
 				HostConfig: dockerHostConfig{
-					AutoRemove:    isAutoRemove(did),
-					NetworkMode:   inspectDetails.HostConfig.NetworkMode,
-					PortBindings:  portBindingsFromStore(ns, c.ID()),
-					RestartPolicy: dockerRestartPolicy{},
+					AutoRemove:   isAutoRemove(did),
+					NetworkMode:  inspectDetails.HostConfig.NetworkMode,
+					PortBindings: portBindingsFromStore(ns, c.ID()),
+					// nerdctl never sees --restart (it arms its own supervisor
+					// that fights ours); report the policy from our registry.
+					RestartPolicy: restarts.policySpecFor(did),
 				},
 				NetworkSettings: dockerNetworkSettings{
 					IPAddress: containerIP,

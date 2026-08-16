@@ -89,6 +89,7 @@ func main() {
 	// them so they do not accumulate as zombies and deadlock containerd-shim.
 	go reapZombies()
 	go servePortProxy()
+	go runRestartMonitor()
 
 	// Recreate CNI conflists from the host share after a cold boot. nerdctl
 	// keeps network state on the persistent containerd disk, but the conflist

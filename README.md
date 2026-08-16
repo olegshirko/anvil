@@ -176,10 +176,8 @@ Key design points (the full rationale lives in
   build cache — add `--load` to import it into the image store (compose does
   this automatically). The buildx `docker-container` driver (which pulls a
   moby/buildkit image) does not work.
-- `--restart` policies are accepted but not enforced: there is no restart
-  monitor process in the VM, so a stopped container stays stopped.
-- UDP port publishing (`-p <port>:<port>/udp`) is not forwarded yet — only
-  TCP listeners are opened on the host.
+- `docker events --since` in the past replays nothing: there is no event
+  log, only live events are streamed (`--until` and filters work).
 - Docker API is emulated, not complete: it covers what `docker` CLI and
   `docker compose` actually use. Swarm, plugins and some prune endpoints are
   out of scope.
@@ -198,7 +196,7 @@ make test                    # smoke: build + --help
 Layout: `Sources/vz-runner/` (Swift host daemon, one file ≈ one component),
 `guest-agent/` (Go, organized by Docker API domain), `scripts/` (initramfs
 build + service wrapper), `bench-harness/` (benchmarks), `IMPROVEMENTS.md`
-(roadmap), `ARCHITECTURE.md` (design decisions, in Russian).
+(roadmap), `ARCHITECTURE.md` (design decisions).
 
 Releases: `make release VERSION=x.y.z` — tag, GitHub Actions build + codesign,
 Homebrew tap update.

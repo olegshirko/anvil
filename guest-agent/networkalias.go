@@ -117,6 +117,99 @@ func applyNetworkAliases(ns, containerdID string) {
 		ns, containerdID[:12], ip, aliases, len(matches))
 }
 
+// Container --link entries, remembered at create and applied at start
+// (the target may not have an IP before then).
+var containerLinks = struct {
+	mu sync.Mutex
+	m  map[string][]string // dockerID -> raw link specs ("name:alias")
+}{m: make(map[string][]string)}
+
+func setContainerLinks(dockerID string, links []string) {
+	containerLinks.mu.Lock()
+	if len(links) > 0 {
+		containerLinks.m[dockerID] = links
+	} else {
+		delete(containerLinks.m, dockerID)
+	}
+	containerLinks.mu.Unlock()
+}
+
+func pendingLinkEntries(dockerID string) []string {
+	containerLinks.mu.Lock()
+	defer containerLinks.mu.Unlock()
+	return containerLinks.m[dockerID]
+}
+
+// applyLinkAliases appends alias -> target-IP lines to this container's own
+// /etc/hosts bind mount (the legacy docker --link contract).
+func applyLinkAliases(ns, containerdID string, links []string) {
+	entries := linkAliases(ns, links)
+	if len(entries) == 0 {
+		return
+	}
+	hostsPath := filepath.Join(nerdctlStoreRoot, "*", "etchosts", ns, containerdID, "hosts")
+	matches, _ := filepath.Glob(hostsPath)
+	written := 0
+	for _, p := range matches {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		for _, e := range entries {
+			alias := strings.Fields(e)
+			if len(alias) == 2 && strings.Contains(content, alias[1]) {
+				continue
+			}
+			if !strings.HasSuffix(content, "\n") {
+				content += "\n"
+			}
+			content += e + "\n"
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			log.Printf("[net-alias] link write %s: %v", p, err)
+			continue
+		}
+		written++
+	}
+	if written == 0 {
+		// Hosts file not there yet (e.g. applied before create finalized);
+		// keep the entries pending for the post-start application.
+		return
+	}
+	setContainerLinks(dockerID(ns, containerdID), nil)
+	log.Printf("[net-alias] applied %d link aliases to %s/%s", len(entries), ns, containerdID[:12])
+}
+
+// linkAliases returns extra /etc/hosts entries (alias -> target IP) for the
+// docker --link flag: "name:alias" pairs referencing containers in the same
+// namespace. Returns entries to append to this container's hosts file.
+func linkAliases(ns string, links []string) []string {
+	var out []string
+	for _, l := range links {
+		// Docker sends "/target:/consumer/alias" (or "target:alias"); the
+		// link alias is the last path segment of the second part.
+		parts := strings.SplitN(l, ":", 2)
+		target := strings.TrimPrefix(parts[0], "/")
+		alias := target
+		if len(parts) == 2 && parts[1] != "" {
+			segs := strings.Split(strings.TrimPrefix(parts[1], "/"), "/")
+			if last := segs[len(segs)-1]; last != "" {
+				alias = last
+			}
+		}
+		tns, tid, _, err := resolveDockerID(target)
+		if err != nil {
+			continue
+		}
+		ip := containerAddress(tns, tid)
+		if ip != "" {
+			out = append(out, ip+"\t"+alias)
+		}
+	}
+	return out
+}
+
 // containerAddress returns the container's first CNI IPv4 address from the
 // nerdctl etchosts metadata (meta.json records the network config nerdctl's
 // CNI returned on start), falling back to nerdctl inspect.
