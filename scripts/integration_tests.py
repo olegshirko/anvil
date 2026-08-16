@@ -374,6 +374,39 @@ def test_events() -> None:
     record("docker events stream", "PASS", f"create/start/die observed: {types}")
 
 
+def test_events_filters_and_until() -> None:
+    """--filter (type/event/container/label) must drop non-matching events,
+    and an absolute future --until must terminate the stream (the CLI blocks
+    on it). Note: `--until +Ns` is NOT future — the docker CLI resolves it
+    as N seconds ago (historical dump), which correctly yields nothing."""
+    name = f"{PREFIX}-evf"
+    try:
+        docker("run", "-d", "--name", name, "--label", "anvil.test=evf",
+               "alpine", "sleep", "3")
+        until = int(time.time()) + 8
+        proc = subprocess.Popen(
+            ["docker", "events", "--format", "{{json .}}",
+             "--filter", "type=container", "--filter", "event=die",
+             "--filter", f"container={name}", "--filter", "label=anvil.test=evf",
+             "--until", str(until)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=DOCKER_ENV)
+        out, _ = proc.communicate(timeout=30.0)
+        if proc.returncode != 0:
+            raise RuntimeError(f"docker events exited {proc.returncode}: {out[-300:]!r}")
+        actions = []
+        for line in out.splitlines():
+            try:
+                actions.append(json.loads(line).get("Action", ""))
+            except json.JSONDecodeError:
+                continue
+        if actions != ["die"]:
+            raise RuntimeError(f"filtered events should be exactly [die], got {actions}")
+        record("docker events filters + --until", "PASS",
+               "only the matching die event streamed, stream terminated")
+    finally:
+        cleanup(name)
+
+
 def _compose_file(web_port: int) -> str:
     return f"""services:
   web:
@@ -553,6 +586,55 @@ def test_compose_service_dns() -> None:
                 raise RuntimeError(f"container-name DNS failed: {out2.stdout!r}")
             record("compose DNS by service name", "PASS",
                    "http://web and http://web-1 both resolve")
+        finally:
+            subprocess.run(["docker", *base, "down", "-v", "--timeout", "5"],
+                           capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
+
+
+def test_compose_depends_on_completed() -> None:
+    """depends_on with condition: service_completed_successfully — compose
+    waits for the dependency to exit 0 (via /wait) before starting the
+    dependent service."""
+    project = f"{PREFIX}-dep"
+    with tempfile.TemporaryDirectory() as tmp:
+        compose_file = Path(tmp) / "compose.yml"
+        compose_file.write_text("""services:
+  init:
+    image: alpine
+    command: echo init-done
+  app:
+    image: alpine
+    command: echo app-ok
+    depends_on:
+      init:
+        condition: service_completed_successfully
+""")
+        base = ["compose", "-p", project, "-f", str(compose_file)]
+        try:
+            proc = docker(*base, "up", "--no-color", timeout=300.0)
+            # compose's log multiplexer can drop the interleaved service
+            # line; "app-1 exited with code 0" proves the dependent started
+            # and completed after the dependency.
+            if "app-ok" not in proc.stdout and "app-1 exited with code 0" not in proc.stdout:
+                raise RuntimeError(f"app did not run after dependency completed: {proc.stdout[-300:]!r}")
+            # the failing variant must refuse to start the dependent service
+            compose_file.write_text("""services:
+  init:
+    image: alpine
+    command: sh -c 'exit 3'
+  app:
+    image: alpine
+    command: echo app-ok
+    depends_on:
+      init:
+        condition: service_completed_successfully
+""")
+            fail = docker(*base, "up", "--no-color", "--exit-code-from", "app",
+                          timeout=300.0, check=False)
+            if "didn't complete successfully" not in fail.stdout + fail.stderr:
+                raise RuntimeError(f"failed dependency not reported: {fail.stdout[-200:]!r} {fail.stderr[-200:]!r}")
+            record("compose depends_on service_completed_successfully", "PASS",
+                   "app starts after exit 0; failure blocks it")
         finally:
             subprocess.run(["docker", *base, "down", "-v", "--timeout", "5"],
                            capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
@@ -1208,9 +1290,11 @@ TESTS = [
     ("healthcheck healthy", test_healthcheck),
     ("healthcheck unhealthy", test_healthcheck_unhealthy),
     ("events", test_events),
+    ("events filters + --until", test_events_filters_and_until),
     ("compose up", test_compose_up),
     ("compose lifecycle verbs", test_compose_lifecycle_verbs),
     ("compose service DNS", test_compose_service_dns),
+    ("compose depends_on completed", test_compose_depends_on_completed),
     ("compose recreate over live", test_compose_recreate_over_live),
     ("compose run one-off", test_compose_run_one_off),
     ("compose isolation", test_compose_project_isolation),
