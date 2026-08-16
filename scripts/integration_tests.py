@@ -996,6 +996,71 @@ def test_run_flags_wave2() -> None:
            "all honored")
 
 
+def test_run_flags_wave3() -> None:
+    """Third flag wave: --dns, --sysctl, --device, --link alias DNS,
+    --restart policies."""
+    out = docker("run", "--rm", "--dns", "1.1.1.1", "alpine",
+                 "sh", "-c", "grep -c '^nameserver 1.1.1.1' /etc/resolv.conf").stdout.strip()
+    if out != "1":
+        raise RuntimeError(f"dns: {out!r}")
+    out = docker("run", "--rm", "--sysctl", "net.ipv4.ip_forward=0", "alpine",
+                 "cat", "/proc/sys/net/ipv4/ip_forward").stdout.strip()
+    if out != "0":
+        raise RuntimeError(f"sysctl: {out!r}")
+    out = docker("run", "--rm", "--device", "/dev/null:/dev/mynull", "alpine",
+                 "sh", "-c", "echo hi > /dev/mynull && echo dev-ok").stdout.strip()
+    if out != "dev-ok":
+        raise RuntimeError(f"device: {out!r}")
+    # --link alias resolves to the target container
+    target = f"{PREFIX}-lkt"
+    try:
+        docker("run", "-d", "--name", target, "nginx:alpine")
+        wait_http_ok = False
+        for _ in range(10):
+            probe = docker("run", "--rm", "--link", f"{target}:myalias", "alpine",
+                           "sh", "-c", "wget -qO- --timeout=3 http://myalias 2>/dev/null | head -c 15",
+                           check=False)
+            if "DOCTYPE" in probe.stdout or "html" in probe.stdout:
+                wait_http_ok = True
+                break
+            time.sleep(1.0)
+        if not wait_http_ok:
+            raise RuntimeError(f"link alias: {probe.stdout!r} {probe.stderr[-200:]!r}")
+    finally:
+        cleanup(target)
+    record("run flags wave3: dns/sysctl/device/link", "PASS", "all honored")
+
+
+def test_restart_policy() -> None:
+    """--restart=on-failure actually restarts (guest-agent monitor)."""
+    name = f"{PREFIX}-rstpol"
+    try:
+        # Fail on the first run (marker missing), sleep after the restart.
+        docker("run", "-d", "--name", name, "--restart", "on-failure:3",
+               "alpine", "sh", "-c",
+               "[ -f /tmp/m ] && sleep 300 || { touch /tmp/m; exit 1; }")
+        restart_seen = False
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            st = docker("inspect", "--format", "{{.State.Status}}", name,
+                        check=False).stdout.strip()
+            if st == "running":
+                restart_seen = True
+                break
+            time.sleep(1.0)
+        if not restart_seen:
+            raise RuntimeError("container was not restarted after failure")
+        # docker stop must win over the policy
+        docker("stop", "-t", "1", name, timeout=60.0)
+        time.sleep(4.0)
+        st = docker("inspect", "--format", "{{.State.Status}}", name).stdout.strip()
+        if st != "exited":
+            raise RuntimeError(f"policy outlived user stop: {st!r}")
+    finally:
+        cleanup(name)
+    record("--restart=on-failure monitor", "PASS", "restarts on failure, stop wins")
+
+
 def test_classic_build() -> None:
     """DOCKER_BUILDKIT=0 sends the context to our POST /build endpoint."""
     tag = f"{PREFIX}-built:1"
@@ -1119,6 +1184,8 @@ TESTS = [
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
     ("run flags P0 (entrypoint/w/add-host/memory/cap)", test_run_flags_p0),
     ("run flags wave2 (read-only/stop-signal/tmpfs/pid/net-host)", test_run_flags_wave2),
+    ("run flags wave3 (dns/sysctl/device/link)", test_run_flags_wave3),
+    ("restart policy monitor", test_restart_policy),
     ("published port forwarded", test_port_forward),
     ("foreign host-port conflict", test_foreign_port_conflict),
     ("container lifecycle", test_create_ps_inspect_stop),

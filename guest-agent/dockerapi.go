@@ -16,7 +16,11 @@ import (
 	"github.com/mdlayher/vsock"
 )
 
-const dockerAPIVersion = "1.24"
+// Advertise a modern API version: the CLI downgrades to the server's
+// version (ping header), and compose requires >= 1.40. The handlers only
+// implement a subset, but stripAPIVersion routes any /vX.Y path the same.
+const dockerAPIVersion = "1.51"
+const dockerMinAPIVersion = "1.24"
 
 // writeDockerStream writes a Docker multiplexed stream frame.
 // streamType: 0=stdin, 1=stdout, 2=stderr.
@@ -412,6 +416,14 @@ func runDockerAPIServer() {
 
 		switch {
 		case path == "/_ping":
+			// The docker CLI reads server metadata from ping headers instead
+			// of extra round-trips: without "Ostype" it fails `docker run
+			// --device` with "unknown server OS" (client-side parsing).
+			w.Header().Set("Api-Version", dockerAPIVersion)
+			w.Header().Set("Ostype", "linux")
+			w.Header().Set("Docker-Experimental", "false")
+			w.Header().Set("Builder-Version", "2")
+			w.Header().Set("Server", "Docker/anvil (guest-agent)")
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("OK"))
 		case path == "/version":
@@ -419,7 +431,7 @@ func runDockerAPIServer() {
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"Version":       "24.0.0",
 				"ApiVersion":    dockerAPIVersion,
-				"MinAPIVersion": dockerAPIVersion,
+				"MinAPIVersion": dockerMinAPIVersion,
 				"GitCommit":     "anvil",
 				"Os":            "linux",
 				"Arch":          "arm64",
