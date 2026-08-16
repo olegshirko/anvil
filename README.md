@@ -196,7 +196,7 @@ make test                    # smoke: build + --help
 Layout: `Sources/vz-runner/` (Swift host daemon, one file ≈ one component),
 `guest-agent/` (Go, organized by Docker API domain), `scripts/` (initramfs
 build + service wrapper), `bench-harness/` (benchmarks), `IMPROVEMENTS.md`
-(roadmap), `ARCHITECTURE.md` (design decisions, in Russian).
+(roadmap), `ARCHITECTURE.md` (design decisions).
 
 Releases: `make release VERSION=x.y.z` — tag, GitHub Actions build + codesign,
 Homebrew tap update.

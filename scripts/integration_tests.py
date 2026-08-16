@@ -374,6 +374,28 @@ def test_events() -> None:
     record("docker events stream", "PASS", f"create/start/die observed: {types}")
 
 
+def test_udp_publishing() -> None:
+    """-p <host>:<ctr>/udp must be reachable from the host: the forwarder
+    opens a datagram listener and relays to guestIP:hostPort, where nerdctl
+    arms the persisted mapping (reservation socket + nft DNAT)."""
+    name = f"{PREFIX}-udp"
+    try:
+        docker("run", "-d", "--name", name, "-p", "25354:15354/udp", "alpine",
+               "sh", "-c", "while true; do echo -n UDP-OK | nc -l -u -p 15354; done")
+        time.sleep(2.0)
+        reply = subprocess.run(
+            ["sh", "-c", "echo ping | nc -u -w 3 localhost 25354"],
+            capture_output=True, text=True, timeout=10.0)
+        if "UDP-OK" not in reply.stdout:
+            raise RuntimeError(f"udp relay: stdout={reply.stdout!r} rc={reply.returncode}")
+        ps_ports = docker("ps", "--filter", f"name={name}", "--format", "{{.Ports}}")
+        if "25354" not in ps_ports.stdout:
+            raise RuntimeError(f"udp in ps ports: {ps_ports.stdout!r}")
+        record("UDP port publishing", "PASS", "datagram relay works end-to-end")
+    finally:
+        cleanup(name)
+
+
 def test_events_filters_and_until() -> None:
     """--filter (type/event/container/label) must drop non-matching events,
     and an absolute future --until must terminate the stream (the CLI blocks
@@ -1291,6 +1313,7 @@ TESTS = [
     ("healthcheck unhealthy", test_healthcheck_unhealthy),
     ("events", test_events),
     ("events filters + --until", test_events_filters_and_until),
+    ("UDP port publishing", test_udp_publishing),
     ("compose up", test_compose_up),
     ("compose lifecycle verbs", test_compose_lifecycle_verbs),
     ("compose service DNS", test_compose_service_dns),
