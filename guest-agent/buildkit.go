@@ -63,6 +63,13 @@ func ensureBuildkitd() error {
 	}
 	defer logFile.Close()
 	cmd := exec.Command(buildkitdBin)
+	// guest-agent (PID 1) runs with an almost empty environment; a child
+	// with no PATH/HOME misbehaves subtly (registry credential lookup,
+	// helper resolution). Give buildkitd a sane minimal env.
+	cmd.Env = []string{
+		"PATH=/bin:/sbin:/usr/bin:/usr/sbin:/opt/containerd/bin",
+		"HOME=/root",
+	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {

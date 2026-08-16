@@ -12,6 +12,8 @@ Checks:
 5. vsock/exec file-descriptor leaks on host and inside guest.
 6. CNI cleanup after container removal.
 7. Two-project isolation and host port conflict handling.
+8. Restart policy across a save/resume cycle.
+9. UDP port forwarding across a save/resume cycle.
 
 Each test prints PASS/FAIL with details; final summary at the end.
 """
@@ -456,6 +458,96 @@ def test_two_projects() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 8: restart policy survives a save/resume cycle
+# ---------------------------------------------------------------------------
+def test_restart_policy_survives_resume() -> None:
+    log("\n=== Test: restart policy across save/resume ===")
+    kill_daemon()
+    proc = start_daemon(fresh=True)
+    try:
+        wait_for_marker("daemon ready")
+        vz_exec("nerdctl", "-n", "project-a", "pull", "alpine", timeout=300)
+        # The container fails once (marker missing), then sleeps: the
+        # restart monitor in guest-agent must bring it back up.
+        vz_exec("nerdctl", "-n", "project-a", "run", "-d", "--restart", "on-failure:3",
+                "--name", "restarting", "alpine", "sh", "-c",
+                "[ -f /tmp/m ] && sleep 300 || { touch /tmp/m; exit 1; }")
+
+        def wait_running(timeout: float = 40.0) -> bool:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                st = run_host([str(VZ_RUNNER), "exec", "nerdctl", "-n", "project-a",
+                               "inspect", "--format", "{{.State.Status}}", "restarting"],
+                              timeout=30.0, check=False)
+                if st.stdout.strip() == "running":
+                    return True
+                time.sleep(1.0)
+            return False
+
+        if not wait_running():
+            raise RuntimeError("container not restarted before save")
+        stop_daemon(proc)  # save
+        proc = start_daemon(fresh=False)  # resume
+        wait_for_marker("daemon ready", timeout=60.0)
+
+        # The policy registry is in guest-agent memory, which IS the
+        # snapshot: after resume the monitor must still own the policy.
+        # Kill the process (exit 137) and expect a restart.
+        vz_exec("nerdctl", "-n", "project-a", "kill", "restarting", timeout=30.0)
+        restarted = wait_running()
+        # A user stop must still win after the resume.
+        vz_exec("nerdctl", "-n", "project-a", "stop", "-t", "1", "restarting", timeout=60.0)
+        time.sleep(4.0)
+        st = run_host([str(VZ_RUNNER), "exec", "nerdctl", "-n", "project-a",
+                       "inspect", "--format", "{{.State.Status}}", "restarting"],
+                      timeout=30.0, check=False)
+        stop_daemon(proc)
+        ok = restarted and st.stdout.strip() == "exited"
+        record("restart policy across save/resume", ok,
+               f"restarted after resume+kill={restarted}, stopped state={st.stdout.strip()!r}")
+    except Exception as e:
+        stop_daemon(proc)
+        record("restart policy across save/resume", False, str(e))
+
+
+# ---------------------------------------------------------------------------
+# Test 9: UDP port forwarding survives a save/resume cycle
+# ---------------------------------------------------------------------------
+def test_udp_survives_resume() -> None:
+    log("\n=== Test: UDP forwarding across save/resume ===")
+    kill_daemon()
+    proc = start_daemon(fresh=True)
+    try:
+        wait_for_marker("daemon ready")
+        vz_exec("nerdctl", "-n", "project-a", "pull", "alpine", timeout=300)
+        vz_exec("nerdctl", "-n", "project-a", "run", "-d", "-p", "25361:15361/udp",
+                "--name", "udpecho", "alpine", "sh", "-c",
+                "while true; do echo -n UDP-UP | nc -l -u -p 15361; done")
+        time.sleep(2.0)
+
+        def udp_probe() -> str:
+            p = run_host(["sh", "-c", "echo ping | nc -u -w 3 localhost 25361"],
+                         timeout=10.0, check=False)
+            return p.stdout.strip()
+
+        before = udp_probe()
+        stop_daemon(proc)  # save
+        proc = start_daemon(fresh=False)  # resume
+        wait_for_marker("daemon ready", timeout=60.0)
+        time.sleep(2.0)  # scanner push + listener rebind
+        after = udp_probe()
+
+        vz_exec("nerdctl", "-n", "project-a", "rm", "-f", "udpecho", timeout=30.0)
+        stop_daemon(proc)
+        ok = before == "UDP-UP" and after == "UDP-UP"
+        record("UDP forwarding across save/resume", ok,
+               f"before={before!r} after_resume={after!r}")
+    except Exception as e:
+        stop_daemon(proc)
+        record("UDP forwarding across save/resume", False, str(e))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -470,6 +562,8 @@ def main() -> int:
     test_fd_leaks()
     test_cni_cleanup()
     test_two_projects()
+    test_restart_policy_survives_resume()
+    test_udp_survives_resume()
 
     log("\n=== Summary ===")
     passed = sum(1 for _, ok, _ in results if ok)
