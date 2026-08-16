@@ -20,17 +20,21 @@ components:
   vsock (port 1024 — length-prefixed JSON control channel, port 1025 — Docker
   API emulation for `docker`/`docker compose`, port 1026 — bridge to the
   buildkitd unix socket for the buildx remote driver), scans containerd and
-  pushes port mappings to vz-runner, runs healthchecks, generates CNI configs.
-  When a container with `-p` starts, it asks vz-runner whether the host ports
-  are taken (the guest dials vsock port 1027, listened to by vz-runner —
-  `PortCheckServer`): if a port is held by someone else's process on the host
-  (Docker Desktop, Lima, a local postgres), start fails with a Docker-style
-  "port is already allocated" error instead of silently leaving the container
-  unreachable. The check happens on start, not on create: compose
-  `--force-recreate` creates the replacement while the old container still
-  holds the port. Inside the VM run containerd + nerdctl + runc + CNI plugins;
-  there is no systemd and no SSH. buildkitd starts lazily — on the first
-  connection to port 1026 or the first `nerdctl build`.
+  pushes port mappings to vz-runner, runs healthchecks and the restart-policy
+  monitor (`--restart` is never given to nerdctl — its own supervisor races
+  Docker semantics; see `restart.go`), generates CNI configs, and writes
+  compose service aliases / `--link` aliases into container hosts files
+  (`networkalias.go`). When a container with `-p` starts, it asks vz-runner
+  whether the host ports are taken (the guest dials vsock port 1027,
+  listened to by vz-runner — `PortCheckServer`): if a port is held by
+  someone else's process on the host (Docker Desktop, Lima, a local
+  postgres), start fails with a Docker-style "port is already allocated"
+  error instead of silently leaving the container unreachable. The check
+  happens on start, not on create: compose `--force-recreate` creates the
+  replacement while the old container still holds the port. Inside the VM
+  run containerd + nerdctl + runc + CNI plugins; there is no systemd and no
+  SSH. buildkitd starts lazily — on the first connection to port 1026 or
+  the first `nerdctl build`.
 
 The user works with the regular Docker CLI: `docker context use anvil` points
 at `~/.anvil-vz/docker.sock`, and HTTP traffic is proxied into the guest-agent
@@ -96,7 +100,8 @@ Unit tests exist for both components and run on the dev host (no VM needed):
 
 - `make unit-tests` — `go vet` + `go test` for guest-agent pure helpers
   (deterministic IDs, ref canonicalization, inspect parser, AutoRemove/wait
-  invariants from `ARCHITECTURE.md` §4.3) and `swift test` for
+  invariants from `ARCHITECTURE.md` §4.3, event filters/timestamps, port
+  proxy framing, scanner state diffing) and `swift test` for
   ControlProtocol framing and the snapshot config hash. The guest-agent
   package must keep compiling on darwin: Linux-only syscalls live in
   `*_linux.go` files behind build tags (see `dupfd_*`, `entropy_*`).
@@ -106,11 +111,16 @@ Integration verification is script-driven and manual:
 
 - `make integration` — Docker API integration tests
   (`scripts/integration_tests.py`): the real `docker` CLI against a running
-  daemon — run/attach/exit codes, port forwarding, host-port conflicts,
-  ps filters, inspect, logs/exec/cp, bind mounts, volumes, images,
-  save/load, networks, healthchecks, events, compose (incl. two-project
-  isolation) and both build paths (classic /build, buildx remote --load).
-  Requires `make service-start` first; pulls alpine/nginx/busybox.
+  daemon — run/attach/exit codes, run-flag waves (entrypoint/workdir/
+  add-host/memory/caps/read-only/stop-signal/tmpfs/pid/net-host/dns/
+  sysctl/device/--link), restart policies, port forwarding (TCP + UDP),
+  host-port conflicts, port ranges, ps filters, inspect, pause/top/stats/
+  system df, logs/exec/cp, bind mounts, volumes, images, save/load,
+  networks, healthchecks, events (incl. filters and `--until`), compose
+  (networks, DNS, depends_on conditions, recreate over live containers,
+  one-off run, two-project isolation) and both build paths (classic /build,
+  buildx remote --load). Requires `make service-start` first; pulls
+  alpine/nginx/busybox.
 - `make time-boot` / `make time-service` — boot time measurements
   (`scripts/time_boot.py`, `scripts/time_service.py`).
 - `make validate` — a robustness suite (`scripts/validate_robustness.py`):
@@ -137,8 +147,14 @@ Any change to guest-agent or vz-runner is verified with a real run:
   (vsock control server, zombie reaper), `dockerapi.go` (HTTP routes),
   `containers.go`, `images.go`, `networks.go`, `volumes.go`, `exec.go`,
   `archive.go`, `healthcheck.go`, `scanner.go` (port scanner/pusher),
-  `buildkit.go` (vsock:1026 bridge to buildkitd + lazy start),
-  `build.go` (`/build` via nerdctl), `info.go`, `utils.go`.
+  `portcheck.go` (start-time host-port conflict checks), `portproxy.go`
+  (guest-side TCP dial-through for the host forwarder), `networkalias.go`
+  (compose service aliases + `--link` in /etc/hosts), `restart.go`
+  (restart-policy monitor), `events.go` (Docker-format event stream with
+  filters), `buildkit.go` (vsock:1026 bridge to buildkitd + lazy start),
+  `build.go` (`/build` via nerdctl), `info.go`, `inspectextra.go`
+  (system df, inspect enrichment), `logrotate.go` (debug log rotation),
+  `utils.go`.
 - `scripts/` — initramfs build and service wrapper
   (`build_initramfs_containerd.sh` is the main one; `stage2.sh` and `myinit`
   are generated inline inside it).
