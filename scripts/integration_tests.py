@@ -1365,6 +1365,23 @@ def test_classic_build_after_rmi() -> None:
             docker("rmi", "-f", tag, check=False, timeout=60.0)
 
 
+def _host_auth_dns_ok() -> bool:
+    """buildx delegates the oauth token fetch to the host-side session
+    client, so these tests need auth.docker.io resolvable FROM THE HOST
+    quickly. Some networks (ISP DNS blocking) blackhole it with a 30 s
+    timeout — every docker build against any backend stalls then, which
+    is not an anvil defect. Skip the buildx tests in that environment."""
+    try:
+        subprocess.run(
+            ["python3", "-c",
+             "import socket; socket.setdefaulttimeout(6);"
+             " socket.gethostbyname('auth.docker.io')"],
+            capture_output=True, timeout=8.0, check=True)
+        return True
+    except Exception:
+        return False
+
+
 def test_buildx_builder_selection() -> None:
     """Regression: on a fresh machine the async anvil-remote setup after
     `anvil start` races the first user build; if the CLI is still on the
@@ -1374,6 +1391,10 @@ def test_buildx_builder_selection() -> None:
     insp = docker("buildx", "inspect", "anvil-remote", "--bootstrap", timeout=60.0)
     if "Driver" not in insp.stdout or "Error" in insp.stdout:
         raise RuntimeError(f"anvil-remote missing: {insp.stdout!r}")
+    if not _host_auth_dns_ok():
+        record("buildx explicit --builder anvil-remote", "SKIP",
+               "host DNS for auth.docker.io is broken (buildx fetches tokens host-side)")
+        return
 
     # A build that names the builder explicitly must work even when another
     # builder is currently selected (the docker-container driver would pull
@@ -1413,6 +1434,10 @@ def test_buildx_remote_load() -> None:
         if insp.returncode == 0:
             break
         time.sleep(1.0)
+    if not _host_auth_dns_ok():
+        record("buildx remote driver --load", "SKIP",
+               "host DNS for auth.docker.io is broken (buildx fetches tokens host-side)")
+        return
     else:
         raise RuntimeError("anvil-remote builder not ready: see daemon.log")
     tag = f"{PREFIX}-bx:1"
