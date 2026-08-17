@@ -1,5 +1,10 @@
 # Anvil
 
+[![CI](https://github.com/olegshirko/anvil/actions/workflows/go.yml/badge.svg)](https://github.com/olegshirko/anvil/actions/workflows/go.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey)
+![brew](https://img.shields.io/badge/homebrew-olegshirko%2Ftap%2Fanvil-orange)
+
 A minimal, fast alternative to Lima / Docker Desktop / OrbStack for running
 Docker containers on macOS (Apple Silicon only). One host process, one tiny
 Linux VM, no SSH, no systemd, no background fleet of helpers.
