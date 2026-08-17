@@ -3,13 +3,13 @@ name: Release
 on:
   push:
     tags: ["v*"]
-    branches: [test]
+    branches: [main]
     paths-ignore:
       - "**/*.md"
       - "**/*.nix"
       - "**/*.lock"
   pull_request:
-    branches: [test]
+    branches: [main]
     paths-ignore:
       - "**/*.md"
       - "**/*.nix"
