@@ -19,3 +19,7 @@ Sources/vz-runner/version.swift
 
 .anvil-host-time
 .anvil-host-entropy
+
+# internal planning docs, kept local only
+AGENTS.md
+IMPROVEMENTS.md
