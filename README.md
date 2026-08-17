@@ -129,29 +129,7 @@ and a static Go binary (`guest-agent`) that is PID 1 inside it. Your
 `docker` CLI never knows the difference — it talks to a unix socket that
 gets proxied, byte for byte, into the VM:
 
-```
- docker / compose            buildx remote           anvil CLI
-       │                           │                     │
-       ▼                           ▼                     ▼
- ┌─────────────────── vz-runner (Swift) ─────────────────────┐
- │  docker.sock            buildkit.sock          control.sock
- │      │                       │                     │
- │  DockerProxy             BuildkitProxy        ControlServer
- │      └───────────┬───────────┘                     │
- │              PortForwarder  ← port pushes ─────────┤
- └──────┬──────────────────┬──────────────────────────┬──────┘
-        │ vsock            │ vsock                    │ vsock
-        ▼                  ▼                          ▼
- ┌────────────────────── Linux VM (Alpine, 51 MB initramfs) ─────┐
- │  guest-agent (Go, PID 1)                                      │
- │    • Docker API emulation        • port scanner → host         │
- │    • healthchecks, restart       • CNI config generation       │
- │      policy monitor              • clock sync, cache trim      │
- │    containerd · nerdctl · runc · buildkitd (lazy) · CNI        │
- │    /var/lib on persistent virtio-blk (ext4, sparse, growable)  │
- └────────────────────────────────────────────────────────────────┘
-        ▲ virtiofs: /Users mounted at /Users (bind mounts, same path)
-```
+![architecture](arch-diagram.png)
 
 What a `docker run` actually does: the CLI POSTs to `docker.sock` →
 vz-runner pumps the bytes over virtio-vsock → guest-agent translates the
