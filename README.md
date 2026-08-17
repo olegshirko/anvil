@@ -124,57 +124,75 @@ intact).
 
 ## Architecture
 
-Two components, one process each:
+Two processes total. A Swift host daemon (`vz-runner`) that owns the VM,
+and a static Go binary (`guest-agent`) that is PID 1 inside it. Your
+`docker` CLI never knows the difference — it talks to a unix socket that
+gets proxied, byte for byte, into the VM:
 
 ```
-┌──────────────────────────── macOS (host) ───────────────────────────┐
-│  docker CLI / docker compose                                        │
-│      │ unix://~/.anvil-vz/docker.sock                               │
-│      ▼                                                              │
-│  vz-runner (Swift, single long-lived process)                       │
-│    • VMLifecycleManager — boot / save / restore via VZ snapshots    │
-│    • DockerProxyServer — unix socket ⇆ vsock:1025 proxy             │
-│    • ControlServer     — ~/.anvil-vz/control.sock ⇆ vsock:1024      │
-│    • PortForwarder     — localhost:PORT → container IP              │
-└───────┼──────────────────────────────────────────┼──────────────────┘
-        │ virtio-vsock                             │ virtiofs
-┌───────▼──────────────────────────────────────────▼──────────────────┐
-│  Linux VM (Alpine kernel 6.6 + custom initramfs)                    │
-│    guest-agent (Go, PID 1)                                          │
-│    • Docker API emulation on vsock:1025 (subset used by docker/     │
-│      compose: containers, images, networks, volumes, exec, logs,    │
-│      build, events, archive)                                        │
-│    • control channel on vsock:1024 (exec, status, port mappings)    │
-│    • port scanner, healthchecks, CNI config generation              │
-│    containerd + nerdctl + runc + buildkitd + CNI plugins            │
-│    /var/lib on a persistent virtio-blk disk (ext4)                  │
-└─────────────────────────────────────────────────────────────────────┘
+ docker / compose            buildx remote           anvil CLI
+       │                           │                     │
+       ▼                           ▼                     ▼
+ ┌─────────────────── vz-runner (Swift) ─────────────────────┐
+ │  docker.sock            buildkit.sock          control.sock
+ │      │                       │                     │
+ │  DockerProxy             BuildkitProxy        ControlServer
+ │      └───────────┬───────────┘                     │
+ │              PortForwarder  ← port pushes ─────────┤
+ └──────┬──────────────────┬──────────────────────────┬──────┘
+        │ vsock            │ vsock                    │ vsock
+        ▼                  ▼                          ▼
+ ┌────────────────────── Linux VM (Alpine, 51 MB initramfs) ─────┐
+ │  guest-agent (Go, PID 1)                                      │
+ │    • Docker API emulation        • port scanner → host         │
+ │    • healthchecks, restart       • CNI config generation       │
+ │      policy monitor              • clock sync, cache trim      │
+ │    containerd · nerdctl · runc · buildkitd (lazy) · CNI        │
+ │    /var/lib on persistent virtio-blk (ext4, sparse, growable)  │
+ └────────────────────────────────────────────────────────────────┘
+        ▲ virtiofs: /Users mounted at /Users (bind mounts, same path)
 ```
 
-Key design points (the full rationale lives in
-[ARCHITECTURE.md](ARCHITECTURE.md)):
+What a `docker run` actually does: the CLI POSTs to `docker.sock` →
+vz-runner pumps the bytes over virtio-vsock → guest-agent translates the
+Docker API into nerdctl/containerd calls, tracks ports and policies →
+the port scanner pushes the new mappings back over vsock → vz-runner
+opens a `localhost` listener and relays into the guest. No daemon chain
+on the host, no network stack in userspace.
 
-- **Snapshot resume, not reboot.** After the first boot the VM state is saved
-  (`~/.anvil-vz/snapshots`). Later starts restore memory and device state
-  directly; the snapshot is keyed by a hash of kernel/initrd/CPU/RAM/disk/
-  shares, so any config change falls back to a cold boot automatically.
-- **No SSH, no systemd.** guest-agent is PID 1: it mounts filesystems, starts
-  containerd/buildkitd, reaps orphans and serves the API over vsock.
-- **POSIX sockets, not Network.framework** — the proxy is a plain
-  byte-pump between a unix socket and vsock, with no per-request overhead.
-- **Persistent containerd disk.** Images and volumes live on a sparse raw
-  disk image (host writeback cache, durability traded for speed — snapshots
-  provide the safety net). The disk grows automatically and the guest ext4 is
-  resized online (`resize2fs`) after a grow.
-- **Bind mounts like Docker Desktop.** The host `/Users` tree is shared via
-  virtiofs and mounted at the *same absolute path* in the guest, so
-  `-v $HOME/...:/path` and compose relative volumes need no path rewriting.
-- **Per-project networking.** Each compose project gets its own CNI bridge;
-  the guest-agent generates CNI configs and pushes port mappings to the
-  host-side PortForwarder.
-- **`docker build` without Docker Desktop.** A classic `POST /build`
-  endpoint extracts the context onto the persistent disk and runs
-  `nerdctl build` against an in-VM buildkitd.
+Why it's fast — the decisions that matter:
+
+- **Snapshot resume, not reboot.** After the first boot the VM is paused
+  into a memory snapshot. Every later start is a restore (~0.5 s): no
+  kernel boot, no provisioning, no DHCP. The snapshot is keyed by a hash
+  of kernel/initrd/CPU/RAM/disk/shares — any config change falls back to
+  a cold boot instead of restoring a stale guest.
+- **No SSH, no systemd, no fleet.** guest-agent is PID 1: it mounts
+  filesystems, starts containerd, reaps zombies, serves the API. The
+  proxies are plain POSIX byte-pumps — Network.framework's TLS machinery
+  and event loops would be pure overhead here.
+- **The Docker API is emulated, precisely.** guest-agent implements the
+  slice the CLI actually uses — including the undocumented invariants
+  (`/_ping` identity headers, `/wait` streaming before blocking,
+  deterministic container IDs) that make the real client behave.
+- **A real disk, tuned.** Images and volumes live on a sparse raw
+  virtio-blk disk (ext4 with writeback tuning; host writeback cache,
+  durability traded for speed — the snapshot is the safety net). It
+  grows automatically with online `resize2fs`, and daily `fstrim`
+  returns space to the host after you delete images.
+- **Bind mounts like Docker Desktop.** The host `/Users` tree is shared
+  via virtiofs and mounted at the *same absolute path*, so
+  `-v $HOME/...:/path` and compose relative volumes need no rewriting.
+- **Per-project networking.** Each compose project gets its own containerd
+  namespace and CNI bridge; subnets are deterministic per project name.
+- **`docker build` two ways.** The buildkitd socket is forwarded to the
+  host (`~/.anvil-vz/buildkit.sock`) so `docker buildx build` works via
+  the remote driver without pulling a moby/buildkit container; the
+  classic `POST /build` path runs `nerdctl build` in the VM. buildkitd
+  starts lazily — nothing runs until your first build.
+
+The full rationale — every trade-off, benchmark, and post-mortem — is in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Current limitations
 
