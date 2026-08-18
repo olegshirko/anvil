@@ -18,15 +18,19 @@ itself is restored from a memory snapshot in 0.5 s.)
 
 ## Why
 
-| Metric | **anvil** | colima | lima | orbstack | docker-desktop |
-|---|---|---|---|---|---|
-| Cold start (daemon ready) | **1765 ms** | 11388 ms | 9339 ms | 1811 ms | 6177 ms |
-| Cold start: compose up (all healthy) | **963 ms** | 1529 ms | 1541 ms | 4608 ms | 1621 ms |
-| Resume (daemon ready) | **579 ms** | 10864 ms | 7162 ms | 1763 ms | 5936 ms |
-| Resume: compose up (all healthy) | **873 ms** | 1679 ms | 1604 ms | 4553 ms | 1557 ms |
-| Idle RSS | 1247 MB | 2198 MB | 2010 MB | 2208 MB | **1224 MB** |
+| Metric | **anvil** | colima | lima | orbstack | docker-desktop | apple-containers |
+|---|---|---|---|---|---|---|
+| Cold start (daemon ready) | 769 ms | 11388 ms | 9339 ms | 1811 ms | 6177 ms | **277 ms** |
+| Cold start: compose up (all healthy) | **825 ms** | 1529 ms | 1541 ms | 4608 ms | 1621 ms | 2815 ms |
+| Resume (daemon ready) | 699 ms | 10864 ms | 7162 ms | 1763 ms | 5936 ms | **268 ms** |
+| Resume: compose up (all healthy) | **843 ms** | 1679 ms | 1604 ms | 4553 ms | 1557 ms | 2523 ms |
+| Idle RSS | **1206 MB** | 2198 MB | 2010 MB | 2208 MB | 1224 MB | 2076 MB |
 
 Full methodology and workloads: [bench-harness/](bench-harness/README.md).
+Apple Containers has no compose API: the same stack is started there as four
+plain `container run` calls, and its "resume" is a second cold start (no
+snapshot API) — the apiserver itself is a lightweight launchd service, which
+is why daemon-ready is fast while bringing the stack up is not.
 
 The speed comes from two decisions: the VM is paused into a **memory snapshot**
 after boot and restored from it (no re-boot, no re-provisioning), and the whole
@@ -46,7 +50,7 @@ daemons and no userspace network stack in between.
 
 ```sh
 brew install olegshirko/tap/anvil
-anvil start        # first run is a cold boot (~1.5 s), then a snapshot is saved
+anvil start        # first run is a cold boot (~0.8 s), then a snapshot is saved
 ```
 
 ### zerobrew
@@ -192,8 +196,8 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
 ```sh
 make service-debug-rebuild   # rebuild everything, cold boot with debug logs
 make validate                # robustness suite (save/resume, kill -9, FD leaks, CNI)
-make harness                 # benchmarks against Lima/Colima/OrbStack/Docker Desktop
-make test                    # smoke: build + --help
+make harness                 # benchmarks against Lima/Colima/OrbStack/Docker Desktop/Apple Containers
+make test                    # sign + unit tests (Go guest-agent, Swift host)
 ```
 
 Layout: `Sources/vz-runner/` (Swift host daemon, one file ≈ one component),
