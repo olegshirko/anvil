@@ -104,6 +104,13 @@ func main() {
 		pruneStaleNetworkStore()
 	}()
 
+	// Boot tail moved out of stage2: wait for the containerd socket and run
+	// the stale-container cleanup after the control channel is up. The Docker
+	// API server waits on containerdReady so container operations never race
+	// the cleanup; the status/health path does not wait.
+	containerdReady := make(chan struct{})
+	go runBootFinalize(containerdReady)
+
 	// VZ does not guarantee a sane RTC and snapshot resume leaves the clock
 	// frozen at pause time; sync it from the host-written time file.
 	syncClockFromShare()
@@ -118,7 +125,7 @@ func main() {
 
 	// Docker API server on a separate vsock port so the existing control
 	// channel stays untouched.
-	go runDockerAPIServer()
+	go runDockerAPIServer(containerdReady)
 
 	// Buildkit bridge for the buildx remote driver (lazy buildkitd start).
 	go serveBuildkitBridge()

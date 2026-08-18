@@ -69,7 +69,20 @@ def remove_snapshots() -> None:
 def start_daemon(fresh: bool = False) -> subprocess.Popen:
     LOG_FILE.unlink(missing_ok=True)
     SHARE_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [str(VZ_RUNNER), "daemon", "--share", str(SHARE_DIR)]
+    # The persistent containerd disk is required for container starts: the
+    # virtiofs fallback for /var/lib breaks the native snapshotter (read-only
+    # rootfs errors from runc), the same reason the bench-harness drivers
+    # always pass --containerd-disk.
+    disk = os.environ.get("ANVIL_VALIDATE_DISK",
+                          os.path.expanduser("~/.anvil-vz/validate-disk.img"))
+    if not os.path.exists(disk):
+        # Sparse image, the same way anvil-service.sh provisions its disk.
+        os.makedirs(os.path.dirname(disk), exist_ok=True)
+        subprocess.run(["/bin/dd", "if=/dev/zero", f"of={disk}", "bs=1",
+                        "count=0", "seek=10g"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cmd = [str(VZ_RUNNER), "daemon", "--share", str(SHARE_DIR),
+           "--containerd-disk", disk]
     if fresh:
         remove_snapshots()
     return subprocess.Popen(

@@ -133,6 +133,9 @@ func makeConfiguration(
         FileManager.default.createFile(atPath: consolePath, contents: nil, attributes: nil)
         let readHandle = FileHandle(forReadingAtPath: "/dev/null") ?? FileHandle.standardInput
         let writeHandle = FileHandle(forWritingAtPath: consolePath) ?? FileHandle.standardOutput
+        // Opened without O_TRUNC: a shorter boot would leave the previous
+        // run's tail readable after the new content, mixing runs.
+        try? writeHandle.truncate(atOffset: 0)
         serialConfig.attachment = VZFileHandleSerialPortAttachment(
             fileHandleForReading: readHandle,
             fileHandleForWriting: writeHandle

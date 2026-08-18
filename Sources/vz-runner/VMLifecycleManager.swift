@@ -7,6 +7,30 @@ protocol VMLifecycleManagerDelegate: AnyObject {
     func vmLifecycleManagerDidStop(_ manager: VMLifecycleManager)
 }
 
+/// Coarse boot-phase stopwatch: prints `[anvil] phase <name> <ms> (total <ms>)`
+/// per mark so daemon.log shows where start/restore time actually goes.
+/// Parsed by scripts/time_boot.py.
+final class BootPhaseTimer {
+    private let lock = NSLock()
+    private let start: Date
+    private var last: Date
+
+    init() {
+        start = Date()
+        last = start
+    }
+
+    func mark(_ name: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = Date()
+        let delta = now.timeIntervalSince(last) * 1000
+        let total = now.timeIntervalSince(start) * 1000
+        last = now
+        print("[anvil] phase \(name.padding(toLength: 14, withPad: " ", startingAt: 0)) \(String(format: "%6.0f", delta)) ms (total \(String(format: "%6.0f", total)) ms)")
+    }
+}
+
 /// Owns a single VZVirtualMachine and exposes lifecycle operations used by both
 /// the one-shot `boot` path and the long-lived `daemon` path.
 final class VMLifecycleManager: NSObject {
@@ -23,6 +47,8 @@ final class VMLifecycleManager: NSObject {
 
     weak var delegate: VMLifecycleManagerDelegate?
 
+    private let phaseTimer: BootPhaseTimer
+
     /// Optional host-port availability endpoint; attached to the VM's socket
     /// device before every start/restore. Set by the daemon only.
     var portCheckServer: PortCheckServer?
@@ -31,16 +57,19 @@ final class VMLifecycleManager: NSObject {
         vm?.socketDevices.first as? VZVirtioSocketDevice
     }
 
-    /// Install the port-check listener on the live socket device (the device
-    /// object exists only after the VM is created/started).
+    /// Install the port-check listener on the live socket device. The device
+    /// object exists once the VM is created, before start/restore — which is
+    /// the required ordering (the guest may dial port 1027 right after a
+    /// snapshot resume, before didBecomeReady fires).
     func attachPortCheckServer() {
         guard let device = socketDevice else { return }
         portCheckServer?.attach(to: device)
     }
 
-    init(args: BootArgs) {
+    init(args: BootArgs, phaseTimer: BootPhaseTimer = BootPhaseTimer()) {
         self.args = args
         self.snapshot = SnapshotManager()
+        self.phaseTimer = phaseTimer
     }
 
     // MARK: - Public lifecycle
@@ -56,6 +85,12 @@ final class VMLifecycleManager: NSObject {
                 self.delegate?.vmLifecycleManager(self, didFailWithError: error)
             case .success(let vm):
                 self.vm = vm
+                self.phaseTimer.mark("config")
+                // The port-check listener must be installed before the VM
+                // starts or restores (see attachPortCheckServer); attaching
+                // once here also fixes the post-resume race of attaching in
+                // didBecomeReady.
+                self.attachPortCheckServer()
                 self.attemptRestoreOrColdBoot(vm: vm)
             }
         }
@@ -313,6 +348,7 @@ final class VMLifecycleManager: NSObject {
                     self.coldBoot(vm: vm)
                 } else {
                     print("[anvil] VM restored in \(String(format: "%.3f", restoreDuration))s, resuming...")
+                    self.phaseTimer.mark("vm_restore")
                     let resumeStart = Date()
                     vm.resume { result in
                         DispatchQueue.main.async { [weak self] in
@@ -321,6 +357,7 @@ final class VMLifecycleManager: NSObject {
                             switch result {
                             case .success:
                                 print("[anvil] VM resumed in \(String(format: "%.3f", resumeDuration))s, streaming console:\n---")
+                                self.phaseTimer.mark("vm_resume")
                                 self.delegate?.vmLifecycleManagerDidBecomeReady(self)
                             case .failure(let error):
                                 self.delegate?.vmLifecycleManager(self, didFailWithError: error)
@@ -348,6 +385,7 @@ final class VMLifecycleManager: NSObject {
                     } else {
                         print("[anvil] VM started, streaming console:\n---")
                     }
+                    self.phaseTimer.mark("vm_start")
                     if self.args.useAgent {
                         self.waitForGuestAgent(vm: vm)
                     }
@@ -382,13 +420,17 @@ final class VMLifecycleManager: NSObject {
                     } else {
                         print("[anvil] guest agent ready")
                     }
+                    self.phaseTimer.mark("agent")
                     // Declare readiness immediately. Saving the snapshot used
                     // to block here for ~2.4s (pause -> save -> resume); the
                     // daemon already saves on idle timeout and on shutdown,
                     // so an inline save only delayed first use.
                     self.delegate?.vmLifecycleManagerDidBecomeReady(self)
                 case .failure:
-                    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) {
+                    // Fine-grained: the agent is typically up within a second
+                    // of vm.start completing, so a coarse poll interval adds
+                    // hundreds of ms of pure slack to cold-boot readiness.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                         attempt()
                     }
                 }

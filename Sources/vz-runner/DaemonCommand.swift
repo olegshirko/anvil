@@ -8,13 +8,18 @@ enum DaemonCommand {
         setbuf(stdout, nil)
         let cliArgs = parseDaemonArgs(args)
 
+        // Measures the whole daemon spawn -> control-socket-bound window;
+        // phase marks land in daemon.log for boot profiling.
+        let phaseTimer = BootPhaseTimer()
+
         guard acquireDaemonLock() else {
             print("[anvil] daemon already running")
             exit(1)
         }
+        phaseTimer.mark("lock")
 
-        let manager = VMLifecycleManager(args: cliArgs.bootArgs)
-        let daemon = Daemon(manager: manager, idleSeconds: cliArgs.idleSeconds)
+        let manager = VMLifecycleManager(args: cliArgs.bootArgs, phaseTimer: phaseTimer)
+        let daemon = Daemon(manager: manager, idleSeconds: cliArgs.idleSeconds, phaseTimer: phaseTimer)
         globalDaemon = daemon
 
         signal(SIGINT) { _ in
@@ -113,7 +118,11 @@ enum DaemonCommand {
         // For the daemon we always use the agent path; fresh boot is handled via --fresh on demand.
         return DaemonCLIArgs(
             bootArgs: BootArgs(
-                kernelPath: kernel ?? ".download/ubuntu/vmlinuz-raw",
+                // The Alpine linux-virt kernel is the pairing the packed
+                // modules match; the Ubuntu generic kernel under
+                // .download/ubuntu cannot load them (vsock/virtio fail and
+                // the guest panics).
+                kernelPath: kernel ?? ".download/alpine/vmlinuz-raw",
                 initrdPath: initrd ?? ".download/ubuntu/initramfs-containerd",
                 useAgent: true,
                 fresh: false,
@@ -132,6 +141,7 @@ enum DaemonCommand {
     fileprivate class Daemon: VMLifecycleManagerDelegate {
         let manager: VMLifecycleManager
         let idleSeconds: TimeInterval
+        private let phaseTimer: BootPhaseTimer
         private var server: ControlServer?
         private var dockerProxyServer: DockerProxyServer?
         private var buildkitProxyServer: DockerProxyServer?
@@ -141,9 +151,10 @@ enum DaemonCommand {
         private let cacheManager: ContainerdCacheManager?
         private var clientTracker: ClientTracker?
 
-        init(manager: VMLifecycleManager, idleSeconds: TimeInterval) {
+        init(manager: VMLifecycleManager, idleSeconds: TimeInterval, phaseTimer: BootPhaseTimer) {
             self.manager = manager
             self.idleSeconds = idleSeconds
+            self.phaseTimer = phaseTimer
             self.cacheManager = ContainerdCacheManager(sharePath: manager.args.sharePath)
             manager.delegate = self
             manager.portCheckServer = PortCheckServer { [weak self] port in
@@ -230,10 +241,9 @@ enum DaemonCommand {
         // MARK: - VMLifecycleManagerDelegate
 
         func vmLifecycleManagerDidBecomeReady(_ manager: VMLifecycleManager) {
-            // Host-port availability endpoint for the guest-agent; install
-            // before opening the docker proxy so early container creates
-            // are checked.
-            manager.attachPortCheckServer()
+            // Host-port availability endpoint for the guest-agent is now
+            // attached inside manager.start() before start/restore (its
+            // listener must predate the guest dialing out).
 
             let tracker = ClientTracker(
                 idleSeconds: idleSeconds,
@@ -261,6 +271,7 @@ enum DaemonCommand {
             }
             server.start()
             self.server = server
+            phaseTimer.mark("control_sock")
             print("[anvil] daemon ready, control socket: \(controlSocketPath)")
 
             let dockerProxy = DockerProxyServer(
@@ -319,6 +330,7 @@ enum DaemonCommand {
             let forwarder = PortForwarder { [weak manager] in manager?.socketDevice }
             forwarder.start()
             self.portForwarder = forwarder
+            phaseTimer.mark("ready_binds")
 
             // Start the idle timer if no client connected while the VM was starting.
             if tracker.isIdle {

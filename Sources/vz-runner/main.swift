@@ -356,12 +356,17 @@ func cmdStatus() {
         // readiness gate; previously status always succeeded.
         exit(1)
     }
-    let ctx = shell("docker", "context", "show").trimmingCharacters(in: .whitespacesAndNewlines)
-    print("[anvil] docker context: \(ctx)")
-    // Query the control socket; exits non-zero until the full chain
+    // Query the control socket first; exits non-zero until the full chain
     // (daemon -> control server -> guest agent) answers, so scripts and the
-    // bench harness can poll `status` as an honest readiness gate.
+    // bench harness can poll `status` as an honest readiness gate. The
+    // docker-context print is cosmetic, shells out to the docker CLI
+    // (~100-300 ms) and only makes sense for a human at a terminal — skip it
+    // when stdout is not a TTY (bench harness, scripts).
     ControlClient.status()
+    if isatty(STDOUT_FILENO) == 1 {
+        let ctx = shell("docker", "context", "show").trimmingCharacters(in: .whitespacesAndNewlines)
+        print("[anvil] docker context: \(ctx)")
+    }
 }
 
 // MARK: - Arg helpers
@@ -509,7 +514,7 @@ func printUsage() {
       status    Show daemon status and Docker context.
 
     Daemon options (start / daemon):
-      --kernel <path>   Path to the Linux kernel image (default: .download/ubuntu/vmlinuz-raw)
+      --kernel <path>   Path to the Linux kernel image (default: .download/alpine/vmlinuz-raw)
       --initrd <path>   Path to the initramfs/initrd image (default: .download/ubuntu/initramfs-containerd)
       --share <path>    Share host directory via virtiofs
       --idle <seconds>  Seconds to wait before pausing VM (default: 600)

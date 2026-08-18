@@ -20,7 +20,12 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VZ_RUNNER = PROJECT_ROOT / ".build" / "release" / "vz-runner"
-KERNEL = PROJECT_ROOT / ".download" / "ubuntu" / "vmlinuz-raw"
+# The Alpine linux-virt kernel is the production pairing for the containerd
+# initramfs (same as the bench-harness driver): its modules are the ones
+# packed by build_initramfs_containerd.sh. The Ubuntu generic kernel under
+# .download/ubuntu has no matching modules — vsock/virtio modprobes fail and
+# the guest panics.
+KERNEL = PROJECT_ROOT / ".download" / "alpine" / "vmlinuz-raw"
 INITRD = PROJECT_ROOT / ".download" / "ubuntu" / "initramfs-containerd"
 SHARE_DIR = Path("/tmp/anvil-share")
 LOG_FILE = Path("/tmp/time_boot_vz_runner.log")
@@ -66,6 +71,36 @@ def wait_for_lines(cmd: list[str], markers: set[str], timeout: float = 120.0) ->
     return times
 
 
+def print_phase_report(title: str) -> None:
+    """Print host phase marks and guest boot marks from the last run log."""
+    if not LOG_FILE.exists():
+        return
+    text = LOG_FILE.read_text(errors="replace")
+
+    host = [ln.strip() for ln in text.splitlines() if "[anvil] phase" in ln]
+    if host:
+        print(f"  --- host phases ({title}) ---")
+        for ln in host:
+            print(f"  {ln}")
+
+    # Guest markers: "[boot] <name> up=<seconds>" (kernel-relative).
+    boot: list[tuple[str, float]] = []
+    for ln in text.splitlines():
+        if "[boot] " in ln and " up=" in ln:
+            try:
+                name = ln.split("[boot] ", 1)[1].rsplit(" up=", 1)[0]
+                up = float(ln.rsplit(" up=", 1)[1])
+                boot.append((name, up))
+            except (IndexError, ValueError):
+                pass
+    if boot:
+        print(f"  --- guest phases ({title}, kernel-relative) ---")
+        prev = 0.0
+        for name, up in boot:
+            print(f"  {name:<28} +{up - prev:6.2f}s  ({up:6.2f}s)")
+            prev = up
+
+
 def main() -> int:
     if not VZ_RUNNER.exists():
         print(f"binary not found: {VZ_RUNNER}; run 'make sign' first", file=sys.stderr)
@@ -92,6 +127,7 @@ def main() -> int:
     )
     for marker in ["VM started", "guest agent ready", "snapshot saved"]:
         print(f"  {marker}: {cold.get(marker, -1.0):.2f}s")
+    print_phase_report("cold")
 
     print("\n=== resume from snapshot ===")
     resume = wait_for_lines(
@@ -100,6 +136,7 @@ def main() -> int:
     )
     for marker in ["restoring VM from snapshot", "VM resumed"]:
         print(f"  {marker}: {resume.get(marker, -1.0):.2f}s")
+    print_phase_report("resume")
 
     if "guest agent ready" in cold and "VM resumed" in resume:
         speedup = cold["guest agent ready"] / resume["VM resumed"]

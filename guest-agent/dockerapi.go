@@ -373,7 +373,9 @@ func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 // runDockerAPIServer starts the Docker-compatible HTTP server on vsock:1025.
-func runDockerAPIServer() {
+// It waits for boot finalize (containerd up + stale-container cleanup) before
+// listening; see runBootFinalize.
+func runDockerAPIServer(containerdReady <-chan struct{}) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := stripAPIVersion(r.URL.Path)
@@ -882,6 +884,16 @@ func runDockerAPIServer() {
 			http.NotFound(w, r)
 		}
 	})
+
+	// Container operations must not race the boot-time stale-container
+	// cleanup (and need containerd reachable); the host-side docker proxy
+	// retries the vsock connect, so waiting here serializes cleanly without
+	// delaying the status/health control channel.
+	select {
+	case <-containerdReady:
+	case <-time.After(10 * time.Second):
+		log.Printf("[docker-api] boot finalize timeout, serving anyway")
+	}
 
 	l, err := vsock.Listen(dockerAPIPort, nil)
 	if err != nil {

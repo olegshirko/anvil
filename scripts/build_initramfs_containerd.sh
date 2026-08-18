@@ -449,6 +449,13 @@ cat > myinit <<'EOF'
 #!/bin/sh
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 
+# Boot-phase markers (seconds since kernel start, from /proc/uptime) —
+# land on the hvc0 console -> ~/.anvil-vz/console.log, parsed by
+# scripts/time_boot.py. Pure-shell: busybox in the initramfs has no `cut`
+# applet, and `read` avoids even the cat fork.
+bmark() { read -r up _ < /proc/uptime; echo "[boot] $1 up=$up"; }
+bmark myinit_start
+
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
@@ -456,19 +463,23 @@ mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts
 mkdir -p /tmp /var/log /sys/fs/cgroup
 mount -t cgroup2 cgroup2 /sys/fs/cgroup
+bmark mounts
 
 # Load modules (modprobe resolves dependency chains via modules.dep).
 for m in vmw_vsock_virtio_transport af_packet virtio_net virtiofs overlay llc stp bridge veth; do
     modprobe $m 2>/dev/null || echo "[myinit] modprobe $m failed"
 done
+bmark modprobe
 
 for i in 1 2 3 4 5 6 7 8 9 10; do
     if [ -e /dev/vsock ]; then break; fi
     sleep 0.2
 done
+bmark vsock_dev
 
 mkdir -p /mnt/anvil
 mount -t virtiofs anvil /mnt/anvil 2>/dev/null || true
+bmark virtiofs
 
 # Set the clock from the host-written time file: VZ does not guarantee a sane
 # RTC (boots can start at 1970-01-01) and TLS to registries fails then.
@@ -480,34 +491,50 @@ fi
 # RANDOM_TRUST_CPU and VZ provides no virtio-rng, so crng init otherwise
 # takes ~10 s and stalls containerd/guest-agent start.
 /bin/guest-agent seed-entropy /mnt/anvil/.anvil-host-entropy 2>/dev/null || true
+bmark entropy
 
-# Bring up NAT network via virtio-net. udhcpc -n -q blocks until the lease is
-# obtained (typically <200 ms on VZ NAT) and exits on failure, so no polling.
+# Bring up the loopback interface; the eth0 DHCP lease is obtained in stage2
+# off the boot critical path (nothing before the first container needs it,
+# and udhcpc used to block myinit for ~250-300 ms). Pre-seed the resolver
+# files so the tmpfs root copy carries them; stage2's udhcpc rewrites
+# resolv.conf from the lease when it arrives.
 echo "[myinit] configuring network"
 ifconfig lo up 2>/dev/null || true
-ifconfig eth0 up 2>/dev/null || true
-udhcpc -i eth0 -n -q -s /usr/share/udhcpc/default.script >/tmp/udhcpc.log 2>&1 || true
-ip addr show eth0 >/tmp/network.log 2>&1 || true
 mkdir -p /etc
-# Keep the DNS servers provided by DHCP (the VZ NAT gateway forwards to the
-# host resolver, which also works on VPN/restricted networks). If the lease
-# included none, use the NAT gateway first and public DNS as backup — VZ NAT
-# runs a DNS forwarder on the gateway address.
-if [ ! -s /etc/resolv.conf ]; then
-    gw=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')
-    [ -n "$gw" ] && printf 'nameserver %s\n' "$gw" >> /etc/resolv.conf
-    printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\n' >> /etc/resolv.conf
-fi
+# Public-DNS fallback for the pre-lease window; after the lease arrives the
+# NAT gateway's forwarder takes over (it also works on VPN/restricted
+# networks). Serialize A/AAAA lookups: under load the VZ NAT DNS forwarder
+# sporadically drops one of the two parallel UDP queries, which Go resolvers
+# (nerdctl, buildkitd) surface as "lookup ... i/o timeout" after exhausting
+# retries.
+printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\noptions single-request timeout:1 attempts:3\n' > /etc/resolv.conf
 # A base /etc/hosts is required by nerdctl's --net host (its etchosts
 # generator opens the host file directly; without it `--network host`
 # containers fail with "filesystem error: open /etc/hosts").
-if [ ! -f /etc/hosts ]; then
-    printf '127.0.0.1\tlocalhost\n::1\t\tlocalhost\n' > /etc/hosts
-fi
-# Serialize A/AAAA lookups: under load the VZ NAT DNS forwarder sporadically
-# drops one of the two parallel UDP queries, which Go resolvers (nerdctl,
-# buildkitd) surface as "lookup ... i/o timeout" after exhausting retries.
-grep -q "^options" /etc/resolv.conf || printf 'options single-request timeout:1 attempts:3\n' >> /etc/resolv.conf
+printf '127.0.0.1\tlocalhost\n::1\t\tlocalhost\n' > /etc/hosts
+# Minimal udhcpc event script: busybox's default.script lives under
+# /usr/share, which is NOT copied into the tmpfs root, so stage2's background
+# udhcpc would obtain a lease without ever applying it to eth0. /etc is
+# copied, so the script lives here.
+cat > /etc/udhcpc-script <<'UDHEOF'
+#!/bin/sh
+case "$1" in
+bound|renew)
+    ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}" ${broadcast:+broadcast $broadcast} up
+    # busybox in this initramfs has no `route` applet; `ip route` is present.
+    for r in $router; do ip route replace default via "$r" dev "$interface"; done
+    : > /etc/resolv.conf
+    for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done
+    echo "options single-request timeout:1 attempts:3" >> /etc/resolv.conf
+    ;;
+deconfig)
+    ifconfig "$interface" 0.0.0.0 up
+    ;;
+esac
+exit 0
+UDHEOF
+chmod +x /etc/udhcpc-script
+bmark dhcp
 
 # containerd needs /etc/containerd and a state dir.
 mkdir -p /etc/containerd /run/containerd /var/lib/containerd
@@ -539,6 +566,7 @@ for d in usr/bin usr/sbin usr/lib; do
         cp -a /$d /newroot/usr/ 2>/dev/null || true
     fi
 done
+bmark tmpfs_copy
 mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/run /newroot/tmp /newroot/var /newroot/mnt
 mount --make-rprivate /
 mount --move /proc /newroot/proc
@@ -550,10 +578,23 @@ mount --move /var/lib/containerd /newroot/var/lib/containerd 2>/dev/null || true
 cat > /newroot/stage2.sh <<'STAGE2'
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 
+bmark() { read -r up _ < /proc/uptime; echo "[boot] $1 up=$up"; }
+bmark stage2_start
+
 # Background drift correction only; the clock is already set from the host
 # time file in myinit. Must run in stage2: processes started in myinit do
 # not survive switch_root.
 ( ntpd -nq -p pool.ntp.org >/dev/null 2>&1 || true ) &
+
+# Obtain the eth0 DHCP lease off the boot critical path: nothing until the
+# first container (CNI) or an outbound connection needs it. On lease, busybox
+# default.script rewrites /etc/resolv.conf with the NAT gateway's DNS
+# forwarder; re-append the lookup options Go resolvers need (default.script
+# drops them).
+( ifconfig eth0 up 2>/dev/null || true
+  udhcpc -i eth0 -n -q -s /etc/udhcpc-script >/tmp/udhcpc.log 2>&1 || true
+  ip addr show eth0 >/tmp/network.log 2>&1 || true
+) &
 
 # Remount virtual filesystems if switch_root did not move them.
 mountpoint -q /proc || mount -t proc proc /proc
@@ -635,6 +676,7 @@ if ! mountpoint -q /var/lib; then
     mount --bind /mnt/anvil/var-lib /var/lib
     echo "[stage2] /var/lib bound to virtiofs share"
 fi
+bmark varlib_mount
 
 mkdir -p /var/lib/containerd /var/lib/nerdctl /var/lib/cni
 
@@ -658,59 +700,25 @@ mount --make-rprivate /
 # guest, making localhost:PORT forwarding from the host work.
 iptables -t nat -C POSTROUTING -p tcp -m conntrack --ctstate DNAT -j MASQUERADE -m comment --comment "anvil-dnat-masq" 2>/dev/null || \
 iptables -t nat -A POSTROUTING -p tcp -m conntrack --ctstate DNAT -j MASQUERADE -m comment --comment "anvil-dnat-masq"
+bmark netfilter
 
 # Start containerd in background.
 echo "[stage2] starting containerd"
 /opt/containerd/bin/containerd > /tmp/containerd.log 2>&1 &
-
-# Wait for containerd socket (it usually appears within ~300 ms).
-i=0
-while [ $i -lt 75 ]; do
-    if [ -S /run/containerd/containerd.sock ]; then break; fi
-    sleep 0.1
-    i=$((i + 1))
-done
+bmark containerd_started
 
 # buildkitd is started lazily by guest-agent on the first build request
 # (classic /build or the vsock:1026 buildx bridge) — it idles at ~50 MB RSS,
 # so booting it here would tax every user, including those who never build.
 
-# Cold boot only: per-container nerdctl state (/var/lib/nerdctl) is persisted
-# on disk. Restored containerd metadata would reference missing or stale state
-# files, causing containers to fail on start. Drop all containers on cold boot
-# so the VM starts with a clean slate; images, snapshots and volumes survive in
-# the persisted cache.
-# Use the low-level `ctr` client instead of `nerdctl rm` so a stuck OCI hook or
-# shim cannot block the whole boot process.
-echo "[stage2] cleaning up containers from restored metadata"
-
-# Old shims/hooks from a crashed/hung previous session cannot be talked to;
-# trying to delete their tasks through containerd would hang. Kill them first,
-# and only wait if there was actually something to kill.
-killed=0
-killall -9 containerd-shim-runc-v2 2>/dev/null && killed=1
-killall -9 runc 2>/dev/null && killed=1
-killall -9 nerdctl 2>/dev/null && killed=1
-[ "$killed" = 1 ] && sleep 1
-
-for ns in $(/opt/containerd/bin/ctr namespace ls -q 2>/dev/null); do
-    for id in $(/opt/containerd/bin/ctr -n "$ns" c ls -q 2>/dev/null); do
-        /opt/containerd/bin/ctr -n "$ns" t rm -f "$id" >/dev/null 2>&1 || true
-        /opt/containerd/bin/ctr -n "$ns" c rm "$id" >/dev/null 2>&1 || true
-    done
-done
-
-# ctr rm does not clean nerdctl's name-store files. Stale name-to-ID mappings
-# survive on the persisted disk and block docker compose from reusing names.
-# Name files live at /var/lib/nerdctl/<datastore>/<namespace>/<name> and, for
-# nerdctl >= 2.2, /var/lib/nerdctl/<datastore>/names/<namespace>/<name> — both
-# sit at depth 4 and are covered by this find.
-find /var/lib/nerdctl -mindepth 4 -maxdepth 4 -type f 2>/dev/null | while read f; do
-    rm -f "$f"
-done
+# The containerd-socket wait and the cold-boot stale-container cleanup used
+# to run here and gated the guest-agent. Both now run inside guest-agent
+# (runBootFinalize) after the control channel is up; the Docker API server
+# there waits for them, so container operations cannot race the cleanup.
 
 # Start guest agent in foreground.
 echo "[stage2] starting guest-agent"
+bmark agent_start
 if [ -f /mnt/anvil/.anvil-debug ]; then
     echo "[stage2] enabling guest-agent debug mode"
     export ANVIL_DEBUG=1
