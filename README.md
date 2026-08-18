@@ -20,11 +20,11 @@ itself is restored from a memory snapshot in 0.5 s.)
 
 | Metric | **anvil** | colima | lima | orbstack | docker-desktop | apple-containers |
 |---|---|---|---|---|---|---|
-| Cold start (daemon ready) | 769 ms | 11388 ms | 9339 ms | 1811 ms | 6177 ms | **277 ms** |
-| Cold start: compose up (all healthy) | **825 ms** | 1529 ms | 1541 ms | 4608 ms | 1621 ms | 2815 ms |
-| Resume (daemon ready) | 699 ms | 10864 ms | 7162 ms | 1763 ms | 5936 ms | **268 ms** |
-| Resume: compose up (all healthy) | **843 ms** | 1679 ms | 1604 ms | 4553 ms | 1557 ms | 2523 ms |
-| Idle RSS | **1206 MB** | 2198 MB | 2010 MB | 2208 MB | 1224 MB | 2076 MB |
+| Cold start (daemon ready) | 613 ms | 12107 ms | 8682 ms | 1972 ms | 5643 ms | **520 ms** |
+| Cold start: compose up (all healthy) | **792 ms** | 1456 ms | 1435 ms | 3436 ms | 1550 ms | 2598 ms |
+| Resume (daemon ready) | 742 ms | 9228 ms | 5768 ms | 1586 ms | 5616 ms | **269 ms** |
+| Resume: compose up (all healthy) | **734 ms** | 1439 ms | 1394 ms | 1495 ms | 1476 ms | 2377 ms |
+| Idle RSS | **1139 MB** | 2185 MB | 2057 MB | 2201 MB | 1220 MB | 2057 MB |
 
 Full methodology and workloads: [bench-harness/](bench-harness/README.md).
 Apple Containers has no compose API: the same stack is started there as four
@@ -50,7 +50,7 @@ daemons and no userspace network stack in between.
 
 ```sh
 brew install olegshirko/tap/anvil
-anvil start        # first run is a cold boot (~0.8 s), then a snapshot is saved
+anvil start        # first run is a cold boot (~0.6 s), then a snapshot is saved
 ```
 
 ### zerobrew
