@@ -16,6 +16,7 @@ export VZRUNNER_BIN=/path/to/.build/release/vz-runner
 ./scripts/prepull.sh docker        # current docker context (Colima, OrbStack, Docker Desktop)
 ./scripts/prepull.sh lima          # Lima VM instance "anvil"
 ./scripts/prepull.sh vz-runner     # inside vz-runner VM (namespace bench)
+./scripts/prepull.sh apple-containers  # Apple Containers image store (macOS 26+)
 
 # 3. Make sure vz-runner shares the root of this folder into the VM at
 #    /mnt/anvil via virtiofs (see M2); otherwise vzc.sh will not find the
@@ -25,7 +26,7 @@ export VZRUNNER_BIN=/path/to/.build/release/vz-runner
 ## Run
 
 ```bash
-./run_bench.sh vz-runner lima colima orbstack docker-desktop
+./run_bench.sh vz-runner lima colima orbstack docker-desktop apple-containers
 # or
 ./run_bench.sh all
 # or only your runner if competitors are not installed
@@ -48,9 +49,24 @@ time) → cleanup.
 | resume | compose_up_healthy | compose up on the already warm backend |
 | steady_state | idle_rss_mb | host daemon/VM process memory at idle |
 
-Backends without a snapshot/resume API (Colima, OrbStack, Docker Desktop today)
-run an honest second cold start in the "resume" phase. This makes the
-difference visible instead of hiding it.
+Backends without a snapshot/resume API (Colima, OrbStack, Docker Desktop,
+Apple Containers today) run an honest second cold start in the "resume"
+phase. This makes the difference visible instead of hiding it.
+
+The apple-containers backend (Apple's `container` CLI, macOS 26+) has no
+compose: scripts/apple-compose runs the same four services as plain
+`container run` calls. Setup:
+
+```bash
+# 1. Install the CLI from https://github.com/apple/container/releases
+#    (double-click the signed installer pkg), or:
+sudo installer -pkg container-*-installer-signed.pkg -target /
+# 2. One-time: install the recommended Linux kernel
+container system kernel set --recommended
+```
+
+A user-space extraction (payload unpacked outside /usr/local) also works:
+point CONTAINER_BIN at that `container` binary when running the harness.
 
 ## Output
 

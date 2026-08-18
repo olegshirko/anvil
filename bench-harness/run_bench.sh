@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Anvil bench harness: compare cold start / resume / compose-up time
-# between runners (vz-runner, Colima, OrbStack, Docker Desktop) on the
+# between runners (vz-runner, Colima, OrbStack, Docker Desktop, Apple
+# Containers) on the
 # same workload.
 #
 # Usage:
@@ -36,7 +37,7 @@ TS="$(date +%Y%m%d-%H%M%S)"
 CSV="$RESULTS_DIR/$TS.csv"
 MD="$RESULTS_DIR/latest.md"
 
-ALL_BACKENDS=(vz-runner lima colima orbstack docker-desktop)
+ALL_BACKENDS=(vz-runner lima colima orbstack docker-desktop apple-containers)
 
 if [[ $# -eq 0 ]]; then
     echo "Usage: $0 <backend...> | all"

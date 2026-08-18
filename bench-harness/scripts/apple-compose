@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Compose emulator for Apple Containers.
+#
+# The harness drives every backend through docker-compose-style invocations:
+#     <cmd> -f <compose-file> up -d
+#     <cmd> -f <compose-file> down [-v]
+# Apple Containers has no compose; this script runs the same four services
+# as workloads/docker-compose.bench.yml as plain `container run` calls, so
+# the measured phases stay comparable. Keep the service list in sync with
+# the compose file (and with backend_all_healthy in the driver).
+
+set -uo pipefail
+
+CONTAINER_BIN="${CONTAINER_BIN:-container}"
+
+AC_SERVICES=(bench-db bench-cache bench-api bench-web)
+
+# `container run` renders progress bars on stderr; hide them unless the run
+# fails, so harness output stays readable without losing error details.
+_ac_run() {
+    local err
+    err="$(mktemp)"
+    if ! "$CONTAINER_BIN" run "$@" >/dev/null 2>"$err"; then
+        cat "$err" >&2
+        rm -f "$err"
+        return 1
+    fi
+    rm -f "$err"
+}
+
+_up() {
+    # Same images/env/command/ports as the compose workload; depends_on
+    # ordering is preserved by launching sequentially.
+    _ac_run -d --name bench-db \
+        -e POSTGRES_PASSWORD=bench \
+        -e POSTGRES_DB=bench \
+        postgres:16-alpine
+    _ac_run -d --name bench-cache \
+        redis:7-alpine
+    _ac_run -d --name bench-api \
+        node:20-alpine \
+        node -e "require('http').createServer((q,r)=>r.end('ok')).listen(3000); console.log('ready')"
+    _ac_run -d --name bench-web \
+        -p 18080:80 \
+        nginx:alpine
+}
+
+_down() {
+    local svc
+    for svc in "${AC_SERVICES[@]}"; do
+        "$CONTAINER_BIN" stop "$svc" >/dev/null 2>&1 || true
+        "$CONTAINER_BIN" delete --force "$svc" >/dev/null 2>&1 || true
+    done
+}
+
+# Accept the harness calling convention: -f <file> up -d | down [-v].
+# The compose file itself is only validated (services are mirrored above,
+# not parsed).
+COMPOSE_FILE=""
+subcmd=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -f)
+            COMPOSE_FILE="$2"
+            shift 2
+            ;;
+        up|down)
+            subcmd="$1"
+            shift
+            ;; # swallow -d / -v / anything else that follows
+        *)
+            shift
+            ;;
+    esac
+done
+
+if [[ -n "$COMPOSE_FILE" && ! -f "$COMPOSE_FILE" ]]; then
+    echo "apple-compose: workload file not found: $COMPOSE_FILE" >&2
+    exit 1
+fi
+
+case "$subcmd" in
+    up)   _up ;;
+    down) _down ;;
+    *)
+        echo "apple-compose: expected 'up -d' or 'down [-v]'" >&2
+        exit 1
+        ;;
+esac

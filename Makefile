@@ -406,7 +406,7 @@ harness harness-tests: sign
 # Run harness against all supported backends. Requires each backend to be
 # installed (Lima, Colima, OrbStack, Docker Desktop) and its docker context to
 # exist. Results are merged into the same CSV and latest.md as a single run.
-ALL_BENCH_BACKENDS ?= vz-runner lima colima orbstack docker-desktop
+ALL_BENCH_BACKENDS ?= vz-runner lima colima orbstack docker-desktop apple-containers
 
 bench-all harness-all: sign
 	@$(MAKE) service-stop

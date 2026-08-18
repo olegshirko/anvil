@@ -25,6 +25,14 @@ case "$BACKEND" in
             "$VZRUNNER_BIN" exec nerdctl -n bench pull "$img" >/dev/null
         done
         ;;
+    apple-containers)
+        CONTAINER_BIN="${CONTAINER_BIN:-container}"
+        echo "Prepulling into Apple Containers via $CONTAINER_BIN..."
+        for img in "${IMAGES[@]}"; do
+            echo "  pulling $img"
+            "$CONTAINER_BIN" image pull "$img" >/dev/null
+        done
+        ;;
     docker|colima|orbstack|docker-desktop|*)
         echo "Prepulling on current docker context ($(docker context show 2>/dev/null || echo default))..."
         for img in "${IMAGES[@]}"; do
