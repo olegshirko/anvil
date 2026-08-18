@@ -306,10 +306,16 @@ The base is the Alpine initramfs-virt. Inside a Linux container
 - busybox + basic applets;
 - containerd, nerdctl, runc, CNI plugins;
 - guest-agent;
-- Ubuntu kernel modules: vsock, virtiofs, overlayfs, bridge, veth,
-  netfilter/xt/nft modules;
+- Alpine linux-virt kernel modules: vsock, virtiofs, overlayfs, bridge,
+  veth, netfilter/xt/nft modules;
 - iptables + libmnl/libnftnl/libxtables;
-- GNU tar + libacl/libattr for `nerdctl cp`.
+- GNU tar + libacl/libattr for `nerdctl cp`;
+- buildkitd/buildctl/qemu emulators as a single `/opt/buildkit.tar.zst`:
+  build-only binaries do not ride through kernel initramfs unpack and the
+  tmpfs-root copy on every boot. stage2 extracts the tarball to the
+  persistent `/var/lib/buildkit` once (in the background) and symlinks the
+  binaries into `/opt/containerd/bin`; the agent's lazy buildkitd start
+  waits for the symlink, bounded.
 
 ### 5.2 Why switch_root, not bind/pivot
 
@@ -338,10 +344,19 @@ tmpfs root.
 4. Loads the netfilter/bridge/veth modules;
 5. Adds an iptables MASQUERADE rule for DNATed TCP (fixes asymmetric
    routing under VZ NAT);
-6. Starts containerd;
-7. Cleans orphaned containers via low-level `ctr` (not `nerdctl rm`, to
-   avoid waiting on a hung shim);
-8. Starts the guest-agent.
+6. Starts containerd and immediately `exec`s the guest-agent — the
+   containerd-socket wait, the orphaned-container cleanup (low-level `ctr`,
+   not `nerdctl rm`, to avoid waiting on a hung shim) and the DHCP lease
+   wait all run inside the agent (`runBootFinalize`) after its control
+   channel is up. The Docker API server on vsock:1025 and exec'd commands
+   wait on that finalize (bounded), so container operations never race a
+   boot still in flight; `status`/`health` does not wait, keeping the
+   readiness gate honest but fast.
+
+   The DHCP lease itself is obtained by a background `udhcpc` in stage2
+   (with retries — the VZ NAT DHCP server occasionally drops the first
+   discover), off the boot critical path: nothing before the first
+   container needs it.
 
 ## 6. Restart behavior
 
@@ -387,11 +402,12 @@ On shutdown:
 1. `vz-runner` finds no snapshot or the hash does not match — cold boot.
 2. The VM starts with kernel + initramfs.
 3. `myinit` → `switch_root` → `stage2`.
-4. Containerd comes up with the persistent disk.
-5. The guest-agent starts, restoring CNI conflists from
-   `/mnt/anvil/networks/`.
-6. The guest-agent pushes the full port state (still empty).
-7. `vz-runner` saves the snapshot.
+4. Containerd starts on the persistent disk; the guest-agent `exec`s right
+   after it and brings up its vsock control channel while containerd and
+   the DHCP lease are still settling (boot finalize, see §5.3).
+5. The guest-agent restores CNI conflists from `/mnt/anvil/networks/` in
+   the background and pushes the full port state (still empty).
+6. `vz-runner` saves the snapshot.
 
 ### 6.3 Resume
 
