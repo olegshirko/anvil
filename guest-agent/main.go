@@ -91,10 +91,14 @@ func main() {
 	go servePortProxy()
 	go runRestartMonitor()
 
-	// Recreate CNI conflists from the host share after a cold boot. nerdctl
-	// keeps network state on the persistent containerd disk, but the conflist
-	// itself is on tmpfs and disappears on reboot.
-	restoreNetworkConfigs()
+	// Recreate CNI conflists from the host share after a cold boot, and set
+	// the clock from the host time file. Both are file I/O + a date exec on
+	// the pre-listen critical path (~30-60 ms); nothing needs them before
+	// the first container, and subscribe_ports re-syncs the clock anyway.
+	go func() {
+		restoreNetworkConfigs()
+		syncClockFromShare()
+	}()
 
 	// The cold-boot metadata cleanup in stage2 removes containers bypassing
 	// nerdctl rm, leaving their network-store entries behind; prune them once
@@ -104,16 +108,16 @@ func main() {
 		pruneStaleNetworkStore()
 	}()
 
-	// Boot tail moved out of stage2: wait for the containerd socket and run
-	// the stale-container cleanup after the control channel is up. The Docker
-	// API server waits on containerdReady so container operations never race
-	// the cleanup; the status/health path does not wait.
-	containerdReady := make(chan struct{})
-	go runBootFinalize(containerdReady)
+	// Boot tail moved out of stage2: wait for the containerd socket, run the
+	// stale-container cleanup and wait for the DHCP lease — after the control
+	// channel is up. The Docker API server and exec'd commands wait on
+	// bootFinalized (bounded) so container/pull operations never race a boot
+	// still in flight; the status/health path does not wait.
+	go runBootFinalize()
 
 	// VZ does not guarantee a sane RTC and snapshot resume leaves the clock
-	// frozen at pause time; sync it from the host-written time file.
-	syncClockFromShare()
+	// frozen at pause time; periodic sync keeps it stepping after the
+	// initial set done above.
 	go periodicClockSync()
 
 	// Discard unused blocks on the containerd ext4 once a day so the sparse
@@ -125,7 +129,7 @@ func main() {
 
 	// Docker API server on a separate vsock port so the existing control
 	// channel stays untouched.
-	go runDockerAPIServer(containerdReady)
+	go runDockerAPIServer(bootFinalized)
 
 	// Buildkit bridge for the buildx remote driver (lazy buildkitd start).
 	go serveBuildkitBridge()
@@ -161,6 +165,17 @@ func handle(conn net.Conn, scanner *portScanner) {
 		if req.Cmd == "subscribe_ports" {
 			handleSubscribe(conn, scanner)
 			return
+		}
+
+		// Commands that touch containerd or the network wait (bounded) for
+		// boot finalize — containerd up, stale cleanup done, DHCP lease in.
+		// health/status stay unblocked so the host readiness gate reflects
+		// agent liveness, not boot completion.
+		if req.Cmd != "health" && req.Cmd != "status" {
+			select {
+			case <-bootFinalized:
+			case <-time.After(10 * time.Second):
+			}
 		}
 
 		resp := dispatch(req)

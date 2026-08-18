@@ -1,19 +1,28 @@
 package main
 
 import (
+	"bytes"
 	"log"
 	"os"
 	"os/exec"
 	"time"
 )
 
+// bootFinalized closes when boot finalize completes: containerd reachable,
+// stale-container cleanup done and a default network route present. The
+// status/health control path never waits on it (daemon readiness is honest
+// but does not block on it); exec'd commands and the Docker API server do,
+// bounded, so early nerdctl invocations cannot race a boot still in flight.
+var bootFinalized = make(chan struct{})
+
 // runBootFinalize performs the boot tail that stage2 used to run before exec'ing
-// the agent: waiting for the containerd socket and removing stale container
-// metadata left by an unclean shutdown. Moved here so the control channel
-// (vsock:1024) comes up immediately; closes done once containerd is reachable
-// and cleanup has run, which gates the Docker API server.
-func runBootFinalize(done chan<- struct{}) {
-	defer close(done)
+// the agent: waiting for the containerd socket, removing stale container
+// metadata left by an unclean shutdown, and waiting for the DHCP lease (stage2
+// obtains it in the background, off the boot critical path). Moved here so the
+// control channel (vsock:1024) comes up immediately; closes bootFinalized when
+// done, which gates the Docker API server and exec'd commands.
+func runBootFinalize() {
+	defer close(bootFinalized)
 
 	// Kill unreachable shims/hooks from a crashed previous session first —
 	// trying to delete their tasks through containerd would hang, and any
@@ -61,5 +70,21 @@ done
 		log.Printf("[boot] stale container cleanup failed: %v: %s", err, out)
 	} else {
 		log.Printf("[boot] stale container cleanup done")
+	}
+
+	// Wait for the DHCP lease: pulls and DNS through the NAT gateway fail
+	// with "network is unreachable" until a default route exists, and
+	// nerdctl's internal pull retries turn that into minutes-long hangs.
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		out, err := exec.Command("ip", "route", "show", "default").Output()
+		if err == nil && len(bytes.Fields(out)) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			log.Printf("[boot] no default route after 10s, proceeding without network")
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

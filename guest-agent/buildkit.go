@@ -54,6 +54,16 @@ func ensureBuildkitd() error {
 	// resolution) must own /run/buildkit.
 	killallStaleBuildkitd()
 
+	// buildkitd ships as a tarball extracted to /var/lib/buildkit by a
+	// background stage2 job on first boot; a build racing that extraction
+	// would see a dangling symlink. Wait (bounded) for it to appear.
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(buildkitdBin); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	if err := os.MkdirAll("/var/lib/buildkit", 0o755); err != nil {
 		return err
 	}

@@ -98,6 +98,10 @@ cd "$WORK_DIR"
 
 # Base userspace from Alpine initramfs.
 gunzip -c "$ALPINE_INITRD" | cpio -idm 2>/dev/null || true
+# The netboot initramfs bundles its own (older) lib/modules tree for the
+# kernel it was built for; ours comes from the linux-virt apk below. Drop
+# the stale tree so modprobe can never resolve into it.
+rm -rf lib/modules/*
 
 # Busybox applets.
 for applet in mount umount mkdir mknod sleep sh insmod modprobe \
@@ -124,27 +128,26 @@ mkdir -p opt/containerd/bin
 tar -xzf "$TOOLS_DIR/containerd.tgz" -C opt/containerd/bin --strip-components=1 2>/dev/null || true
 tar -xzf "$TOOLS_DIR/nerdctl.tgz" -C opt/containerd/bin 2>/dev/null || true
 cp "$TOOLS_DIR/runc" opt/containerd/bin/runc
-# buildkitd + buildctl for `docker build` (nerdctl build frontend).
-tar -xzf "$TOOLS_DIR/buildkit.tgz" -C opt/containerd/bin --strip-components=1 2>/dev/null || true
-chmod +x opt/containerd/bin/*
+# buildkitd + buildctl for `docker build` (nerdctl build frontend). These
+# build-only binaries (~150 MB unpacked, the largest part of the initramfs)
+# are packed as ONE compressed tarball in /opt instead of loose rootfs
+# files: loose files ride through kernel initramfs decompress AND the tmpfs
+# root copy on every boot; the tarball is extracted to the persistent
+# /var/lib/buildkit once (stage2, background) and symlinked into place.
+BUILDKIT_STAGE="$(mktemp -d)"
+tar -xzf "$TOOLS_DIR/buildkit.tgz" -C "$BUILDKIT_STAGE" --strip-components=1 2>/dev/null || true
 # Drop unused containerd tools (~19 MB): stress tester and rootless helpers.
 rm -f opt/containerd/bin/containerd-stress opt/containerd/bin/containerd-rootless*.sh
-
-# Slim down buildkit, the largest part of the initramfs (~150 MB unpacked):
-# - qemu emulators are only needed for cross-platform `docker build
-#   --platform`; keep x86_64 (and 32-bit arm) on an arm64 VM, drop the rest;
-# - buildkit's bundled runc duplicates the system one — symlink it;
-# - UPX-pack the remaining build-only binaries (buildkitd/buildctl/qemu).
-#   They run once per build, so exec-time decompression is irrelevant —
-#   unlike the hot-path containerd/nerdctl/runc/shim, which stay unpacked.
-for q in opt/containerd/bin/buildkit-qemu-*; do
+# qemu emulators are only needed for cross-platform `docker build
+# --platform`; keep x86_64 (and 32-bit arm) on an arm64 VM, drop the rest.
+# buildkit's bundled runc duplicates the system one — stage2 symlinks it.
+for q in "$BUILDKIT_STAGE"/buildkit-qemu-*; do
     case "$(basename "$q")" in
         buildkit-qemu-x86_64|buildkit-qemu-arm) ;;
         *) rm -f "$q" ;;
     esac
 done
-rm -f opt/containerd/bin/buildkit-runc
-ln -sf /opt/containerd/bin/runc opt/containerd/bin/buildkit-runc
+rm -f "$BUILDKIT_STAGE"/buildkit-runc
 
 # buildkitd runs with the containerd worker (same store as nerdctl/docker
 # pull) so `FROM` resolves local images instead of hitting the registry
@@ -170,12 +173,19 @@ fi
 if [[ -n "$UPX_BIN" ]]; then
     # -9, not --best: --best selects LZMA, which takes tens of minutes on
     # 70+ MB binaries under the QEMU-emulated CI build container.
-    "$UPX_BIN" -q -9 opt/containerd/bin/buildkitd opt/containerd/bin/buildctl \
-        opt/containerd/bin/buildkit-qemu-* 2>/dev/null || \
+    # They run once per build, so exec-time decompression is irrelevant —
+    # unlike the hot-path containerd/nerdctl/runc/shim, which stay unpacked.
+    "$UPX_BIN" -q -9 "$BUILDKIT_STAGE"/buildkitd "$BUILDKIT_STAGE"/buildctl \
+        "$BUILDKIT_STAGE"/buildkit-qemu-* 2>/dev/null || \
         echo "WARNING: upx packing failed, shipping unpacked buildkit binaries" >&2
 else
     echo "WARNING: upx not found, shipping unpacked buildkit binaries" >&2
 fi
+# Single tarball in /opt: stage2 extracts it to /var/lib/buildkit once.
+mkdir -p opt
+tar -C "$BUILDKIT_STAGE" -cf - buildkitd buildctl buildkit-qemu-x86_64 buildkit-qemu-arm \
+    | zstd -q -o opt/buildkit.tar.zst
+rm -rf "$BUILDKIT_STAGE"
 cat > bin/nerdctl <<'NERDCTLEOF'
 #!/bin/sh
 # Thin wrapper that ensures a per-project CNI bridge exists and is used
@@ -220,13 +230,22 @@ if [ "$HAS_NET" -eq 0 ] && [ "$RUN_IDX" -ne 0 ]; then
     shift_count=$RUN_IDX
     head=""
     while [ "$shift_count" -gt 0 ]; do
-        head="$head '$1'"
+        # Each head argument is baked into an eval string, so embedded
+        # single quotes must be escaped for it to re-parse verbatim.
+        # The TAIL arguments ("$@" below) are NOT baked in: they expand
+        # inside eval with proper per-word quoting. Before this, an
+        # argument containing shell metacharacters — e.g. `nerdctl ... run
+        # ... sh -c '[ -f /x ] && sleep 300'` — was executed as shell code
+        # on the guest (the sleep literally ran in the root cgroup) and
+        # the container was never created.
+        esc=${1//\'/\'\\\'\'}
+        head="$head '$esc'"
         shift
         shift_count=$((shift_count - 1))
     done
     # head now contains the first RUN_IDX arguments (including "run").
     # Insert --net right after the "run" subcommand.
-    eval set -- $head --net "$NS" "$@"
+    eval "set -- $head --net \"\$NS\" \"\$@\""
 fi
 exec /opt/containerd/bin/nerdctl "$@"
 NERDCTLEOF
@@ -587,12 +606,20 @@ bmark stage2_start
 ( ntpd -nq -p pool.ntp.org >/dev/null 2>&1 || true ) &
 
 # Obtain the eth0 DHCP lease off the boot critical path: nothing until the
-# first container (CNI) or an outbound connection needs it. On lease, busybox
-# default.script rewrites /etc/resolv.conf with the NAT gateway's DNS
-# forwarder; re-append the lookup options Go resolvers need (default.script
-# drops them).
+# first container (CNI) or an outbound connection needs it. The VZ NAT
+# DHCP server occasionally drops the first discover, so retry the whole
+# client a few times before giving up (and say so on the console).
 ( ifconfig eth0 up 2>/dev/null || true
-  udhcpc -i eth0 -n -q -s /etc/udhcpc-script >/tmp/udhcpc.log 2>&1 || true
+  lease=1
+  for attempt in 1 2 3 4 5; do
+    if udhcpc -i eth0 -n -q -t 3 -T 2 -s /etc/udhcpc-script >>/tmp/udhcpc.log 2>&1; then
+      lease=0
+      break
+    fi
+    echo "[stage2] udhcpc attempt $attempt failed, retrying" >>/tmp/udhcpc.log
+    sleep 1
+  done
+  [ "$lease" = 0 ] || echo "[stage2] WARNING: no DHCP lease after 5 attempts" >/dev/console
   ip addr show eth0 >/tmp/network.log 2>&1 || true
 ) &
 
@@ -679,6 +706,21 @@ fi
 bmark varlib_mount
 
 mkdir -p /var/lib/containerd /var/lib/nerdctl /var/lib/cni
+
+# Build-only binaries (buildkitd/buildctl/qemu) ship as /opt/buildkit.tar.zst
+# and live on the persistent disk: unpack once in the background (they are
+# needed only on the first `docker build`) and symlink into the PATH location
+# guest-agent starts buildkitd from.
+( if [ ! -x /var/lib/buildkit/bin/buildkitd ] && [ -f /opt/buildkit.tar.zst ]; then
+      mkdir -p /var/lib/buildkit/bin
+      /bin/zstd -dc /opt/buildkit.tar.zst | tar -x -C /var/lib/buildkit/bin
+  fi
+  ln -sf /var/lib/buildkit/bin/buildkitd            /opt/containerd/bin/buildkitd
+  ln -sf /var/lib/buildkit/bin/buildctl             /opt/containerd/bin/buildctl
+  ln -sf /var/lib/buildkit/bin/buildkit-qemu-x86_64 /opt/containerd/bin/buildkit-qemu-x86_64
+  ln -sf /var/lib/buildkit/bin/buildkit-qemu-arm    /opt/containerd/bin/buildkit-qemu-arm
+  ln -sf /opt/containerd/bin/runc                   /opt/containerd/bin/buildkit-runc
+) &
 
 # Load netfilter modules so CNI bridge/portmap/firewall and iptables-nft work.
 # modprobe resolves dependency order itself; crc32c_generic must come first
