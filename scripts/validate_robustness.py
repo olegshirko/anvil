@@ -108,6 +108,20 @@ def vz_exec(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
     return run_host([str(VZ_RUNNER), "exec", *args], timeout=timeout)
 
 
+def vz_pull(namespace: str, image: str, attempts: int = 3) -> None:
+    """Pull with retries: the VZ NAT path to registries sporadically resets
+    the first TLS connection, which would otherwise fail a whole test."""
+    last = None
+    for i in range(attempts):
+        try:
+            vz_exec("nerdctl", "-n", namespace, "pull", image, timeout=300)
+            return
+        except Exception as e:  # noqa: BLE001 - retried below
+            last = e
+            time.sleep(2)
+    raise last
+
+
 def snapshot_size() -> int:
     return SNAPSHOT_FILE.stat().st_size if SNAPSHOT_FILE.exists() else 0
 
@@ -144,7 +158,7 @@ def test_repeated_resume_cycles() -> None:
         if (SHARE_DIR / "nginx.tar").exists():
             vz_exec("nerdctl", "-n", "project-a", "load", "-i", "/mnt/anvil/nginx.tar", timeout=120)
         else:
-            vz_exec("nerdctl", "-n", "project-a", "pull", "nginx", timeout=300)
+            vz_pull("project-a", "nginx")
 
         base_size = snapshot_size()
         sizes = [base_size]
@@ -479,7 +493,7 @@ def test_restart_policy_survives_resume() -> None:
     proc = start_daemon(fresh=True)
     try:
         wait_for_marker("daemon ready")
-        vz_exec("nerdctl", "-n", "project-a", "pull", "alpine", timeout=300)
+        vz_pull("project-a", "alpine")
         # The container fails once (marker missing), then sleeps: the
         # restart monitor in guest-agent must bring it back up.
         vz_exec("nerdctl", "-n", "project-a", "run", "-d", "--restart", "on-failure:3",
@@ -532,7 +546,7 @@ def test_udp_survives_resume() -> None:
     proc = start_daemon(fresh=True)
     try:
         wait_for_marker("daemon ready")
-        vz_exec("nerdctl", "-n", "project-a", "pull", "alpine", timeout=300)
+        vz_pull("project-a", "alpine")
         vz_exec("nerdctl", "-n", "project-a", "run", "-d", "-p", "25361:15361/udp",
                 "--name", "udpecho", "alpine", "sh", "-c",
                 "while true; do echo -n UDP-UP | nc -l -u -p 15361; done")
