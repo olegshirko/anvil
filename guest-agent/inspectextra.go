@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,8 +13,8 @@ import (
 )
 
 // pauseDockerContainer pauses (pause=true) or unpauses a container.
-func pauseDockerContainer(id string, pause bool) error {
-	ns, containerdID, _, err := resolveDockerID(id)
+func pauseDockerContainer(ctx context.Context, id string, pause bool) error {
+	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -30,8 +31,8 @@ func pauseDockerContainer(id string, pause bool) error {
 
 // handleContainerTop implements GET /containers/{id}/top: process list of
 // the container, read from the task's cgroup procs via the guest.
-func handleContainerTop(w http.ResponseWriter, id string) {
-	ns, containerdID, _, err := resolveDockerID(id)
+func handleContainerTop(ctx context.Context, w http.ResponseWriter, id string) {
+	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
 		return
@@ -96,10 +97,10 @@ func runGuestShell(script string) (string, string, int, error) {
 // handleContainerStats implements GET /containers/{id}/stats. With
 // stream=false a single reading is returned (what `docker stats
 // --no-stream` needs); streaming mode sends one reading per second.
-func handleContainerStats(w http.ResponseWriter, id string, stream bool) {
+func handleContainerStats(ctx context.Context, w http.ResponseWriter, id string, stream bool) {
 	w.Header().Set("Content-Type", "application/json")
 	reading := func() map[string]interface{} {
-		return containerStatsReading(id)
+		return containerStatsReading(ctx, id)
 	}
 	if !stream {
 		json.NewEncoder(w).Encode(reading())
@@ -123,10 +124,10 @@ func sleepms(ms int) {
 
 // containerStatsReading builds a Docker-shaped stats sample from
 // /sys/fs/cgroup of the container's task pid and /proc/<pid>/stat for CPU.
-func containerStatsReading(id string) map[string]interface{} {
+func containerStatsReading(ctx context.Context, id string) map[string]interface{} {
 	zero := func(s string) uint64 { v, _ := strconv.ParseUint(s, 10, 64); return v }
 	reading := func() map[string]interface{} {
-		ns, containerdID, _, err := resolveDockerID(id)
+		ns, containerdID, _, err := resolveDockerID(ctx, id)
 		if err != nil {
 			return nil
 		}
@@ -206,14 +207,14 @@ func disconnectContainerNetwork(network, container string) error {
 }
 
 // handleSystemDF implements GET /system/df: reclaimable-space overview.
-func handleSystemDF(w http.ResponseWriter) {
-	images, err := listDockerImages()
+func handleSystemDF(ctx context.Context, w http.ResponseWriter) {
+	images, err := listDockerImages(ctx)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
-	containers, _ := listDockerContainers(nil)
-	volumes, _ := listDockerVolumes(nil)
+	containers, _ := listDockerContainers(ctx, nil)
+	volumes, _ := listDockerVolumes(ctx, nil)
 
 	// Mark images referenced by any container as in-use.
 	inUse := map[string]bool{}

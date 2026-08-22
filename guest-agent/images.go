@@ -171,7 +171,7 @@ func splitImageTag(ref string) (name, tag string, ok bool) {
 // GitHub API call is made and the unauthenticated release-asset download never
 // hits API rate limits. Returns errMirrorNotFound when the image has not been
 // mirrored, so callers can distinguish "mirror it first" from a real failure.
-func loadFromMirror(ref, ns string) error {
+func loadFromMirror(ctx context.Context, ref, ns string) error {
 	name, tag, ok := splitImageTag(ref)
 	if !ok {
 		return errMirrorNotFound
@@ -192,13 +192,12 @@ func loadFromMirror(ref, ns string) error {
 		return fmt.Errorf("mirror download %s: %s", url, resp.Status)
 	}
 
-	cl, err := client.New(containerdSocket)
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd client: %w", err)
 	}
-	defer cl.Close()
 
-	nsCtx := namespaces.WithNamespace(context.Background(), ns)
+	nsCtx := namespaces.WithNamespace(ctx, ns)
 	ds, err := compression.DecompressStream(resp.Body)
 	if err != nil {
 		return fmt.Errorf("decompress: %w", err)
@@ -234,14 +233,12 @@ func loadFromMirror(ref, ns string) error {
 // (containerd's content store is namespaced, so a bare metadata copy would
 // leave a dangling pointer and nerdctl would fall back to a registry pull).
 // Otherwise it is pulled into the target namespace.
-func ensureImageInNamespace(ref, targetNs string) error {
-	cl, err := client.New(containerdSocket)
+func ensureImageInNamespace(ctx context.Context, ref, targetNs string) error {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd client: %w", err)
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	canonicalRef := canonicalizeImageRef(ref)
 
 	// Fast path: image already exists in target namespace.
@@ -301,7 +298,7 @@ func ensureImageInNamespace(ref, targetNs string) error {
 		// Fallback: docker-mirror GitHub release (used when the registry is
 		// unreachable or rate-limited but a mirror exists). Only silent on a
 		// clean 404 ("not mirrored yet"); other download errors are logged.
-		if mErr := loadFromMirror(ref, targetNs); mErr == nil {
+		if mErr := loadFromMirror(ctx, ref, targetNs); mErr == nil {
 			if _, err := cl.GetImage(targetCtx, canonicalRef); err == nil {
 				return nil
 			}
@@ -371,14 +368,12 @@ func copyImageBetweenNamespaces(srcNs, ref, targetNs string) error {
 
 // listDockerImages collects images from all namespaces and returns a
 // Docker-compatible summary, deduplicating by image ID.
-func listDockerImages() ([]dockerImageSummary, error) {
-	cl, err := client.New(containerdSocket)
+func listDockerImages(ctx context.Context) ([]dockerImageSummary, error) {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd client: %w", err)
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list namespaces: %w", err)
@@ -479,14 +474,12 @@ func listDockerImages() ([]dockerImageSummary, error) {
 // findImageNamespace returns the containerd namespace that contains an image
 // matching the given reference (name or name:tag). The empty string is returned
 // if no matching image is found.
-func findImageNamespace(ref string) string {
-	cl, err := client.New(containerdSocket)
+func findImageNamespace(ctx context.Context, ref string) string {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return ""
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		log.Printf("[images] list namespaces: %v", err)
@@ -522,8 +515,8 @@ func findImageNamespace(ref string) string {
 }
 
 // tagDockerImage tags an image using nerdctl.
-func tagDockerImage(source, target string) error {
-	ns := findImageNamespace(source)
+func tagDockerImage(ctx context.Context, source, target string) error {
+	ns := findImageNamespace(ctx, source)
 	if ns == "" {
 		ns = "default"
 	}
@@ -535,7 +528,7 @@ func tagDockerImage(source, target string) error {
 	// namespace so multi-image operations (save a b) resolve every name in
 	// one namespace.
 	if ns != "default" {
-		if err := ensureImageInNamespace(target, "default"); err != nil {
+		if err := ensureImageInNamespace(ctx, target, "default"); err != nil {
 			log.Printf("[images] mirror tag %s to default: %v", target, err)
 		}
 	}
@@ -545,7 +538,7 @@ func tagDockerImage(source, target string) error {
 // handleImageGet implements GET /images/{name}/get (docker save) — streams a
 // Docker-format tar of the image into the response.
 func handleImageGet(w http.ResponseWriter, r *http.Request, name string) {
-	streamImageSave(w, []string{name})
+	streamImageSave(r.Context(), w, []string{name})
 }
 
 // handleImagesGet implements GET /images/get?names=a&names=b — same, for
@@ -556,15 +549,15 @@ func handleImagesGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"message":"no images specified"}`, http.StatusBadRequest)
 		return
 	}
-	streamImageSave(w, names)
+	streamImageSave(r.Context(), w, names)
 }
 
-func streamImageSave(w http.ResponseWriter, names []string) {
+func streamImageSave(ctx context.Context, w http.ResponseWriter, names []string) {
 	// Verify all images exist first so a missing one is a clean 404 instead
 	// of a failed stream mid-response.
 	ns := "default"
 	for _, name := range names {
-		imgNs := findImageNamespace(name)
+		imgNs := findImageNamespace(ctx, name)
 		if imgNs == "" {
 			http.Error(w, fmt.Sprintf(`{"message":"No such image: %s"}`, name), http.StatusNotFound)
 			return
@@ -605,8 +598,8 @@ func streamImageSave(w http.ResponseWriter, names []string) {
 }
 
 // removeDockerImage removes an image using nerdctl.
-func removeDockerImage(name string, force bool) error {
-	nss := findAllImageNamespaces(name)
+func removeDockerImage(ctx context.Context, name string, force bool) error {
+	nss := findAllImageNamespaces(ctx, name)
 	if len(nss) == 0 {
 		nss = []string{"default"}
 	}
@@ -639,14 +632,12 @@ func removeDockerImage(name string, force bool) error {
 
 // findAllImageNamespaces returns every namespace whose image store holds the
 // ref (strict canonical/raw name match, like findImageNamespace).
-func findAllImageNamespaces(ref string) []string {
-	cl, err := client.New(containerdSocket)
+func findAllImageNamespaces(ctx context.Context, ref string) []string {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return nil
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		log.Printf("[images] list namespaces: %v", err)
@@ -674,14 +665,14 @@ func findAllImageNamespaces(ref string) []string {
 // response shape. With dangling=true only untagged images go; with
 // dangling=false (`docker system prune -a`) every image not referenced by a
 // container goes.
-func pruneDockerImages(dangling bool) ([]map[string]string, int64, error) {
-	images, err := listDockerImages()
+func pruneDockerImages(ctx context.Context, dangling bool) ([]map[string]string, int64, error) {
+	images, err := listDockerImages(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
 
 	used := map[string]bool{}
-	if containers, err := listDockerContainers(nil); err == nil {
+	if containers, err := listDockerContainers(ctx, nil); err == nil {
 		for _, c := range containers {
 			if c.Image != "" {
 				used[c.Image] = true
@@ -710,7 +701,7 @@ func pruneDockerImages(dangling bool) ([]map[string]string, int64, error) {
 		if isDangling {
 			ref = img.Id
 		}
-		if err := removeDockerImage(ref, true); err != nil {
+		if err := removeDockerImage(ctx, ref, true); err != nil {
 			log.Printf("[docker-api] prune image %s: %v", ref, err)
 			continue
 		}
@@ -722,8 +713,8 @@ func pruneDockerImages(dangling bool) ([]map[string]string, int64, error) {
 
 // inspectDockerImage returns a Docker-compatible image inspect payload,
 // searching all namespaces for the image.
-func inspectDockerImage(name string) (map[string]interface{}, error) {
-	ns := findImageNamespace(name)
+func inspectDockerImage(ctx context.Context, name string) (map[string]interface{}, error) {
+	ns := findImageNamespace(ctx, name)
 	if ns == "" {
 		ns = "default"
 	}
@@ -782,8 +773,8 @@ func inspectDockerImage(name string) (map[string]interface{}, error) {
 }
 
 // pushDockerImage pushes an image and streams progress lines to w.
-func pushDockerImage(name string, w io.Writer) error {
-	ns := findImageNamespace(name)
+func pushDockerImage(ctx context.Context, name string, w io.Writer) error {
+	ns := findImageNamespace(ctx, name)
 	if ns == "" {
 		ns = "default"
 	}
@@ -815,14 +806,14 @@ func pushDockerImage(name string, w io.Writer) error {
 // pullDockerImage pulls an image via nerdctl into the default namespace. When
 // the registry pull fails it falls back to the docker-mirror GitHub release
 // and returns a status line describing which path produced the image.
-func pullDockerImage(image string) (string, error) {
+func pullDockerImage(ctx context.Context, image string) (string, error) {
 	ns := "default"
 	stdout, stderr, code, err := runNerdctl(ns, "pull", image)
 	if err == nil && code == 0 {
 		return fmt.Sprintf("Downloaded newer image for %s", image), nil
 	}
 	pullErr := fmt.Errorf("nerdctl pull failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
-	if mErr := loadFromMirror(image, ns); mErr == nil {
+	if mErr := loadFromMirror(ctx, image, ns); mErr == nil {
 		return fmt.Sprintf("Loaded image: %s (from docker-mirror)", image), nil
 	} else if !errors.Is(mErr, errMirrorNotFound) {
 		log.Printf("[images] mirror fallback for %q: %v", image, mErr)
@@ -840,12 +831,11 @@ func handleImageLoad(w http.ResponseWriter, r *http.Request) {
 		ns = r.URL.Query().Get("namespace")
 	}
 
-	cl, err := client.New(containerdSocket)
+	cl, err := pc.get(r.Context())
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
-	defer cl.Close()
 
 	log.Printf("[docker-api] loading image stream (%d bytes) into ns=%q", r.ContentLength, ns)
 
@@ -860,7 +850,7 @@ func handleImageLoad(w http.ResponseWriter, r *http.Request) {
 	// without -t) import content only and register no image reference, so
 	// `docker run <name>` would fall back to a registry pull. Give unnamed
 	// manifests a digest-based ref so they can be run/tagged locally.
-	nsCtx := namespaces.WithNamespace(context.Background(), ns)
+	nsCtx := namespaces.WithNamespace(r.Context(), ns)
 	imgs, err := cl.Import(nsCtx, ds,
 		client.WithDigestRef(func(d digest.Digest) string {
 			return "docker.io/imported/anvil-image:" + d.Encoded()[:12]

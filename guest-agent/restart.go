@@ -145,13 +145,12 @@ func maybeRestartContainers() {
 	if len(snapshot) == 0 {
 		return
 	}
-	cl, err := client.New(containerdSocket)
+	cl, err := pc.get(context.Background())
 	if err != nil {
 		return
 	}
-	defer cl.Close()
 	for did := range snapshot {
-		ns, containerdID, _, err := resolveDockerID(did)
+		ns, containerdID, _, err := resolveDockerID(context.Background(), did)
 		if err != nil {
 			// Container gone (auto-removed); drop the policy.
 			restarts.clear(did)
@@ -199,7 +198,7 @@ func maybeRestartContainers() {
 		restarts.paceNextLocked(did)
 		restarts.mu.Unlock()
 		log.Printf("[restart] restarting %s (policy %s, exit %d)", truncateID(did), p.name, exit)
-		if err := startDockerContainer(did); err != nil {
+		if err := startDockerContainer(context.Background(), did); err != nil {
 			log.Printf("[restart] start %s failed: %v", truncateID(did), err)
 		}
 	}

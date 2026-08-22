@@ -65,12 +65,11 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 		untilTimer = timer.C
 	}
 
-	cl, err := client.New(containerdSocket)
+	cl, err := pc.get(r.Context())
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
-	defer cl.Close()
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()

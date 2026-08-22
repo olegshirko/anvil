@@ -30,7 +30,7 @@ func handleContainerArchive(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, `{"message":"path is required"}`, http.StatusBadRequest)
 		return
 	}
-	ns, containerdID, _, err := resolveDockerID(id)
+	ns, containerdID, _, err := resolveDockerID(r.Context(), id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
 		return

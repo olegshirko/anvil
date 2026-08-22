@@ -7,8 +7,6 @@ import (
 	"log"
 	"strings"
 	"time"
-
-	"github.com/containerd/containerd/v2/client"
 )
 
 // dockerVolume matches the JSON returned by GET /volumes and /volumes/{name}.
@@ -54,14 +52,12 @@ type dockerVolumeCreateRequest struct {
 }
 
 // listDockerVolumes returns volumes from all namespaces.
-func listDockerVolumes(filters map[string]map[string]bool) ([]dockerVolume, error) {
-	cl, err := client.New(containerdSocket)
+func listDockerVolumes(ctx context.Context, filters map[string]map[string]bool) ([]dockerVolume, error) {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd client: %w", err)
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list namespaces: %w", err)
@@ -113,14 +109,12 @@ func listDockerVolumes(filters map[string]map[string]bool) ([]dockerVolume, erro
 }
 
 // inspectDockerVolume returns a volume by name from any namespace.
-func inspectDockerVolume(name string) (*dockerVolume, error) {
-	cl, err := client.New(containerdSocket)
+func inspectDockerVolume(ctx context.Context, name string) (*dockerVolume, error) {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd client: %w", err)
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list namespaces: %w", err)
@@ -174,7 +168,7 @@ func inspectDockerVolume(name string) (*dockerVolume, error) {
 
 // createDockerVolume creates a volume in the default namespace.
 // nerdctl volume create only supports --label, so Driver/Options are ignored.
-func createDockerVolume(req dockerVolumeCreateRequest) (*dockerVolume, error) {
+func createDockerVolume(ctx context.Context, req dockerVolumeCreateRequest) (*dockerVolume, error) {
 	ns := "default"
 	args := []string{"volume", "create"}
 	for k, v := range req.Labels {
@@ -190,18 +184,16 @@ func createDockerVolume(req dockerVolumeCreateRequest) (*dockerVolume, error) {
 	if volName == "" {
 		volName = req.Name
 	}
-	return inspectDockerVolume(volName)
+	return inspectDockerVolume(ctx, volName)
 }
 
 // removeDockerVolume removes a volume by name from any namespace.
-func removeDockerVolume(name string) error {
-	cl, err := client.New(containerdSocket)
+func removeDockerVolume(ctx context.Context, name string) error {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd client: %w", err)
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return fmt.Errorf("list namespaces: %w", err)

@@ -21,7 +21,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/mdlayher/vsock"
 )
@@ -129,7 +128,10 @@ func main() {
 
 	// Docker API server on a separate vsock port so the existing control
 	// channel stays untouched.
-	go runDockerAPIServer(bootFinalized)
+	go func() {
+		pc = newPersistentClient(containerdSocket)
+		runDockerAPIServer(bootFinalized)
+	}()
 
 	// Buildkit bridge for the buildx remote driver (lazy buildkitd start).
 	go serveBuildkitBridge()
@@ -295,7 +297,7 @@ func runExec(args []string) Response {
 		if ports, err := parsePublishHostPorts(args); err != nil {
 			return Response{Error: fmt.Sprintf("invalid publish spec: %v", err), ExitCode: 1}
 		} else if len(ports) > 0 {
-			if conflict, err := findHostPortConflict(ports, ""); err != nil {
+			if conflict, err := findHostPortConflict(context.Background(), ports, ""); err != nil {
 				return Response{Error: fmt.Sprintf("host port conflict check failed: %v", err), ExitCode: 1}
 			} else if conflict != nil {
 				return Response{
@@ -421,14 +423,11 @@ func parsePublishHostPorts(args []string) ([]int, error) {
 // findHostPortConflict checks whether any requested host port is already used
 // by a running container in any namespace. It returns the first conflict found.
 // The container excludeID is skipped: it is the one being started.
-func findHostPortConflict(ports []int, excludeID string) (*PortMapping, error) {
-	cl, err := client.New(containerdSocket)
+func findHostPortConflict(ctx context.Context, ports []int, excludeID string) (*PortMapping, error) {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer cl.Close()
-
-	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return nil, err

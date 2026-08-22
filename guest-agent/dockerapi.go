@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -224,7 +225,7 @@ func streamNerdctlLogsToTTY(out io.Writer, ns, name string, follow bool, tty boo
 // the container is still running and the client asked for a stream. This avoids
 // the race where short-lived containers exit before attach is called.
 func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
-	ns, containerdID, name, err := resolveDockerID(id)
+	ns, containerdID, name, err := resolveDockerID(r.Context(), id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
 		return
@@ -270,7 +271,7 @@ func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
 
 // handleLogs streams container logs using Docker's multiplexed stream format.
 func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
-	ns, _, name, err := resolveDockerID(id)
+	ns, _, name, err := resolveDockerID(r.Context(), id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
 		return
@@ -470,7 +471,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case path == "/info" && r.Method == http.MethodGet:
 			handleDockerInfo(w, r)
 		case path == "/system/df" && r.Method == http.MethodGet:
-			handleSystemDF(w)
+			handleSystemDF(r.Context(), w)
 		case path == "/system/prune" && r.Method == http.MethodPost:
 			// docker system prune = containers + networks + volumes(?) + images
 			// (volumes only with --volumes, sent as a filter).
@@ -479,13 +480,13 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			if v, ok := filters["volumes"]["true"]; ok && v {
 				withVolumes = true
 			} // container prune: remove all stopped containers.
-			stopped, _, _ := pruneDockerContainers()
-			nets, _ := pruneDockerNetworks()
+			stopped, _, _ := pruneDockerContainers(r.Context())
+			nets, _ := pruneDockerNetworks(r.Context())
 			var vols []string
 			if withVolumes {
-				vols, _, _ = pruneDockerVolumes()
+				vols, _, _ = pruneDockerVolumes(r.Context())
 			}
-			imgs, reclaimed, _ := pruneDockerImages(false)
+			imgs, reclaimed, _ := pruneDockerImages(r.Context(), false)
 			_ = imgs
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -497,7 +498,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case path == "/containers/json":
 			all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
 			filters := parseDockerFilters(r.URL.Query().Get("filters"))
-			containers, err := listDockerContainers(filters)
+			containers, err := listDockerContainers(r.Context(), filters)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
@@ -514,7 +515,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(containers)
 		case path == "/containers/prune" && r.Method == http.MethodPost:
-			deleted, reclaimed, err := pruneDockerContainers()
+			deleted, reclaimed, err := pruneDockerContainers(r.Context())
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
@@ -525,7 +526,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				"SpaceReclaimed":    reclaimed,
 			})
 		case path == "/images/json":
-			images, err := listDockerImages()
+			images, err := listDockerImages(r.Context())
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
@@ -541,7 +542,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				http.Error(w, `{"message":"missing fromImage"}`, http.StatusBadRequest)
 				return
 			}
-			status, err := pullDockerImage(image)
+			status, err := pullDockerImage(r.Context(), image)
 			w.Header().Set("Content-Type", "application/json")
 			if err != nil {
 				// Docker CLI expects a stream of progress objects; send one error line.
@@ -562,20 +563,20 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				http.Error(w, `{"message":"missing repo/tag"}`, http.StatusBadRequest)
 				return
 			}
-			if err := tagDockerImage(tagName, target); err != nil {
+			if err := tagDockerImage(r.Context(), tagName, target); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
 			w.WriteHeader(http.StatusCreated)
 		case isPush && r.Method == http.MethodPost:
 			w.Header().Set("Content-Type", "application/json")
-			if err := pushDockerImage(pushName, w); err != nil {
+			if err := pushDockerImage(r.Context(), pushName, w); err != nil {
 				fmt.Fprintf(w, "{\"status\":\"error pushing %s: %s\"}\n", pushName, err.Error())
 				return
 			}
 		case isRMI:
 			// force=1 is docker rmi -f (compose down --rmi sends it).
-			if err := removeDockerImage(rmiName, r.URL.Query().Get("force") == "1"); err != nil {
+			if err := removeDockerImage(r.Context(), rmiName, r.URL.Query().Get("force") == "1"); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
@@ -587,7 +588,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			if filters["dangling"]["false"] {
 				dangling = false
 			}
-			deleted, reclaimed, err := pruneDockerImages(dangling)
+			deleted, reclaimed, err := pruneDockerImages(r.Context(), dangling)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
@@ -619,8 +620,8 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				"SpaceReclaimed": reclaimed,
 			})
 		case isImageInspect && r.Method == http.MethodGet:
-			log.Printf("[docker-api] image inspect %q (resolved ns=%q)", imageInspectName, findImageNamespace(imageInspectName))
-			info, err := inspectDockerImage(imageInspectName)
+			log.Printf("[docker-api] image inspect %q (resolved ns=%q)", imageInspectName, findImageNamespace(r.Context(), imageInspectName))
+			info, err := inspectDockerImage(r.Context(), imageInspectName)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
 				return
@@ -629,7 +630,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			json.NewEncoder(w).Encode(info)
 		case path == "/networks":
 			filters := parseDockerFilters(r.URL.Query().Get("filters"))
-			networks, err := listDockerNetworks(filters)
+			networks, err := listDockerNetworks(r.Context(), filters)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
@@ -642,7 +643,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusBadRequest)
 				return
 			}
-			nw, err := createDockerNetwork(req)
+			nw, err := createDockerNetwork(r.Context(), req)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
@@ -650,7 +651,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{"Id": nw.Id, "Warning": ""})
 		case isNetworkInspect && r.Method == http.MethodGet:
-			nw, err := inspectDockerNetwork(networkInspectID)
+			nw, err := inspectDockerNetwork(r.Context(), networkInspectID)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
 				return
@@ -658,7 +659,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(nw)
 		case isNetworkInspect && r.Method == http.MethodDelete:
-			if err := removeDockerNetwork(networkInspectID); err != nil {
+			if err := removeDockerNetwork(r.Context(), networkInspectID); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
@@ -690,7 +691,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case path == "/networks/prune" && r.Method == http.MethodPost:
-			deleted, err := pruneDockerNetworks()
+			deleted, err := pruneDockerNetworks(r.Context())
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
@@ -699,7 +700,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			json.NewEncoder(w).Encode(map[string][]string{"NetworksDeleted": deleted})
 		case path == "/volumes":
 			filters := parseDockerFilters(r.URL.Query().Get("filters"))
-			volumes, err := listDockerVolumes(filters)
+			volumes, err := listDockerVolumes(r.Context(), filters)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
@@ -707,7 +708,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(dockerVolumeList{Volumes: volumes})
 		case path == "/volumes/prune" && r.Method == http.MethodPost:
-			deleted, reclaimed, err := pruneDockerVolumes()
+			deleted, reclaimed, err := pruneDockerVolumes(r.Context())
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
@@ -723,7 +724,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusBadRequest)
 				return
 			}
-			vol, err := createDockerVolume(req)
+			vol, err := createDockerVolume(r.Context(), req)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
@@ -731,7 +732,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(vol)
 		case isVolumeInspect && r.Method == http.MethodGet:
-			vol, err := inspectDockerVolume(volumeInspectName)
+			vol, err := inspectDockerVolume(r.Context(), volumeInspectName)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
 				return
@@ -739,7 +740,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(vol)
 		case isVolumeInspect && r.Method == http.MethodDelete:
-			if err := removeDockerVolume(volumeInspectName); err != nil {
+			if err := removeDockerVolume(r.Context(), volumeInspectName); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
@@ -751,7 +752,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				return
 			}
 			name := r.URL.Query().Get("name")
-			id, err := createDockerContainer(req, name)
+			id, err := createDockerContainer(r.Context(), req, name)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
@@ -759,7 +760,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(dockerCreateResponse{Id: id})
 		case isStart && r.Method == http.MethodPost:
-			if err := startDockerContainer(startID); err != nil {
+			if err := startDockerContainer(r.Context(), startID); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
@@ -771,7 +772,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 					timeout = v
 				}
 			}
-			if err := stopDockerContainer(stopID, timeout); err != nil {
+			if err := stopDockerContainer(r.Context(), stopID, timeout); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
@@ -781,7 +782,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			if signal == "" {
 				signal = "SIGKILL"
 			}
-			if err := killDockerContainer(killID, signal); err != nil {
+			if err := killDockerContainer(r.Context(), killID, signal); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
@@ -793,7 +794,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 					timeout = v
 				}
 			}
-			if err := restartDockerContainer(restartID, timeout); err != nil {
+			if err := restartDockerContainer(r.Context(), restartID, timeout); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
@@ -802,27 +803,27 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			handleContainerWait(w, r, waitID)
 		case isRename && r.Method == http.MethodPost:
 			newName := strings.TrimPrefix(r.URL.Query().Get("name"), "/")
-			if err := renameDockerContainer(renameID, newName); err != nil {
+			if err := renameDockerContainer(r.Context(), renameID, newName); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case isPause && r.Method == http.MethodPost:
-			if err := pauseDockerContainer(pauseID, true); err != nil {
+			if err := pauseDockerContainer(r.Context(), pauseID, true); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case isUnpause && r.Method == http.MethodPost:
-			if err := pauseDockerContainer(unpauseID, false); err != nil {
+			if err := pauseDockerContainer(r.Context(), unpauseID, false); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case isTop && r.Method == http.MethodGet:
-			handleContainerTop(w, topID)
+			handleContainerTop(r.Context(), w, topID)
 		case isStats && r.Method == http.MethodGet:
-			handleContainerStats(w, statsID, r.URL.Query().Get("stream") == "1")
+			handleContainerStats(r.Context(), w, statsID, r.URL.Query().Get("stream") == "1")
 		case isAttach && r.Method == http.MethodPost:
 			handleAttach(w, r, attachID)
 		case isLogs && r.Method == http.MethodGet:
@@ -835,7 +836,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusBadRequest)
 				return
 			}
-			id, err := createDockerExec(execCreateID, req)
+			id, err := createDockerExec(r.Context(), execCreateID, req)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
 				return
@@ -867,13 +868,13 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			json.NewEncoder(w).Encode(info)
 		case isDelete && r.Method == http.MethodDelete:
 			force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
-			if err := deleteDockerContainer(deleteID, force); err != nil {
+			if err := deleteDockerContainer(r.Context(), deleteID, force); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case isInspect && r.Method == http.MethodGet:
-			inspect, err := inspectDockerContainer(inspectID)
+			inspect, err := inspectDockerContainer(r.Context(), inspectID)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
 				return
@@ -909,8 +910,8 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 
 // pruneDockerContainers removes stopped/created containers and returns their
 // Docker IDs. It mirrors the response shape of POST /containers/prune.
-func pruneDockerContainers() ([]string, int64, error) {
-	containers, err := listDockerContainers(nil)
+func pruneDockerContainers(ctx context.Context) ([]string, int64, error) {
+	containers, err := listDockerContainers(ctx, nil)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -919,7 +920,7 @@ func pruneDockerContainers() ([]string, int64, error) {
 		if c.State == "running" {
 			continue
 		}
-		if err := deleteDockerContainer(c.Id, true); err != nil {
+		if err := deleteDockerContainer(ctx, c.Id, true); err != nil {
 			log.Printf("[docker-api] prune container %s: %v", c.Id, err)
 			continue
 		}
@@ -929,12 +930,12 @@ func pruneDockerContainers() ([]string, int64, error) {
 }
 
 // pruneDockerNetworks removes unused non-default networks.
-func pruneDockerNetworks() ([]string, error) {
-	networks, err := listDockerNetworks(nil)
+func pruneDockerNetworks(ctx context.Context) ([]string, error) {
+	networks, err := listDockerNetworks(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	containers, err := listDockerContainers(nil)
+	containers, err := listDockerContainers(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -970,7 +971,7 @@ func pruneDockerNetworks() ([]string, error) {
 		if _, ok := inUse[nw.Name]; ok {
 			continue
 		}
-		if err := removeDockerNetwork(nw.Name); err != nil {
+		if err := removeDockerNetwork(ctx, nw.Name); err != nil {
 			log.Printf("[docker-api] prune network %s: %v", nw.Name, err)
 			continue
 		}
@@ -980,12 +981,12 @@ func pruneDockerNetworks() ([]string, error) {
 }
 
 // pruneDockerVolumes removes volumes not referenced by any container.
-func pruneDockerVolumes() ([]string, int64, error) {
-	volumes, err := listDockerVolumes(nil)
+func pruneDockerVolumes(ctx context.Context) ([]string, int64, error) {
+	volumes, err := listDockerVolumes(ctx, nil)
 	if err != nil {
 		return nil, 0, err
 	}
-	containers, err := listDockerContainers(nil)
+	containers, err := listDockerContainers(ctx, nil)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1027,7 +1028,7 @@ func pruneDockerVolumes() ([]string, int64, error) {
 		if _, ok := inUse[v.Name]; ok {
 			continue
 		}
-		if err := removeDockerVolume(v.Name); err != nil {
+		if err := removeDockerVolume(ctx, v.Name); err != nil {
 			log.Printf("[docker-api] prune volume %s: %v", v.Name, err)
 			continue
 		}

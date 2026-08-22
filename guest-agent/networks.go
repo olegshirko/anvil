@@ -9,8 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/containerd/containerd/v2/client"
 )
 
 // anvilShareRoot is the virtiofs mount exposed by the host.
@@ -80,14 +78,12 @@ type dockerNetworkCreateRequest struct {
 }
 
 // listDockerNetworks returns networks from all namespaces.
-func listDockerNetworks(filters map[string]map[string]bool) ([]dockerNetwork, error) {
-	cl, err := client.New(containerdSocket)
+func listDockerNetworks(ctx context.Context, filters map[string]map[string]bool) ([]dockerNetwork, error) {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd client: %w", err)
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list namespaces: %w", err)
@@ -150,14 +146,12 @@ func listDockerNetworks(filters map[string]map[string]bool) ([]dockerNetwork, er
 }
 
 // inspectDockerNetwork returns a network by name or ID.
-func inspectDockerNetwork(name string) (*dockerNetwork, error) {
-	cl, err := client.New(containerdSocket)
+func inspectDockerNetwork(ctx context.Context, name string) (*dockerNetwork, error) {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd client: %w", err)
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list namespaces: %w", err)
@@ -307,7 +301,7 @@ func cniLabelsForNetwork(name string) map[string]string {
 // createDockerNetwork creates a network in the requested namespace.
 // It first writes a deterministic CNI conflist for the requested name, because
 // `nerdctl network create` cannot reuse a conflist it did not create itself.
-func createDockerNetwork(req dockerNetworkCreateRequest) (*dockerNetwork, error) {
+func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*dockerNetwork, error) {
 	ns := req.Namespace
 	if ns == "" {
 		// Compose custom networks are named <project>_<network>. Use the project
@@ -328,7 +322,7 @@ func createDockerNetwork(req dockerNetworkCreateRequest) (*dockerNetwork, error)
 	// previous compose run), return it. Do this before writing the CNI conflist,
 	// otherwise nerdctl network inspect will report the conflist as an existing
 	// network and we would skip the real creation and label persistence.
-	if existing, err := inspectDockerNetwork(req.Name); err == nil && existing != nil {
+	if existing, err := inspectDockerNetwork(ctx, req.Name); err == nil && existing != nil {
 		return existing, nil
 	}
 
@@ -371,21 +365,19 @@ func createDockerNetwork(req dockerNetworkCreateRequest) (*dockerNetwork, error)
 }
 
 // removeDockerNetwork removes a network by name or ID.
-func removeDockerNetwork(name string) error {
+func removeDockerNetwork(ctx context.Context, name string) error {
 	// Resolve the network first so we can delete the persisted labels by name
 	// even when the client sent the network ID.
 	var netName string
-	if nw, err := inspectDockerNetwork(name); err == nil && nw != nil {
+	if nw, err := inspectDockerNetwork(ctx, name); err == nil && nw != nil {
 		netName = nw.Name
 	}
 
-	cl, err := client.New(containerdSocket)
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd client: %w", err)
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return fmt.Errorf("list namespaces: %w", err)

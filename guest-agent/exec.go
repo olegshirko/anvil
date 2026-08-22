@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
@@ -123,8 +124,8 @@ type dockerExecInspectResponse struct {
 }
 
 // createDockerExec creates an exec instance and returns its Docker-compatible ID.
-func createDockerExec(containerID string, req dockerExecCreateRequest) (string, error) {
-	ns, containerdID, name, err := resolveDockerID(containerID)
+func createDockerExec(ctx context.Context, containerID string, req dockerExecCreateRequest) (string, error) {
+	ns, containerdID, name, err := resolveDockerID(ctx, containerID)
 	if err != nil {
 		return "", err
 	}

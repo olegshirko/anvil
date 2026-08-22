@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
@@ -294,14 +293,13 @@ func peekContainerExitCode(dockerID string) (int, bool) {
 
 // waitContainerTask blocks until the containerd task exits and returns its exit
 // code. It returns an error if the task does not appear or is already deleted.
-func waitContainerTask(ns, containerdID string) (int, error) {
-	cl, err := client.New(containerdSocket)
+func waitContainerTask(ctx context.Context, ns, containerdID string) (int, error) {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return 0, err
 	}
-	defer cl.Close()
 
-	nsCtx := namespaces.WithNamespace(context.Background(), ns)
+	nsCtx := namespaces.WithNamespace(ctx, ns)
 
 	// Poll until the task exists. /wait may be called before /start.
 	deadline := time.Now().Add(30 * time.Second)
@@ -412,14 +410,12 @@ type dockerPort struct {
 
 // resolveDockerID maps a Docker ID prefix or container name to a containerd ID
 // and its namespace. It returns an error if no unique match is found.
-func resolveDockerID(prefix string) (ns, containerdID, name string, err error) {
-	cl, err := client.New(containerdSocket)
+func resolveDockerID(ctx context.Context, prefix string) (ns, containerdID, name string, err error) {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return "", "", "", fmt.Errorf("containerd client: %w", err)
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return "", "", "", fmt.Errorf("list namespaces: %w", err)
@@ -536,13 +532,12 @@ func isNerdctlContainerRunning(ns, name string) bool {
 
 // findContainerByName returns the Docker ID of a container with the given name
 // in the given namespace, or an empty string if none exists.
-func findContainerByName(ns, name string) (string, error) {
-	cl, err := client.New(containerdSocket)
+func findContainerByName(ctx context.Context, ns, name string) (string, error) {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return "", err
 	}
-	defer cl.Close()
-	nsCtx := namespaces.WithNamespace(context.Background(), ns)
+	nsCtx := namespaces.WithNamespace(ctx, ns)
 	containers, err := cl.Containers(nsCtx)
 	if err != nil {
 		return "", err
@@ -560,7 +555,7 @@ func findContainerByName(ns, name string) (string, error) {
 }
 
 // createDockerContainer creates a container via nerdctl and returns its Docker ID.
-func createDockerContainer(req dockerCreateRequest, name string) (string, error) {
+func createDockerContainer(ctx context.Context, req dockerCreateRequest, name string) (string, error) {
 	networkMode := req.HostConfig.NetworkMode
 	ns := namespaceFromNetwork(networkMode)
 	// Compose attaches containers to a network named <project>_<network>. The
@@ -582,7 +577,7 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 	// store is shared, so when the image already exists elsewhere we copy its
 	// metadata instead of re-pulling, which avoids corrupting the shared content
 	// store when docker compose creates multiple containers in parallel.
-	if err := ensureImageInNamespace(req.Image, ns); err != nil {
+	if err := ensureImageInNamespace(ctx, req.Image, ns); err != nil {
 		return "", err
 	}
 
@@ -596,7 +591,7 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 
 	// Docker refuses duplicate names; mimic that to avoid ambiguous lookups later.
 	if name != "" {
-		if existing, err := findContainerByName(ns, name); err == nil && existing != "" {
+		if existing, err := findContainerByName(ctx, ns, name); err == nil && existing != "" {
 			return "", fmt.Errorf("Conflict. The container name \"/%s\" is already in use by container \"%s\". You have to remove (or rename) that container to be able to reuse that name.", name, existing)
 		}
 	}
@@ -796,13 +791,11 @@ func createDockerContainer(req dockerCreateRequest, name string) (string, error)
 	}
 
 	// Look up the container by the ID nerdctl printed, then by requested name.
-	cl, err := client.New(containerdSocket)
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return "", fmt.Errorf("containerd client: %w", err)
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	nsCtx := namespaces.WithNamespace(ctx, ns)
 
 	var containerdID string
@@ -962,11 +955,10 @@ func writeContainerPortMappings(ns, containerdID string, mappings []cniPortMappi
 // containers bypassing `nerdctl rm`, so their store entries would otherwise
 // accumulate forever on the persistent disk.
 func pruneStaleNetworkStore() {
-	cl, err := client.New(containerdSocket)
+	cl, err := pc.get(context.Background())
 	if err != nil {
 		return
 	}
-	defer cl.Close()
 
 	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
@@ -1002,13 +994,12 @@ func pruneStaleNetworkStore() {
 
 // containerHostPorts returns the TCP host ports published by the container,
 // read from the nerdctl port-mapping metadata.
-func containerHostPorts(ns, containerdID string) []int {
-	cl, err := client.New(containerdSocket)
+func containerHostPorts(ctx context.Context, ns, containerdID string) []int {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return nil
 	}
-	defer cl.Close()
-	nsCtx := namespaces.WithNamespace(context.Background(), ns)
+	nsCtx := namespaces.WithNamespace(ctx, ns)
 	c, err := cl.LoadContainer(nsCtx, containerdID)
 	if err != nil {
 		return nil
@@ -1034,8 +1025,8 @@ func containerHostPorts(ns, containerdID string) []int {
 	return ports
 }
 
-func startDockerContainer(id string) error {
-	ns, containerdID, _, err := resolveDockerID(id)
+func startDockerContainer(ctx context.Context, id string) error {
+	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -1047,8 +1038,8 @@ func startDockerContainer(id string) error {
 	// process (Docker Desktop, Lima, a local postgres) — the port forwarder
 	// can only log that bind failure, leaving the container silently
 	// unreachable on localhost.
-	if ports := containerHostPorts(ns, containerdID); len(ports) > 0 {
-		if conflict, err := findHostPortConflict(ports, containerdID); err == nil && conflict != nil {
+	if ports := containerHostPorts(ctx, ns, containerdID); len(ports) > 0 {
+		if conflict, err := findHostPortConflict(ctx, ports, containerdID); err == nil && conflict != nil {
 			log.Printf("[portcheck] start %s: host port %d already published by container %q (%s) in ns %q",
 				containerdID, conflict.HostPort, conflict.Name, conflict.ContainerID, conflict.Namespace)
 			return fmt.Errorf("Bind for 0.0.0.0:%d failed: port is already allocated", conflict.HostPort)
@@ -1065,7 +1056,7 @@ func startDockerContainer(id string) error {
 	// records). nerdctl prepares the hosts file at create; the post-start
 	// application below covers restarts and any nerdctl rewrites.
 	if links := pendingLinkEntries(dockerID(ns, containerdID)); len(links) > 0 {
-		applyLinkAliases(ns, containerdID, links)
+		applyLinkAliases(ctx, ns, containerdID, links)
 	}
 	stdout, stderr, code, err := runNerdctl(ns, "start", containerdID)
 	if err != nil || code != 0 {
@@ -1081,7 +1072,7 @@ func startDockerContainer(id string) error {
 	// docker --link: append alias -> target-IP entries to THIS container's
 	// /etc/hosts (legacy link semantics are plain /etc/hosts records).
 	if links := pendingLinkEntries(dockerID(ns, containerdID)); len(links) > 0 {
-		go applyLinkAliases(ns, containerdID, links)
+		go applyLinkAliases(context.Background(), ns, containerdID, links)
 	}
 	// Re-attach the health monitor after a stop/start cycle.
 	did := dockerID(ns, containerdID)
@@ -1093,12 +1084,12 @@ func startDockerContainer(id string) error {
 	// delete the container. nerdctl --rm would delete too early for /wait.
 	if isAutoRemove(did) {
 		go func() {
-			code, _ := waitContainerTask(ns, containerdID)
+			code, _ := waitContainerTask(context.Background(), ns, containerdID)
 			cacheContainerExitCode(did, code)
 			// Let any attach connection finish replaying the output before
 			// the container (and its logs) disappear.
 			waitForAttachDrain(did, 30*time.Second)
-			if err := deleteDockerContainer(did, true); err != nil {
+			if err := deleteDockerContainer(context.Background(), did, true); err != nil {
 				log.Printf("[docker-api] auto-remove %s: %v", did, err)
 			}
 			unmarkAutoRemove(did)
@@ -1111,8 +1102,8 @@ func startDockerContainer(id string) error {
 // the containerd task actually reaches the stopped state. nerdctl stop can
 // return before the task exits, which makes a subsequent `docker rm` fail with
 // "container is in running status".
-func stopDockerContainer(id string, timeout int) error {
-	ns, containerdID, _, err := resolveDockerID(id)
+func stopDockerContainer(ctx context.Context, id string, timeout int) error {
+	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -1133,14 +1124,10 @@ func stopDockerContainer(id string, timeout int) error {
 
 	// Poll containerd until the task stops or disappears.
 	waitDeadline := time.Now().Add(30 * time.Second)
-	for {
-		cl, err := client.New(containerdSocket)
-		if err != nil {
-			break
-		}
-		nsCtx := namespaces.WithNamespace(context.Background(), ns)
+	cl, cerr := pc.get(ctx)
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	for cerr == nil {
 		c, err := cl.LoadContainer(nsCtx, containerdID)
-		cl.Close()
 		if err != nil {
 			break
 		}
@@ -1181,7 +1168,7 @@ func handleContainerWait(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	ns, containerdID, _, err := resolveDockerID(id)
+	ns, containerdID, _, err := resolveDockerID(r.Context(), id)
 	if err != nil {
 		// The container may have been auto-removed before we could cache the code.
 		if code, ok := takeContainerExitCode(id); ok {
@@ -1202,7 +1189,7 @@ func handleContainerWait(w http.ResponseWriter, r *http.Request, id string) {
 		f.Flush()
 	}
 
-	exitCode, err := waitContainerTask(ns, containerdID)
+	exitCode, err := waitContainerTask(r.Context(), ns, containerdID)
 	if err != nil {
 		log.Printf("[docker-api] wait %s task error: %v", id, err)
 	}
@@ -1268,8 +1255,8 @@ func removeNerdctlNameStoreByName(ns, name string) {
 	}
 }
 
-func deleteDockerContainer(id string, force bool) error {
-	ns, containerdID, _, err := resolveDockerID(id)
+func deleteDockerContainer(ctx context.Context, id string, force bool) error {
+	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -1301,8 +1288,8 @@ func deleteDockerContainer(id string, force bool) error {
 // renameDockerContainer implements POST /containers/{id}/rename. Compose
 // uses it in the recreate flow: the replacement is created under a temporary
 // name and renamed once the old container is removed.
-func renameDockerContainer(id string, newName string) error {
-	ns, _, name, err := resolveDockerID(id)
+func renameDockerContainer(ctx context.Context, id string, newName string) error {
+	ns, _, name, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -1317,8 +1304,8 @@ func renameDockerContainer(id string, newName string) error {
 }
 
 // killDockerContainer kills a container by Docker ID or name.
-func killDockerContainer(id string, signal string) error {
-	ns, containerdID, _, err := resolveDockerID(id)
+func killDockerContainer(ctx context.Context, id string, signal string) error {
+	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -1344,8 +1331,8 @@ func killDockerContainer(id string, signal string) error {
 }
 
 // restartDockerContainer restarts a container by Docker ID or name.
-func restartDockerContainer(id string, timeout int) error {
-	ns, containerdID, _, err := resolveDockerID(id)
+func restartDockerContainer(ctx context.Context, id string, timeout int) error {
+	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -1410,14 +1397,12 @@ func matchesContainerFilters(s dockerContainerSummary, filters map[string]map[st
 	return true
 }
 
-func listDockerContainers(filters map[string]map[string]bool) ([]dockerContainerSummary, error) {
-	cl, err := client.New(containerdSocket)
+func listDockerContainers(ctx context.Context, filters map[string]map[string]bool) ([]dockerContainerSummary, error) {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd client: %w", err)
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list namespaces: %w", err)
@@ -1514,14 +1499,12 @@ func listDockerContainers(filters map[string]map[string]bool) ([]dockerContainer
 // inspectDockerContainer returns a minimal inspect payload for a container.
 // The lookup accepts a Docker ID prefix, a container name, or a leading-slash
 // name as returned by `docker ps`.
-func inspectDockerContainer(prefix string) (*dockerContainerInspect, error) {
-	cl, err := client.New(containerdSocket)
+func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContainerInspect, error) {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd client: %w", err)
 	}
-	defer cl.Close()
 
-	ctx := context.Background()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list namespaces: %w", err)

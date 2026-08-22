@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"path/filepath"
@@ -142,8 +143,8 @@ func pendingLinkEntries(dockerID string) []string {
 
 // applyLinkAliases appends alias -> target-IP lines to this container's own
 // /etc/hosts bind mount (the legacy docker --link contract).
-func applyLinkAliases(ns, containerdID string, links []string) {
-	entries := linkAliases(ns, links)
+func applyLinkAliases(ctx context.Context, ns, containerdID string, links []string) {
+	entries := linkAliases(ctx, ns, links)
 	if len(entries) == 0 {
 		return
 	}
@@ -184,7 +185,7 @@ func applyLinkAliases(ns, containerdID string, links []string) {
 // linkAliases returns extra /etc/hosts entries (alias -> target IP) for the
 // docker --link flag: "name:alias" pairs referencing containers in the same
 // namespace. Returns entries to append to this container's hosts file.
-func linkAliases(ns string, links []string) []string {
+func linkAliases(ctx context.Context, ns string, links []string) []string {
 	var out []string
 	for _, l := range links {
 		// Docker sends "/target:/consumer/alias" (or "target:alias"); the
@@ -198,7 +199,7 @@ func linkAliases(ns string, links []string) []string {
 				alias = last
 			}
 		}
-		tns, tid, _, err := resolveDockerID(target)
+		tns, tid, _, err := resolveDockerID(ctx, target)
 		if err != nil {
 			continue
 		}
