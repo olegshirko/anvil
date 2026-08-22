@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -112,8 +111,8 @@ type dockerWaitResponse struct {
 }
 
 // autoRemoveContainers tracks Docker IDs that were created with AutoRemove.
-// We do not pass --rm to nerdctl so that we can capture the exit code before
-// the container disappears.
+// Removal happens in-agent after the exit code is captured so /wait can
+// still read it.
 var autoRemoveContainers = struct {
 	mu  sync.RWMutex
 	ids map[string]struct{}
@@ -121,9 +120,9 @@ var autoRemoveContainers = struct {
 	ids: make(map[string]struct{}),
 }
 
-// containerTTYFlags remembers which containers were created with Tty=true.
-// nerdctl's inspect does not report the flag, but attach needs it to pick
-// the raw (non-multiplexed) stream format, and inspect must return it.
+// containerTTYFlags remembers which containers were created with Tty=true:
+// attach needs it to pick the raw (non-multiplexed) stream format, and
+// inspect must return it.
 var containerTTYFlags = struct {
 	mu sync.RWMutex
 	m  map[string]bool
@@ -132,7 +131,7 @@ var containerTTYFlags = struct {
 }
 
 // containerEntryPoints remembers WorkingDir/Entrypoint per container for
-// inspect responses (nerdctl's inspect does not report them).
+// inspect responses.
 var containerEntryPoints = struct {
 	mu    sync.RWMutex
 	dirs  map[string]string
@@ -478,24 +477,6 @@ func resolveDockerID(ctx context.Context, prefix string) (ns, containerdID, name
 	return matches[0].ns, matches[0].id, matches[0].name, nil
 }
 
-// runNerdctl runs a nerdctl command in the given namespace and returns output.
-func runNerdctl(ns string, args ...string) (stdout, stderr string, exitCode int, err error) {
-	cmdArgs := append([]string{"-n", ns}, args...)
-	cmd := exec.Command("/opt/containerd/bin/nerdctl", cmdArgs...)
-	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-	var outBuf, errBuf strings.Builder
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
-	}
-	return outBuf.String(), errBuf.String(), exitCode, err
-}
-
 // containerTaskState reads the task state for a container directly from
 // containerd. Returns ("", false) when the task does not exist.
 func containerTaskState(ctx context.Context, ns, id string) (running bool, status string, ok bool) {
@@ -521,10 +502,10 @@ func containerTaskState(ctx context.Context, ns, id string) (running bool, statu
 	return st.Status == "running", dockerStatus(string(st.Status)), true
 }
 
-// nerdctlContainerStatus returns the container's status string ("created",
-// "running", "exited", ...) or "" when it cannot be determined. The name
-// predates the native runtime; it now reads containerd directly.
-func nerdctlContainerStatus(ns, name string) string {
+// containerStatus returns the container's status string ("created",
+// "running", "exited", ...) or "" when it cannot be determined. It reads
+// containerd task state directly.
+func containerStatus(ns, name string) string {
 	id := resolveContainerdIDByName(context.Background(), ns, name)
 	if id == "" {
 		return ""

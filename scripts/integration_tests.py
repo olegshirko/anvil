@@ -381,7 +381,7 @@ def test_events() -> None:
 
 def test_udp_publishing() -> None:
     """-p <host>:<ctr>/udp must be reachable from the host: the forwarder
-    opens a datagram listener and relays to guestIP:hostPort, where nerdctl
+    opens a datagram listener and relays to guestIP:hostPort, where the
     arms the persisted mapping (reservation socket + nft DNAT)."""
     name = f"{PREFIX}-udp"
     try:
@@ -482,7 +482,7 @@ def test_compose_up() -> None:
 
 def test_compose_recreate_over_live() -> None:
     """Regression: `compose up` over LIVE containers creates the replacement
-    before stopping the old one. nerdctl used to reserve host ports at create
+    before stopping the old one. The old nerdctl path reserved host ports at create
     time (inherited listener fd), so this always failed with 'port is already
     allocated'. Docker checks ports at start; our port publishing must not
     bind user host ports inside the guest at all."""
@@ -623,7 +623,7 @@ def test_compose_project_isolation() -> None:
 
 def test_compose_service_dns() -> None:
     """Regression: compose resolves services by name (`http://web`), which
-    arrives as NetworkingConfig aliases in the create request. nerdctl has no
+    arrives as NetworkingConfig aliases in the create request. Compose resolves
     --network-alias, so guest-agent writes the aliases into the /etc/hosts
     bind mounts of the project's containers."""
     project = f"{PREFIX}-dns"
@@ -654,7 +654,7 @@ def test_compose_service_dns() -> None:
                 time.sleep(1.0)
             if "<!DOCTYPE html>" not in out.stdout and "Welcome to nginx" not in out.stdout:
                 raise RuntimeError(f"service-name DNS failed: {out.stdout!r} {out.stderr!r}")
-            # by container name (nerdctl-native) must keep working; compose
+            # by container name must keep working; compose
             # names containers <project>-<service>-1
             out2 = docker(*base, "exec", "-T", "client",
                           "sh", "-c", f"wget -qO- --timeout=5 http://{project}-web-1 | head -c 40",
@@ -940,7 +940,7 @@ def test_system_df() -> None:
 
 
 def test_network_connect() -> None:
-    """Live network attach is not supported by the runtime (nerdctl has no
+    """Live network attach is not supported by the runtime (no network connect,
     `network connect`); the API must fail with an actionable error rather
     than a bare 404."""
     net, name = f"{PREFIX}-conn", f"{PREFIX}-connc"

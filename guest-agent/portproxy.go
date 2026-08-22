@@ -12,10 +12,10 @@ import (
 	"time"
 )
 
-// Anvil port publishing deliberately does not hand `-p` flags to nerdctl:
-// nerdctl reserves host ports with an inherited listener fd and validates
+// Anvil port publishing deliberately does not bind published ports inside
+// the guest: create-time reservation would race
 // availability at CREATE time (docker semantics are: check at start). With
-// nerdctl-managed ports, `docker compose up` over live containers — which
+// live containers, which `docker compose up --force-recreate` relies on:
 // creates the replacement before stopping the old one — always failed with
 // "port is already allocated". Instead, the host-side PortForwarder connects
 // to this single guest-side proxy port and sends the real target

@@ -109,7 +109,7 @@ backend_compose_cmd() {
 
 backend_all_healthy() {
     local unhealthy
-    unhealthy=$("$VZRUNNER_BIN" exec nerdctl -n bench compose -f "$GUEST_SHARE_ROOT/workloads/docker-compose.bench.yml" ps --format json 2>/dev/null \
+    unhealthy=$("$SCRIPT_DIR/scripts/vzc.sh" -f "$HOST_SHARE_ROOT/workloads/docker-compose.bench.yml" ps --format json 2>/dev/null \
         | python3 -c '
 import sys, json
 n = 0

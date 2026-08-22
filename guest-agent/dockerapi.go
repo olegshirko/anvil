@@ -170,7 +170,7 @@ func streamTaskLogToTTY(out io.Writer, ns, id string, follow bool, tty bool) {
 	// container may start, print and exit while we are still replaying
 	// nothing — and its output is lost.
 	for i := 0; i < 100; i++ {
-		status := nerdctlContainerStatus(ns, id)
+		status := containerStatus(ns, id)
 		if status != "" && status != "created" && status != "paused" {
 			break
 		}

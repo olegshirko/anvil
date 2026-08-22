@@ -108,13 +108,28 @@ def vz_exec(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
     return run_host([str(VZ_RUNNER), "exec", *args], timeout=timeout)
 
 
+# Containers are driven through anvil's Docker API socket — the same endpoint
+# users configure their docker context to. A containerd namespace maps to a
+# Docker network here: `--network <name>` puts the container into the
+# namespace/conflist of that name (see guest-agent createDockerContainer).
+DOCKER_SOCKET = Path.home() / ".anvil-vz" / "docker.sock"
+
+
+def docker(*args: str, network: str | None = None,
+           timeout: float = 60.0) -> subprocess.CompletedProcess:
+    full = ["docker", "--host", f"unix://{DOCKER_SOCKET}"]
+    if network:
+        full += ["--network", network]
+    return run_host([*full, *args], timeout=timeout)
+
+
 def vz_pull(namespace: str, image: str, attempts: int = 3) -> None:
     """Pull with retries: the VZ NAT path to registries sporadically resets
     the first TLS connection, which would otherwise fail a whole test."""
     last = None
     for i in range(attempts):
         try:
-            vz_exec("nerdctl", "-n", namespace, "pull", image, timeout=300)
+            docker("pull", image, timeout=300)
             return
         except Exception as e:  # noqa: BLE001 - retried below
             last = e
@@ -156,7 +171,7 @@ def test_repeated_resume_cycles() -> None:
         wait_for_marker("daemon ready")
         # Prepare a clean snapshot with the image cached but no container.
         if (SHARE_DIR / "nginx.tar").exists():
-            vz_exec("nerdctl", "-n", "project-a", "load", "-i", "/mnt/anvil/nginx.tar", timeout=120)
+            docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
         else:
             vz_pull("project-a", "nginx")
 
@@ -200,8 +215,8 @@ def test_resume_after_workload() -> None:
     try:
         wait_for_marker("daemon ready")
         if (SHARE_DIR / "nginx.tar").exists():
-            vz_exec("nerdctl", "-n", "project-a", "load", "-i", "/mnt/anvil/nginx.tar", timeout=120)
-        vz_exec("nerdctl", "-n", "project-a", "run", "-d", "-p", "8080:80", "--name", "nginx", "nginx")
+            docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
+        docker("run", "-d", "-p", "8080:80", "--name", "nginx", "nginx", network="project-a")
         # Let it serve for a few seconds before saving.
         for _ in range(30):
             p = run_host(["curl", "--noproxy", "*", "-s", "-o", "/dev/null", "-w", "%{http_code}", "http://localhost:8080"], check=False)
@@ -242,8 +257,8 @@ def test_stateful_connection() -> None:
     try:
         wait_for_marker("daemon ready")
         if (SHARE_DIR / "nginx.tar").exists():
-            vz_exec("nerdctl", "-n", "project-a", "load", "-i", "/mnt/anvil/nginx.tar", timeout=120)
-        vz_exec("nerdctl", "-n", "project-a", "run", "-d", "-p", "8080:80", "--name", "nginx", "nginx")
+            docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
+        docker("run", "-d", "-p", "8080:80", "--name", "nginx", "nginx", network="project-a")
         for _ in range(30):
             p = run_host(["curl", "--noproxy", "*", "-s", "-o", "/dev/null", "-w", "%{http_code}", "http://localhost:8080"], check=False)
             if p.stdout.strip() == "200":
@@ -406,11 +421,11 @@ def test_cni_cleanup() -> None:
     try:
         wait_for_marker("daemon ready")
         if (SHARE_DIR / "nginx.tar").exists():
-            vz_exec("nerdctl", "-n", "project-a", "load", "-i", "/mnt/anvil/nginx.tar", timeout=120)
-        vz_exec("nerdctl", "-n", "project-a", "run", "-d", "-p", "8080:80", "--name", "nginx", "nginx")
+            docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
+        docker("run", "-d", "-p", "8080:80", "--name", "nginx", "nginx", network="project-a")
         rules_with_container = _iptables_nat_rules()
         bridges_with_container = _bridge_interfaces()
-        vz_exec("nerdctl", "-n", "project-a", "rm", "-f", "nginx", timeout=30.0)
+        docker("rm", "-f", "nginx", timeout=30.0)
         rules_after = _iptables_nat_rules()
         bridges_after = _bridge_interfaces()
         stop_daemon(proc)
@@ -435,10 +450,10 @@ def test_two_projects() -> None:
     try:
         wait_for_marker("daemon ready")
         if (SHARE_DIR / "nginx.tar").exists():
-            vz_exec("nerdctl", "-n", "project-a", "load", "-i", "/mnt/anvil/nginx.tar", timeout=120)
-            vz_exec("nerdctl", "-n", "project-b", "load", "-i", "/mnt/anvil/nginx.tar", timeout=120)
-        vz_exec("nerdctl", "-n", "project-a", "run", "-d", "-p", "8080:80", "--name", "nginx-a", "nginx")
-        vz_exec("nerdctl", "-n", "project-b", "run", "-d", "-p", "8081:80", "--name", "nginx-b", "nginx")
+            docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
+            docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
+        docker("run", "-d", "-p", "8080:80", "--name", "nginx-a", "nginx", network="project-a")
+        docker("run", "-d", "-p", "8081:80", "--name", "nginx-b", "nginx", network="project-b")
 
         def wait_http(url: str) -> str:
             for _ in range(50):
@@ -456,20 +471,20 @@ def test_two_projects() -> None:
         # conflict check in guest-agent this must fail before the container is
         # created, with a clear error message.
         conflict = run_host(
-            [str(VZ_RUNNER), "exec", "nerdctl", "-n", "project-b", "run", "-d", "-p", "8080:80",
-             "--name", "nginx-b-conflict", "nginx"],
+            ["docker", "--host", f"unix://{DOCKER_SOCKET}", "--network", "project-b",
+             "run", "-d", "-p", "8080:80", "--name", "nginx-b-conflict", "nginx"],
             timeout=30.0,
             check=False,
         )
         conflict_rejected = conflict.returncode != 0
         if not conflict_rejected:
-            vz_exec("nerdctl", "-n", "project-b", "rm", "-f", "nginx-b-conflict", timeout=30.0)
+            docker("rm", "-f", "nginx-b-conflict", timeout=30.0)
 
         # After the rejected conflict attempt, project-a:8080 must still work.
         a_after = wait_http("http://localhost:8080")
 
-        vz_exec("nerdctl", "-n", "project-a", "rm", "-f", "nginx-a", timeout=30.0)
-        vz_exec("nerdctl", "-n", "project-b", "rm", "-f", "nginx-b", timeout=30.0)
+        docker("rm", "-f", "nginx-a", timeout=30.0)
+        docker("rm", "-f", "nginx-b", timeout=30.0)
         stop_daemon(proc)
 
         ok = both_reachable and conflict_rejected and a_after == "200"
@@ -496,14 +511,15 @@ def test_restart_policy_survives_resume() -> None:
         vz_pull("project-a", "alpine")
         # The container fails once (marker missing), then sleeps: the
         # restart monitor in guest-agent must bring it back up.
-        vz_exec("nerdctl", "-n", "project-a", "run", "-d", "--restart", "on-failure:3",
+        docker("run", "-d", "--restart", "on-failure:3",
                 "--name", "restarting", "alpine", "sh", "-c",
-                "[ -f /tmp/m ] && sleep 300 || { touch /tmp/m; exit 1; }")
+                "[ -f /tmp/m ] && sleep 300 || { touch /tmp/m; exit 1; }",
+                network="project-a")
 
         def wait_running(timeout: float = 40.0) -> bool:
             deadline = time.time() + timeout
             while time.time() < deadline:
-                st = run_host([str(VZ_RUNNER), "exec", "nerdctl", "-n", "project-a",
+                st = run_host(["docker", "--host", f"unix://{DOCKER_SOCKET}",
                                "inspect", "--format", "{{.State.Status}}", "restarting"],
                               timeout=30.0, check=False)
                 if st.stdout.strip() == "running":
@@ -520,12 +536,12 @@ def test_restart_policy_survives_resume() -> None:
         # The policy registry is in guest-agent memory, which IS the
         # snapshot: after resume the monitor must still own the policy.
         # Kill the process (exit 137) and expect a restart.
-        vz_exec("nerdctl", "-n", "project-a", "kill", "restarting", timeout=30.0)
+        docker("kill", "restarting", timeout=30.0)
         restarted = wait_running()
         # A user stop must still win after the resume.
-        vz_exec("nerdctl", "-n", "project-a", "stop", "-t", "1", "restarting", timeout=60.0)
+        docker("stop", "-t", "1", "restarting", timeout=60.0)
         time.sleep(4.0)
-        st = run_host([str(VZ_RUNNER), "exec", "nerdctl", "-n", "project-a",
+        st = run_host(["docker", "--host", f"unix://{DOCKER_SOCKET}",
                        "inspect", "--format", "{{.State.Status}}", "restarting"],
                       timeout=30.0, check=False)
         stop_daemon(proc)
@@ -547,9 +563,10 @@ def test_udp_survives_resume() -> None:
     try:
         wait_for_marker("daemon ready")
         vz_pull("project-a", "alpine")
-        vz_exec("nerdctl", "-n", "project-a", "run", "-d", "-p", "25361:15361/udp",
+        docker("run", "-d", "-p", "25361:15361/udp",
                 "--name", "udpecho", "alpine", "sh", "-c",
-                "while true; do echo -n UDP-UP | nc -l -u -p 15361; done")
+                "while true; do echo -n UDP-UP | nc -l -u -p 15361; done",
+                network="project-a")
         time.sleep(2.0)
 
         def udp_probe() -> str:
@@ -564,7 +581,7 @@ def test_udp_survives_resume() -> None:
         time.sleep(2.0)  # scanner push + listener rebind
         after = udp_probe()
 
-        vz_exec("nerdctl", "-n", "project-a", "rm", "-f", "udpecho", timeout=30.0)
+        docker("rm", "-f", "udpecho", timeout=30.0)
         stop_daemon(proc)
         ok = before == "UDP-UP" and after == "UDP-UP"
         record("UDP forwarding across save/resume", ok,

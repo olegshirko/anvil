@@ -181,7 +181,7 @@ func inspectDockerNetwork(ctx context.Context, name string) (*dockerNetwork, err
 
 
 // networkLabelsPath returns the host-share path where we persist Compose labels
-// for a network. nerdctl bridge network inspect does not reliably return the
+// for a network. The conflist is the source of truth; it reliably returns the
 // labels passed at create time, so we keep our own copy.
 func networkLabelsPath(name string) string {
 	base := sanitizeCNIName(name)
@@ -220,7 +220,7 @@ func deleteNetworkLabels(name string) {
 	_ = os.Remove(networkLabelsPath(name))
 }
 
-// mergeNetworkLabels combines nerdctl/inspect labels with persisted Compose labels.
+// mergeNetworkLabels combines conflist labels with persisted Compose labels.
 func mergeNetworkLabels(base, persisted map[string]string) map[string]string {
 	out := map[string]string{}
 	for k, v := range base {
@@ -233,7 +233,7 @@ func mergeNetworkLabels(base, persisted map[string]string) map[string]string {
 }
 
 // restoreNetworkConfigs recreates CNI conflists from persisted labels after a
-// cold boot. nerdctl keeps network state on the persistent containerd disk, but
+// cold boot. containerd keeps its state on the persistent disk, but
 // the CNI conflist lives on tmpfs and is lost on reboot. Without the conflist
 // Docker Compose sees the network as "not created by compose" and refuses to
 // use it.
@@ -281,7 +281,8 @@ func cniLabelsForNetwork(name string) map[string]string {
 
 // createDockerNetwork creates a network in the requested namespace.
 // It first writes a deterministic CNI conflist for the requested name, because
-// `nerdctl network create` cannot reuse a conflist it did not create itself.
+// The runtime consumes the conflist directly — there is no separate
+// "network create" step beyond writing the file.
 func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*dockerNetwork, error) {
 	ns := req.Namespace
 	if ns == "" {
@@ -301,24 +302,22 @@ func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*
 
 	// If the network already exists (e.g. pre-created by the scanner or a
 	// previous compose run), return it. Do this before writing the CNI conflist,
-	// otherwise nerdctl network inspect will report the conflist as an existing
-	// network and we would skip the real creation and label persistence.
+	// otherwise inspectDockerNetwork would report the conflist as an existing
+	// network and we would skip label persistence.
 	if existing, err := inspectDockerNetwork(ctx, req.Name); err == nil && existing != nil {
 		return existing, nil
 	}
 
 	// Pre-create the CNI config so the new network uses our deterministic subnet
 	// and bridge name instead of an auto-generated one. Include any labels sent
-	// by Compose so the network is recognised as Compose-managed. nerdctl treats
-	// a conflist in /etc/cni/net.d as an existing network, so we do not need to
-	// (and must not) call `nerdctl network create` afterwards.
+	// by Compose so the network is recognised as Compose-managed. A conflist
+	// in /etc/cni/net.d IS the network, so no further registration is needed.
 	if err := generateCNIConfigWithLabels(req.Name, req.Labels); err != nil {
 		log.Printf("[docker-api] ensure cni config for network %s: %v", req.Name, err)
 	}
 
-	// Build the response manually. nerdctl's bridge network inspect does not
-	// always surface the labels we passed, but Compose relies on them being
-	// present in inspect output.
+	// Build the response manually: Compose relies on the labels being
+	// present in the create response.
 	subnet := ""
 	if len(req.IPAM.Config) > 0 && req.IPAM.Config[0].Subnet != "" {
 		subnet = req.IPAM.Config[0].Subnet

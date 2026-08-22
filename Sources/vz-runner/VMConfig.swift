@@ -189,7 +189,7 @@ func makeConfiguration(
     // M8: persistent block device for /var/lib. Images and snapshots live on
     // disk, so the VM needs less RAM and the memory-only snapshot stays small.
     // Use host writeback caching with no guest-fsync synchronization: this makes
-    // nerdctl/docker metadata operations fast. Durability is provided by the
+    // image and container metadata operations stay fast. Durability is provided by the
     // snapshot save/resume path; an abnormal host shutdown may lose the last
     // metadata changes, which is acceptable for a development VM.
     if let diskPath = args.containerdDiskPath {

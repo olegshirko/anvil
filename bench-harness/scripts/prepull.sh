@@ -22,7 +22,7 @@ case "$BACKEND" in
         echo "Prepulling inside vz-runner VM (namespace: bench) via $VZRUNNER_BIN..."
         for img in "${IMAGES[@]}"; do
             echo "  pulling $img"
-            "$VZRUNNER_BIN" exec nerdctl -n bench pull "$img" >/dev/null
+            ANVIL_DOCKER_SOCK="${ANVIL_DOCKER_SOCK:-$HOME/.anvil-vz/docker.sock}" DOCKER_HOST="unix://${ANVIL_DOCKER_SOCK}" docker pull "$img" >/dev/null
         done
         ;;
     apple-containers)

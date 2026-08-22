@@ -12,7 +12,7 @@
 #   backend_start          - cold start daemon/VM, return when ready for commands
 #   backend_stop           - full stop (so the next cold start is honest)
 #   backend_resume         - snapshot/resume if supported, else same as backend_start
-#   backend_compose_cmd    - print the docker/nerdctl compose command
+#   backend_compose_cmd    - print the compose command for this backend
 #   backend_idle_rss       - idle RSS of daemon/VM process in MB (after compose down)
 #   backend_name           - human-readable name for the report
 #

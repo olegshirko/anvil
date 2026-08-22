@@ -1,24 +1,14 @@
 #!/usr/bin/env bash
-# Thin wrapper: "vzc compose -f <host-path> up -d" translates the host workload
-# path to the guest path under the virtiofs mount and runs
-# vz-runner exec nerdctl compose ... inside the VM.
+# Thin wrapper: "vzc compose -f <host-path> up -d" runs host-side
+# `docker compose` against anvil's Docker API socket. The project name is
+# pinned to "workloads" (the compose file directory), matching the namespace
+# the guest-side flow used to derive.
 #
-# Assumes vz-runner shares SCRIPT_DIR/.. (the bench-harness root) into the VM
-# at /mnt/anvil via virtiofs (see M2).
+# Assumes vz-runner shares SCRIPT_DIR/.. (the bench-harness root) into the VM;
+# the daemon's docker.sock is proxied by vz-runner to ~/.anvil-vz/docker.sock.
 set -euo pipefail
 
-VZRUNNER_BIN="${VZRUNNER_BIN:-vz-runner}"
-HOST_SHARE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GUEST_SHARE_ROOT="/mnt/anvil"
+DOCKER_SOCKET="${ANVIL_DOCKER_SOCK:-$HOME/.anvil-vz/docker.sock}"
+export DOCKER_HOST="unix://${DOCKER_SOCKET}"
 
-args=("$@")
-for i in "${!args[@]}"; do
-    if [[ "${args[$i]}" == -f ]]; then
-        host_path="${args[$((i+1))]}"
-        # host_path is usually .../bench-harness/workloads/docker-compose.bench.yml
-        rel="${host_path#"$HOST_SHARE_ROOT"/}"
-        args[$((i+1))]="$GUEST_SHARE_ROOT/$rel"
-    fi
-done
-
-"$VZRUNNER_BIN" exec nerdctl -n bench compose "${args[@]}"
+exec docker compose --project-name workloads "$@"

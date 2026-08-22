@@ -12,11 +12,9 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
-// nerdctl accepts --restart but has no restart monitor, so policies were
-// silently ignored (documented as a limitation until now). This monitor
-// watches policy-tracked containers via the containerd task status (the
-// authoritative state — nerdctl's own inspect reports Status:""/Restarting
-// for policy containers) and brings them back per Docker semantics:
+// containerd has no restart policy concept of its own. This monitor watches
+// policy-tracked containers via the containerd task status (the authoritative
+// state) and brings them back per Docker semantics:
 //   - "always" / "unless-stopped": restart on any exit
 //   - "on-failure[:max]": restart only on non-zero exit, up to max retries
 // A user-initiated stop (docker stop / kill / rm) clears the policy.
@@ -236,7 +234,7 @@ func (m *restartMonitor) bumpRetries(dockerID string) int {
 }
 
 // taskExitState reads the authoritative run state from the containerd task:
-// running, the real exit code (nerdctl reports 0 for policy containers),
+// running, and the real exit code,
 // and whether the state could be determined at all.
 func taskExitState(cl *client.Client, ns, containerdID string) (running bool, exit int, ok bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

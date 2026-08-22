@@ -9,9 +9,11 @@ returns HTTP 200, going through:
 1. cold boot (--fresh) + load/pull nginx image + run nginx + curl
 2. resume from saved snapshot + run nginx + curl
 
-If /tmp/anvil-share/nginx.tar exists, it is imported into the VM with
-`nerdctl load`, which avoids network variability and gives stable numbers.
-Otherwise the image is pulled from the registry.
+Containers are driven through anvil's Docker API socket (~/.anvil-vz/docker.sock,
+the same endpoint users configure their docker context to). If
+/tmp/anvil-share/nginx.tar exists, it is imported with `docker load`, which
+avoids network variability and gives stable numbers; otherwise the image is
+pulled from the registry.
 
 Output is printed as plain timings; non-zero exit code on failure.
 """
@@ -27,6 +29,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VZ_RUNNER = PROJECT_ROOT / ".build" / "release" / "vz-runner"
 SHARE_DIR = Path("/tmp/anvil-share")
 DAEMON_LOG = Path("/tmp/time_service_vz_runner.log")
+DOCKER_SOCKET = Path.home() / ".anvil-vz" / "docker.sock"
+DOCKER_ENV = {**os.environ, "DOCKER_HOST": f"unix://{DOCKER_SOCKET}"}
 CURL_CMD = ["curl", "--noproxy", "*", "-s", "-o", "/dev/null", "-w", "%{http_code}", "http://localhost:8080"]
 
 
@@ -77,27 +81,23 @@ def wait_for_marker(marker: str, timeout: float = 120.0) -> float:
 def load_or_pull_nginx(timeout: float = 120.0) -> float:
     """Make the nginx image available inside the VM.
 
-    If /mnt/anvil/nginx.tar exists (pre-loaded on the host into the virtiofs
-    share), import it with `nerdctl load`. This avoids relying on the network
-    and gives stable benchmark numbers. Otherwise fall back to `nerdctl pull`.
+    If /tmp/anvil-share/nginx.tar exists on the host, import it with
+    `docker load`. This avoids relying on the network and gives stable
+    benchmark numbers. Otherwise fall back to `docker pull`.
 
     The timeout is 120s: loading a local tarball takes ~1-2s, while a slow
     registry pull over a congested link can need up to a minute. Anything
     longer than that is effectively a hang and should fail fast.
     """
     t0 = time.time()
-    tar_path = "/mnt/anvil/nginx.tar"
     # Check from the host side whether the tarball is present.
     if (SHARE_DIR / "nginx.tar").exists():
-        cmd = [
-            str(VZ_RUNNER), "exec",
-            "nerdctl", "-n", "project-a", "load", "-i", tar_path,
-        ]
+        cmd = ["docker", "--host", f"unix://{DOCKER_SOCKET}", "load", "-i", str(SHARE_DIR / "nginx.tar")]
     else:
-        cmd = [str(VZ_RUNNER), "exec", "nerdctl", "-n", "project-a", "pull", "nginx"]
+        cmd = ["docker", "--host", f"unix://{DOCKER_SOCKET}", "pull", "nginx"]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
-        raise RuntimeError(f"nerdctl image prep failed: {proc.stderr or proc.stdout}")
+        raise RuntimeError(f"image prep failed: {proc.stderr or proc.stdout}")
     return time.time() - t0
 
 
@@ -105,13 +105,12 @@ def run_nginx(timeout: float = 60.0) -> float:
     """Run nginx with a host port mapping and return elapsed wall time."""
     t0 = time.time()
     cmd = [
-        str(VZ_RUNNER), "exec",
-        "nerdctl", "-n", "project-a",
+        "docker", "--host", f"unix://{DOCKER_SOCKET}",
         "run", "-d", "-p", "8080:80", "--name", "nginx", "nginx",
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
-        raise RuntimeError(f"nerdctl run failed: {proc.stderr or proc.stdout}")
+        raise RuntimeError(f"docker run failed: {proc.stderr or proc.stdout}")
     return time.time() - t0
 
 
@@ -137,7 +136,7 @@ def wait_for_http_200(timeout: float = 60.0) -> float:
 def remove_nginx() -> None:
     """Remove a previous nginx container if it exists."""
     subprocess.run(
-        [str(VZ_RUNNER), "exec", "nerdctl", "-n", "project-a", "rm", "-f", "nginx"],
+        ["docker", "--host", f"unix://{DOCKER_SOCKET}", "rm", "-f", "nginx"],
         capture_output=True,
     )
 
@@ -197,7 +196,7 @@ def main() -> int:
     image_label = "load nginx.tar" if (SHARE_DIR / "nginx.tar").exists() else "pull nginx"
     print(f"  daemon ready:       {cold['daemon_ready']:.2f}s")
     print(f"  {image_label:<18}   {cold['image_load']:.2f}s")
-    print(f"  nerdctl run nginx:  {cold['container_start']:.2f}s")
+    print(f"  docker run nginx:   {cold['container_start']:.2f}s")
     print(f"  curl -> 200:        {cold['curl_200']:.2f}s")
     print(f"  total:              {cold['total']:.2f}s")
 
@@ -208,7 +207,7 @@ def main() -> int:
         print(f"resume phase failed: {e}", file=sys.stderr)
         return 1
     print(f"  daemon ready:       {resume['daemon_ready']:.2f}s")
-    print(f"  nerdctl run nginx:  {resume['container_start']:.2f}s")
+    print(f"  docker run nginx:   {resume['container_start']:.2f}s")
     print(f"  curl -> 200:        {resume['curl_200']:.2f}s")
     print(f"  total:              {resume['total']:.2f}s")
 

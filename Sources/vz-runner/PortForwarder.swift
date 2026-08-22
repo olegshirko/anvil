@@ -328,10 +328,9 @@ private final class Listener {
     }
 
     private func startUDP(onFailure: @escaping () -> Void) {
-        // Published UDP ports are served by the guest itself: nerdctl arms
-        // the persisted portMappings (network-config.json) at start — a
-        // reservation socket plus nft DNAT hostPort -> containerPort in the
-        // guest's root netns. The host side therefore only needs a datagram
+        // Published UDP ports are served by the guest itself: CNI portmap
+        // arms nft DNAT hostPort -> containerPort in the container's netns
+        // at attach time. The host side therefore only needs a datagram
         // listener forwarding to guestIP:hostPort, which vzNAT delivers.
         guard !mapping.guestIP.isEmpty else {
             print("[listener :\(mapping.hostPort)/udp] no guest IP; refusing to start")
@@ -528,8 +527,8 @@ private final class Listener {
         // Preferred path: the guest-side port proxy. The forwarder connects
         // to a single well-known port and names the real target
         // (containerIP:containerPort) in a length-prefixed JSON header —
-        // user host ports are never bound inside the guest, so nerdctl's
-        // create-time port reservation cannot conflict with live containers.
+        // user host ports are never bound inside the guest, so published
+        // ports cannot conflict with live containers.
         // Fallback (containers created before the proxy existed / snapshots
         // from older guests): dial guestIP:hostPort directly, where CNI DNAT
         // still answers.

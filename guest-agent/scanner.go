@@ -25,7 +25,7 @@ const (
 	pollInterval       = 500 * time.Millisecond
 )
 
-// cniPortMapping is the shape of the nerdctl/ports label.
+// cniPortMapping is the shape of the anvil/ports label.
 type cniPortMapping struct {
 	HostPort      int    `json:"hostPort"`
 	ContainerPort int    `json:"containerPort"`
@@ -49,7 +49,7 @@ type portScanner struct {
 	subscribers map[chan PortMapState]struct{}
 	guestIP     string
 	// containerIPs caches (namespace, containerd id) -> {task pid, CNI IP}
-	// so per-scan nerdctl inspects only run for new or restarted containers.
+	// so per-scan address lookups only run for new or restarted containers.
 	containerIPs map[string]containerIPEntry
 }
 
@@ -237,7 +237,7 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 
 			// The host forwarder reaches containers through the guest-side
 			// port proxy, so it needs the CNI address (10.10.x.y), not the
-			// guest NAT IP. nerdctl inspect costs ~100ms, so cache per
+			// guest NAT IP. Address lookups cost ~ms, so cache per
 			// (namespace, id) keyed by task pid — a restart gets a new pid.
 			containerIP := s.containerIPFor(ns, c.ID(), task.Pid(), labels[labelName])
 
