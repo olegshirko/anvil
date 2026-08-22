@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Build a minimal initramfs with containerd + runc + nerdctl for M3 testing.
+# Build a minimal initramfs with containerd + runc (no nerdctl: the guest-agent talks to containerd directly).
 # The whole rootfs tree is assembled inside a Linux container so that
 # case-differing filenames (e.g. libxt_MARK.so vs libxt_mark.so) survive
 # and the final cpio archive is produced by GNU cpio instead of a custom
@@ -126,9 +126,8 @@ chmod +x bin/guest-agent
 # Container tools.
 mkdir -p opt/containerd/bin
 tar -xzf "$TOOLS_DIR/containerd.tgz" -C opt/containerd/bin --strip-components=1 2>/dev/null || true
-tar -xzf "$TOOLS_DIR/nerdctl.tgz" -C opt/containerd/bin 2>/dev/null || true
 cp "$TOOLS_DIR/runc" opt/containerd/bin/runc
-# buildkitd + buildctl for `docker build` (nerdctl build frontend). These
+# buildkitd + buildctl for `docker build` (the agent calls buildkitd via gRPC). These
 # build-only binaries (~150 MB unpacked, the largest part of the initramfs)
 # are packed as ONE compressed tarball in /opt instead of loose rootfs
 # files: loose files ride through kernel initramfs decompress AND the tmpfs
@@ -149,7 +148,7 @@ for q in "$BUILDKIT_STAGE"/buildkit-qemu-*; do
 done
 rm -f "$BUILDKIT_STAGE"/buildkit-runc
 
-# buildkitd runs with the containerd worker (same store as nerdctl/docker
+# buildkitd runs with the containerd worker (same image store as docker
 # pull) so `FROM` resolves local images instead of hitting the registry
 # (an unreachable registry means OAuth token requests and a failed build
 # even when every base image is present). buildkitd reads this file from
@@ -174,7 +173,7 @@ if [[ -n "$UPX_BIN" ]]; then
     # -9, not --best: --best selects LZMA, which takes tens of minutes on
     # 70+ MB binaries under the QEMU-emulated CI build container.
     # They run once per build, so exec-time decompression is irrelevant —
-    # unlike the hot-path containerd/nerdctl/runc/shim, which stay unpacked.
+    # unlike the hot-path containerd/runc/shim, which stay unpacked.
     "$UPX_BIN" -q -9 "$BUILDKIT_STAGE"/buildkitd "$BUILDKIT_STAGE"/buildctl \
         "$BUILDKIT_STAGE"/buildkit-qemu-* 2>/dev/null || \
         echo "WARNING: upx packing failed, shipping unpacked buildkit binaries" >&2
@@ -186,72 +185,7 @@ mkdir -p opt
 tar -C "$BUILDKIT_STAGE" -cf - buildkitd buildctl buildkit-qemu-x86_64 buildkit-qemu-arm \
     | zstd -q -o opt/buildkit.tar.zst
 rm -rf "$BUILDKIT_STAGE"
-cat > bin/nerdctl <<'NERDCTLEOF'
-#!/bin/sh
-# Thin wrapper that ensures a per-project CNI bridge exists and is used
-# automatically for the requested namespace.
-NS="default"
-NET=""
-NEXT_IS_NS=0
-NEXT_IS_NET=0
-HAS_NET=0
-RUN_IDX=0
-i=0
-for arg in "$@"; do
-    i=$((i + 1))
-    if [ "$NEXT_IS_NS" -eq 1 ]; then
-        NS="$arg"
-        NEXT_IS_NS=0
-        continue
-    fi
-    if [ "$NEXT_IS_NET" -eq 1 ]; then
-        NET="$arg"
-        NEXT_IS_NET=0
-        HAS_NET=1
-        continue
-    fi
-    case "$arg" in
-        -n|--namespace) NEXT_IS_NS=1 ;;
-        -n=*|--namespace=*) NS="${arg#*=}" ;;
-        --net|--network) NEXT_IS_NET=1 ;;
-        --net=*|--network=*) NET="${arg#*=}"; HAS_NET=1 ;;
-        run) RUN_IDX=$i ;;
-    esac
-done
-# Remove the global default bridge so each project gets its own bridge.
-rm -f /etc/cni/net.d/nerdctl-bridge.conflist /etc/cni/net.d/bridge.conflist
-# Generate the CNI config for the network that will actually be used.
-if [ -z "$NET" ]; then
-    NET="$NS"
-fi
-/bin/guest-agent cni-gen "$NET" >/dev/null 2>&1 || true
-
-if [ "$HAS_NET" -eq 0 ] && [ "$RUN_IDX" -ne 0 ]; then
-    shift_count=$RUN_IDX
-    head=""
-    while [ "$shift_count" -gt 0 ]; do
-        # Each head argument is baked into an eval string, so embedded
-        # single quotes must be escaped for it to re-parse verbatim.
-        # The TAIL arguments ("$@" below) are NOT baked in: they expand
-        # inside eval with proper per-word quoting. Before this, an
-        # argument containing shell metacharacters — e.g. `nerdctl ... run
-        # ... sh -c '[ -f /x ] && sleep 300'` — was executed as shell code
-        # on the guest (the sleep literally ran in the root cgroup) and
-        # the container was never created.
-        esc=${1//\'/\'\\\'\'}
-        head="$head '$esc'"
-        shift
-        shift_count=$((shift_count - 1))
-    done
-    # head now contains the first RUN_IDX arguments (including "run").
-    # Insert --net right after the "run" subcommand.
-    eval "set -- $head --net \"\$NS\" \"\$@\""
-fi
-exec /opt/containerd/bin/nerdctl "$@"
-NERDCTLEOF
-chmod +x bin/nerdctl
 ln -sf /opt/containerd/bin/ctr bin/ctr
-# nerdctl build shells out to buildctl and needs it in PATH.
 ln -sf /opt/containerd/bin/buildctl bin/buildctl
 
 # CNI plugins for per-project bridge networking.
@@ -294,8 +228,8 @@ for p in opt/containerd/bin/buildkit-cni-*; do
     fi
 done
 
-# iptables + libraries required by CNI plugins; GNU tar for nerdctl cp and
-# /build; e2fsprogs for the containerd disk (mkfs.ext4 on first boot,
+# iptables + libraries required by CNI plugins; GNU tar for docker cp and
+# /build context handling; e2fsprogs for the containerd disk (mkfs.ext4 on first boot,
 # resize2fs when the disk image has grown).
 for apk in iptables libmnl libnftnl libxtables tar libacl libattr \
            e2fsprogs e2fsprogs-extra e2fsprogs-libs libcom_err libblkid libuuid; do
@@ -311,7 +245,7 @@ if [[ ! -x usr/sbin/resize2fs ]]; then
     exit 1
 fi
 
-# GNU tar is required by nerdctl cp and /build; busybox tar is not sufficient.
+# GNU tar is required by docker cp and /build; busybox tar is not sufficient.
 # The Alpine tar/acl/attr apks (musl-linked) extracted above put GNU tar at
 # bin/tar and its libs under usr/lib — no build-VM tar is used (a glibc-linked
 # one would not run on the musl rootfs).
@@ -524,10 +458,10 @@ mkdir -p /etc
 # NAT gateway's forwarder takes over (it also works on VPN/restricted
 # networks). Serialize A/AAAA lookups: under load the VZ NAT DNS forwarder
 # sporadically drops one of the two parallel UDP queries, which Go resolvers
-# (nerdctl, buildkitd) surface as "lookup ... i/o timeout" after exhausting
+# (image pulls, buildkitd) surface as "lookup ... i/o timeout" after exhausting
 # retries.
 printf 'nameserver 8.8.8.8\nnameserver 8.8.4.4\noptions single-request timeout:1 attempts:3\n' > /etc/resolv.conf
-# A base /etc/hosts is required by nerdctl's --net host (its etchosts
+# A base /etc/hosts is required for --net host containers (the agent bind-mounts its own hosts
 # generator opens the host file directly; without it `--network host`
 # containers fail with "filesystem error: open /etc/hosts").
 printf '127.0.0.1\tlocalhost\n::1\t\tlocalhost\n' > /etc/hosts
@@ -643,8 +577,8 @@ mkdir -p /Users
 mountpoint -q /Users || mount -t virtiofs macusers /Users 2>/dev/null || true
 
 # Persistent state: mount the virtio-blk disk (or virtiofs share) over /var/lib
-# so both containerd root (/var/lib/containerd) and nerdctl metadata/volumes
-# (/var/lib/nerdctl) survive reboots and resume, instead of filling tmpfs root.
+# so both containerd root (/var/lib/containerd) and anvil state (/var/lib/anvil)
+# survive reboots and resume, instead of filling tmpfs root.
 mkdir -p /var/lib
 mountpoint -q /var/lib || {
     # Load virtio-blk and ext4 for the optional persistent block disk.
@@ -705,7 +639,7 @@ if ! mountpoint -q /var/lib; then
 fi
 bmark varlib_mount
 
-mkdir -p /var/lib/containerd /var/lib/nerdctl /var/lib/cni
+mkdir -p /var/lib/containerd /var/lib/anvil /var/lib/cni
 
 # Build-only binaries (buildkitd/buildctl/qemu) ship as /opt/buildkit.tar.zst
 # and live on the persistent disk: unpack once in the background (they are

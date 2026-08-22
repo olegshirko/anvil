@@ -246,7 +246,6 @@ boot-ubuntu: boot
 # -----------------------------------------------------------------------------
 CONTAINER_TOOLS_DIR := .download/container-tools
 CONTAINERD_URL := https://github.com/containerd/containerd/releases/download/v2.3.3/containerd-static-2.3.3-linux-arm64.tar.gz
-NERDCTL_URL := https://github.com/containerd/nerdctl/releases/download/v2.3.5/nerdctl-2.3.5-linux-arm64.tar.gz
 RUNC_URL := https://github.com/opencontainers/runc/releases/download/v1.5.1/runc.arm64
 CNI_PLUGINS_URL := https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-arm64-v1.9.1.tgz
 BUILDKIT_URL := https://github.com/moby/buildkit/releases/download/v0.32.2/buildkit-v0.32.2.linux-arm64.tar.gz
@@ -276,9 +275,6 @@ container-tools: $(CONTAINER_TOOLS_DIR)
 	if [ ! -f $(CONTAINER_TOOLS_DIR)/containerd.tgz ]; then \
 	    curl -L -o $(CONTAINER_TOOLS_DIR)/containerd.tgz $(CONTAINERD_URL); \
 	fi
-	if [ ! -f $(CONTAINER_TOOLS_DIR)/nerdctl.tgz ]; then \
-	    curl -L -o $(CONTAINER_TOOLS_DIR)/nerdctl.tgz $(NERDCTL_URL); \
-	fi
 	if [ ! -f $(CONTAINER_TOOLS_DIR)/runc ]; then \
 	    curl -L -o $(CONTAINER_TOOLS_DIR)/runc $(RUNC_URL); \
 	    chmod +x $(CONTAINER_TOOLS_DIR)/runc; \
@@ -291,7 +287,7 @@ container-tools: $(CONTAINER_TOOLS_DIR)
 	fi
 
 # Alpine iptables + libs needed by CNI bridge/portmap/firewall plugins.
-# Plus GNU tar + acl/attr (musl-linked, required by nerdctl cp and /build).
+# Plus GNU tar + acl/attr (musl-linked, required by docker cp and /build).
 ALPINE_IPTABLES_DIR := .download/alpine-iptables
 ALPINE_IPTABLES_URL := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/iptables-1.8.10-r3.apk
 ALPINE_LIBMNL_URL   := https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libmnl-1.0.5-r2.apk
