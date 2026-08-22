@@ -16,7 +16,6 @@ import (
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
-	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 const (
@@ -34,58 +33,14 @@ type cniPortMapping struct {
 	HostIP        string `json:"hostIP"`
 }
 
-// getNerdctlPortsLabel returns the container's port mappings as the legacy
-// nerdctl/ports label JSON. Sources, in order: the label itself, the OCI spec
-// annotations (containers on non-default networks), and — since nerdctl 2.2
-// (PR #4290) deprecated the label — the nerdctl network store on disk.
-func getNerdctlPortsLabel(c client.Container, nsCtx context.Context) string {
-	if labels, err := c.Labels(nsCtx); err == nil && labels != nil {
-		if v := labels["nerdctl/ports"]; v != "" {
-			return v
-		}
+// portsLabel returns the container's port mappings as JSON (the shape of the
+// anvil/ports label written at create time).
+func portsLabel(c client.Container, nsCtx context.Context) string {
+	labels, err := c.Labels(nsCtx)
+	if err != nil || labels == nil {
+		return ""
 	}
-	var spec *specs.Spec
-	var err error
-	if spec, err = c.Spec(nsCtx); err == nil && spec != nil {
-		if v := spec.Annotations["nerdctl/ports"]; v != "" {
-			return v
-		}
-	}
-	if ns, ok := namespaces.Namespace(nsCtx); ok {
-		if v := readNetworkStorePorts(ns, c.ID()); v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-// nerdctlNetworkConfig mirrors nerdctl's networkstore.NetworkConfig.
-type nerdctlNetworkConfig struct {
-	PortMappings []cniPortMapping `json:"portMappings"`
-}
-
-// readNetworkStorePorts reads the port mappings nerdctl >= 2.2 persists in
-// <dataRoot>/<addrHash>/containers/<ns>/<id>/network-config.json and renders
-// them as the legacy label JSON so callers keep a single parse path. The
-// addrHash directory (sha256 of the containerd socket address) is located by
-// glob — only one exists in practice.
-func readNetworkStorePorts(ns, id string) string {
-	matches, _ := filepath.Glob(filepath.Join(nerdctlStoreRoot, "*", "containers", ns, id, "network-config.json"))
-	for _, path := range matches {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		var conf nerdctlNetworkConfig
-		if err := json.Unmarshal(data, &conf); err != nil || len(conf.PortMappings) == 0 {
-			continue
-		}
-		out, err := json.Marshal(conf.PortMappings)
-		if err == nil {
-			return string(out)
-		}
-	}
-	return ""
+	return labels[labelPorts]
 }
 
 type portScanner struct {
@@ -269,7 +224,7 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 				continue
 			}
 
-			portsJSON := getNerdctlPortsLabel(c, nsCtx)
+			portsJSON := portsLabel(c, nsCtx)
 			if portsJSON == "" {
 				continue
 			}

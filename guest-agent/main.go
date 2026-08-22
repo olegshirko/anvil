@@ -60,6 +60,16 @@ func main() {
 	log.SetPrefix("[guest-agent] ")
 	setupDebugLogRotation()
 
+	// Hidden logging subcommand: the containerd shim spawns us as the
+	// binary-v2 task logger (fd3/fd4 = stdout/stderr, fd5 = ready pipe).
+	// Invoked as: guest-agent --log-json <path> log-path <path>
+	if len(os.Args) > 3 && os.Args[1] == "--log-json" {
+		if err := runJSONLogger(os.Args[2]); err != nil {
+			log.Fatalf("log-json: %v", err)
+		}
+		return
+	}
+
 	if len(os.Args) > 1 && os.Args[1] == "cni-gen" {
 		ns := "default"
 		if len(os.Args) > 2 {
@@ -99,12 +109,12 @@ func main() {
 		syncClockFromShare()
 	}()
 
-	// The cold-boot metadata cleanup in stage2 removes containers bypassing
-	// nerdctl rm, leaving their network-store entries behind; prune them once
-	// containerd is reachable.
+	// The cold-boot metadata cleanup in stage2 removes containers directly
+	// through the containerd API, leaving anvil metadata behind; prune it
+	// once containerd is reachable.
 	go func() {
 		time.Sleep(2 * time.Second)
-		pruneStaleNetworkStore()
+		pruneStaleContainerMeta()
 	}()
 
 	// Boot tail moved out of stage2: wait for the containerd socket, run the
@@ -460,7 +470,7 @@ func findHostPortConflict(ctx context.Context, ports []int, excludeID string) (*
 			if err != nil || status.Status != "running" {
 				continue
 			}
-			portsJSON := getNerdctlPortsLabel(c, nsCtx)
+			portsJSON := portsLabel(c, nsCtx)
 			if portsJSON == "" {
 				continue
 			}

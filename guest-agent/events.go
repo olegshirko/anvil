@@ -313,7 +313,7 @@ func translateDockerEvent(ctx context.Context, cl *client.Client, env *events.En
 			}
 		}
 	}
-	if name, ok := attrs["nerdctl/name"]; ok {
+	if name, ok := attrs[labelName]; ok {
 		attrs["name"] = name
 	}
 	if exitCode != "" {

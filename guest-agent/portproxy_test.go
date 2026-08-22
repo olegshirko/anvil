@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"net"
-	"os"
 	"testing"
 )
 
@@ -62,85 +61,63 @@ func TestPortProxyHeaderRejectsIncompleteTarget(t *testing.T) {
 	}
 }
 
-// writeContainerPortMappings persists the published ports into nerdctl's
-// network store; readNetworkStorePorts (the scanner's fallback) must read
-// them back unchanged.
-func TestWriteContainerPortMappingsRoundtrip(t *testing.T) {
+// Container ports persist in the per-container metadata; portBindingsFromMeta
+// must render them back into the Docker PortBindings shape unchanged.
+func TestPortBindingsFromMetaRoundtrip(t *testing.T) {
 	dir := t.TempDir()
-	orig := nerdctlStoreRoot
-	nerdctlStoreRoot = dir
-	defer func() { nerdctlStoreRoot = orig }()
+	orig := anvilStoreRoot
+	anvilStoreRoot = dir
+	defer func() { anvilStoreRoot = orig }()
 
-	// Seed the datastore layout glob expects: <root>/<addrHash>/containers.
-	if err := os.MkdirAll(dir+"/1935db59/containers", 0o755); err != nil {
-		t.Fatalf("seed datastore: %v", err)
+	meta := &containerMeta{
+		ID:        "abc123",
+		Name:      "web",
+		Namespace: "testns",
+		Ports: []cniPortMapping{
+			{HostPort: 8080, ContainerPort: 80, Protocol: "tcp", HostIP: "0.0.0.0"},
+		},
 	}
-
-	mappings := []cniPortMapping{
-		{HostPort: 8080, ContainerPort: 80, Protocol: "tcp", HostIP: "0.0.0.0"},
-	}
-	if err := writeContainerPortMappings("testns", "abc123", mappings); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	got := readNetworkStorePorts("testns", "abc123")
-	if got == "" {
-		t.Fatal("readNetworkStorePorts returned empty")
-	}
-	var parsed []cniPortMapping
-	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if len(parsed) != 1 || parsed[0].HostPort != 8080 || parsed[0].ContainerPort != 80 {
-		t.Fatalf("roundtrip = %+v", parsed)
+	if err := saveContainerMeta(meta); err != nil {
+		t.Fatalf("save meta: %v", err)
 	}
 
-	// Rewriting must preserve foreign fields (read-modify-write).
-	// The datastore glob sorts, so 1935db59 wins over ds; seed in place.
-	raw, _ := json.Marshal(map[string]interface{}{
-		"portMappings": parsed,
-		"networks":     []string{"some"},
-	})
-	path := dir + "/1935db59/containers/testns/abc123/network-config.json"
-	if err := os.WriteFile(path, raw, 0o644); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	if err := writeContainerPortMappings("testns", "abc123", mappings); err != nil {
-		t.Fatalf("rewrite: %v", err)
-	}
-	data, err := os.ReadFile(path)
+	got, err := loadContainerMeta("testns", "abc123")
 	if err != nil {
-		t.Fatalf("read: %v", err)
+		t.Fatalf("load meta: %v", err)
 	}
-	var stored map[string]interface{}
-	if err := json.Unmarshal(data, &stored); err != nil {
-		t.Fatalf("stored parse: %v", err)
+	if len(got.Ports) != 1 || got.Ports[0].HostPort != 8080 {
+		t.Fatalf("roundtrip = %+v", got.Ports)
 	}
-	if _, ok := stored["networks"]; !ok {
-		t.Fatal("rewrite dropped the foreign 'networks' field")
+	bindings := portBindingsFromMeta(got)
+	tcp, ok := bindings["80/tcp"]
+	if !ok || len(tcp) != 1 || tcp[0].HostPort != "8080" || tcp[0].HostIp != "0.0.0.0" {
+		t.Fatalf("tcp binding = %+v", bindings)
 	}
 }
 
-// portBindingsFromStore renders the persisted mappings back into the Docker
-// HostConfig.PortBindings shape the CLI expects.
-func TestPortBindingsFromStore(t *testing.T) {
+func TestPortBindingsFromMetaMulti(t *testing.T) {
 	dir := t.TempDir()
-	orig := nerdctlStoreRoot
-	nerdctlStoreRoot = dir
-	defer func() { nerdctlStoreRoot = orig }()
-	if err := os.MkdirAll(dir+"/1935db59/containers", 0o755); err != nil {
-		t.Fatalf("seed datastore: %v", err)
-	}
+	orig := anvilStoreRoot
+	anvilStoreRoot = dir
+	defer func() { anvilStoreRoot = orig }()
 
-	mappings := []cniPortMapping{
-		{HostPort: 18330, ContainerPort: 80, Protocol: "tcp"},
-		{HostPort: 15353, ContainerPort: 53, Protocol: "udp"},
+	meta := &containerMeta{
+		ID:        "id1",
+		Name:      "dns",
+		Namespace: "tbs",
+		Ports: []cniPortMapping{
+			{HostPort: 18330, ContainerPort: 80, Protocol: "tcp"},
+			{HostPort: 15353, ContainerPort: 53, Protocol: "udp"},
+		},
 	}
-	if err := writeContainerPortMappings("tbs", "id1", mappings); err != nil {
-		t.Fatalf("write: %v", err)
+	if err := saveContainerMeta(meta); err != nil {
+		t.Fatalf("save meta: %v", err)
 	}
-
-	bindings := portBindingsFromStore("tbs", "id1")
+	got, err := loadContainerMeta("tbs", "id1")
+	if err != nil {
+		t.Fatalf("load meta: %v", err)
+	}
+	bindings := portBindingsFromMeta(got)
 	if len(bindings) != 2 {
 		t.Fatalf("bindings = %+v", bindings)
 	}

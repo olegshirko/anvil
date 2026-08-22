@@ -6,13 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -318,16 +317,27 @@ func waitContainerTask(ctx context.Context, ns, containerdID string) (int, error
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// Use nerdctl wait to reliably block until the task exits and returns its
-	// exit code. The containerd client task.Wait can race with short-lived tasks.
-	// A cached code (e.g. the mapped 137 from docker kill) wins over the
-	// task status, which reports 0 for signal deaths.
+	// Block on the task's Wait channel until it exits. A cached code (e.g.
+	// the mapped 137 from docker kill) wins over the task status, which
+	// reports 0 for signal deaths.
 	did := dockerID(ns, containerdID)
-	stdout, stderr, code, err := runNerdctl(ns, "wait", containerdID)
-	if err != nil || code != 0 {
-		return 0, fmt.Errorf("nerdctl wait failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	c, err := cl.LoadContainer(nsCtx, containerdID)
+	if err != nil {
+		return 0, fmt.Errorf("load container: %w", err)
 	}
-	exit, _ := strconv.Atoi(strings.TrimSpace(stdout))
+	task, err := c.Task(nsCtx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("task: %w", err)
+	}
+	exitCh, werr := task.Wait(nsCtx)
+	if werr != nil {
+		return 0, fmt.Errorf("wait: %w", werr)
+	}
+	st := <-exitCh
+	if serr := st.Error(); serr != nil {
+		debugLog("[docker-api] wait %s/%s: %v", ns, truncateID(containerdID), serr)
+	}
+	exit := int(st.ExitCode())
 	if cached, ok := takeContainerExitCode(did); ok && cached != 0 {
 		return cached, nil
 	}
@@ -440,7 +450,7 @@ func resolveDockerID(ctx context.Context, prefix string) (ns, containerdID, name
 			if labels == nil {
 				labels = map[string]string{}
 			}
-			cname := labels["nerdctl/name"]
+			cname := labels[labelName]
 			if cname == "" {
 				cname = c.ID()
 			}
@@ -486,48 +496,84 @@ func runNerdctl(ns string, args ...string) (stdout, stderr string, exitCode int,
 	return outBuf.String(), errBuf.String(), exitCode, err
 }
 
-// containerStateFromInspect parses `nerdctl inspect --format json` output.
-// nerdctl >= 2.1 prints a single JSON object; older versions printed an
-// array with one element. Accept both.
-func containerStateFromInspect(stdout string) (running bool, status string, ok bool) {
-	type containerState struct {
-		Running bool   `json:"Running"`
-		Status  string `json:"Status"`
+// containerTaskState reads the task state for a container directly from
+// containerd. Returns ("", false) when the task does not exist.
+func containerTaskState(ctx context.Context, ns, id string) (running bool, status string, ok bool) {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return false, "", false
 	}
-	type containerInfo struct {
-		State containerState `json:"State"`
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	c, err := cl.LoadContainer(nsCtx, id)
+	if err != nil {
+		return false, "", false
 	}
-	var arr []containerInfo
-	if err := json.Unmarshal([]byte(stdout), &arr); err == nil && len(arr) > 0 {
-		return arr[0].State.Running, arr[0].State.Status, true
+	task, err := c.Task(nsCtx, nil)
+	if err != nil {
+		// No task: the container exists but was never started (or its last
+		// run's task is gone) — Docker reports "created"/"exited" here.
+		return false, "created", true
 	}
-	var single containerInfo
-	if err := json.Unmarshal([]byte(stdout), &single); err == nil && single.State.Status != "" {
-		return single.State.Running, single.State.Status, true
+	st, err := task.Status(nsCtx)
+	if err != nil {
+		return false, "", false
 	}
-	return false, "", false
+	return st.Status == "running", dockerStatus(string(st.Status)), true
 }
 
-// isNerdctlContainerRunning reports whether the named container is currently
-// running, using nerdctl inspect.
 // nerdctlContainerStatus returns the container's status string ("created",
-// "running", "exited", ...) or "" when it cannot be determined.
+// "running", "exited", ...) or "" when it cannot be determined. The name
+// predates the native runtime; it now reads containerd directly.
 func nerdctlContainerStatus(ns, name string) string {
-	stdout, _, code, err := runNerdctl(ns, "inspect", "--format", "json", name)
-	if err != nil || code != 0 {
+	id := resolveContainerdIDByName(context.Background(), ns, name)
+	if id == "" {
 		return ""
 	}
-	_, status, _ := containerStateFromInspect(stdout)
+	_, status, ok := containerTaskState(context.Background(), ns, id)
+	if !ok {
+		return ""
+	}
 	return status
 }
 
 func isNerdctlContainerRunning(ns, name string) bool {
-	stdout, _, code, err := runNerdctl(ns, "inspect", "--format", "json", name)
-	if err != nil || code != 0 {
-		return false
+	running, _, ok := func() (bool, string, bool) {
+		ctx := context.Background()
+		id := resolveContainerdIDByName(ctx, ns, name)
+		if id == "" {
+			return false, "", false
+		}
+		return containerTaskState(ctx, ns, id)
+	}()
+	return ok && running
+}
+
+// resolveContainerdIDByName finds the containerd ID for a container name
+// (label lookup) within one namespace.
+func resolveContainerdIDByName(ctx context.Context, ns, name string) string {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return ""
 	}
-	running, status, ok := containerStateFromInspect(stdout)
-	return ok && (running || status == "running")
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	containers, err := cl.Containers(nsCtx)
+	if err != nil {
+		return ""
+	}
+	for _, c := range containers {
+		labels, err := c.Labels(nsCtx)
+		if err != nil {
+			continue
+		}
+		cn := labels[labelName]
+		if cn == "" {
+			cn = c.ID()
+		}
+		if cn == name || c.ID() == name {
+			return c.ID()
+		}
+	}
+	return ""
 }
 
 // findContainerByName returns the Docker ID of a container with the given name
@@ -547,14 +593,15 @@ func findContainerByName(ctx context.Context, ns, name string) (string, error) {
 		if err != nil {
 			continue
 		}
-		if labels["nerdctl/name"] == name {
+		if labels[labelName] == name {
 			return dockerID(ns, c.ID()), nil
 		}
 	}
 	return "", nil
 }
 
-// createDockerContainer creates a container via nerdctl and returns its Docker ID.
+// createDockerContainer creates a container natively via containerd and
+// returns its Docker ID.
 func createDockerContainer(ctx context.Context, req dockerCreateRequest, name string) (string, error) {
 	networkMode := req.HostConfig.NetworkMode
 	ns := namespaceFromNetwork(networkMode)
@@ -566,11 +613,12 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name st
 	}
 	log.Printf("[docker-api] create container %q image=%q network=%q namespace=%q", name, req.Image, networkMode, ns)
 
-	// nerdctl invoked directly (not through the wrapper script) does not create
-	// the CNI conflist. Make sure it exists before creating the container,
-	// otherwise the CNI hook fails with "no such network".
-	if err := generateCNIConfig(networkMode); err != nil {
-		log.Printf("[docker-api] ensure cni config for %s: %v", networkMode, err)
+	// Make sure the per-network CNI conflist exists before creating the
+	// container, otherwise CNI attach fails with "no such network".
+	if !usesHostNetwork(req) {
+		if err := generateCNIConfig(effectiveNetworkName(networkMode)); err != nil {
+			log.Printf("[docker-api] ensure cni config for %s: %v", networkMode, err)
+		}
 	}
 
 	// Ensure the image metadata exists in the target namespace. The content
@@ -581,14 +629,6 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name st
 		return "", err
 	}
 
-	// nerdctl leaves stale name-to-ID files in /var/lib/nerdctl when its metadata
-	// and containerd's bolt DB drift (e.g. after cold boot or forced cleanup).
-	// Remove any existing name-store file for this name before create, otherwise
-	// `nerdctl create --name <name>` fails with "name ... is already used".
-	if name != "" {
-		removeNerdctlNameStoreByName(ns, name)
-	}
-
 	// Docker refuses duplicate names; mimic that to avoid ambiguous lookups later.
 	if name != "" {
 		if existing, err := findContainerByName(ctx, ns, name); err == nil && existing != "" {
@@ -596,244 +636,12 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name st
 		}
 	}
 
-	args := []string{"create"}
-	if networkMode != "" && networkMode != "default" {
-		args = append(args, "--net", networkMode)
-	}
-	// json-file logger makes `nerdctl logs -f` reliable enough for attach.
-	args = append(args, "--log-driver", "json-file")
-	// TTY changes the stream contract: with -t, attach output must be raw
-	// bytes instead of the multiplexed docker stream format.
-	if req.Tty {
-		args = append(args, "-t")
-	}
-	if name != "" {
-		args = append(args, "--name", name)
-	}
-	if req.Hostname != "" {
-		args = append(args, "--hostname", req.Hostname)
-	}
-	if req.User != "" {
-		args = append(args, "--user", req.User)
-	}
-	for _, e := range req.Env {
-		args = append(args, "-e", e)
-	}
-	for k, v := range req.Labels {
-		args = append(args, "-l", k+"="+v)
-	}
-	if req.HostConfig.Privileged {
-		args = append(args, "--privileged")
-	}
-	// Restart policy is NOT passed to nerdctl: nerdctl/containerd arms its
-	// own supervisor that races our monitor and re-restarts containers the
-	// user stopped (on-failure sees exit 143 from stop). Our monitor in
-	// restart.go owns the policy; inspect reports it from the registry.
-	// Entrypoint override (docker run --entrypoint, compose entrypoint:).
-	// nerdctl's --entrypoint is a single binary path, while Docker allows a
-	// list ([bin, args...]). Translate: first element becomes --entrypoint,
-	// the rest are prepended to the command argv.
-	entrypointArgs := []string{}
-	if len(req.Entrypoint) > 0 {
-		args = append(args, "--entrypoint", req.Entrypoint[0])
-		entrypointArgs = req.Entrypoint[1:]
-	}
-	if req.WorkingDir != "" {
-		args = append(args, "-w", req.WorkingDir)
-	}
-	// /etc/hosts extras (docker run --add-host, compose extra_hosts:).
-	for _, h := range req.HostConfig.ExtraHosts {
-		args = append(args, "--add-host", h)
-	}
-	// Resource limits (compose mem_limit/cpus). nerdctl takes bytes and
-	// fractional CPUs; Docker sends Memory in bytes and NanoCpus (1e9 = 1 CPU).
-	if req.HostConfig.Memory > 0 {
-		args = append(args, "--memory", fmt.Sprintf("%db", req.HostConfig.Memory))
-	}
-	if req.HostConfig.NanoCpus > 0 {
-		cpus := float64(req.HostConfig.NanoCpus) / 1e9
-		args = append(args, "--cpus", strconv.FormatFloat(cpus, 'f', -1, 64))
-	}
-	for _, c := range req.HostConfig.CapAdd {
-		args = append(args, "--cap-add", c)
-	}
-	for _, c := range req.HostConfig.CapDrop {
-		args = append(args, "--cap-drop", c)
-	}
-	if req.HostConfig.ReadonlyRootfs {
-		args = append(args, "--read-only")
-	}
-	// PID namespace sharing (docker --pid host / compose pid: host).
-	if mode := req.HostConfig.PidMode; mode != "" && mode != "private" {
-		args = append(args, "--pid", mode)
-	}
-	if req.StopSignal != "" {
-		args = append(args, "--stop-signal", req.StopSignal)
-	}
-	// tmpfs mounts with options (docker --tmpfs /x:ro,size=1m). nerdctl
-	// takes the same path:opts syntax via --tmpfs.
-	for path, opts := range req.HostConfig.TmpFs {
-		spec := path
-		if opts != "" {
-			spec += ":" + opts
-		}
-		args = append(args, "--tmpfs", spec)
-	}
-	// Custom DNS servers (docker --dns / compose dns:).
-	for _, d := range req.HostConfig.Dns {
-		args = append(args, "--dns", d)
-	}
-	// Namespaced kernel parameters (docker --sysctl / compose sysctls:).
-	for k, v := range req.HostConfig.Sysctls {
-		args = append(args, "--sysctl", k+"="+v)
-	}
-	// Device passthrough (docker --device). nerdctl uses the same
-	// host[:container] syntax.
-	for _, d := range req.HostConfig.Devices {
-		if d.PathOnHost == "" {
-			continue
-		}
-		spec := d.PathOnHost
-		if d.PathInContainer != "" && d.PathInContainer != d.PathOnHost {
-			spec += ":" + d.PathInContainer
-		}
-		args = append(args, "--device", spec)
-	}
-
-	// Bind mounts and named volumes. Host paths under /Users are visible in
-	// the guest at the same absolute path via the "macusers" virtiofs share,
-	// so binds pass through unchanged (like Docker Desktop). Paths outside
-	// the shared trees refer to the guest's own filesystem.
-	for _, bind := range req.HostConfig.Binds {
-		args = append(args, "-v", bind)
-	}
-	for _, m := range req.HostConfig.Mounts {
-		// tmpfs-type Mounts (compose tmpfs:) become --tmpfs specs.
-		if m.Type == "tmpfs" && m.Target != "" {
-			spec := m.Target
-			if m.ReadOnly {
-				spec += ":ro"
-			}
-			args = append(args, "--tmpfs", spec)
-			continue
-		}
-		if m.Type == "tmpfs" || m.Source == "" || m.Target == "" {
-			continue
-		}
-		spec := m.Source + ":" + m.Target
-		if m.ReadOnly {
-			spec += ":ro"
-		}
-		args = append(args, "-v", spec)
-	}
-
-	// Port bindings: containerPort/proto -> [{HostIp, HostPort}]
-	// Ports are NOT passed to nerdctl: nerdctl reserves host ports at CREATE
-	// time with an inherited listener fd, which breaks the Docker flow where
-	// the check belongs to start (compose creates the replacement container
-	// before stopping the old one). We persist the mappings into nerdctl's
-	// network store instead — the same place nerdctl itself uses — so ps,
-	// inspect and the port scanner see them, while the guest-side port proxy
-	// + host PortForwarder own the actual publishing (see portproxy.go).
-	var portMappings []cniPortMapping
-	for cportSpec, hostPorts := range req.HostConfig.PortBindings {
-		proto := "tcp"
-		parts := strings.SplitN(cportSpec, "/", 2)
-		cport := parts[0]
-		if len(parts) == 2 {
-			proto = parts[1]
-		}
-		for _, hp := range hostPorts {
-			hostIP := hp.HostIp
-			if hostIP == "" {
-				hostIP = "0.0.0.0"
-			}
-			// Docker allows ranges ("8100-8101:80-81"): expand pairwise.
-			cPorts, err := expandPortRange(cport)
-			if err != nil {
-				return "", fmt.Errorf("invalid container port %q", cport)
-			}
-			hPorts, err := expandPortRange(hp.HostPort)
-			if err != nil || (len(hPorts) > 1 && len(hPorts) != len(cPorts)) {
-				return "", fmt.Errorf("invalid host port %q", hp.HostPort)
-			}
-			for i, c := range cPorts {
-				h := hPorts[0]
-				if len(hPorts) == len(cPorts) {
-					h = hPorts[i]
-				}
-				if h == 0 {
-					continue
-				}
-				portMappings = append(portMappings, cniPortMapping{
-					HostPort:      h,
-					ContainerPort: c,
-					Protocol:      proto,
-					HostIP:        hostIP,
-				})
-			}
-		}
-	}
-
-	args = append(args, req.Image)
-	args = append(args, entrypointArgs...)
-	args = append(args, req.Cmd...)
-
-	stdout, stderr, code, err := runNerdctl(ns, args...)
-	if err != nil || code != 0 {
-		return "", fmt.Errorf("nerdctl create failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
-	}
-
-	// nerdctl create prints the container name/ID to stdout.
-	createdName := strings.TrimSpace(stdout)
-	if createdName == "" {
-		return "", fmt.Errorf("nerdctl create returned empty ID")
-	}
-
-	// Look up the container by the ID nerdctl printed, then by requested name.
-	cl, err := pc.get(ctx)
+	containerdID, err := createNativeContainer(ctx, ns, name, req)
 	if err != nil {
-		return "", fmt.Errorf("containerd client: %w", err)
-	}
-
-	nsCtx := namespaces.WithNamespace(ctx, ns)
-
-	var containerdID string
-	// nerdctl create usually prints the containerd ID; try loading it directly.
-	if c, err := cl.LoadContainer(nsCtx, createdName); err == nil {
-		containerdID = c.ID()
-	} else {
-		containers, err := cl.Containers(nsCtx)
-		if err != nil {
-			return "", fmt.Errorf("list containers: %w", err)
-		}
-		searchName := name
-		if searchName == "" {
-			searchName = createdName
-		}
-		for _, c := range containers {
-			labels, err := c.Labels(nsCtx)
-			if err != nil {
-				continue
-			}
-			if labels["nerdctl/name"] == searchName {
-				containerdID = c.ID()
-				break
-			}
-		}
-	}
-	if containerdID == "" {
-		return "", fmt.Errorf("could not find created container %s", createdName)
+		return "", err
 	}
 
 	dockerID := dockerID(ns, containerdID)
-	// Persist the port mappings into nerdctl's network store so list/ps and
-	// the port scanner (and nerdctl's own tooling) see the published ports.
-	if len(portMappings) > 0 {
-		if err := writeContainerPortMappings(ns, containerdID, portMappings); err != nil {
-			log.Printf("[docker-api] persist ports for %s: %v", containerdID, err)
-		}
-	}
 	// Remember compose service aliases for the start-time /etc/hosts update.
 	if aliases := requestedNetworkAliases(req); len(aliases) > 0 {
 		setNetworkAliases(dockerID, aliases)
@@ -842,7 +650,8 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name st
 	if len(req.HostConfig.Links) > 0 {
 		setContainerLinks(dockerID, req.HostConfig.Links)
 	}
-	// Register the restart policy with our monitor (nerdctl has none).
+	// Register the restart policy with our monitor (the runtime has none —
+	// restart.go owns the policy; inspect reports it from the registry).
 	if spec := req.HostConfig.RestartPolicy.Name; spec != "" {
 		p := parseRestartPolicy(spec)
 		if p.max < 0 && req.HostConfig.RestartPolicy.MaximumRetryCount > 0 {
@@ -855,29 +664,28 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name st
 	// Remember WorkingDir/Entrypoint for inspect responses.
 	setContainerEntryPointInfo(dockerID, req.WorkingDir, req.Entrypoint)
 	setContainerStopSignal(dockerID, req.StopSignal)
-	// AutoRemove is handled by guest-agent after we capture the exit code.
-	// Passing --rm to nerdctl would delete the container immediately on exit
-	// and cause /wait to miss the exit status.
+	// AutoRemove is handled by guest-agent after we capture the exit code,
+	// so /wait can still read the status.
 	if req.HostConfig.AutoRemove {
 		markAutoRemove(dockerID)
 	}
-	// nerdctl 2.0.4 does not implement Docker healthchecks, so we run the
-	// configured check ourselves via nerdctl exec on a ticker. Store the
-	// configuration at create time and start the ticker when the container
-	// is started so the first check does not run against a created-but-not
-	// yet-running container.
+	// Healthchecks run in-agent via exec on a ticker. Store the configuration
+	// at create time and start the ticker when the container is started so
+	// the first check does not run against a created-but-not-yet-running
+	// container. The exec user mirrors the container process user.
 	containerUser := ""
-	if c, err := cl.LoadContainer(nsCtx, containerdID); err == nil {
-		if spec, err := c.Spec(nsCtx); err == nil && spec != nil && spec.Process != nil {
-			containerUser = spec.Process.User.Username
+	cl, cerr := pc.get(ctx)
+	if cerr == nil {
+		nsCtx := namespaces.WithNamespace(ctx, ns)
+		if c, lerr := cl.LoadContainer(nsCtx, containerdID); lerr == nil {
+			if spec, serr := c.Spec(nsCtx); serr == nil && spec != nil && spec.Process != nil {
+				containerUser = spec.Process.User.Username
+			}
 		}
 	}
 	setHealthcheckConfig(dockerID, req.Healthcheck, containerUser)
 	return dockerID, nil
 }
-
-// nerdctlStoreRoot is the nerdctl data root (override in tests).
-var nerdctlStoreRoot = "/var/lib/nerdctl"
 
 // expandPortRange parses "80" or "80-81" into a list of port numbers.
 func expandPortRange(spec string) ([]int, error) {
@@ -905,56 +713,12 @@ func expandPortRange(spec string) ([]int, error) {
 	return out, nil
 }
 
-// writeContainerPortMappings stores the published port mappings in nerdctl's
-// network store (network-config.json) — the same file nerdctl itself writes
-// for `-p` containers. We create containers without `-p` (nerdctl's
-// create-time host-port reservation breaks compose-style recreate), so this
-// is the authoritative record. The file is read-modify-written to preserve
-// any fields nerdctl stores alongside portMappings.
-func writeContainerPortMappings(ns, containerdID string, mappings []cniPortMapping) error {
-	// The datastore directory is /var/lib/nerdctl/<addrHash>; locate it by
-	// glob (only one exists in practice) or create it under the first
-	// datastore root found.
-	matches, _ := filepath.Glob(filepath.Join(nerdctlStoreRoot, "*", "containers"))
-	var dir string
-	if len(matches) > 0 {
-		dir = filepath.Join(matches[0], ns, containerdID)
-	} else {
-		roots, _ := filepath.Glob(nerdctlStoreRoot + "/*")
-		if len(roots) == 0 {
-			return fmt.Errorf("nerdctl datastore not found")
-		}
-		dir = filepath.Join(roots[0], "containers", ns, containerdID)
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	path := filepath.Join(dir, "network-config.json")
-
-	raw := map[string]interface{}{}
-	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &raw)
-	}
-	encoded, err := json.Marshal(mappings)
-	if err != nil {
-		return err
-	}
-	// Round-trip through json.RawMessage to keep the exact cni shape.
-	raw["portMappings"] = json.RawMessage(encoded)
-	out, err := json.Marshal(raw)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, out, 0o644)
-}
-
-// startDockerContainer starts a container by Docker ID or name.
-// pruneStaleNetworkStore removes nerdctl network-store entries
-// (/var/lib/nerdctl/<hash>/containers/<ns>/<id>) whose container no longer
-// exists in containerd. The cold-boot metadata cleanup in stage2 removes
-// containers bypassing `nerdctl rm`, so their store entries would otherwise
-// accumulate forever on the persistent disk.
-func pruneStaleNetworkStore() {
+// pruneStaleContainerMeta removes anvil metadata directories
+// (/var/lib/anvil/containers/<ns>/<id>) whose container no longer exists in
+// containerd. Cold-boot cleanup deletes containers directly through the
+// containerd API, so their metadata would otherwise accumulate forever on
+// the persistent disk.
+func pruneStaleContainerMeta() {
 	cl, err := pc.get(context.Background())
 	if err != nil {
 		return
@@ -977,17 +741,15 @@ func pruneStaleNetworkStore() {
 		}
 	}
 
-	matches, _ := filepath.Glob("/var/lib/nerdctl/*/containers/*/*")
-	for _, dir := range matches {
-		parts := strings.Split(dir, "/")
-		if len(parts) < 2 {
-			continue
-		}
-		id := parts[len(parts)-1]
-		ns := parts[len(parts)-2]
-		if ids, ok := live[ns]; !ok || !ids[id] {
-			debugLog("pruning stale nerdctl store entry %s/%s", ns, id)
-			os.RemoveAll(dir)
+	metas, err := containerMetas()
+	if err != nil {
+		return
+	}
+	for _, m := range metas {
+		if ids, ok := live[m.Namespace]; !ok || !ids[m.ID] {
+			debugLog("pruning stale anvil metadata %s/%s", m.Namespace, truncateID(m.ID))
+			deleteContainerMeta(m.Namespace, m.ID)
+			releaseNamedNetNS(m.ID)
 		}
 	}
 }
@@ -1004,7 +766,7 @@ func containerHostPorts(ctx context.Context, ns, containerdID string) []int {
 	if err != nil {
 		return nil
 	}
-	portsJSON := getNerdctlPortsLabel(c, nsCtx)
+	portsJSON := portsLabel(c, nsCtx)
 	if portsJSON == "" {
 		return nil
 	}
@@ -1058,9 +820,9 @@ func startDockerContainer(ctx context.Context, id string) error {
 	if links := pendingLinkEntries(dockerID(ns, containerdID)); len(links) > 0 {
 		applyLinkAliases(ctx, ns, containerdID, links)
 	}
-	stdout, stderr, code, err := runNerdctl(ns, "start", containerdID)
-	if err != nil || code != 0 {
-		return fmt.Errorf("nerdctl start failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	// Native start: CNI attach + task creation + json-file logging.
+	if err := startNativeTask(ctx, ns, containerdID); err != nil {
+		return err
 	}
 	// Service-name DNS: append the container's compose aliases (e.g. "web")
 	// to the /etc/hosts bind mounts of every running container on the same
@@ -1112,14 +874,9 @@ func stopDockerContainer(ctx context.Context, id string, timeout int) error {
 	// so the restart monitor cannot race a restart between the exit and
 	// the cleanup below.
 	restarts.clear(did)
-	args := []string{"stop"}
-	if timeout > 0 {
-		args = append(args, "-t", strconv.Itoa(timeout))
-	}
-	args = append(args, containerdID)
-	stdout, stderr, code, err := runNerdctl(ns, args...)
-	if err != nil || code != 0 {
-		return fmt.Errorf("nerdctl stop failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	// Native stop: stop signal, then SIGKILL after the grace period.
+	if err := stopNativeTask(ctx, ns, containerdID, timeout); err != nil {
+		return err
 	}
 
 	// Poll containerd until the task stops or disappears.
@@ -1199,84 +956,15 @@ func handleContainerWait(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 // deleteDockerContainer removes a container by Docker ID or name.
-// removeNerdctlNameStore removes stale name-to-ID mappings that nerdctl leaves
-// behind after `nerdctl rm`. Without this, `nerdctl create --name <name>` later
-// fails with "name <name> is already used by ID <id>".
-// nerdctl stores names under /var/lib/nerdctl/<datastore>/<namespace>/<name>.
-func removeNerdctlNameStore(ns, containerdID string) {
-	base := "/var/lib/nerdctl"
-	entries, err := os.ReadDir(base)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		nsDir := filepath.Join(base, e.Name(), ns)
-		subs, err := os.ReadDir(nsDir)
-		if err != nil {
-			continue
-		}
-		for _, sub := range subs {
-			if sub.IsDir() {
-				continue
-			}
-			path := filepath.Join(nsDir, sub.Name())
-			data, err := os.ReadFile(path)
-			if err != nil {
-				continue
-			}
-			if strings.TrimSpace(string(data)) == containerdID {
-				_ = os.Remove(path)
-			}
-		}
-	}
-}
-
-// removeNerdctlNameStoreByName removes any name-store file for the given
-// namespace and container name, regardless of which container ID it points to.
-// This fixes drift between containerd metadata and nerdctl's name store after
-// cold boot or snapshot resume.
-func removeNerdctlNameStoreByName(ns, name string) {
-	base := "/var/lib/nerdctl"
-	entries, err := os.ReadDir(base)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		path := filepath.Join(base, e.Name(), ns, name)
-		if _, err := os.Stat(path); err == nil {
-			_ = os.Remove(path)
-		}
-	}
-}
-
 func deleteDockerContainer(ctx context.Context, id string, force bool) error {
 	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
 	}
 	did := dockerID(ns, containerdID)
-	args := []string{"rm"}
-	if force {
-		args = append(args, "-f")
-	}
-	args = append(args, containerdID)
-	stdout, stderr, code, err := runNerdctl(ns, args...)
-	if err != nil || code != 0 {
-		return fmt.Errorf("nerdctl rm failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
-	}
-	removeNerdctlNameStore(ns, containerdID)
-	// nerdctl rm does not always remove the container's network-store entry;
-	// drop it so stale port mappings do not accumulate on the persistent disk.
-	if matches, _ := filepath.Glob("/var/lib/nerdctl/*/containers/" + ns + "/" + containerdID); len(matches) > 0 {
-		for _, dir := range matches {
-			os.RemoveAll(dir)
-		}
+	// Native delete: task + snapshot + CNI + netns + metadata cleanup.
+	if err := deleteNativeContainer(ctx, ns, containerdID, force); err != nil {
+		return err
 	}
 	stopHealthCheck(did)
 	restarts.clear(did)
@@ -1289,17 +977,36 @@ func deleteDockerContainer(ctx context.Context, id string, force bool) error {
 // uses it in the recreate flow: the replacement is created under a temporary
 // name and renamed once the old container is removed.
 func renameDockerContainer(ctx context.Context, id string, newName string) error {
-	ns, _, name, err := resolveDockerID(ctx, id)
+	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
 	}
 	if newName == "" {
 		return fmt.Errorf("name is required")
 	}
-	stdout, stderr, code, err := runNerdctl(ns, "rename", name, newName)
-	if err != nil || code != 0 {
-		return fmt.Errorf("nerdctl rename failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return err
 	}
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	c, err := cl.LoadContainer(nsCtx, containerdID)
+	if err != nil {
+		return err
+	}
+	labels, err := c.Labels(nsCtx)
+	if err != nil {
+		return err
+	}
+	oldName := labels[labelName]
+	labels[labelName] = newName
+	if _, err := c.SetLabels(nsCtx, labels); err != nil {
+		return fmt.Errorf("rename: %w", err)
+	}
+	if meta, merr := loadContainerMeta(ns, containerdID); merr == nil {
+		meta.Name = newName
+		saveContainerMeta(meta)
+	}
+	debugLog("[docker-api] renamed %s/%s: %s -> %s", ns, truncateID(containerdID), oldName, newName)
 	return nil
 }
 
@@ -1311,14 +1018,30 @@ func killDockerContainer(ctx context.Context, id string, signal string) error {
 	}
 	// A user signal wins over any restart policy (see stopDockerContainer).
 	restarts.clear(dockerID(ns, containerdID))
-	args := []string{"kill"}
-	if signal != "" {
-		args = append(args, "-s", signal)
-	}
-	args = append(args, containerdID)
-	stdout, stderr, code, err := runNerdctl(ns, args...)
-	if err != nil || code != 0 {
-		return fmt.Errorf("nerdctl kill failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	// Native kill: signal the running task directly.
+	{
+		cl, cerr := pc.get(ctx)
+		if cerr != nil {
+			return fmt.Errorf("containerd client: %w", cerr)
+		}
+		nsCtx := namespaces.WithNamespace(ctx, ns)
+		c, lerr := cl.LoadContainer(nsCtx, containerdID)
+		if lerr != nil {
+			return lerr
+		}
+		task, terr := c.Task(nsCtx, nil)
+		if terr != nil {
+			return fmt.Errorf("container is not running")
+		}
+		sig := syscall.SIGKILL
+		if signal != "" {
+			if s, ok := signalValue(signal); ok {
+				sig = s
+			}
+		}
+		if kerr := task.Kill(nsCtx, sig); kerr != nil {
+			return kerr
+		}
 	}
 	// Docker reports SIGKILL'd containers with exit code 137 (128+9);
 	// compose and the CLI rely on it in events and /wait. containerd's task
@@ -1330,22 +1053,18 @@ func killDockerContainer(ctx context.Context, id string, signal string) error {
 	return nil
 }
 
-// restartDockerContainer restarts a container by Docker ID or name.
+// restartDockerContainer restarts a container by Docker ID or name. Native
+// implementation: graceful stop (the stopped task is deleted by the next
+// start) followed by a fresh start with CNI re-attach.
 func restartDockerContainer(ctx context.Context, id string, timeout int) error {
 	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
 	}
-	args := []string{"restart"}
-	if timeout > 0 {
-		args = append(args, "-t", strconv.Itoa(timeout))
+	if err := stopNativeTask(ctx, ns, containerdID, timeout); err != nil {
+		return err
 	}
-	args = append(args, containerdID)
-	stdout, stderr, code, err := runNerdctl(ns, args...)
-	if err != nil || code != 0 {
-		return fmt.Errorf("nerdctl restart failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
-	}
-	return nil
+	return startNativeTask(ctx, ns, containerdID)
 }
 
 // listDockerContainers scans all containerd namespaces and returns a
@@ -1427,7 +1146,7 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 			if labels == nil {
 				labels = map[string]string{}
 			}
-			name := labels["nerdctl/name"]
+			name := labels[labelName]
 			if name == "" {
 				name = c.ID()
 			}
@@ -1444,7 +1163,7 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 			}
 
 			var ports []dockerPort
-			if portsJSON := getNerdctlPortsLabel(c, nsCtx); portsJSON != "" {
+			if portsJSON := portsLabel(c, nsCtx); portsJSON != "" {
 				var pm []cniPortMapping
 				if err := json.Unmarshal([]byte(portsJSON), &pm); err == nil {
 					for _, p := range pm {
@@ -1526,7 +1245,7 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 			if labels == nil {
 				labels = map[string]string{}
 			}
-			name := labels["nerdctl/name"]
+			name := labels[labelName]
 			if name == "" {
 				name = c.ID()
 			}
@@ -1548,12 +1267,17 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 
 			status := "created"
 			running := false
+			exitCode := 0
+			pid := 0
 			task, err := c.Task(nsCtx, nil)
 			if err == nil {
-				st, err := task.Status(nsCtx)
-				if err == nil {
+				if st, serr := task.Status(nsCtx); serr == nil {
 					status = dockerStatus(string(st.Status))
 					running = st.Status == "running"
+					if st.Status == "stopped" {
+						exitCode = int(st.ExitStatus)
+					}
+					pid = int(task.Pid())
 				}
 			}
 
@@ -1563,25 +1287,37 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 			}
 
 			did := dockerID(ns, c.ID())
-			inspectDetails := inspectDetailsFor(ns, c.ID())
-			exitCode := inspectDetails.State.ExitCode
 			if exitCode == 0 && !running {
 				if cached, ok := peekContainerExitCode(did); ok {
 					exitCode = cached
 				}
 			}
-			networkName := inspectDetails.HostConfig.NetworkMode
-			if networkName == "" || networkName == "default" || networkName == "bridge" {
-				networkName = "bridge"
+			meta, _ := loadContainerMeta(ns, c.ID())
+
+			// Process config comes from the OCI spec; env/cmd reflect what
+			// will actually run (image config merged with overrides).
+			envList, cmdList, openStdin := []string{}, []string{}, false
+			if spec, err := c.Spec(nsCtx); err == nil && spec != nil && spec.Process != nil {
+				envList = spec.Process.Env
+				cmdList = spec.Process.Args
 			}
-			endpoint := dockerEndpointStats{
-				IPAddress:   inspectDetails.NetworkSettings.IPAddress,
-				IPPrefixLen: inspectDetails.NetworkSettings.IPPrefixLen,
-				MacAddress:  inspectDetails.NetworkSettings.MacAddress,
+			networkName := "bridge"
+			if meta != nil && len(meta.Networks) > 0 {
+				networkName = meta.Networks[0]
+			}
+			endpoint := dockerEndpointStats{}
+			if ni, ok := loadNetInfo(ns, c.ID()); ok {
+				endpoint = dockerEndpointStats{IPAddress: ni.IP, MacAddress: ni.Mac}
+			} else if usesHostNetworkName(networkName) {
+				endpoint = dockerEndpointStats{IPAddress: detectGuestIP()}
 			}
 			containerIP := endpoint.IPAddress
 			if containerIP == "" {
 				containerIP = detectGuestIP()
+			}
+			var portBindings map[string][]dockerHostPort
+			if meta != nil {
+				portBindings = portBindingsFromMeta(meta)
 			}
 			return &dockerContainerInspect{
 				Id:    did,
@@ -1590,7 +1326,7 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 				State: dockerContainerState{
 					Status:   status,
 					Running:  running,
-					Pid:      inspectDetails.State.Pid,
+					Pid:      pid,
 					ExitCode: exitCode,
 					Health:   getHealthState(did),
 				},
@@ -1600,24 +1336,24 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 					Image:       imageName,
 					Healthcheck: getHealthcheckConfig(did),
 					Tty:         getContainerTTY(did),
-					OpenStdin:   inspectDetails.Config.OpenStdin,
-					Env:         inspectDetails.Config.Env,
-					Cmd:         inspectDetails.Config.Cmd,
+					OpenStdin:   openStdin,
+					Env:         envList,
+					Cmd:         cmdList,
 					Entrypoint:  getContainerEntrypoint(did),
 					WorkingDir:  getContainerWorkingDir(did),
 					StopSignal:  getContainerStopSignal(did),
 				},
 				HostConfig: dockerHostConfig{
 					AutoRemove:   isAutoRemove(did),
-					NetworkMode:  inspectDetails.HostConfig.NetworkMode,
-					PortBindings: portBindingsFromStore(ns, c.ID()),
-					// nerdctl never sees --restart (it arms its own supervisor
-					// that fights ours); report the policy from our registry.
+					NetworkMode:  networkName,
+					PortBindings: portBindings,
+					// The restart policy is owned by our monitor; report it
+					// from the registry.
 					RestartPolicy: restarts.policySpecFor(did),
 				},
 				NetworkSettings: dockerNetworkSettings{
 					IPAddress: containerIP,
-					Ports:     portBindingsFromStore(ns, c.ID()),
+					Ports:     portBindings,
 					Networks:  map[string]dockerEndpointStats{networkName: endpoint},
 				},
 			}, nil
@@ -1626,79 +1362,33 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 	return nil, fmt.Errorf("No such container: %s", prefix)
 }
 
-// containerNetworkInfo returns the container's per-network endpoints for
-// docker inspect (NetworkSettings.Networks) and its primary IP. nerdctl's own
-// inspect knows the CNI-assigned address, but keys the map by interface name
-// ("unknown-eth0") — the real network name comes from HostConfig.NetworkMode.
-type nerdctlInspectNetInfo struct {
-	HostConfig struct {
-		NetworkMode string `json:"NetworkMode"`
-	} `json:"HostConfig"`
-	Config struct {
-		Tty        bool     `json:"Tty"`
-		OpenStdin  bool     `json:"OpenStdin"`
-		Env        []string `json:"Env"`
-		Cmd        []string `json:"Cmd"`
-		Entrypoint []string `json:"Entrypoint"`
-	} `json:"Config"`
-	State struct {
-		ExitCode int `json:"ExitCode"`
-		Pid      int `json:"Pid"`
-	} `json:"State"`
-	NetworkSettings struct {
-		IPAddress   string `json:"IPAddress"`
-		IPPrefixLen int    `json:"IPPrefixLen"`
-		MacAddress  string `json:"MacAddress"`
-		Networks    map[string]struct {
-			IPAddress   string `json:"IPAddress"`
-			IPPrefixLen int    `json:"IPPrefixLen"`
-			MacAddress  string `json:"MacAddress"`
-		} `json:"Networks"`
-	} `json:"NetworkSettings"`
-}
-
+// containerNetworkInfo returns the container's primary network endpoint and
+// its CNI-assigned address. State comes from the persisted net.json written
+// at start time (the CNI attach result), not from a runtime round-trip.
 func containerNetworkInfo(ns, containerdID, name string) (map[string]dockerEndpointStats, string) {
-	info := inspectDetailsFor(ns, containerdID)
-	primary := dockerEndpointStats{
-		IPAddress:   info.NetworkSettings.IPAddress,
-		IPPrefixLen: info.NetworkSettings.IPPrefixLen,
-		MacAddress:  info.NetworkSettings.MacAddress,
+	primary := dockerEndpointStats{}
+	networkName := "bridge"
+	if meta, err := loadContainerMeta(ns, containerdID); err == nil && len(meta.Networks) > 0 {
+		networkName = meta.Networks[0]
 	}
-	networkName := info.HostConfig.NetworkMode
-	if networkName == "" || networkName == "default" || networkName == "bridge" {
-		networkName = "bridge"
+	if ni, ok := loadNetInfo(ns, containerdID); ok {
+		primary = dockerEndpointStats{IPAddress: ni.IP, MacAddress: ni.Mac}
+	} else if usesHostNetworkName(networkName) {
+		primary.IPAddress = detectGuestIP()
 	}
 	networks := map[string]dockerEndpointStats{networkName: primary}
 	return networks, primary.IPAddress
 }
 
-// inspectDetailsFor returns the nerdctl inspect payload for a container
-// (network info plus Config fields like Tty/Env/Cmd). The unused `name`
-// parameter keeps call sites stable; nerdctl resolves by container ID.
-func inspectDetailsFor(ns, containerdID string) nerdctlInspectNetInfo {
-	stdout, _, code, err := runNerdctl(ns, "inspect", "--format", "json", containerdID)
-	if err != nil || code != 0 {
-		return nerdctlInspectNetInfo{}
-	}
-	var info nerdctlInspectNetInfo
-	_ = json.Unmarshal([]byte(stdout), &info)
-	return info
-}
-
-// portBindingsFromStore renders the persisted port mappings back into the
+// portBindingsFromMeta renders the persisted port mappings back into the
 // Docker HostConfig.PortBindings shape: "<containerPort>/<proto>" ->
 // [{HostIp, HostPort}].
-func portBindingsFromStore(ns, containerdID string) map[string][]dockerHostPort {
+func portBindingsFromMeta(meta *containerMeta) map[string][]dockerHostPort {
 	bindings := map[string][]dockerHostPort{}
-	portsJSON := readNetworkStorePorts(ns, containerdID)
-	if portsJSON == "" {
+	if meta == nil {
 		return bindings
 	}
-	var mappings []cniPortMapping
-	if err := json.Unmarshal([]byte(mappingsJSON(portsJSON)), &mappings); err != nil {
-		return bindings
-	}
-	for _, m := range mappings {
+	for _, m := range meta.Ports {
 		proto := m.Protocol
 		if proto == "" {
 			proto = "tcp"
@@ -1715,6 +1405,3 @@ func portBindingsFromStore(ns, containerdID string) map[string][]dockerHostPort 
 	}
 	return bindings
 }
-
-// mappingsJSON is a no-op cast keeping the call site readable.
-func mappingsJSON(s string) []byte { return []byte(s) }

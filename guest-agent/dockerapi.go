@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"net/http"
 	"net/url"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -130,102 +130,65 @@ func matchesLabelFilters(labels map[string]string, filters map[string]map[string
 	return true
 }
 
-// streamNerdctlLogsTo runs `nerdctl logs` (and optionally `nerdctl logs -f`)
-// and writes output as Docker multiplexed stream frames until the command exits
-// or the writer fails.
-func streamNerdctlLogsTo(out io.Writer, ns, name string, follow bool) {
-	streamNerdctlLogsToTTY(out, ns, name, follow, false)
+// streamTaskLogTo replays the container's json-file log (and optionally
+// follows it), writing output as Docker multiplexed stream frames until the
+// container exits or the writer fails.
+func streamTaskLogTo(out io.Writer, ns, id string, follow bool) {
+	streamTaskLogToTTY(out, ns, id, follow, false)
 }
 
-// streamNerdctlLogsToTTY streams `nerdctl logs` output; with tty=true the
-// bytes go out raw (Docker sends TTY output unmultiplexed — a mux header
-// would corrupt the client terminal), otherwise in the 8-byte-header
-// multiplexed stream format.
-func streamNerdctlLogsToTTY(out io.Writer, ns, name string, follow bool, tty bool) {
+// streamTaskLogToTTY streams the task log; with tty=true the bytes go out raw
+// (Docker sends TTY output unmultiplexed — a mux header would corrupt the
+// client terminal), otherwise in the 8-byte-header multiplexed format.
+func streamTaskLogToTTY(out io.Writer, ns, id string, follow bool, tty bool) {
 	flusher, _ := out.(http.Flusher)
-	buf := make([]byte, 4096)
-
-	// Helper that runs nerdctl logs with given args and copies output to out.
-	runLogs := func(extraArgs ...string) (int, error) {
-		args := []string{"-n", ns, "logs"}
-		args = append(args, extraArgs...)
-		args = append(args, name)
-		cmd := exec.Command("/opt/containerd/bin/nerdctl", args...)
-		cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			return 0, err
-		}
-		stderr, err := cmd.StderrPipe()
-		if err != nil {
-			return 0, err
-		}
-		if err := cmd.Start(); err != nil {
-			return 0, err
-		}
-		total := 0
-		for {
-			n, err := stdout.Read(buf)
-			if n > 0 {
-				total += n
-				var writeErr error
-				if tty {
-					_, writeErr = out.Write(buf[:n])
-				} else {
-					writeErr = writeDockerStream(out, 1, buf[:n])
-				}
-				if writeErr != nil {
-					cmd.Process.Kill()
-					cmd.Wait()
-					return total, writeErr
-				}
-				if flusher != nil {
-					flusher.Flush()
-				}
-			}
-			if err != nil {
-				break
+	emit := func(stream byte, line []byte) {
+		var writeErr error
+		if tty {
+			_, writeErr = out.Write(line)
+		} else {
+			writeErr = writeDockerStream(out, stream, line)
+			if writeErr == nil {
+				writeErr = writeDockerStream(out, stream, []byte("\n"))
 			}
 		}
-		io.Copy(io.Discard, stderr)
-		cmd.Wait()
-		return total, nil
+		if writeErr != nil {
+			panic(errWriteFailed) // unwind readTaskLog's follow loop
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
 	}
 
+	defer func() {
+		recover() //nolint:errcheck — errWriteFailed unwinds the follow loop
+	}()
+
+	logPath := containerLogPath(ns, id)
 	// Attach often arrives before the client issues start. Wait briefly for
 	// the container to leave the "created" state, otherwise a short-lived
 	// container may start, print and exit while we are still replaying
 	// nothing — and its output is lost.
 	for i := 0; i < 100; i++ {
-		status := nerdctlContainerStatus(ns, name)
+		status := nerdctlContainerStatus(ns, id)
 		if status != "" && status != "created" && status != "paused" {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-
-	// First replay any output that already exists. Short-lived containers may
-	// need a brief moment for the json-file log to be flushed after exit.
-	for attempt := 0; attempt < 10; attempt++ {
-		n, err := runLogs()
-		if err == nil && n > 0 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	// Then follow if requested and the container is still running.
-	if follow && isNerdctlContainerRunning(ns, name) {
-		runLogs("-f")
-	}
+	_ = readTaskLog(logPath, logReadOptions{follow: follow, tail: -1}, emit)
 }
 
+// errWriteFailed unwinds readTaskLog when the HTTP client disconnects.
+var errWriteFailed = errors.New("write failed")
+
 // handleAttach hijacks the HTTP connection and streams container output using
-// Docker's raw-stream multiplexing format. It uses `nerdctl logs` (non-following)
-// first to replay output that already exists, then `nerdctl logs -f` only if
-// the container is still running and the client asked for a stream. This avoids
-// the race where short-lived containers exit before attach is called.
+// Docker's raw-stream multiplexing format. It replays the json-file task log
+// first, then follows it only if the container is still running and the
+// client asked for a stream. This avoids the race where short-lived
+// containers exit before attach is called.
 func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
-	ns, containerdID, name, err := resolveDockerID(r.Context(), id)
+	ns, containerdID, _, err := resolveDockerID(r.Context(), id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
 		return
@@ -262,7 +225,7 @@ func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
 
 	// Replay existing logs then follow if the container is still running.
 	// TTY containers stream raw bytes (no docker mux headers).
-	streamNerdctlLogsToTTY(bufrw, ns, name, true, getContainerTTY(did))
+	streamTaskLogToTTY(bufrw, ns, containerdID, true, getContainerTTY(did))
 
 	// Ensure all buffered output reaches the client before closing.
 	bufrw.Flush()
@@ -271,58 +234,33 @@ func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
 
 // handleLogs streams container logs using Docker's multiplexed stream format.
 func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
-	ns, _, name, err := resolveDockerID(r.Context(), id)
+	ns, containerdID, _, err := resolveDockerID(r.Context(), id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
 		return
 	}
 
-	args := []string{"-n", ns, "logs"}
-	if r.URL.Query().Get("timestamps") == "1" || r.URL.Query().Get("timestamps") == "true" {
-		args = append(args, "-t")
-	}
-	follow := r.URL.Query().Get("follow") == "1" || r.URL.Query().Get("follow") == "true"
-	if follow {
-		args = append(args, "-f")
-	}
+	opts := logReadOptions{tail: -1}
+	q := r.URL.Query()
+	opts.timestamps = q.Get("timestamps") == "1" || q.Get("timestamps") == "true"
+	opts.follow = q.Get("follow") == "1" || q.Get("follow") == "true"
 	// since/until: the docker CLI sends unix timestamps (possibly with
-	// fractional seconds); nerdctl expects RFC3339 or a relative duration.
-	for param, flag := range map[string]string{"since": "--since", "until": "--until"} {
-		v := r.URL.Query().Get(param)
-		if v == "" {
-			continue
-		}
-		if rfc := unixToRFC3339(v); rfc != "" {
-			args = append(args, flag, rfc)
-		} else {
-			// Already a timestamp or a relative duration nerdctl understands.
-			args = append(args, flag, v)
+	// fractional seconds); RFC3339 is accepted as a fallback.
+	if v := q.Get("since"); v != "" {
+		if ts := parseLogTime(v); !ts.IsZero() {
+			opts.since = ts
 		}
 	}
-	// tail=N: buffer the replayed output and emit only the last N lines.
-	// nerdctl has no --tail; implemented post-hoc on the replayed output
-	// (follow-mode streams everything that comes after, like Docker).
-	tail := 0
-	if v := r.URL.Query().Get("tail"); v != "" && v != "all" {
+	if v := q.Get("until"); v != "" {
+		if ts := parseLogTime(v); !ts.IsZero() {
+			opts.until = ts
+		}
+	}
+	if v := q.Get("tail"); v != "" && v != "all" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			tail = n
+			opts.tail = n
 		}
 	}
-	args = append(args, name)
-
-	cmd := exec.Command("/opt/containerd/bin/nerdctl", args...)
-	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-	defer cmd.Wait()
 
 	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 	w.Header().Set("Connection", "close")
@@ -331,48 +269,31 @@ func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
 		f.Flush()
 	}
 
-	buf := make([]byte, 4096)
-	var pending []byte
-	var curLine []byte
-	lineDone := func(line []byte) {
-		if tail > 0 && !follow {
-			pending = append(pending, line...)
-			pending = append(pending, '\n')
-			return
-		}
-		writeDockerStream(w, 1, line)
-		writeDockerStream(w, 1, []byte("\n"))
-	}
-	for {
-		n, err := stdout.Read(buf)
-		for _, b := range buf[:n] {
-			if b == '\n' {
-				lineDone(curLine)
-				curLine = curLine[:0]
-			} else {
-				curLine = append(curLine, b)
-			}
-		}
-		if err != nil {
-			break
+	flusher, _ := w.(http.Flusher)
+	emit := func(stream byte, line []byte) {
+		writeDockerStream(w, stream, line)
+		writeDockerStream(w, stream, []byte("\n"))
+		if flusher != nil {
+			flusher.Flush()
 		}
 	}
-	if len(curLine) > 0 {
-		lineDone(curLine)
-	}
-	// Emit the tail: last N lines of the buffered replay.
-	if tail > 0 && !follow {
-		lines := strings.Split(strings.TrimSuffix(string(pending), "\n"), "\n")
-		if len(lines) > tail {
-			lines = lines[len(lines)-tail:]
-		}
-		writeDockerStream(w, 1, []byte(strings.Join(lines, "\n")+"\n"))
-	}
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
+	_ = readTaskLog(containerLogPath(ns, containerdID), opts, emit)
 }
 
+// parseLogTime accepts unix seconds (optionally fractional) and RFC3339.
+func parseLogTime(v string) time.Time {
+	if f, err := strconv.ParseFloat(v, 64); err == nil {
+		return time.Unix(int64(f), int64((f-float64(int64(f)))*float64(time.Second)))
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, v); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+// runDockerAPIServer starts the Docker-compatible HTTP server on vsock:1025.
 // runDockerAPIServer starts the Docker-compatible HTTP server on vsock:1025.
 // It waits for boot finalize (containerd up + stale-container cleanup) before
 // listening; see runBootFinalize.

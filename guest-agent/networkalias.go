@@ -10,14 +10,13 @@ import (
 	"sync"
 )
 
-// nerdctl has no --network-alias flag, but compose resolves services by
-// their service name ("db", "web"), which the CLI passes as Aliases in the
-// create request's NetworkingConfig. We remember the aliases at create time
-// and, once the container starts and has a CNI address, append
-// "<ip> <aliases...>" to the /etc/hosts bind mounts of every running
-// container on the same network (nerdctl generates those files itself, and
-// each container's /etc/hosts is a bind mount of the file on the persistent
-// disk — see /var/lib/nerdctl/<ds>/etchosts/<ns>/<id>/hosts).
+// Compose resolves services by their service name ("db", "web"), which the
+// CLI passes as Aliases in the create request's NetworkingConfig. We remember
+// the aliases at create time and, once the container starts and has a CNI
+// address, append "<ip> <aliases...>" to the /etc/hosts bind mounts of every
+// running container on the same network. Each container's /etc/hosts is a
+// bind mount of the file under its anvil metadata directory
+// (/var/lib/anvil/containers/<ns>/<id>/hosts).
 
 var networkAliases = struct {
 	mu sync.Mutex
@@ -93,7 +92,7 @@ func applyNetworkAliases(ns, containerdID string) {
 	}
 	entry := ip + "\t" + strings.Join(aliases, " ")
 
-	matches, _ := filepath.Glob(filepath.Join(nerdctlStoreRoot, "*", "etchosts", ns, "*", "hosts"))
+	matches, _ := filepath.Glob(containerMetaDir(ns, "*") + "/hosts")
 	for _, hostsPath := range matches {
 		data, err := os.ReadFile(hostsPath)
 		if err != nil {
@@ -148,8 +147,7 @@ func applyLinkAliases(ctx context.Context, ns, containerdID string, links []stri
 	if len(entries) == 0 {
 		return
 	}
-	hostsPath := filepath.Join(nerdctlStoreRoot, "*", "etchosts", ns, containerdID, "hosts")
-	matches, _ := filepath.Glob(hostsPath)
+	matches := []string{containerHostsPath(ns, containerdID)}
 	written := 0
 	for _, p := range matches {
 		data, err := os.ReadFile(p)
@@ -212,21 +210,11 @@ func linkAliases(ctx context.Context, ns string, links []string) []string {
 }
 
 // containerAddress returns the container's first CNI IPv4 address from the
-// nerdctl etchosts metadata (meta.json records the network config nerdctl's
-// CNI returned on start), falling back to nerdctl inspect.
+// persisted net.json (written by the start-time CNI attach), falling back to
+// the derived network info.
 func containerAddress(ns, containerdID string) string {
-	metaPath := filepath.Join(nerdctlStoreRoot, "*", "etchosts", ns, containerdID, "meta.json")
-	matches, _ := filepath.Glob(metaPath)
-	for _, p := range matches {
-		data, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		// The JSON is small; a focused regex avoids a full schema.
-		m := regexp.MustCompile(`"address"\s*:\s*"(\d+\.\d+\.\d+\.\d+)/`).FindSubmatch(data)
-		if len(m) == 2 {
-			return string(m[1])
-		}
+	if ni, ok := loadNetInfo(ns, containerdID); ok && ni.IP != "" {
+		return ni.IP
 	}
 	_, ip := containerNetworkInfo(ns, containerdID, "")
 	return ip

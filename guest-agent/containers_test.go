@@ -7,31 +7,19 @@ import (
 	"time"
 )
 
-// nerdctl >= 2.1 prints a single JSON object from `inspect --format json`;
-// older versions printed an array with one element. When nerdctl 2.3.x
-// switched to the single-object form, the old parser silently returned
-// not-ok and every `docker run` with attach spun through all 100 wait
-// iterations (+7 s). Accept both formats — see IMPROVEMENTS.md §2.1.
-func TestContainerStateFromInspectArray(t *testing.T) {
-	stdout := `[{"State":{"Running":true,"Status":"running"}}]`
-	running, status, ok := containerStateFromInspect(stdout)
-	if !ok || !running || status != "running" {
-		t.Fatalf("array form: got (%v, %q, %v)", running, status, ok)
+// dockerStatus maps containerd task statuses onto Docker state strings —
+// the contract every ps/inspect/events response relies on.
+func TestDockerStatusMapping(t *testing.T) {
+	cases := map[string]string{
+		"running": "running",
+		"stopped": "exited",
+		"paused":  "paused",
+		"created": "created",
+		"":        "created",
 	}
-}
-
-func TestContainerStateFromInspectSingleObject(t *testing.T) {
-	stdout := `{"State":{"Running":false,"Status":"exited"}}`
-	running, status, ok := containerStateFromInspect(stdout)
-	if !ok || running || status != "exited" {
-		t.Fatalf("single-object form: got (%v, %q, %v)", running, status, ok)
-	}
-}
-
-func TestContainerStateFromInspectGarbage(t *testing.T) {
-	for _, in := range []string{"", "not json", `{}`, `[]`} {
-		if _, _, ok := containerStateFromInspect(in); ok {
-			t.Errorf("containerStateFromInspect(%q) = ok, want not ok", in)
+	for in, want := range cases {
+		if got := dockerStatus(in); got != want {
+			t.Errorf("dockerStatus(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

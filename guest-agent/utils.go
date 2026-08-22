@@ -1,10 +1,13 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -15,7 +18,23 @@ const (
 	hostPortCheckPort = 1027
 	containerdSocket  = "/run/containerd/containerd.sock"
 	cniConfDir        = "/etc/cni/net.d"
+	netnsDir          = "/var/run/netns"
 )
+
+// newContainerID returns a 64-char hex id in the shape Docker clients expect
+// (containerd accepts any unique string; we keep it docker-like).
+func newContainerID() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic(err) // crypto/rand failure is unrecoverable
+	}
+	return hex.EncodeToString(b)
+}
+
+// netnsPathFor returns the named netns path of a container.
+func netnsPathFor(id string) string {
+	return filepath.Join(netnsDir, id)
+}
 
 var debugMode = os.Getenv("ANVIL_DEBUG") == "1" || os.Getenv("ANVIL_DEBUG") == "true"
 
