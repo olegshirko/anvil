@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -318,6 +320,12 @@ type simpleExecResult struct {
 // runSimpleExec runs argv inside a running container and captures output.
 // It is the shared foundation for healthchecks and cp/archive operations.
 func runSimpleExec(ctx context.Context, ns, id string, argv []string, user, cwd string, timeout time.Duration) (*simpleExecResult, error) {
+	return runSimpleExecStdin(ctx, ns, id, argv, user, cwd, nil, timeout)
+}
+
+// runSimpleExecStdin additionally feeds the given bytes to the exec's stdin
+// (nil = closed stdin).
+func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user, cwd string, stdin []byte, timeout time.Duration) (*simpleExecResult, error) {
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd client: %w", err)
@@ -355,7 +363,11 @@ func runSimpleExec(ctx context.Context, ns, id string, argv []string, user, cwd 
 		return nil, err
 	}
 
-	process, err := task.Exec(nsCtx, execID, pspec, cio.NewCreator(cio.WithStreams(nil, stdoutW, stderrW)))
+	var stdinR io.Reader
+	if len(stdin) > 0 {
+		stdinR = bytes.NewReader(stdin)
+	}
+	process, err := task.Exec(nsCtx, execID, pspec, cio.NewCreator(cio.WithStreams(stdinR, stdoutW, stderrW)))
 	if err != nil {
 		stdoutW.Close()
 		stderrW.Close()

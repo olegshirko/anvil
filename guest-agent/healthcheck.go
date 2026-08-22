@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -9,7 +10,7 @@ import (
 
 // dockerHealthState mirrors the State.Health object Docker returns from
 // GET /containers/{id}/json. It is populated by the guest-agent because
-// nerdctl 2.0.4 does not implement Docker-compatible healthchecks.
+// Docker-compatible healthchecks are implemented in-agent via task exec.
 type dockerHealthState struct {
 	Status        string            `json:"Status"`
 	FailingStreak int               `json:"FailingStreak"`
@@ -185,21 +186,18 @@ func startHealthCheck(dockerID, ns, containerdID string, hc *dockerHealthcheck, 
 }
 
 func runHealthCheckCommand(ns, containerdID, containerUser string, cmd []string, timeout time.Duration) (int, string) {
-	args := []string{"exec"}
-	if containerUser != "" {
-		args = append(args, "--user", containerUser)
+	res, err := runSimpleExec(context.Background(), ns, containerdID, cmd, containerUser, "", timeout)
+	if res == nil {
+		if err != nil {
+			return 126, err.Error()
+		}
+		return 126, "exec failed"
 	}
-	args = append(args, containerdID)
-	args = append(args, cmd...)
-	stdout, stderr, code, err := runNerdctl(ns, args...)
-	output := strings.TrimSpace(stdout)
+	output := strings.TrimSpace(res.stdout)
 	if output == "" {
-		output = strings.TrimSpace(stderr)
+		output = strings.TrimSpace(res.stderr)
 	}
-	if err != nil {
-		return code, output
-	}
-	return code, output
+	return res.exitCode, output
 }
 
 // getHealthcheckUser returns the stored container user for a healthcheck.

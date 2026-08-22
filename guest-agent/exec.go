@@ -1,24 +1,26 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"io"
 	"net/http"
-	"os/exec"
-	"regexp"
-	"strconv"
+	"os"
 	"sync"
 	"time"
+
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // execSpec holds the configuration for a created exec instance.
 type execSpec struct {
 	ID                string
 	Namespace         string
+	ContainerdID      string
 	ContainerName     string
 	ContainerDockerID string
 	Cmd               []string
@@ -133,6 +135,7 @@ func createDockerExec(ctx context.Context, containerID string, req dockerExecCre
 	spec := &execSpec{
 		ID:                newExecID(),
 		Namespace:         ns,
+		ContainerdID:      containerdID,
 		ContainerName:     name,
 		ContainerDockerID: dockerID(ns, containerdID),
 		Cmd:               req.Cmd,
@@ -149,48 +152,22 @@ func createDockerExec(ctx context.Context, containerID string, req dockerExecCre
 	return spec.ID, nil
 }
 
-// buildNerdctlExecArgs builds the nerdctl exec argument slice for a spec.
-func buildNerdctlExecArgs(spec *execSpec, detach bool) []string {
-	args := []string{"exec"}
-	if detach {
-		args = append(args, "-d")
-	}
-	if spec.Tty {
-		args = append(args, "-t")
-	}
-	// Only request interactive when stdin is wanted and we are not detaching.
-	if spec.AttachStdin && !detach {
-		args = append(args, "-i")
-	}
-	for _, e := range spec.Env {
-		args = append(args, "-e", e)
-	}
-	if spec.User != "" {
-		args = append(args, "-u", spec.User)
-	}
-	if spec.WorkingDir != "" {
-		args = append(args, "-w", spec.WorkingDir)
-	}
-	if spec.Privileged {
-		args = append(args, "--privileged")
-	}
-	args = append(args, spec.ContainerName)
-	args = append(args, spec.Cmd...)
-	return args
-}
-
-// startDetachedExec runs an exec instance in the background and returns immediately.
+// startDetachedExec runs an exec instance in the background and returns
+// immediately (the process keeps running inside the container).
 func startDetachedExec(id string) error {
 	spec := execs.get(id)
 	if spec == nil {
 		return fmt.Errorf("No such exec instance: %s", id)
 	}
-
-	args := buildNerdctlExecArgs(spec, true)
-	stdout, stderr, code, err := runNerdctl(spec.Namespace, args...)
-	if err != nil || code != 0 {
-		return fmt.Errorf("nerdctl exec failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
-	}
+	go func() {
+		res, err := runSimpleExecStdin(context.Background(), spec.Namespace,
+			spec.ContainerdID, spec.Cmd, spec.User, spec.WorkingDir, nil, time.Hour)
+		if err != nil {
+			spec.setExit(126)
+			return
+		}
+		spec.setExit(res.exitCode)
+	}()
 	return nil
 }
 
@@ -227,129 +204,119 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	spec.exitCode = 0
 	spec.mu.Unlock()
 
-	args := buildNerdctlExecArgs(spec, false)
-	cmd := exec.Command("/opt/containerd/bin/nerdctl", append([]string{"-n", spec.Namespace}, args...)...)
-	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
+	// Native exec: task.Exec inside the container's task, with the hijacked
+	// connection wired to the process stdio. Docker's hijacked attach
+	// protocol sends client stdin as a raw byte stream in both TTY and
+	// non-TTY modes (only the output direction is multiplexed).
+	cl, cerr := pc.get(context.Background())
+	if cerr != nil {
 		spec.setExit(126)
 		return
 	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
+	nsCtx := namespaces.WithNamespace(context.Background(), spec.Namespace)
+	container, lerr := cl.LoadContainer(nsCtx, spec.ContainerdID)
+	if lerr != nil {
+		spec.setExit(126)
+		return
+	}
+	task, terr := container.Task(nsCtx, nil)
+	if terr != nil {
 		spec.setExit(126)
 		return
 	}
 
-	stdinPipe, stdinWriter := io.Pipe()
+	stdoutR, stdoutW, perr := os.Pipe()
+	if perr != nil {
+		spec.setExit(126)
+		return
+	}
+	stderrR, stderrW, perr := os.Pipe()
+	if perr != nil {
+		stdoutR.Close()
+		stdoutW.Close()
+		spec.setExit(126)
+		return
+	}
+
+	var stdinR io.Reader
+	var stdinWriteCloser io.WriteCloser
 	if spec.AttachStdin || spec.Tty {
-		cmd.Stdin = stdinPipe
+		pr, pw := io.Pipe()
+		stdinR = pr
+		stdinWriteCloser = pw
 		go func() {
-			// Docker's hijacked attach protocol: client->server stdin is a raw
-			// byte stream in both TTY and non-TTY modes (only the output
-			// direction is multiplexed), so forward it verbatim. buildx's
-			// `buildctl dial-stdio` relies on this bidirectional pipe.
-			io.Copy(stdinWriter, conn)
-			stdinWriter.Close()
+			io.Copy(pw, conn)
+			pw.Close()
 		}()
-	} else {
-		stdinWriter.Close()
-		stdinPipe.Close()
 	}
 
-	if err := cmd.Start(); err != nil {
+	pspec := &specs.Process{
+		Args: spec.Cmd,
+		Env:  mergeEnv([]string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}, spec.Env),
+		Cwd:  defaultString(spec.WorkingDir, "/"),
+		User: execUserFor(nsCtx, container, spec.User),
+		Terminal: spec.Tty,
+	}
+
+	execID := newExecID()
+	process, xerr := task.Exec(nsCtx, execID, pspec, cio.NewCreator(cio.WithStreams(stdinR, stdoutW, stderrW)))
+	if xerr != nil {
+		stdoutR.Close(); stdoutW.Close(); stderrR.Close(); stderrW.Close()
 		spec.setExit(126)
 		return
 	}
+	stdoutW.Close()
+	stderrW.Close()
 
 	var wg sync.WaitGroup
 	writeMu := &sync.Mutex{}
-	var (
-		parsedExit   = -1
-		parsedExitMu sync.Mutex
-		execExitRe   = regexp.MustCompile(`exec failed with exit code (\d+)`)
-	)
-
 	stream := func(rc io.ReadCloser, streamType byte) {
 		defer wg.Done()
 		buf := make([]byte, 4096)
 		for {
-			n, err := rc.Read(buf)
+			n, rerr := rc.Read(buf)
 			if n > 0 {
+				writeMu.Lock()
 				if spec.Tty {
-					writeMu.Lock()
 					bufrw.Write(buf[:n])
-					bufrw.Flush()
-					writeMu.Unlock()
 				} else {
-					writeMu.Lock()
 					writeDockerStream(bufrw, streamType, buf[:n])
-					bufrw.Flush()
-					writeMu.Unlock()
 				}
+				bufrw.Flush()
+				writeMu.Unlock()
 			}
-			if err != nil {
+			if rerr != nil {
 				return
 			}
 		}
 	}
-
-	// Scan stderr line-by-line so we can extract the real command exit code
-	// from nerdctl's fatal message while still streaming it to the client.
-	scanStderr := func(rc io.ReadCloser) {
-		defer wg.Done()
-		scanner := bufio.NewScanner(rc)
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			out := append([]byte{}, line...)
-			out = append(out, '\n')
-			writeMu.Lock()
-			writeDockerStream(bufrw, 2, out)
-			bufrw.Flush()
-			writeMu.Unlock()
-			if m := execExitRe.FindSubmatch(line); len(m) > 1 {
-				if c, err := strconv.Atoi(string(m[1])); err == nil {
-					parsedExitMu.Lock()
-					parsedExit = c
-					parsedExitMu.Unlock()
-				}
-			}
-		}
-	}
-
 	wg.Add(2)
-	go stream(stdout, 1)
-	go scanStderr(stderr)
+	go stream(stdoutR, 1)
+	go stream(stderrR, 2)
 
-	// os/exec's Wait also blocks on the internal goroutine copying our stdin
-	// pipe into the child, which only ends when stdinWriter is closed. That
-	// normally happens on client disconnect, but clients like buildx keep the
-	// hijacked connection open while waiting for output — deadlocking Wait.
-	// Output EOF means the process exited, so close stdin at that point.
-	stdinDone := make(chan struct{})
-	go func() {
+	exitCh, werr := process.Wait(nsCtx)
+	if werr != nil {
 		wg.Wait()
-		stdinWriter.Close()
-		close(stdinDone)
-	}()
+		spec.setExit(126)
+		return
+	}
+	st := <-exitCh
+
+	// Close stdin so the client sees EOF semantics; then drain output.
+	if stdinWriteCloser != nil {
+		stdinWriteCloser.Close()
+	}
+	wg.Wait()
 
 	exitCode := 0
-	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-			parsedExitMu.Lock()
-			if parsedExit >= 0 {
-				exitCode = parsedExit
-			}
-			parsedExitMu.Unlock()
-		} else {
-			exitCode = 126
-		}
+	if serr := st.Error(); serr != nil {
+		exitCode = 126
+	} else {
+		exitCode = int(st.ExitCode())
 	}
+	process.Delete(context.Background()) //nolint:errcheck
 	spec.setExit(exitCode)
 
-	<-stdinDone
 	bufrw.Flush()
 	time.Sleep(50 * time.Millisecond)
 }

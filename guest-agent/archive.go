@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
 // dockerPathStat is the JSON returned in the X-Docker-Container-Path-Stat header.
@@ -88,26 +91,16 @@ func handleArchiveGet(w http.ResponseWriter, r *http.Request, ns, containerdID, 
 }
 
 func handleArchivePut(w http.ResponseWriter, r *http.Request, ns, containerdID, dstPath string) {
-	// Docker CLI sends a tar stream. Save it locally, copy into the container,
-	// then extract with tar.
-	tmpHost, err := os.CreateTemp("/tmp", "anvil-cp-in-*.tar")
+	// Docker CLI sends a tar stream. Buffer it (bounded by what docker cp
+	// sends in practice), then extract inside the container or into its
+	// rootfs snapshot when it is not running.
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
-	defer os.Remove(tmpHost.Name())
-	defer tmpHost.Close()
 
-	if _, err := io.Copy(tmpHost, r.Body); err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-	if err := tmpHost.Close(); err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	if err := extractTarIntoContainer(ns, containerdID, tmpHost.Name(), dstPath); err != nil {
+	if err := extractTarIntoContainer(ns, containerdID, body, dstPath); err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
@@ -117,13 +110,14 @@ func handleArchivePut(w http.ResponseWriter, r *http.Request, ns, containerdID, 
 // statContainerPath runs stat inside the container and returns a Docker-compatible stat.
 func statContainerPath(ns, containerdID, path string) (dockerPathStat, error) {
 	script := fmt.Sprintf("stat -c '%%n|%%s|%%a|%%Y|%%N' %s", shellescape(path))
-	stdout, stderr, code, err := runNerdctl(ns, "exec", "--user", "0", containerdID, "sh", "-c", script)
-	if err != nil || code != 0 {
-		return dockerPathStat{}, fmt.Errorf("stat failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	res, err := runSimpleExec(context.Background(), ns, containerdID,
+		[]string{"sh", "-c", script}, "0", "", 30*time.Second)
+	if err != nil || res.exitCode != 0 {
+		return dockerPathStat{}, fmt.Errorf("stat failed: %v %s%s", err, outOf(res), errOf(res))
 	}
-	fields := strings.SplitN(strings.TrimSpace(stdout), "|", 5)
+	fields := strings.SplitN(strings.TrimSpace(res.stdout), "|", 5)
 	if len(fields) < 4 {
-		return dockerPathStat{}, fmt.Errorf("unexpected stat output: %q", stdout)
+		return dockerPathStat{}, fmt.Errorf("unexpected stat output: %q", res.stdout)
 	}
 	size, _ := strconv.ParseInt(fields[1], 10, 64)
 	mode, _ := strconv.ParseUint(fields[2], 8, 32)
@@ -142,72 +136,116 @@ func statContainerPath(ns, containerdID, path string) (dockerPathStat, error) {
 	}, nil
 }
 
-// createContainerTar archives the given path inside the container to a temporary host file.
+// createContainerTar archives the given path inside the container to a
+// temporary host file by piping the in-container tar stream out through exec.
 func createContainerTar(ns, containerdID, srcPath string) (string, error) {
-	tmpGuest := "/tmp/anvil-cp-out-" + strconv.FormatInt(time.Now().UnixNano(), 10) + ".tar"
 	base := filepath.Base(srcPath)
 	dir := filepath.Dir(srcPath)
-	script := fmt.Sprintf("tar -cf %s -C %s %s", shellescape(tmpGuest), shellescape(dir), shellescape(base))
-	stdout, stderr, code, err := runNerdctl(ns, "exec", "--user", "0", containerdID, "sh", "-c", script)
-	if err != nil || code != 0 {
-		return "", fmt.Errorf("tar create failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	script := fmt.Sprintf("tar -cf - -C %s %s", shellescape(dir), shellescape(base))
+	res, err := runSimpleExec(context.Background(), ns, containerdID,
+		[]string{"sh", "-c", script}, "0", "", 5*time.Minute)
+	if err != nil || res.exitCode != 0 {
+		return "", fmt.Errorf("tar create failed (%d): %s%s", codeOf(res), stripANSI(outOf(res)), stripANSI(errOf(res)))
 	}
 
 	tmpHost, err := os.CreateTemp("/tmp", "anvil-cp-out-*.tar")
 	if err != nil {
 		return "", err
 	}
-	tmpHost.Close()
-
-	stdout, stderr, code, err = runNerdctl(ns, "cp", containerdID+":"+tmpGuest, tmpHost.Name())
-	if err != nil || code != 0 {
+	defer tmpHost.Close()
+	if _, werr := tmpHost.WriteString(res.stdout); werr != nil {
 		os.Remove(tmpHost.Name())
-		return "", fmt.Errorf("nerdctl cp failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+		return "", werr
 	}
-	// Best-effort cleanup inside the container.
-	runNerdctl(ns, "exec", "--user", "0", containerdID, "rm", "-f", tmpGuest)
 	return tmpHost.Name(), nil
 }
 
-// extractTarIntoContainer copies the host tar into the container and extracts it.
-func extractTarIntoContainer(ns, containerdID, hostTar, dstPath string) error {
-	if !isNerdctlContainerRunning(ns, containerdID) {
-		// nerdctl exec needs a running task, while nerdctl cp also works on
-		// stopped/created containers: extract the tar on the guest and copy
-		// the payload into the container rootfs. The buildx docker-container
-		// driver relies on this when it stages files into its buildkit
-		// container before starting it.
-		tmpDir := "/tmp/anvil-cp-in-" + strconv.FormatInt(time.Now().UnixNano(), 10)
-		if err := os.MkdirAll(tmpDir, 0o755); err != nil {
-			return err
-		}
-		defer os.RemoveAll(tmpDir)
-		if out, err := exec.Command("/bin/tar", "-xf", hostTar, "-C", tmpDir).CombinedOutput(); err != nil {
-			return fmt.Errorf("guest tar extract failed: %s", stripANSI(string(out)))
-		}
-		stdout, stderr, code, err := runNerdctl(ns, "cp", tmpDir+"/.", containerdID+":"+dstPath)
-		if err != nil || code != 0 {
-			return fmt.Errorf("nerdctl cp failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+// extractTarIntoContainer extracts a host-side tar stream into the container.
+// Running containers get the stream piped to an in-container `tar -xf -`;
+// stopped containers have their rootfs snapshot mounted and extracted on the
+// guest directly (the buildx docker-container driver stages files this way).
+func extractTarIntoContainer(ns, containerdID string, tarStream []byte, dstPath string) error {
+	script := fmt.Sprintf("mkdir -p %s && tar -xf - -C %s", shellescape(dstPath), shellescape(dstPath))
+	running, _, stateOK := containerTaskState(context.Background(), ns, containerdID)
+	if stateOK && running {
+		res, err := runSimpleExecStdin(context.Background(), ns, containerdID,
+			[]string{"sh", "-c", script}, "0", "/", tarStream, 5*time.Minute)
+		if err != nil || res.exitCode != 0 {
+			return fmt.Errorf("tar extract failed (%d): %s%s", codeOf(res), stripANSI(outOf(res)), stripANSI(errOf(res)))
 		}
 		return nil
 	}
+	// Not running: mount the rootfs snapshot and extract there.
+	return extractTarIntoSnapshot(ns, containerdID, tarStream, dstPath)
+}
 
-	tmpGuest := "/tmp/anvil-cp-in-" + strconv.FormatInt(time.Now().UnixNano(), 10) + ".tar"
-	stdout, stderr, code, err := runNerdctl(ns, "cp", hostTar, containerdID+":"+tmpGuest)
-	if err != nil || code != 0 {
-		return fmt.Errorf("nerdctl cp failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+// extractTarIntoSnapshot mounts a stopped container's rootfs snapshot on the
+// guest, extracts the tar stream into dstPath inside it, and unmounts.
+func extractTarIntoSnapshot(ns, containerdID string, tarStream []byte, dstPath string) error {
+	cl, err := pc.get(context.Background())
+	if err != nil {
+		return err
 	}
+	ctx := namespaces.WithNamespace(context.Background(), ns)
+	c, err := cl.LoadContainer(ctx, containerdID)
+	if err != nil {
+		return fmt.Errorf("load container: %w", err)
+	}
+	info, err := c.Info(ctx)
+	if err != nil || info.SnapshotKey == "" {
+		return fmt.Errorf("container has no rootfs snapshot")
+	}
+	sn := cl.SnapshotService(info.Snapshotter)
+	if sn == nil {
+		return fmt.Errorf("snapshotter %q unavailable", info.Snapshotter)
+	}
+	mounts, err := sn.Mounts(ctx, info.SnapshotKey)
+	if err != nil {
+		return fmt.Errorf("snapshot mounts: %w", err)
+	}
+	root, err := os.MkdirTemp("/tmp", "anvil-rootfs-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(root)
+	if err := mountAll(mounts, root); err != nil {
+		return fmt.Errorf("mount rootfs: %w", err)
+	}
+	defer unmountAll(root)
 
-	script := fmt.Sprintf("mkdir -p %s && tar -xf %s -C %s", shellescape(dstPath), shellescape(tmpGuest), shellescape(dstPath))
-	stdout, stderr, code, err = runNerdctl(ns, "exec", "--user", "0", containerdID, "sh", "-c", script)
-	if err != nil || code != 0 {
-		return fmt.Errorf("tar extract failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	target := filepath.Join(root, filepath.Clean("/"+dstPath))
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		return err
 	}
-	runNerdctl(ns, "exec", "--user", "0", containerdID, "rm", "-f", tmpGuest)
+	extract := exec.Command("/bin/tar", "-xf", "-", "-C", target)
+	extract.Stdin = strings.NewReader(string(tarStream))
+	if out, err := extract.CombinedOutput(); err != nil {
+		return fmt.Errorf("tar extract: %v: %s", err, stripANSI(string(out)))
+	}
 	return nil
 }
 
 // shellescape escapes a path for use in shell arguments.
 func shellescape(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+// Small helpers keeping the exec result handling terse at call sites above.
+func codeOf(r *simpleExecResult) int {
+	if r == nil {
+		return 126
+	}
+	return r.exitCode
+}
+func outOf(r *simpleExecResult) string {
+	if r == nil {
+		return ""
+	}
+	return r.stdout
+}
+func errOf(r *simpleExecResult) string {
+	if r == nil {
+		return ""
+	}
+	return r.stderr
 }
