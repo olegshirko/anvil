@@ -239,7 +239,7 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 			// port proxy, so it needs the CNI address (10.10.x.y), not the
 			// guest NAT IP. nerdctl inspect costs ~100ms, so cache per
 			// (namespace, id) keyed by task pid — a restart gets a new pid.
-			containerIP := s.containerIPFor(ns, c.ID(), task.Pid(), labels["nerdctl/name"])
+			containerIP := s.containerIPFor(ns, c.ID(), task.Pid(), labels[labelName])
 
 			for _, p := range ports {
 				proto := p.Protocol
@@ -249,7 +249,7 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 				mappings = append(mappings, PortMapping{
 					Namespace:     ns,
 					ContainerID:   c.ID(),
-					Name:          labels["nerdctl/name"],
+					Name:          labels[labelName],
 					HostPort:      p.HostPort,
 					ContainerPort: p.ContainerPort,
 					Protocol:      proto,

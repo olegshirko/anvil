@@ -8,18 +8,18 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
-	"os/exec"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	digest "github.com/opencontainers/go-digest"
+
+	"github.com/containerd/errdefs"
 )
 
 // dockerImageSummary matches the JSON returned by GET /images/json.
@@ -33,78 +33,6 @@ type dockerImageSummary struct {
 	Labels      map[string]string `json:"Labels"`
 	ParentId    string            `json:"ParentId"`
 	Containers  int               `json:"Containers"`
-}
-
-// nerdctlImage is the shape of `nerdctl images --format json` output.
-type nerdctlImage struct {
-	CreatedAt  string `json:"CreatedAt"`
-	Digest     string `json:"Digest"`
-	ID         string `json:"ID"`
-	Repository string `json:"Repository"`
-	Tag        string `json:"Tag"`
-	Name       string `json:"Name"`
-	Size       string `json:"Size"`
-	BlobSize   string `json:"BlobSize"`
-	Platform   string `json:"Platform"`
-}
-
-// parseHumanSize converts nerdctl size strings like "182.2 MiB" or "211.5 MB" to bytes.
-func parseHumanSize(s string) int64 {
-	s = strings.TrimSpace(s)
-	if s == "" || s == "0" || s == "0B" {
-		return 0
-	}
-
-	// Try to parse a plain number first.
-	if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return v
-	}
-	if v, err := strconv.ParseFloat(s, 64); err == nil {
-		return int64(v)
-	}
-
-	// Find where the numeric part ends and the unit begins.
-	numEnd := 0
-	for i, r := range s {
-		if (r >= '0' && r <= '9') || r == '.' {
-			numEnd = i + 1
-		} else {
-			break
-		}
-	}
-	if numEnd == 0 {
-		return 0
-	}
-	valStr := strings.TrimSpace(s[:numEnd])
-	unit := strings.TrimSpace(s[numEnd:])
-
-	val, err := strconv.ParseFloat(valStr, 64)
-	if err != nil {
-		return 0
-	}
-
-	switch {
-	case strings.HasPrefix(unit, "KiB"):
-		return int64(val * 1024)
-	case strings.HasPrefix(unit, "MiB"):
-		return int64(val * 1024 * 1024)
-	case strings.HasPrefix(unit, "GiB"):
-		return int64(val * 1024 * 1024 * 1024)
-	case strings.HasPrefix(unit, "TiB"):
-		return int64(val * 1024 * 1024 * 1024 * 1024)
-	case strings.HasPrefix(unit, "kB"):
-		return int64(val * 1000)
-	case strings.HasPrefix(unit, "MB"):
-		return int64(val * 1000 * 1000)
-	case strings.HasPrefix(unit, "GB"):
-		return int64(val * 1000 * 1000 * 1000)
-	case strings.HasPrefix(unit, "TB"):
-		return int64(val * 1000 * 1000 * 1000 * 1000)
-	case strings.HasPrefix(unit, "B"):
-		return int64(val)
-	default:
-		return 0
-	}
 }
 
 // canonicalizeImageRef returns a fully-qualified containerd image reference.
@@ -289,12 +217,11 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs string) error {
 		}
 	}
 
-	// Image not found anywhere; pull it. Use the user-supplied short form so
-	// nerdctl resolves aliases the same way Docker does.
+	// Image not found anywhere; pull it natively through containerd's remote
+	// resolver (public registries; auth comes later if ever needed).
 	log.Printf("[images] pulling %q (canonical %q) into namespace %s", ref, canonicalRef, targetNs)
-	stdout, stderr, code, err := runNerdctl(targetNs, "pull", ref)
-	if err != nil || code != 0 {
-		pullErr := fmt.Errorf("nerdctl pull failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	if perr := pullImageIntoNamespace(ctx, canonicalRef, targetNs); perr != nil {
+		pullErr := fmt.Errorf("pull failed: %w", perr)
 		// Fallback: docker-mirror GitHub release (used when the registry is
 		// unreachable or rate-limited but a mirror exists). Only silent on a
 		// clean 404 ("not mirrored yet"); other download errors are logged.
@@ -311,6 +238,20 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs string) error {
 	return nil
 }
 
+// pullImageIntoNamespace pulls an image into the given namespace's image and
+// content stores, unpacking its rootfs so containers can start immediately.
+func pullImageIntoNamespace(ctx context.Context, canonicalRef, ns string) error {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return fmt.Errorf("containerd client: %w", err)
+	}
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	_, err = cl.Pull(nsCtx, canonicalRef,
+		client.WithPullUnpack,
+	)
+	return err
+}
+
 // putImage creates or updates an image record.
 func putImage(cl *client.Client, nsCtx context.Context, img images.Image) error {
 	if _, err := cl.ImageService().Create(nsCtx, img); err != nil {
@@ -322,52 +263,61 @@ func putImage(cl *client.Client, nsCtx context.Context, img images.Image) error 
 }
 
 // copyImageBetweenNamespaces streams an image from one containerd namespace
-// to another via `nerdctl save | ctr images import`, so that both the image
-// record and the content store entries exist in the target namespace.
-// containerd's content store is namespaced: a metadata-only copy would
-// reference blobs the target namespace cannot see.
+// to another via Export/Import, so that both the image records and the
+// content store entries exist in the target namespace. containerd's content
+// store is namespaced: a metadata-only copy would reference blobs the target
+// namespace cannot see.
 func copyImageBetweenNamespaces(srcNs, ref, targetNs string) error {
-	env := append([]string{}, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-	// nerdctl save writing to a pipe silently produces an empty stream in
-	// this build (stdout mode yields 0 bytes with exit 0), so round-trip
-	// through a temp file on the persistent disk instead.
-	tmp, err := os.CreateTemp("/var/lib", "anvil-img-copy-*.tar")
+	ctx := context.Background()
+	cl, err := pc.get(ctx)
 	if err != nil {
-		return fmt.Errorf("temp file: %w", err)
+		return fmt.Errorf("containerd client: %w", err)
 	}
-	tmpPath := tmp.Name()
-	tmp.Close()
-	defer os.Remove(tmpPath)
-
-	save := exec.Command("/opt/containerd/bin/nerdctl", "--namespace", srcNs, "save", "-o", tmpPath, ref)
-	save.Env = env
-	var saveErr strings.Builder
-	save.Stderr = &saveErr
-	if err := save.Run(); err != nil {
-		return fmt.Errorf("save: %v: %s", err, saveErr.String())
+	srcCtx := namespaces.WithNamespace(ctx, srcNs)
+	canonical := canonicalizeImageRef(ref)
+	var imgs []images.Image
+	for _, name := range []string{canonical, ref} {
+		if img, gerr := cl.GetImage(srcCtx, name); gerr == nil {
+			imgs = append(imgs, images.Image{
+				Name:   name,
+				Labels: img.Labels(),
+				Target: img.Target(),
+			})
+		}
 	}
-	if info, err := os.Stat(tmpPath); err != nil || info.Size() == 0 {
-		return fmt.Errorf("save produced empty archive for %s", ref)
+	if len(imgs) == 0 {
+		return fmt.Errorf("image %s not found in namespace %s", ref, srcNs)
 	}
 
-	f, err := os.Open(tmpPath)
-	if err != nil {
-		return err
+	pr, pw := io.Pipe()
+	exportDone := make(chan error, 1)
+	go func() {
+		exportDone <- cl.Export(srcCtx, pw, archive.WithImages(imgs))
+		pw.Close() //nolint:errcheck
+	}()
+
+	dstCtx := namespaces.WithNamespace(ctx, targetNs)
+	imported, ierr := cl.Import(dstCtx, pr,
+		client.WithSkipMissing(),
+		client.WithDigestRef(func(d digest.Digest) string {
+			return "docker.io/imported/anvil-image:" + d.Encoded()[:12]
+		}),
+		client.WithSkipDigestRef(func(name string) bool { return name != "" }),
+	)
+	if werr := <-exportDone; werr != nil && ierr == nil {
+		ierr = fmt.Errorf("export: %w", werr)
 	}
-	defer f.Close()
-	imp := exec.Command("/opt/containerd/bin/ctr", "-n", targetNs, "images", "import", "--no-unpack", "-")
-	imp.Env = env
-	imp.Stdin = f
-	var impErr strings.Builder
-	imp.Stderr = &impErr
-	if err := imp.Run(); err != nil {
-		return fmt.Errorf("import: %v: %s", err, impErr.String())
+	if ierr != nil {
+		return fmt.Errorf("stream copy: %w", ierr)
+	}
+	for i := range imported {
+		putImage(cl, dstCtx, imported[i]) //nolint:errcheck
 	}
 	return nil
 }
 
 // listDockerImages collects images from all namespaces and returns a
-// Docker-compatible summary, deduplicating by image ID.
+// Docker-compatible summary, deduplicating by image ID and tag.
 func listDockerImages(ctx context.Context) ([]dockerImageSummary, error) {
 	cl, err := pc.get(ctx)
 	if err != nil {
@@ -383,82 +333,69 @@ func listDockerImages(ctx context.Context) ([]dockerImageSummary, error) {
 	result := make([]dockerImageSummary, 0)
 
 	for _, ns := range nss {
-		stdout, stderr, code, err := runNerdctl(ns, "images", "--format", "json")
-		if err != nil || code != 0 {
-			log.Printf("[docker-api] list images in %s: %s%s", ns, stdout, stderr)
+		nsCtx := namespaces.WithNamespace(ctx, ns)
+		imgs, lerr := cl.ListImages(nsCtx)
+		if lerr != nil {
+			log.Printf("[docker-api] list images in %s: %v", ns, lerr)
 			continue
 		}
-		for _, line := range strings.Split(stdout, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
+		for _, img := range imgs {
+			target := img.Target()
+			id := string(target.Digest)
+			if id == "" {
 				continue
 			}
-			var img nerdctlImage
-			if err := json.Unmarshal([]byte(line), &img); err != nil {
-				log.Printf("[docker-api] parse image line %q: %v", line, err)
-				continue
-			}
-			if img.ID == "" {
-				continue
-			}
+			name := img.Name()
+			repo, tag := splitRepoTag(name)
 			// Dedup by (ID, tag): the same image legitimately appears under
 			// several names (`docker tag alpine x` must stay visible), but
 			// namespace fan-out would otherwise list each name many times.
-			dedupKey := img.ID + "|" + img.Repository + ":" + img.Tag
+			dedupKey := id + "|" + repo + ":" + tag
 			if _, ok := seen[dedupKey]; ok {
 				continue
 			}
 			seen[dedupKey] = struct{}{}
 
-			created := int64(0)
-			if t, err := time.Parse("2006-01-02 15:04:05 +0000 UTC", img.CreatedAt); err == nil {
-				created = t.Unix()
-			}
-
-			size := parseHumanSize(img.Size)
-			if size == 0 {
-				size = parseHumanSize(img.BlobSize)
-			}
-
-			repoTag := ""
-			if img.Repository != "" && img.Tag != "" {
-				repoTag = img.Repository + ":" + img.Tag
-			} else if img.Name != "" {
-				repoTag = img.Name
-			}
-
-			repoDigest := ""
-			if img.Digest != "" && repoTag != "" {
-				// Docker digest format: repo@digest
-				repo := repoTag
-				if idx := strings.Index(repoTag, ":"); idx != -1 {
-					repo = repoTag[:idx]
+			size := int64(0)
+			if uerr := func() error {
+				s, gerr := img.Usage(nsCtx)
+				if gerr == nil {
+					size = s
 				}
-				repoDigest = repo + "@" + img.Digest
+				return gerr
+			}(); uerr != nil {
+				debugLog("[images] usage for %s: %v", name, uerr)
 			}
 
-			dockerID := img.ID
-			if !strings.HasPrefix(dockerID, "sha256:") {
-				dockerID = "sha256:" + dockerID
+			created := int64(0)
+			var labels map[string]string
+			if spec, serr := img.Spec(nsCtx); serr == nil {
+				if !spec.Created.IsZero() {
+					created = spec.Created.Unix()
+				}
+				labels = spec.Config.Labels
+			}
+			if labels == nil {
+				labels = map[string]string{}
 			}
 
 			var repoTags []string
-			if repoTag != "" {
-				repoTags = []string{repoTag}
+			if tag != "" && tag != "none" {
+				repoTags = []string{repo + ":" + tag}
 			}
 			var repoDigests []string
-			if repoDigest != "" {
-				repoDigests = []string{repoDigest}
+			if target.Digest != "" && repo != "" {
+				repoDigests = []string{repo + "@" + target.Digest.String()}
 			}
 
 			result = append(result, dockerImageSummary{
-				Id:          dockerID,
+				Id:          id,
 				RepoTags:    repoTags,
 				RepoDigests: repoDigests,
 				Created:     created,
 				Size:        size,
 				VirtualSize: size,
-				Labels:      map[string]string{},
+				Labels:      labels,
 				ParentId:    "",
 				Containers:  -1,
 			})
@@ -469,6 +406,19 @@ func listDockerImages(ctx context.Context) ([]dockerImageSummary, error) {
 		return result[i].Id < result[j].Id
 	})
 	return result, nil
+}
+
+// splitRepoTag splits an image name into repository and tag parts. Digest
+// refs keep the whole name as the repository (tag empty).
+func splitRepoTag(name string) (repo, tag string) {
+	if i := strings.Index(name, "@"); i != -1 {
+		return name[:i], ""
+	}
+	i := strings.LastIndex(name, ":")
+	if i == -1 || strings.Contains(name[i+1:], "/") {
+		return name, ""
+	}
+	return name[:i], name[i+1:]
 }
 
 // findImageNamespace returns the containerd namespace that contains an image
@@ -514,15 +464,33 @@ func findImageNamespace(ctx context.Context, ref string) string {
 	return ""
 }
 
-// tagDockerImage tags an image using nerdctl.
+// tagDockerImage creates a new image record pointing at the same content —
+// containerd tags are just additional names for a target descriptor.
 func tagDockerImage(ctx context.Context, source, target string) error {
 	ns := findImageNamespace(ctx, source)
 	if ns == "" {
 		ns = "default"
 	}
-	stdout, stderr, code, err := runNerdctl(ns, "tag", source, target)
-	if err != nil || code != 0 {
-		return fmt.Errorf("nerdctl tag failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return fmt.Errorf("containerd client: %w", err)
+	}
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	srcImg, gerr := cl.GetImage(nsCtx, canonicalizeImageRef(source))
+	if gerr != nil {
+		srcImg, gerr = cl.GetImage(nsCtx, source)
+	}
+	if gerr != nil {
+		return fmt.Errorf("tag: %w", gerr)
+	}
+	canonicalTarget := canonicalizeImageRef(target)
+	for _, name := range []string{canonicalTarget, target} {
+		if name == "" {
+			continue
+		}
+		if err := putImage(cl, nsCtx, images.Image{Name: name, Target: srcImg.Target(), Labels: srcImg.Labels()}); err != nil {
+			return fmt.Errorf("tag %s: %w", name, err)
+		}
 	}
 	// Tags must be globally visible: mirror the new tag into the default
 	// namespace so multi-image operations (save a b) resolve every name in
@@ -556,6 +524,7 @@ func streamImageSave(ctx context.Context, w http.ResponseWriter, names []string)
 	// Verify all images exist first so a missing one is a clean 404 instead
 	// of a failed stream mid-response.
 	ns := "default"
+	var imgs []images.Image
 	for _, name := range names {
 		imgNs := findImageNamespace(ctx, name)
 		if imgNs == "" {
@@ -564,70 +533,96 @@ func streamImageSave(ctx context.Context, w http.ResponseWriter, names []string)
 		}
 		ns = imgNs
 	}
+	cl, err := pc.get(ctx)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	log.Printf("[docker-api] saving images %v from ns=%q", names, ns)
-	// nerdctl save with a pipe on stdout can silently produce an empty
-	// stream in this build; round-trip through a temp file and stream that.
-	tmp, err := os.CreateTemp("/var/lib", "anvil-save-*.tar")
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	for _, name := range names {
+		for _, candidate := range []string{canonicalizeImageRef(name), name} {
+			img, gerr := cl.GetImage(nsCtx, candidate)
+			if gerr != nil {
+				continue
+			}
+			imgs = append(imgs, images.Image{
+				Name:   canonicalizeImageRef(name),
+				Labels: img.Labels(),
+				Target: img.Target(),
+			})
+			break
+		}
+	}
+	if len(imgs) == 0 {
+		http.Error(w, `{"message":"save failed: no image records"}`, http.StatusInternalServerError)
 		return
 	}
-	tmpPath := tmp.Name()
-	tmp.Close()
-	defer os.Remove(tmpPath)
 
-	args := append([]string{"--namespace", ns, "save", "-o", tmpPath}, names...)
-	cmd := exec.Command("/opt/containerd/bin/nerdctl", args...)
-	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-	var errBuf strings.Builder
-	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil || func() bool { i, e := os.Stat(tmpPath); return e != nil || i.Size() == 0 }() {
-		log.Printf("[docker-api] save %v failed: %v: %s", names, err, stripANSI(errBuf.String()))
-		http.Error(w, `{"message":"save failed"}`, http.StatusInternalServerError)
-		return
-	}
-	f, err := os.Open(tmpPath)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-	defer f.Close()
 	w.Header().Set("Content-Type", "application/x-tar")
-	io.Copy(w, f)
+	w.WriteHeader(http.StatusOK)
+	if err := cl.Export(nsCtx, w, archive.WithImages(imgs)); err != nil {
+		// Headers are already sent; the client sees the truncated stream.
+		log.Printf("[docker-api] save %v failed: %v", names, stripANSI(err.Error()))
+	}
 }
 
-// removeDockerImage removes an image using nerdctl.
+// removeDockerImage removes every image record matching the ref (canonical or
+// raw name) across namespaces. Docker semantics are "the image is gone";
+// success if at least one namespace removed a record.
 func removeDockerImage(ctx context.Context, name string, force bool) error {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return fmt.Errorf("containerd client: %w", err)
+	}
+	canonical := canonicalizeImageRef(name)
 	nss := findAllImageNamespaces(ctx, name)
 	if len(nss) == 0 {
 		nss = []string{"default"}
 	}
-	// The same ref can exist in several namespaces (compose projects keep
-	// a streamed copy next to the default-ns one); docker semantics are
-	// "the image is gone", so remove it everywhere it matches. Success if
-	// at least one namespace removed it; a per-ns failure is logged, and
-	// the error surfaces only when every attempt failed.
 	removed, lastErr := 0, error(nil)
 	for _, ns := range nss {
-		args := []string{"rmi"}
-		if force {
-			args = append(args, "-f")
+		nsCtx := namespaces.WithNamespace(ctx, ns)
+		deletedOne := false
+		for _, candidate := range dedupeStrings([]string{canonical, name}) {
+			dopts := []images.DeleteOpt{}
+			if force {
+				dopts = append(dopts, images.SynchronousDelete())
+			}
+			derr := cl.ImageService().Delete(nsCtx, candidate, dopts...)
+			if derr == nil || errdefs.IsNotFound(derr) {
+				if derr == nil {
+					deletedOne = true
+				}
+				continue
+			}
+			// Image in use by a container unless forced; report like docker.
+			lastErr = fmt.Errorf("rmi %s: %w", candidate, derr)
 		}
-		args = append(args, name)
-		stdout, stderr, code, err := runNerdctl(ns, args...)
-		log.Printf("[images] rmi %q ns=%q force=%v code=%d out=%q err=%q",
-			name, ns, force, code, stripANSI(stdout), stripANSI(stderr))
-		if err != nil || code != 0 {
-			lastErr = fmt.Errorf("nerdctl rmi failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
-			continue
+		if deletedOne {
+			log.Printf("[images] rmi %q ns=%q force=%v", name, ns, force)
+			removed++
 		}
-		removed++
 	}
 	if removed == 0 && lastErr != nil {
 		return lastErr
 	}
 	return nil
+}
+
+// dedupeStrings preserves order while dropping duplicates.
+func dedupeStrings(in []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 // findAllImageNamespaces returns every namespace whose image store holds the
@@ -718,107 +713,137 @@ func inspectDockerImage(ctx context.Context, name string) (map[string]interface{
 	if ns == "" {
 		ns = "default"
 	}
-	stdout, stderr, code, err := runNerdctl(ns, "image", "inspect", "--format", "json", name)
-	if err != nil || code != 0 {
-		return nil, fmt.Errorf("nerdctl image inspect failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("containerd client: %w", err)
 	}
-	for _, line := range strings.Split(stdout, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var info struct {
-			ID          string   `json:"ID"`
-			RepoTags    []string `json:"RepoTags"`
-			RepoDigests []string `json:"RepoDigests"`
-			Comment     string   `json:"Comment"`
-			Created     string   `json:"Created"`
-			Author      string   `json:"Author"`
-			Config      struct {
-				Cmd          []string            `json:"Cmd"`
-				Entrypoint   []string            `json:"Entrypoint"`
-				Env          []string            `json:"Env"`
-				ExposedPorts map[string]struct{} `json:"ExposedPorts"`
-				Labels       map[string]string   `json:"Labels"`
-				WorkingDir   string              `json:"WorkingDir"`
-				User         string              `json:"User"`
-				StopSignal   string              `json:"StopSignal"`
-			} `json:"Config"`
-			RootFS struct {
-				Type   string   `json:"Type"`
-				Layers []string `json:"Layers"`
-			} `json:"RootFS"`
-		}
-		if err := json.Unmarshal([]byte(line), &info); err != nil {
-			continue
-		}
-		if info.ID == "" {
-			continue
-		}
-		return map[string]interface{}{
-			"Id":          info.ID,
-			"RepoTags":    info.RepoTags,
-			"RepoDigests": info.RepoDigests,
-			"Comment":     info.Comment,
-			"Created":     info.Created,
-			"Author":      info.Author,
-			"Config":      info.Config,
-			"RootFS":      info.RootFS,
-			"Size":        0,
-			"VirtualSize": 0,
-			"GraphDriver": map[string]interface{}{"Data": map[string]interface{}{}, "Name": "overlayfs"},
-		}, nil
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	img, gerr := cl.GetImage(nsCtx, canonicalizeImageRef(name))
+	if gerr != nil {
+		img, gerr = cl.GetImage(nsCtx, name)
 	}
-	return nil, fmt.Errorf("No such image: %s", name)
+	if gerr != nil {
+		return nil, fmt.Errorf("No such image: %s", name)
+	}
+	spec, serr := img.Spec(nsCtx)
+	if serr != nil {
+		return nil, fmt.Errorf("image spec: %w", serr)
+	}
+
+	repo, tag := splitRepoTag(img.Name())
+	var repoTags []string
+	if tag != "" {
+		repoTags = []string{repo + ":" + tag}
+	}
+	target := img.Target()
+	var repoDigests []string
+	if target.Digest != "" {
+		repoDigests = []string{repo + "@" + target.Digest.String()}
+	}
+
+	size := int64(0)
+	if u, uerr := img.Usage(nsCtx); uerr == nil {
+		size = u
+	}
+
+	layers := make([]string, 0, len(spec.RootFS.DiffIDs))
+	for _, d := range spec.RootFS.DiffIDs {
+		layers = append(layers, d.String())
+	}
+
+	config := map[string]interface{}{
+		"Cmd":        spec.Config.Cmd,
+		"Entrypoint": spec.Config.Entrypoint,
+		"Env":        spec.Config.Env,
+		"Labels":     spec.Config.Labels,
+		"WorkingDir": spec.Config.WorkingDir,
+		"User":       spec.Config.User,
+	}
+	if len(spec.Config.ExposedPorts) > 0 {
+		exposed := map[string]interface{}{}
+		for p := range spec.Config.ExposedPorts {
+			exposed[p] = struct{}{}
+		}
+		config["ExposedPorts"] = exposed
+	}
+	if spec.Config.StopSignal != "" {
+		config["StopSignal"] = spec.Config.StopSignal
+	}
+
+	created := ""
+	if spec.Created != nil && !spec.Created.IsZero() {
+		created = spec.Created.Format(time.RFC3339Nano)
+	}
+	comment := ""
+	if n := len(spec.History); n > 0 {
+		comment = spec.History[n-1].Comment
+	}
+
+	return map[string]interface{}{
+		"Id":          target.Digest.String(),
+		"RepoTags":    repoTags,
+		"RepoDigests": repoDigests,
+		"Comment":     comment,
+		"Created":     created,
+		"Author":      spec.Author,
+		"Config":      config,
+		"RootFS": map[string]interface{}{
+			"Type":   "layers",
+			"Layers": layers,
+		},
+		"Size":        size,
+		"VirtualSize": size,
+		"GraphDriver": map[string]interface{}{"Data": map[string]interface{}{}, "Name": "overlayfs"},
+	}, nil
 }
 
-// pushDockerImage pushes an image and streams progress lines to w.
+// pushDockerImage pushes an image to its registry through containerd's
+// remote resolver, streaming minimal Docker-style status lines to w.
 func pushDockerImage(ctx context.Context, name string, w io.Writer) error {
 	ns := findImageNamespace(ctx, name)
 	if ns == "" {
 		ns = "default"
 	}
-	cmd := exec.Command("/opt/containerd/bin/nerdctl", "-n", ns, "push", name)
-	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-	stdout, err := cmd.StdoutPipe()
+	cl, err := pc.get(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("containerd client: %w", err)
 	}
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
-		return err
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	img, gerr := cl.GetImage(nsCtx, canonicalizeImageRef(name))
+	if gerr != nil {
+		img, gerr = cl.GetImage(nsCtx, name)
 	}
-	defer cmd.Wait()
-
-	buf := make([]byte, 4096)
-	for {
-		n, err := stdout.Read(buf)
-		if n > 0 {
-			w.Write(buf[:n])
-		}
-		if err != nil {
-			break
-		}
+	if gerr != nil {
+		return fmt.Errorf("No such image: %s", name)
 	}
+	fmt.Fprintf(w, `{"status":"Pushing %s"}
+`, name)
+	if perr := cl.Push(nsCtx, canonicalizeImageRef(name), img.Target()); perr != nil {
+		fmt.Fprintf(w, `{"errorDetail":{"message":%q}}
+`, stripANSI(perr.Error()))
+		return perr
+	}
+	fmt.Fprintf(w, `{"status":"Pushed %s"}
+`, name)
 	return nil
 }
 
-// pullDockerImage pulls an image via nerdctl into the default namespace. When
+// pullDockerImage pulls an image natively into the default namespace. When
 // the registry pull fails it falls back to the docker-mirror GitHub release
 // and returns a status line describing which path produced the image.
 func pullDockerImage(ctx context.Context, image string) (string, error) {
 	ns := "default"
-	stdout, stderr, code, err := runNerdctl(ns, "pull", image)
-	if err == nil && code == 0 {
+	if err := pullImageIntoNamespace(ctx, canonicalizeImageRef(image), ns); err == nil {
 		return fmt.Sprintf("Downloaded newer image for %s", image), nil
+	} else {
+		pullErr := err
+		if mErr := loadFromMirror(ctx, image, ns); mErr == nil {
+			return fmt.Sprintf("Loaded image: %s (from docker-mirror)", image), nil
+		} else if !errors.Is(mErr, errMirrorNotFound) {
+			log.Printf("[images] mirror fallback for %q: %v", image, mErr)
+		}
+		return "", fmt.Errorf("pull failed: %w", pullErr)
 	}
-	pullErr := fmt.Errorf("nerdctl pull failed (%d): %s%s", code, stripANSI(stdout), stripANSI(stderr))
-	if mErr := loadFromMirror(ctx, image, ns); mErr == nil {
-		return fmt.Sprintf("Loaded image: %s (from docker-mirror)", image), nil
-	} else if !errors.Is(mErr, errMirrorNotFound) {
-		log.Printf("[images] mirror fallback for %q: %v", image, mErr)
-	}
-	return "", pullErr
 }
 
 // handleImageLoad implements POST /images/load — streams a Docker/OCI tar

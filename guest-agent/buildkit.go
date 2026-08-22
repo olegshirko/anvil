@@ -1,22 +1,23 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
+	bkclient "github.com/moby/buildkit/client"
 	"github.com/mdlayher/vsock"
 )
 
 // buildkitd is started lazily: it idles at ~50 MB RSS, so it is launched on
-// the first build request (the classic /build endpoint via nerdctl, or a
-// buildx remote-driver connection over vsock:1026) instead of at boot.
+// the first build request (the classic /build endpoint through its gRPC API,
+// or a buildx remote-driver connection over vsock:1026) instead of at boot.
 const (
 	buildkitVsockPort = 1026
 	buildkitSocket    = "/run/buildkit/buildkitd.sock"
@@ -46,12 +47,10 @@ func ensureBuildkitd() error {
 		return nil
 	}
 
-	// Kill stray buildkitd instances first: nerdctl build starts its own
-	// (with nerdctl's OCI-worker config) whenever its socket probe races a
-	// busy socket, and the strays either hold the socket with a
-	// registry-resolving worker or leak. One canonical instance with
-	// /etc/buildkit/buildkitd.toml (containerd worker, local FROM
-	// resolution) must own /run/buildkit.
+	// Kill stray buildkitd instances first: racing socket probes can leave
+	// behind strays that either hold the socket with a registry-resolving
+	// worker or leak. One canonical instance with /etc/buildkit/buildkitd.toml
+	// (containerd worker, local FROM resolution) must own /run/buildkit.
 	killallStaleBuildkitd()
 
 	// buildkitd ships as a tarball extracted to /var/lib/buildkit by a
@@ -161,19 +160,27 @@ func pruneBuildCache() (int64, error) {
 	if !buildkitUp() {
 		return 0, nil
 	}
-	cmd := exec.Command("/opt/containerd/bin/buildctl", "--addr", "unix://"+buildkitSocket, "prune")
-	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-	out, err := cmd.CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	c, err := bkclient.New(ctx, "unix://"+buildkitSocket)
 	if err != nil {
-		return 0, fmt.Errorf("buildctl prune: %v: %s", err, stripANSI(string(out)))
+		return 0, fmt.Errorf("buildkit connect: %w", err)
 	}
-	// buildctl prune ends with a "Total: <size>" summary line.
+	defer c.Close()
+
 	var reclaimed int64
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Total:") {
-			reclaimed = parseHumanSize(strings.TrimSpace(strings.TrimPrefix(line, "Total:")))
+	ch := make(chan bkclient.UsageInfo)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for u := range ch {
+			reclaimed += u.Size
 		}
+	}()
+	err = c.Prune(ctx, ch, bkclient.PruneAll)
+	<-done
+	if err != nil {
+		return reclaimed, fmt.Errorf("buildkit prune: %w", err)
 	}
 	return reclaimed, nil
 }

@@ -10,23 +10,56 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
-// pauseDockerContainer pauses (pause=true) or unpauses a container.
+// containerTaskPid returns the host-side PID of the container's init process.
+func containerTaskPid(ctx context.Context, ns, containerdID string) (int, bool) {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return 0, false
+	}
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	c, lerr := cl.LoadContainer(nsCtx, containerdID)
+	if lerr != nil {
+		return 0, false
+	}
+	task, terr := c.Task(nsCtx, nil)
+	if terr != nil {
+		return 0, false
+	}
+	st, serr := task.Status(nsCtx)
+	if serr != nil || st.Status != "running" {
+		return 0, false
+	}
+	return int(task.Pid()), true
+}
+
+// pauseDockerContainer pauses (pause=true) or unpauses a container by
+// signalling the containerd task directly.
 func pauseDockerContainer(ctx context.Context, id string, pause bool) error {
 	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
 	}
-	verb := "pause"
-	if !pause {
-		verb = "unpause"
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return fmt.Errorf("containerd client: %w", err)
 	}
-	stdout, stderr, code, err := runNerdctl(ns, verb, containerdID)
-	if err != nil || code != 0 {
-		return fmt.Errorf("nerdctl %s failed (%d): %s%s", verb, code, stripANSI(stdout), stripANSI(stderr))
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	c, lerr := cl.LoadContainer(nsCtx, containerdID)
+	if lerr != nil {
+		return lerr
 	}
-	return nil
+	task, terr := c.Task(nsCtx, nil)
+	if terr != nil {
+		return fmt.Errorf("container is not running")
+	}
+	if pause {
+		return task.Pause(nsCtx)
+	}
+	return task.Resume(nsCtx)
 }
 
 // handleContainerTop implements GET /containers/{id}/top: process list of
@@ -37,17 +70,8 @@ func handleContainerTop(ctx context.Context, w http.ResponseWriter, id string) {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
 		return
 	}
-	stdout, _, code, err := runNerdctl(ns, "inspect", "--format", "json", containerdID)
-	if err != nil || code != 0 {
-		http.Error(w, `{"message":"container not running"}`, http.StatusConflict)
-		return
-	}
-	var info struct {
-		State struct {
-			Pid int `json:"Pid"`
-		} `json:"State"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &info); err != nil || info.State.Pid <= 0 {
+	pid, ok := containerTaskPid(ctx, ns, containerdID)
+	if !ok || pid <= 0 {
 		http.Error(w, `{"message":"container not running"}`, http.StatusConflict)
 		return
 	}
@@ -55,7 +79,7 @@ func handleContainerTop(ctx context.Context, w http.ResponseWriter, id string) {
 	// gives direct children (runc init + the app); include the app itself.
 	cmdline := fmt.Sprintf(
 		`echo "%d $(cat /proc/%d/comm 2>/dev/null)"; kids=$(cat /proc/%d/task/%d/children 2>/dev/null); for k in $kids; do echo "$k $(cat /proc/$k/comm 2>/dev/null)"; ck=$(cat /proc/$k/task/$k/children 2>/dev/null); for c in $ck; do echo "$c $(cat /proc/$c/comm 2>/dev/null)"; done; done`,
-		info.State.Pid, info.State.Pid, info.State.Pid, info.State.Pid)
+		pid, pid, pid, pid)
 	out, _, execCode, _ := runGuestShell(cmdline)
 	if execCode != 0 {
 		out = ""
@@ -131,21 +155,10 @@ func containerStatsReading(ctx context.Context, id string) map[string]interface{
 		if err != nil {
 			return nil
 		}
-		stdout, _, code, err := runNerdctl(ns, "inspect", "--format", "json", containerdID)
-		if err != nil || code != 0 {
+		pid, ok := containerTaskPid(ctx, ns, containerdID)
+		if !ok || pid <= 0 {
 			return nil
 		}
-		var info struct {
-			State struct {
-				Pid     int    `json:"Pid"`
-				Status  string `json:"Status"`
-				Running bool   `json:"Running"`
-			} `json:"State"`
-		}
-		if json.Unmarshal([]byte(stdout), &info) != nil || info.State.Pid <= 0 {
-			return nil
-		}
-		pid := info.State.Pid
 		readFile := func(p string) string {
 			b, err := os.ReadFile(p)
 			if err != nil {
@@ -274,7 +287,7 @@ func handleSystemDF(ctx context.Context, w http.ResponseWriter) {
 		volOut = append(volOut, map[string]interface{}{
 			"Name":       v.Name,
 			"Driver":     "local",
-			"Mountpoint": "/var/lib/nerdctl/volumes/" + v.Name,
+			"Mountpoint": volumeDataDir("default", v.Name),
 			"Labels":     nil,
 			"Scope":      "local",
 			"Options":    nil,

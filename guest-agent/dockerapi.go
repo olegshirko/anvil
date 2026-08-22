@@ -866,7 +866,7 @@ func pruneDockerNetworks(ctx context.Context) ([]string, error) {
 		if labels == nil {
 			labels = map[string]string{}
 		}
-		netsJSON := labels["nerdctl/networks"]
+		netsJSON := labels[labelNetworks]
 		if netsJSON == "" {
 			continue
 		}
@@ -918,7 +918,7 @@ func pruneDockerVolumes(ctx context.Context) ([]string, int64, error) {
 			labels = map[string]string{}
 		}
 		// Anonymous volumes.
-		anonJSON := labels["nerdctl/anonymous-volumes"]
+		anonJSON := labels[labelAnonymousVolumes]
 		if anonJSON != "" {
 			var vols []string
 			if err := json.Unmarshal([]byte(anonJSON), &vols); err == nil {
@@ -928,7 +928,7 @@ func pruneDockerVolumes(ctx context.Context) ([]string, int64, error) {
 			}
 		}
 		// Named mounts.
-		mountsJSON := labels["nerdctl/mounts"]
+		mountsJSON := labels[labelMounts]
 		if mountsJSON != "" {
 			var mounts []struct {
 				Type string `json:"Type"`

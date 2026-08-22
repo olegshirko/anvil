@@ -300,27 +300,6 @@ func runExec(args []string) Response {
 		return Response{Error: "no command", ExitCode: 1}
 	}
 
-	// For container creation commands, refuse to run if the requested host port
-	// is already bound by another running container. This prevents silent
-	// mis-routing when two projects map to the same localhost port.
-	if isNerdctlRun(args) {
-		if ports, err := parsePublishHostPorts(args); err != nil {
-			return Response{Error: fmt.Sprintf("invalid publish spec: %v", err), ExitCode: 1}
-		} else if len(ports) > 0 {
-			if conflict, err := findHostPortConflict(context.Background(), ports, ""); err != nil {
-				return Response{Error: fmt.Sprintf("host port conflict check failed: %v", err), ExitCode: 1}
-			} else if conflict != nil {
-				return Response{
-					Error: fmt.Sprintf(
-						"host port %d already in use by %s/%s",
-						conflict.HostPort, conflict.Namespace, conflict.Name,
-					),
-					ExitCode: 1,
-				}
-			}
-		}
-	}
-
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
 	stdout, err := cmd.StdoutPipe()
@@ -366,69 +345,7 @@ func runExec(args []string) Response {
 	}
 }
 
-// isNerdctlRun reports whether args is a nerdctl command that creates a
-// container and may bind host ports.
-func isNerdctlRun(args []string) bool {
-	if len(args) == 0 || !strings.HasSuffix(args[0], "nerdctl") {
-		return false
-	}
-	for _, a := range args[1:] {
-		if a == "run" || a == "create" {
-			return true
-		}
-	}
-	return false
-}
 
-// parsePublishHostPorts extracts host ports from nerdctl -p/--publish flags.
-// Supported forms: 8080:80, 127.0.0.1:8080:80, --publish=8080:80.
-func parsePublishHostPorts(args []string) ([]int, error) {
-	var ports []int
-	for i := 1; i < len(args); i++ {
-		a := args[i]
-		var spec string
-		switch {
-		case a == "-p" || a == "--publish":
-			if i+1 >= len(args) {
-				return nil, fmt.Errorf("missing value for %s", a)
-			}
-			spec = args[i+1]
-			i++
-		case strings.HasPrefix(a, "-p="):
-			spec = a[len("-p="):]
-		case strings.HasPrefix(a, "--publish="):
-			spec = a[len("--publish="):]
-		default:
-			continue
-		}
-		if spec == "" {
-			continue
-		}
-		// Strip optional protocol suffix.
-		spec = strings.SplitN(spec, "/", 2)[0]
-		parts := strings.Split(spec, ":")
-		var hostPart string
-		switch len(parts) {
-		case 2:
-			hostPart = parts[0]
-		case 3:
-			hostPart = parts[1]
-		default:
-			// Range or unusual format; skip rather than fail.
-			continue
-		}
-		if strings.Contains(hostPart, "-") {
-			// Port ranges are not checked.
-			continue
-		}
-		p, err := strconv.Atoi(hostPart)
-		if err != nil {
-			return nil, fmt.Errorf("invalid host port %q: %w", hostPart, err)
-		}
-		ports = append(ports, p)
-	}
-	return ports, nil
-}
 
 // findHostPortConflict checks whether any requested host port is already used
 // by a running container in any namespace. It returns the first conflict found.
@@ -483,7 +400,7 @@ func findHostPortConflict(ctx context.Context, ports []int, excludeID string) (*
 					return &PortMapping{
 						Namespace:   ns,
 						ContainerID: c.ID(),
-						Name:        labels["nerdctl/name"],
+						Name:        labels[labelName],
 						HostPort:    m.HostPort,
 					}, nil
 				}
@@ -493,10 +410,6 @@ func findHostPortConflict(ctx context.Context, ports []int, excludeID string) (*
 	return nil, nil
 }
 
-// periodicFstrim runs fstrim on the containerd filesystem once a day. The
-// virtio-blk disk reports discard support, so trimmed blocks punch holes in
-// the sparse image on the host and `make disk-compact` becomes unnecessary
-// for routine prune cleanup. Failures are logged and ignored.
 func periodicFstrim() {
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()

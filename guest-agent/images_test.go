@@ -51,24 +51,30 @@ func TestSplitImageTag(t *testing.T) {
 	}
 }
 
-func TestParseHumanSize(t *testing.T) {
-	cases := map[string]int64{
-		"":          0,
-		"0":         0,
-		"0B":        0,
-		"1024":      1024,
-		"64B":       64,
-		"1.5 GB":    1500000000,
-		"211.5 MB":  211500000,
-		"2 kB":      2000,
-		"182.2 MiB": 191050547, // int64(182.2 * 1024 * 1024)
-		"1.5 GiB":   1610612736,
-		"1 TiB":     1024 * 1024 * 1024 * 1024,
-		"garbage":   0,
+func TestSplitRepoTag(t *testing.T) {
+	cases := map[string][2]string{
+		"docker.io/library/nginx:latest":    {"docker.io/library/nginx", "latest"},
+		"ghcr.io/foo/bar":                   {"ghcr.io/foo/bar", ""},
+		"docker.io/library/postgres@sha256:abc": {"docker.io/library/postgres", ""},
 	}
 	for in, want := range cases {
-		if got := parseHumanSize(in); got != want {
-			t.Errorf("parseHumanSize(%q) = %d, want %d", in, got, want)
+		repo, tag := splitRepoTag(in)
+		if repo != want[0] || tag != want[1] {
+			t.Errorf("splitRepoTag(%q) = (%q, %q), want (%q, %q)", in, repo, tag, want[0], want[1])
+		}
+	}
+}
+
+// dedupeStrings preserves order while dropping duplicates.
+func TestDedupeStrings(t *testing.T) {
+	got := dedupeStrings([]string{"a", "b", "a", "c", "b"})
+	want := []string{"a", "b", "c"}
+	if len(got) != len(want) {
+		t.Fatalf("dedupe = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("dedupe = %v, want %v", got, want)
 		}
 	}
 }

@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,12 +12,13 @@ import (
 	"strings"
 	"time"
 
+	bkclient "github.com/moby/buildkit/client"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 )
 
 // handleBuild implements POST /build (classic Docker build API). The client
 // uploads the build context as a tar stream; it is extracted onto the
-// persistent disk and built with `nerdctl build` (buildkitd), streaming
+// persistent disk and built through buildkitd via its gRPC API, streaming
 // Docker-style JSON progress lines back.
 func handleBuild(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -57,43 +58,35 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	args := []string{"--namespace", "default", "build", "-f", dockerfile}
+	var tags []string
 	for _, tag := range strings.Split(q.Get("t"), ",") {
 		if tag = strings.TrimSpace(tag); tag != "" {
-			args = append(args, "-t", tag)
+			tags = append(tags, tag)
 		}
 	}
-	if v := q.Get("buildargs"); v != "" {
-		var buildArgs map[string]string
-		if json.Unmarshal([]byte(v), &buildArgs) == nil {
-			for k, val := range buildArgs {
-				args = append(args, "--build-arg", k+"="+val)
-			}
-		}
+	frontendAttrs := map[string]string{
+		"filename": dockerfile,
 	}
-	if v := q.Get("labels"); v != "" {
-		var labels map[string]string
-		if json.Unmarshal([]byte(v), &labels) == nil {
-			for k, val := range labels {
-				args = append(args, "--label", k+"="+val)
-			}
-		}
+	for k, v := range parseKVParam(q.Get("buildargs")) {
+		frontendAttrs["build-arg:"+k] = v
+	}
+	for k, v := range parseKVParam(q.Get("labels")) {
+		frontendAttrs["label:"+k] = v
 	}
 	if q.Get("nocache") == "1" || q.Get("nocache") == "true" {
-		args = append(args, "--no-cache")
+		frontendAttrs["no-cache"] = ""
 	}
 	if target := q.Get("target"); target != "" {
-		args = append(args, "--target", target)
+		frontendAttrs["target"] = target
 	}
 	if platform := q.Get("platform"); platform != "" {
-		args = append(args, "--platform", platform)
+		frontendAttrs["platform"] = platform
 	}
-	args = append(args, ".")
 	quiet := q.Get("q") == "1" || q.Get("q") == "true"
 
-	log.Printf("[docker-api] build ctx=%s tags=%q", ctxDir, q.Get("t"))
+	log.Printf("[docker-api] build ctx=%s tags=%q", ctxDir, tags)
 
-	// nerdctl build shells out to buildkitd, which is started lazily.
+	// buildkitd is started lazily on first use.
 	if err := ensureBuildkitd(); err != nil {
 		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -103,7 +96,7 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 	writeStream := func(line string) {
-		if quiet {
+		if quiet || line == "" {
 			return
 		}
 		payload, _ := json.Marshal(map[string]string{"stream": line + "\r\n"})
@@ -114,56 +107,74 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// runBuild starts the nerdctl build and streams its output to the
-	// client. Returns the command error and whether the output mentioned a
-	// missing content digest — stale buildkit cache records referencing
-	// blobs removed by `docker rmi` fail this way; the caller prunes and
-	// retries once.
-	runBuild := func() (err error, digestMissing bool) {
-		buildCmd := exec.Command("/opt/containerd/bin/nerdctl", args...)
-		buildCmd.Env = append(buildCmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
-			"BUILDKIT_HOST=unix://"+buildkitSocket)
-		buildCmd.Dir = ctxDir
-		stdout, _ := buildCmd.StdoutPipe()
-		if pipeErr := buildCmd.Start(); pipeErr != nil {
-			return pipeErr, false
+	runBuild := func() (berr error, digestMissing bool) {
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		c, cerr := bkclient.New(ctx, "unix://"+buildkitSocket)
+		if cerr != nil {
+			return cerr, false
 		}
-		buildCmd.Stderr = buildCmd.Stdout
+		defer c.Close()
 
-		lineBuf := make([]byte, 0, 4096)
-		tmp := make([]byte, 4096)
-		for {
-			n, readErr := stdout.Read(tmp)
-			for _, b := range tmp[:n] {
-				if b == '\n' {
-					writeStream(string(lineBuf))
-					if bytes.Contains(lineBuf, []byte("not found")) {
-						digestMissing = true
+		exports := []bkclient.ExportEntry{}
+		if len(tags) > 0 {
+			// type=image with the containerd worker writes straight into the
+			// containerd image store (namespace "default"), so `FROM` sees
+			// locally built images and no separate import step is needed.
+			exports = append(exports, bkclient.ExportEntry{
+				Type: bkclient.ExporterImage,
+				Attrs: map[string]string{
+					"name": strings.Join(tags, ","),
+				},
+			})
+		}
+
+		statusCh := make(chan *bkclient.SolveStatus)
+		done := make(chan error, 1)
+		go func() {
+			var lastVertex string
+			for st := range statusCh {
+				for _, v := range st.Vertexes {
+					if v.Name != "" && v.Name != lastVertex {
+						lastVertex = v.Name
+						writeStream("[+] " + v.Name)
 					}
-					lineBuf = lineBuf[:0]
-				} else if b != '\r' {
-					lineBuf = append(lineBuf, b)
+					if v.Error != "" {
+						writeStream("# " + v.Name + " ERROR: " + v.Error)
+					}
+				}
+				for _, l := range st.Logs {
+					writeStream(strings.TrimRight(string(l.Data), "\n"))
 				}
 			}
-			if readErr != nil {
-				break
-			}
+			done <- nil
+		}()
+
+		solveOpts := bkclient.SolveOpt{
+			Frontend:      "dockerfile.v0",
+			FrontendAttrs: frontendAttrs,
+			LocalDirs: map[string]string{
+				"context":    ctxDir,
+				"dockerfile": filepath.Dir(filepath.Join(ctxDir, dockerfile)),
+			},
+			Exports: exports,
 		}
-		if len(lineBuf) > 0 {
-			writeStream(string(lineBuf))
-			if bytes.Contains(lineBuf, []byte("not found")) {
-				digestMissing = true
-			}
+		_, berr = c.Solve(ctx, nil, solveOpts, statusCh)
+		<-done
+
+		// Stale buildkit cache records referencing blobs removed by
+		// `docker rmi` fail with a missing-digest error; the caller prunes
+		// and retries once.
+		if berr != nil && (strings.Contains(berr.Error(), "not found") || strings.Contains(berr.Error(), "does not exist")) {
+			digestMissing = true
 		}
-		return buildCmd.Wait(), digestMissing
+		return berr, digestMissing
 	}
 
 	buildErr, digestMissing := runBuild()
 	if buildErr != nil && digestMissing {
 		writeStream("[anvil] stale buildkit cache detected, pruning and retrying")
-		if pruneErr := exec.Command("/opt/containerd/bin/buildctl", "prune", "--all").Run(); pruneErr != nil {
-			log.Printf("[docker-api] build retry prune: %v", pruneErr)
-		}
+		pruneBuildkitCache(context.Background())
 		buildErr, _ = runBuild()
 	}
 
@@ -186,5 +197,38 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("\n"))
 	if flusher != nil {
 		flusher.Flush()
+	}
+}
+
+// parseKVParam decodes a JSON object of string→string parameters sent by the
+// docker CLI in query strings (buildargs, labels).
+func parseKVParam(raw string) map[string]string {
+	out := map[string]string{}
+	if raw == "" {
+		return out
+	}
+	json.Unmarshal([]byte(raw), &out) //nolint:errcheck — best effort
+	return out
+}
+
+// pruneBuildkitCache clears all build records via the buildkit API.
+func pruneBuildkitCache(ctx context.Context) {
+	c, err := bkclient.New(ctx, "unix://"+buildkitSocket)
+	if err != nil {
+		log.Printf("[docker-api] buildkit prune connect: %v", err)
+		return
+	}
+	defer c.Close()
+	ch := make(chan bkclient.UsageInfo)
+	done := make(chan struct{})
+	go func() {
+		for range ch {
+		}
+		close(done)
+	}()
+	err = c.Prune(ctx, ch, bkclient.PruneAll)
+	<-done
+	if err != nil {
+		log.Printf("[docker-api] buildkit prune: %v", err)
 	}
 }
