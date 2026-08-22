@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -41,30 +43,6 @@ type dockerIPAMConfig struct {
 	Subnet string `json:"Subnet,omitempty"`
 }
 
-// nerdctlNetworkLs is the shape of `nerdctl network ls --format json` output.
-type nerdctlNetworkLs struct {
-	ID     string `json:"ID"`
-	Name   string `json:"Name"`
-	Labels string `json:"Labels"`
-}
-
-// nerdctlNetworkInspect is the shape of `nerdctl network inspect --format json` output.
-type nerdctlNetworkInspect struct {
-	Name    string `json:"Name"`
-	Id      string `json:"Id"`
-	Driver  string `json:"Driver"`
-	Scope   string `json:"Scope"`
-	Created string `json:"Created"`
-	IPAM    struct {
-		Config []struct {
-			Subnet  string `json:"Subnet"`
-			Gateway string `json:"Gateway"`
-		} `json:"Config"`
-	} `json:"IPAM"`
-	Labels  interface{}       `json:"Labels"`
-	Options map[string]string `json:"Options"`
-}
-
 // dockerNetworkCreateRequest mirrors Docker's POST /networks/create body.
 type dockerNetworkCreateRequest struct {
 	Name      string            `json:"Name"`
@@ -77,125 +55,130 @@ type dockerNetworkCreateRequest struct {
 	Namespace string            `json:"-"`
 }
 
-// listDockerNetworks returns networks from all namespaces.
-func listDockerNetworks(ctx context.Context, filters map[string]map[string]bool) ([]dockerNetwork, error) {
-	cl, err := pc.get(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("containerd client: %w", err)
-	}
+// cniConflist is the subset of our generated CNI conflist files that network
+// listing/inspecting needs. The conflists in /etc/cni/net.d are the single
+// source of truth for networks.
+type cniConflist struct {
+	Name    string `json:"name"`
+	AnvilID string `json:"anvilID"`
+	Labels  map[string]string `json:"anvilLabels"`
+	Plugins []struct {
+		Type   string `json:"type"`
+		Bridge string `json:"bridge"`
+		IPAM   struct {
+			Ranges [][]struct {
+				Subnet  string `json:"subnet"`
+				Gateway string `json:"gateway"`
+			} `json:"ranges"`
+		} `json:"ipam"`
+	} `json:"plugins"`
+}
 
-	nss, err := cl.NamespaceService().List(ctx)
+// cniConflistPath returns the canonical file name of a network's conflist.
+func cniConflistPath(name string) string {
+	base := sanitizeCNIName(name)
+	return filepath.Join(cniConfDir, "anvil-"+base+".conflist")
+}
+
+// loadCNIConflists parses every anvil conflist in the CNI config directory,
+// keyed by logical network name.
+func loadCNIConflists() (map[string]cniConflist, error) {
+	entries, err := os.ReadDir(cniConfDir)
 	if err != nil {
-		return nil, fmt.Errorf("list namespaces: %w", err)
-	}
-	// Always include the default namespace even if it has no containers/images,
-	// because networks and volumes may live there.
-	hasDefault := false
-	for _, ns := range nss {
-		if ns == "default" {
-			hasDefault = true
-			break
+		if os.IsNotExist(err) {
+			return map[string]cniConflist{}, nil
 		}
+		return nil, err
 	}
-	if !hasDefault {
-		nss = append([]string{"default"}, nss...)
-	}
-
-	seen := map[string]struct{}{}
-	result := make([]dockerNetwork, 0)
-	for _, ns := range nss {
-		stdout, stderr, code, err := runNerdctl(ns, "network", "ls", "--format", "json")
-		if err != nil || code != 0 {
-			log.Printf("[docker-api] network ls in %s: %d %s%s", ns, code, stdout, stderr)
+	out := map[string]cniConflist{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".conflist") {
 			continue
 		}
-		for _, line := range strings.Split(stdout, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			var nw nerdctlNetworkLs
-			if err := json.Unmarshal([]byte(line), &nw); err != nil {
-				continue
-			}
-			if nw.ID == "" {
-				continue
-			}
-			if _, ok := seen[nw.ID]; ok {
-				continue
-			}
-			seen[nw.ID] = struct{}{}
+		data, err := os.ReadFile(filepath.Join(cniConfDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var cl cniConflist
+		if json.Unmarshal(data, &cl) != nil || cl.Name == "" {
+			continue
+		}
+		out[cl.Name] = cl
+	}
+	return out, nil
+}
 
-			labels := mergeNetworkLabels(parseNerdctlLabels(nw.Labels), loadNetworkLabels(nw.Name))
-			dn := dockerNetwork{
-				Id:      nw.ID,
-				Name:    nw.Name,
-				Driver:  "bridge",
-				Scope:   "local",
-				Created: time.Now().UTC().Format(time.RFC3339),
-				IPAM:    dockerIPAM{Driver: "default"},
-				Options: map[string]string{},
-				Labels:  labels,
+// conflistToDockerNetwork renders a conflist into the Docker API shape.
+func conflistToDockerNetwork(cl cniConflist) dockerNetwork {
+	ipam := dockerIPAM{Driver: "default"}
+	for _, p := range cl.Plugins {
+		for _, ranges := range p.IPAM.Ranges {
+			for _, r := range ranges {
+				ipam.Config = append(ipam.Config, dockerIPAMConfig{Subnet: r.Subnet})
 			}
-			if matchesLabelFilters(labels, filters) {
-				result = append(result, dn)
-			}
+		}
+	}
+	labels := cl.Labels
+	if labels == nil {
+		labels = mergeNetworkLabels(map[string]string{}, loadNetworkLabels(cl.Name))
+	} else {
+		labels = mergeNetworkLabels(labels, loadNetworkLabels(cl.Name))
+	}
+	return dockerNetwork{
+		Id:      cl.AnvilID,
+		Name:    cl.Name,
+		Driver:  "bridge",
+		Scope:   "local",
+		Created: time.Now().UTC().Format(time.RFC3339),
+		IPAM:    ipam,
+		Options: map[string]string{},
+		Labels:  labels,
+	}
+}
+
+// listDockerNetworks returns all networks known to the guest (one conflist per
+// network; the default namespace bridge included).
+func listDockerNetworks(ctx context.Context, filters map[string]map[string]bool) ([]dockerNetwork, error) {
+	conflists, err := loadCNIConflists()
+	if err != nil {
+		return nil, fmt.Errorf("list cni conflists: %w", err)
+	}
+	result := make([]dockerNetwork, 0, len(conflists))
+	seen := map[string]struct{}{}
+	names := make([]string, 0, len(conflists))
+	for name := range conflists {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		dn := conflistToDockerNetwork(conflists[name])
+		if _, ok := seen[dn.Id]; ok && dn.Id != "" {
+			continue
+		}
+		seen[dn.Id] = struct{}{}
+		if matchesLabelFilters(dn.Labels, filters) {
+			result = append(result, dn)
 		}
 	}
 	return result, nil
 }
 
-// inspectDockerNetwork returns a network by name or ID.
+// inspectDockerNetwork returns a network by name or ID prefix.
 func inspectDockerNetwork(ctx context.Context, name string) (*dockerNetwork, error) {
-	cl, err := pc.get(ctx)
+	conflists, err := loadCNIConflists()
 	if err != nil {
-		return nil, fmt.Errorf("containerd client: %w", err)
+		return nil, fmt.Errorf("list cni conflists: %w", err)
 	}
-
-	nss, err := cl.NamespaceService().List(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("list namespaces: %w", err)
-	}
-	hasDefault := false
-	for _, ns := range nss {
-		if ns == "default" {
-			hasDefault = true
-			break
-		}
-	}
-	if !hasDefault {
-		nss = append([]string{"default"}, nss...)
-	}
-
-	for _, ns := range nss {
-		stdout, stderr, code, err := runNerdctl(ns, "network", "inspect", "--format", "json", name)
-		if err != nil || code != 0 {
-			log.Printf("[docker-api] network inspect in %s: %d %s%s", ns, code, stdout, stderr)
+	for _, cl := range conflists {
+		if cl.Name != name && !(cl.AnvilID != "" && strings.HasPrefix(cl.AnvilID, name)) {
 			continue
 		}
-		for _, line := range strings.Split(stdout, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			var nw nerdctlNetworkInspect
-			if err := json.Unmarshal([]byte(line), &nw); err != nil {
-				continue
-			}
-			dn := nerdctlNetworkInspectToDocker(nw)
-			if dn.Name == name || strings.HasPrefix(dn.Id, name) {
-				// nerdctl inspect may not return Compose labels for bridge networks;
-				// fall back to the CNI conflist we generated.
-				dn.Labels = mergeNetworkLabels(dn.Labels, loadNetworkLabels(name))
-				if len(dn.Labels) == 0 {
-					dn.Labels = cniLabelsForNetwork(name)
-				}
-				return &dn, nil
-			}
-		}
+		dn := conflistToDockerNetwork(cl)
+		return &dn, nil
 	}
 	return nil, fmt.Errorf("No such network: %s", name)
 }
+
 
 // networkLabelsPath returns the host-share path where we persist Compose labels
 // for a network. nerdctl bridge network inspect does not reliably return the
@@ -280,14 +263,12 @@ func restoreNetworkConfigs() {
 // cniLabelsForNetwork reads the labels from the CNI conflist generated for the
 // given network name, if it exists.
 func cniLabelsForNetwork(name string) map[string]string {
-	base := sanitizeCNIName(name)
-	path := filepath.Join(cniConfDir, "nerdctl-"+base+".conflist")
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(cniConflistPath(name))
 	if err != nil {
 		return map[string]string{}
 	}
 	var conf struct {
-		Labels map[string]string `json:"nerdctlLabels"`
+		Labels map[string]string `json:"anvilLabels"`
 	}
 	if err := json.Unmarshal(data, &conf); err != nil {
 		return map[string]string{}
@@ -393,82 +374,38 @@ func removeDockerNetwork(ctx context.Context, name string) error {
 		nss = append([]string{"default"}, nss...)
 	}
 
-	for _, ns := range nss {
-		stdout, stderr, code, err := runNerdctl(ns, "network", "rm", name)
-		if err == nil && code == 0 {
-			if netName != "" {
-				deleteNetworkLabels(netName)
-			}
-			return nil
-		}
-		_ = stdout
-		_ = stderr
+	path := cniConflistPath(name)
+	if _, statErr := os.Stat(path); statErr != nil {
+		return fmt.Errorf("No such network: %s", name)
 	}
-	return fmt.Errorf("No such network: %s", name)
+	removeStaleBridge(path)
+
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("remove conflist: %w", err)
+	}
+	cnim.invalidate()
+	if netName != "" {
+		deleteNetworkLabels(netName)
+	}
+	return nil
 }
 
-// nerdctlNetworkInspectToDocker converts nerdctl network inspect JSON to Docker API shape.
-func nerdctlNetworkInspectToDocker(nw nerdctlNetworkInspect) dockerNetwork {
-	ipam := dockerIPAM{Driver: "default"}
-	for _, cfg := range nw.IPAM.Config {
-		ipam.Config = append(ipam.Config, dockerIPAMConfig{Subnet: cfg.Subnet})
+// removeStaleBridge deletes the Linux bridge of a removed network when no
+// interfaces remain attached to it (best effort).
+func removeStaleBridge(conflistPath string) {
+	data, err := os.ReadFile(conflistPath)
+	if err != nil {
+		return
 	}
-	created := nw.Created
-	if created == "" {
-		created = time.Now().UTC().Format(time.RFC3339)
+	var cl cniConflist
+	if json.Unmarshal(data, &cl) != nil || len(cl.Plugins) == 0 || cl.Plugins[0].Bridge == "" {
+		return
 	}
-	labels := map[string]string{}
-	switch m := nw.Labels.(type) {
-	case map[string]interface{}:
-		for k, v := range m {
-			if s, ok := v.(string); ok {
-				labels[k] = s
-			}
-		}
-	case map[string]string:
-		for k, v := range m {
-			labels[k] = v
-		}
-	}
-	options := nw.Options
-	if options == nil {
-		options = map[string]string{}
-	}
-	if ipam.Options == nil {
-		ipam.Options = map[string]string{}
-	}
-	return dockerNetwork{
-		Id:         nw.Id,
-		Name:       nw.Name,
-		Driver:     defaultString(nw.Driver, "bridge"),
-		Scope:      defaultString(nw.Scope, "local"),
-		Created:    created,
-		Internal:   false,
-		Attachable: false,
-		Ingress:    false,
-		IPAM:       ipam,
-		Options:    options,
-		Labels:     labels,
+	out, err := exec.Command("sh", "-c",
+		fmt.Sprintf("if [ -d /sys/class/net/%s/brif ] && [ -z \"$(ls /sys/class/net/%s/brif)\" ]; then ip link delete %s; fi",
+			cl.Plugins[0].Bridge, cl.Plugins[0].Bridge, cl.Plugins[0].Bridge)).CombinedOutput()
+	if err != nil {
+		debugLog("[docker-api] bridge cleanup %s: %v: %s", cl.Plugins[0].Bridge, err, out)
 	}
 }
 
-// parseNerdctlLabels parses the comma-separated key=value label string returned
-// by `nerdctl network ls --format json` and `nerdctl volume ls --format json`.
-func parseNerdctlLabels(s string) map[string]string {
-	labels := map[string]string{}
-	s = strings.TrimSpace(s)
-	if s == "" || s == "<no value>" {
-		return labels
-	}
-	for _, part := range strings.Split(s, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		kv := strings.SplitN(part, "=", 2)
-		if len(kv) == 2 {
-			labels[kv[0]] = kv[1]
-		}
-	}
-	return labels
-}

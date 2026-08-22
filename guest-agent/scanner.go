@@ -323,7 +323,7 @@ func generateCNIConfigWithLabels(ns string, extraLabels map[string]string) error
 		netName = "bridge"
 	}
 	base := sanitizeCNIName(netName)
-	path := filepath.Join(cniConfDir, "nerdctl-"+base+".conflist")
+	path := filepath.Join(cniConfDir, "anvil-"+base+".conflist")
 
 	bridge := "br-" + base
 	if len(bridge) > 15 {
@@ -336,7 +336,7 @@ func generateCNIConfigWithLabels(ns string, extraLabels map[string]string) error
 
 	labels := map[string]string{}
 	if ns == "default" {
-		labels["nerdctl/default-network"] = "true"
+		labels[labelDefaultNetwork] = "true"
 	}
 	// Docker Compose names its default network `<project>_default`. Add the
 	// labels Compose expects so it treats a pre-created CNI network as its own.
@@ -354,8 +354,8 @@ func generateCNIConfigWithLabels(ns string, extraLabels map[string]string) error
 	conf := map[string]interface{}{
 		"cniVersion":    cniVersion,
 		"name":          netName,
-		"nerdctlID":     networkID(ns),
-		"nerdctlLabels": labels,
+		"anvilID":       networkID(ns),
+		"anvilLabels":   labels,
 		"plugins": []interface{}{
 			map[string]interface{}{
 				"type":        "bridge",
