@@ -340,6 +340,7 @@ func (bc *blobCopier) blobCtx(d ocispec.Descriptor) context.Context {
 // copyTree copies d and everything below it into the destination namespace.
 func (bc *blobCopier) copyTree(d ocispec.Descriptor) error {
 	if _, ierr := bc.cs.Info(bc.dstCtx, d.Digest); ierr == nil {
+		debugLog("copyTree: %s already in destination", d.Digest)
 		return nil // blob already visible in the destination namespace
 	}
 	bctx := bc.blobCtx(d)
@@ -389,6 +390,7 @@ func (bc *blobCopier) copyBlob(bctx context.Context, d ocispec.Descriptor) error
 		return err
 	}
 	defer ra.Close()
+	debugLog("copyBlob: copying %s (%d bytes)", d.Digest, d.Size)
 	if ra.Size() != d.Size {
 		debugLog("copyBlob size mismatch for %s: blob=%d descriptor=%d", d.Digest, ra.Size(), d.Size)
 	}
@@ -536,6 +538,7 @@ func copyBlob(srcCtx, dstCtx context.Context, cs content.Store, cl *client.Clien
 		return err
 	}
 	defer ra.Close()
+	debugLog("copyBlob: copying %s (%d bytes)", d.Digest, d.Size)
 	if ra.Size() != d.Size {
 		debugLog("copyBlob size mismatch for %s: blob=%d descriptor=%d", d.Digest, ra.Size(), d.Size)
 	}

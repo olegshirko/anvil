@@ -163,11 +163,22 @@ func streamTaskLogToTTY(out io.Writer, ns, id string, follow bool, tty bool) {
 
 	logPath := containerLogPath(ns, id)
 
-	// Follow mode must end when the task dies (docker run attaches BEFORE
-	// start, so "not running yet" alone is not a stop condition — only a
-	// task that has actually left the running state ends the stream).
+	n := 0
+	emitWrap := func(stream byte, line []byte) {
+		n++
+		emit(stream, line)
+	}
+	err := readTaskLog(logPath, logReadOptions{follow: follow, tail: -1, stop: taskExitedStopper(ns, id, follow)}, emitWrap)
+	debugLog("attach %s: readTaskLog done err=%v emitted=%d tty=%v follow=%v", id, err, n, tty, follow)
+}
+
+// taskExitedStopper ends a log follow stream when the container's task has
+// exited. Follow mode must not end while the container is merely "created"
+// (docker run attaches BEFORE start), so a task that never ran keeps the
+// stream open until it does.
+func taskExitedStopper(ns, id string, follow bool) func() bool {
 	wasRunning := false
-	stop := func() bool {
+	return func() bool {
 		if !follow {
 			return true
 		}
@@ -181,8 +192,6 @@ func streamTaskLogToTTY(out io.Writer, ns, id string, follow bool, tty bool) {
 		}
 		return true
 	}
-
-	_ = readTaskLog(logPath, logReadOptions{follow: follow, tail: -1, stop: stop}, emit)
 }
 
 // errWriteFailed unwinds readTaskLog when the HTTP client disconnects.
@@ -282,7 +291,7 @@ func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
 			flusher.Flush()
 		}
 	}
-	opts.stop = func() bool { return !opts.follow }
+	opts.stop = taskExitedStopper(ns, containerdID, opts.follow)
 	_ = readTaskLog(containerLogPath(ns, containerdID), opts, emit)
 }
 

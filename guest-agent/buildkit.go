@@ -163,11 +163,13 @@ func pruneBuildCache() (int64, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	log.Printf("[buildkit] prune: connecting")
 	c, err := bkclient.New(ctx, "unix://"+buildkitSocket)
 	if err != nil {
 		return 0, fmt.Errorf("buildkit connect: %w", err)
 	}
 	defer c.Close()
+	log.Printf("[buildkit] prune: connected")
 
 	var reclaimed int64
 	ch := make(chan bkclient.UsageInfo)
@@ -179,7 +181,12 @@ func pruneBuildCache() (int64, error) {
 		}
 	}()
 	err = c.Prune(ctx, ch, bkclient.PruneAll)
-	<-done
+	// The client does not close the usage channel when the RPC completes;
+	// drain briefly for pending records instead of blocking forever.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+	}
 	if err != nil {
 		return reclaimed, fmt.Errorf("buildkit prune: %w", err)
 	}

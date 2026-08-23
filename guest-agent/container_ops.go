@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
+	"net/url"
+
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -117,7 +119,13 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 		err = lerr
 		return err
 	}
-	task, terr := c.NewTask(nsCtx, cio.LogURI(uri))
+	// TTY tasks need Terminal set in the IO config: the shim then allocates
+	// the pty itself (runc refuses a terminal spec with no console socket
+	// otherwise) and duplicates the console output into the log URI.
+	tty := getContainerTTY(dockerID(ns, id))
+	task, terr := c.NewTask(nsCtx, func(string) (cio.IO, error) {
+		return &logOnlyIO{uri: uri, terminal: tty}, nil
+	})
 	if terr != nil {
 		err = fmt.Errorf("new task: %w", terr)
 		return err
@@ -194,6 +202,7 @@ func stopNativeTask(ctx context.Context, ns, id string, timeoutSec int) error {
 	}
 	task, terr := c.Task(nsCtx, nil)
 	if terr != nil {
+		teardownNetwork(ctx, ns, id)
 		return nil // no task: nothing to stop
 	}
 	st, serr := task.Status(nsCtx)
@@ -201,6 +210,7 @@ func stopNativeTask(ctx context.Context, ns, id string, timeoutSec int) error {
 		return serr
 	}
 	if st.Status != "running" && st.Status != "paused" {
+		teardownNetwork(ctx, ns, id)
 		return nil
 	}
 
@@ -221,27 +231,72 @@ func stopNativeTask(ctx context.Context, ns, id string, timeoutSec int) error {
 		time.Sleep(100 * time.Millisecond)
 		cur, err := task.Status(nsCtx)
 		if err != nil {
-			return nil // task gone
+			break // task gone
 		}
 		if cur.Status == "stopped" {
-			return nil
+			break
 		}
 	}
-	kctx, cancel := context.WithTimeout(nsCtx, 5*time.Second)
-	defer cancel()
-	if kerr := task.Kill(kctx, syscall.SIGKILL); kerr != nil {
-		return fmt.Errorf("force kill: %w", kerr)
-	}
-	deadline = time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-		cur, err := task.Status(nsCtx)
-		if err != nil || cur.Status == "stopped" {
-			return nil
+	if stopped, serr := task.Status(nsCtx); serr == nil && stopped.Status != "stopped" {
+		kctx, cancel := context.WithTimeout(nsCtx, 5*time.Second)
+		if kerr := task.Kill(kctx, syscall.SIGKILL); kerr != nil {
+			cancel()
+			return fmt.Errorf("force kill: %w", kerr)
+		}
+		cancel()
+		deadline = time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+			cur, err := task.Status(nsCtx)
+			if err != nil || cur.Status == "stopped" {
+				break
+			}
 		}
 	}
-	return fmt.Errorf("container did not stop after SIGKILL")
+	// Detach CNI synchronously: the exit watcher may fire later, and a
+	// leftover host-side veth makes the next start's CNI attach fail with
+	// "veth ... already exists" (docker restart / compose restart).
+	teardownNetwork(ctx, ns, id)
+	return nil
 }
+
+// teardownNetwork detaches the container's CNI endpoint if one is recorded.
+// Best effort and idempotent (a late exit-watcher detach on an already
+// detached endpoint is harmless).
+func teardownNetwork(ctx context.Context, ns, id string) {
+	ni, ok := loadNetInfo(ns, id)
+	if !ok || usesHostNetworkName(ni.Network) {
+		return
+	}
+	meta, _ := loadContainerMeta(ns, id)
+	var ports []cniPortMapping
+	if meta != nil {
+		ports = meta.Ports
+	}
+	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	detachNetwork(dctx, ni.Network, ns, id, netnsPathFor(id), ports) //nolint:errcheck
+	cancel()
+	removeNetInfo(ns, id)
+}
+
+// logOnlyIO mirrors cio.LogURI but can flag the IO config as a terminal,
+// which the stock LogURI creator cannot do.
+type logOnlyIO struct {
+	uri      *url.URL
+	terminal bool
+}
+
+func (l *logOnlyIO) Config() cio.Config {
+	return cio.Config{
+		Terminal: l.terminal,
+		Stdout:   l.uri.String(),
+		Stderr:   l.uri.String(),
+	}
+}
+
+func (l *logOnlyIO) Cancel()      {}
+func (l *logOnlyIO) Wait()        {}
+func (l *logOnlyIO) Close() error { return nil }
 
 // --- delete -----------------------------------------------------------------
 

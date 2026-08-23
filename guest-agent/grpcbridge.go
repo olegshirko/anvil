@@ -11,8 +11,11 @@ import (
 	control "github.com/moby/buildkit/api/services/control"
 	pb "github.com/moby/buildkit/frontend/gateway/pb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // buildx's "docker" driver connects to the daemon's gRPC endpoint (POST /grpc,
@@ -22,6 +25,35 @@ import (
 // done because dockerd registers a private moby exporter) is undone: the
 // containerd worker's image exporter with push=false imports straight into the
 // shared containerd image store, which is what the moby exporter would do.
+
+// buildkitRawConn connects to buildkitd with the raw-frame codec (see
+// containerdClientConn) for transparently forwarded services.
+var (
+	buildkitRawOnce sync.Once
+	buildkitRaw     *grpc.ClientConn
+	buildkitRawErr  error
+)
+
+func buildkitRawConn() (*grpc.ClientConn, error) {
+	buildkitRawOnce.Do(func() {
+		if err := ensureBuildkitd(); err != nil {
+			buildkitRawErr = err
+			return
+		}
+		cc, err := grpc.NewClient("unix://"+buildkitSocket,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultCallOptions(grpc.CallCustomCodec(hybridCodec{})),
+		)
+		if err != nil {
+			buildkitRawErr = err
+			return
+		}
+		buildkitRaw = cc
+	})
+	return buildkitRaw, buildkitRawErr
+}
+
+var containerdProxyConn *grpc.ClientConn
 
 var (
 	proxyConnOnce sync.Once
@@ -256,7 +288,14 @@ func serveBuildkitGRPC(conn net.Conn, buffered io.Reader) error {
 	if err != nil {
 		return err
 	}
-	gs := grpc.NewServer()
+	containerdProxyConn, err = containerdClientConn()
+	if err != nil {
+		return err
+	}
+	gs := grpc.NewServer(
+		grpc.ForceServerCodec(hybridCodec{}),
+		grpc.UnknownServiceHandler(proxyUnknownStream(containerdProxyConn)),
+	)
 	control.RegisterControlServer(gs, &controlProxy{cc: cc})
 	pb.RegisterLLBBridgeServer(gs, &llbBridge{cc: cc})
 	return gs.Serve(&singleConnListener{conn: prefixConn{Conn: conn, r: io.MultiReader(buffered, conn)}})
@@ -419,4 +458,135 @@ func bridgeSession(conn net.Conn, header http.Header) {
 			}
 		}
 	}()
+}
+
+// --- transparent proxy for containerd services -------------------------------
+
+// rawFrame carries gRPC messages verbatim, so unknown services can be
+// forwarded without their protobuf definitions.
+type rawFrame []byte
+
+func (f *rawFrame) Reset()         {}
+func (f *rawFrame) String() string { return "rawFrame" }
+func (f *rawFrame) ProtoMessage()  {}
+
+// hybridCodec passes rawFrame through untouched and delegates everything
+// else to the proto codec, letting registered (proto-typed) services and the
+// transparent proxy share one gRPC server.
+type hybridCodec struct{}
+
+func (hybridCodec) Name() string   { return "proto" }
+func (hybridCodec) String() string { return "proto" }
+
+func (hybridCodec) Marshal(v any) ([]byte, error) {
+	if f, ok := v.(*rawFrame); ok {
+		return *f, nil
+	}
+	return proto.Marshal(v.(proto.Message))
+}
+
+func (hybridCodec) Unmarshal(data []byte, v any) error {
+	if f, ok := v.(*rawFrame); ok {
+		*f = append((*f)[:0], data...)
+		return nil
+	}
+	return proto.Unmarshal(data, v.(proto.Message))
+}
+
+var (
+	containerdConnOnce sync.Once
+	containerdConn     *grpc.ClientConn
+	containerdConnErr  error
+)
+
+func containerdClientConn() (*grpc.ClientConn, error) {
+	containerdConnOnce.Do(func() {
+		cc, err := grpc.NewClient("unix:///run/containerd/containerd.sock",
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultCallOptions(grpc.CallCustomCodec(hybridCodec{})),
+		)
+		if err != nil {
+			containerdConnErr = err
+			return
+		}
+		containerdConn = cc
+	})
+	return containerdConn, containerdConnErr
+}
+
+// proxyUnknownStream forwards a gRPC stream for an unregistered service to
+// the guest's containerd daemon. buildx's docker driver expects dockerd's
+// containerd services (e.g. content.v1 for provenance records) on the same
+// /grpc endpoint as the buildkit control API.
+func proxyUnknownStream(cc *grpc.ClientConn) grpc.StreamHandler {
+	return func(_ any, ss grpc.ServerStream) error {
+		method, ok := grpc.MethodFromServerStream(ss)
+		if !ok {
+			return status.Error(codes.Internal, "unknown method")
+		}
+		debugLog("grpc-bridge: forwarding %s", method)
+		ctx := outgoing(ss.Context())
+		target := cc
+		// buildx's docker driver reads build-record provenance through the
+		// content service, which buildkitd itself fronts on its gRPC server
+		// (the same service remote-driver clients use); everything else goes
+		// to the containerd daemon.
+		if strings.HasPrefix(method, "/containerd.services.content.v1.") {
+			if bk, berr := buildkitRawConn(); berr == nil {
+				target = bk
+			}
+		} else if md, ok := metadata.FromOutgoingContext(ctx); !ok || len(md.Get("containerd-namespace")) == 0 {
+			// dockerd fronts containerd with its own namespace; buildx
+			// relies on that and sends none, so inject it when missing.
+			ctx = metadata.AppendToOutgoingContext(ctx, "containerd-namespace", "default")
+		}
+		cs, err := target.NewStream(ctx, &grpc.StreamDesc{
+			StreamName:    method,
+			ClientStreams: true,
+			ServerStreams: true,
+		}, method)
+		if err != nil {
+			return err
+		}
+		errCh := make(chan error, 2)
+		go func() {
+			for {
+				var f rawFrame
+				if err := ss.RecvMsg(&f); err != nil {
+					// Client half-closed; the RPC only finishes once the
+					// upstream response arrives — do NOT signal completion
+					// here or the handler returns before forwarding it.
+					cs.CloseSend()
+					return
+				}
+				if err := cs.SendMsg(&f); err != nil {
+					debugLog("grpc-bridge: %s upstream send: %v", method, err)
+					errCh <- err
+					return
+				}
+			}
+		}()
+		go func() {
+			for {
+				var f rawFrame
+				if err := cs.RecvMsg(&f); err != nil {
+					debugLog("grpc-bridge: %s upstream recv done: %v", method, err)
+					if err == io.EOF {
+						errCh <- nil
+					} else {
+						errCh <- err // forward the upstream status to the client
+					}
+					return
+				}
+				if err := ss.SendMsg(&f); err != nil {
+					debugLog("grpc-bridge: %s downstream send: %v", method, err)
+					errCh <- err
+					return
+				}
+			}
+		}()
+		rerr := <-errCh
+		debugLog("grpc-bridge: %s done: %v", method, rerr)
+		return rerr
+	}
 }

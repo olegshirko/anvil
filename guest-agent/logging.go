@@ -194,49 +194,91 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 
 	// The log file appears only when the task starts (the shim spawns the
 	// logging binary then). docker run attaches BEFORE start, so poll until
-	// the file shows up or the stop condition fires.
-	var f *os.File
-	for {
-		var oerr error
-		f, oerr = os.Open(logPath)
-		if oerr == nil {
-			break
-		}
-		if opts.stop != nil && opts.stop() {
-			return nil
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	defer f.Close()
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
-		return err
-	}
-	br := bufio.NewReader(f)
-
-	// The stop condition can fire a moment before the logging binary
-	// finishes flushing; require it three times in a row (~300 ms) so the
-	// tail of the output is not cut off.
+	// the file shows up or the stop condition fires (debounced: a container
+	// that runs and exits between polls must not cut off its own output).
 	stopCount := 0
-	for {
-		raw, err := br.ReadBytes('\n')
-		if len(raw) > 0 {
-			var rec logLine
-			if json.Unmarshal(raw, &rec) == nil {
-				emitRecord(rec)
-			}
+	stopFired := func() bool {
+		if opts.stop == nil {
+			return false
 		}
-		if err != nil {
-			if opts.stop != nil && opts.stop() {
-				stopCount++
-				if stopCount >= 3 {
-					return nil
-				}
-			} else {
-				stopCount = 0
+		if opts.stop() {
+			stopCount++
+			if stopCount >= 3 {
+				return true
 			}
-			time.Sleep(100 * time.Millisecond)
 		} else {
 			stopCount = 0
 		}
+		return false
+	}
+
+	// TTY tasks may flush their console output (and the logging binary may
+	// replace the file wholesale) noticeably after the task exit becomes
+	// observable, so follow re-reads by PATH instead of holding one fd, and
+	// an empty/quiet log at stop time gets a grace period before giving up.
+	var pending []byte // partial line carried between polls
+	off := int64(len(data))
+	var emptyDeadline time.Time
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if chunk, next, cerr := readLogFrom(logPath, off); cerr == nil {
+			pending = append(pending, chunk...)
+			for {
+				idx := bytes.IndexByte(pending, '\n')
+				if idx < 0 {
+					break
+				}
+				var rec logLine
+				if json.Unmarshal(pending[:idx], &rec) == nil {
+					emitRecord(rec)
+				}
+				pending = pending[idx+1:]
+			}
+			off = next
+		}
+		if stopFired() {
+			if fi, serr := os.Stat(logPath); serr == nil && fi.Size() == off {
+				if emptyDeadline.IsZero() {
+					emptyDeadline = time.Now().Add(2 * time.Second)
+				}
+				if time.Now().After(emptyDeadline) {
+					return nil
+				}
+			} else {
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return nil // safety valve for a wedged stop condition
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+// readLogFrom returns the bytes appended to the log file since offset off
+// (reopening by path so a wholesale file replacement is picked up) plus the
+// new offset.
+func readLogFrom(path string, off int64) ([]byte, int64, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, off, err
+	}
+	if fi.Size() == off {
+		return nil, off, nil
+	}
+	if fi.Size() < off {
+		off = 0 // the file was replaced wholesale; read it from the start
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, off, err
+	}
+	defer f.Close()
+	buf := make([]byte, fi.Size()-off)
+	n, err := f.ReadAt(buf, off)
+	if err != nil && err != io.EOF {
+		return nil, off, err
+	}
+	return buf[:n], off + int64(n), nil
+}
+
