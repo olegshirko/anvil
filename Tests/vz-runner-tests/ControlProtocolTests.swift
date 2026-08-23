@@ -11,7 +11,7 @@ final class ControlProtocolTests: XCTestCase {
     }
 
     func testEncodeDecodeRoundtrip() throws {
-        let value = ControlRequest(cmd: "exec", args: ["nerdctl", "ps", "-a"])
+        let value = ControlRequest(cmd: "exec", args: ["ps", "aux"])
         let data = try encodeLengthPrefixed(value)
 
         let stream = InputStream(data: data)
@@ -19,7 +19,7 @@ final class ControlProtocolTests: XCTestCase {
         defer { stream.close() }
         let decoded = try decodeLengthPrefixed(ControlRequest.self, from: stream)
         XCTAssertEqual(decoded.cmd, "exec")
-        XCTAssertEqual(decoded.args, ["nerdctl", "ps", "-a"])
+        XCTAssertEqual(decoded.args, ["ps", "aux"])
     }
 
     func testLengthPrefixIsBigEndian() throws {

@@ -37,8 +37,8 @@ and shutdown.
 │  │  └────────────────────┬────────────────────────────┘   │  │
 │  │                       │                                  │  │
 │  │  ┌────────────────────▼────────────────────────────┐   │  │
-│  │  │  containerd + nerdctl + CNI plugins             │   │  │
-│  │  │  /var/lib (containerd + nerdctl volumes)        │   │  │
+│  │  │  containerd + CNI plugins + buildkitd           │   │  │
+│  │  │  /var/lib (containerd, buildkit state)         │   │  │
 │  │  │  on a virtio-blk disk                           │   │  │
 │  │  └─────────────────────────────────────────────────┘   │  │
 │  └─────────────────────────────────────────────────────────┘  │
@@ -67,8 +67,8 @@ and shutdown.
 - receives commands from `vz-runner` over vsock (exec, status, sync);
 - emulates the Docker API for Docker CLI / docker compose;
 - scans containerd and pushes the current port mappings to `vz-runner`;
-- runs healthchecks itself, because `nerdctl` does not support the Docker
-  `--health-cmd` flags;
+- runs healthchecks itself via native containerd exec (no dependence on
+  external CLI health support);
 - generates CNI configs for per-project bridge networks.
 
 ## 2. Why not Lima / Docker Desktop / OrbStack
@@ -130,7 +130,8 @@ points at it; the builder is created/restored at daemon startup
 (`anvil-service.sh` + `main.swift`). Through it, `docker buildx build` and
 `docker compose build` work without an intermediate buildkit container.
 buildkitd in the guest starts lazily — the guest-agent brings it up on the
-first connection to port 1026 or the first `nerdctl build`.
+first connection to port 1026, the first `/build` request or the first
+`docker build` over the gRPC bridge (§4.3b).
 
 ### 3.4 PortForwarder
 
@@ -146,22 +147,20 @@ mappings to `vz-runner`. `PortForwarder`:
   guests without a container IP fall back to dialing `guestIP:hostPort`;
 - for `udp` mappings opens a SOCK_DGRAM listener instead: datagrams are
   relayed to `guestIP:hostPort` with one connected socket per client
-  endpoint (60 s idle reaping). No guest-side proxy is needed — nerdctl
-  arms the persisted portMappings at start (a reservation socket plus nft
-  DNAT hostPort→containerPort in the guest's root netns), and vzNAT
-  delivers host→guest UDP to the bound port;
+  endpoint (60 s idle reaping). No guest-side proxy is needed: the
+  guest-agent arms the persisted port mappings at start (a reservation
+  socket plus nft DNAT hostPort→containerPort in the guest's root
+  netns), and vzNAT delivers host→guest UDP to the bound port;
 - on every push does a full-state replace: new ports are opened, gone ports
   are closed;
 - logs a conflict when it fails to open an already taken port.
 
-User host ports are deliberately never bound inside the guest: nerdctl
-reserves host ports at CREATE time (an inherited listener fd owned by the
-container process), which breaks the Docker flow where the check belongs to
-start — `docker compose up` over live containers creates the replacement
-before stopping the old one. Ports are therefore not passed to nerdctl at
-all; the mappings are persisted in nerdctl's network store
-(`network-config.json`) so ps/inspect/scanner see them, and our own
-start-time checks enforce conflicts.
+User host ports are deliberately never bound inside the guest at create
+time: the Docker flow expects the conflict check to belong to start —
+`docker compose up` over live containers creates the replacement before
+stopping the old one. The mappings are persisted in the guest-agent's own
+store so ps/inspect/scanner see them, and start-time checks enforce
+conflicts.
 
 POSIX sockets were chosen over `NWListener` because all that is needed is a
 plain TCP proxy loop without the TLS/path-monitoring/event-loop overhead of
@@ -181,8 +180,8 @@ not drag along the page cache of images.
 therefore:
 
 - a background `SIGCHLD` reaper via `syscall.Wait4(-1, WNOHANG)` must run,
-  otherwise finished `containerd-shim`/`runc`/`nerdctl` processes turn into
-  zombies and deadlock containerd;
+  otherwise finished `containerd-shim`/`runc` processes turn into zombies
+  and deadlock containerd;
 - the guest-agent must not crash unexpectedly — otherwise the VM is left
   without management.
 
@@ -202,7 +201,8 @@ An HTTP/1.1 server emulating the subset of the Docker API needed by
 - `/images/*` create/json/inspect/tag/push/rmi/get/save/load/prune;
 - `/networks/*` create/inspect/list/connect/disconnect/rm/prune;
 - `/volumes/*` create/inspect/list/rm/prune;
-- `/build` (classic path via `nerdctl build`) and `/build/prune`;
+- `/build` (classic path: the agent extracts the context tar and solves
+  through buildkitd's gRPC API) and `/build/prune`;
 - `/events` (live stream with filters and `until`; no historical replay —
   there is no event log);
 - `/system/df`, `/system/prune`.
@@ -222,16 +222,12 @@ Notable details:
   because the Docker CLI calls `/wait` before `/start`, and if the response
   is not started right away, the following `/start` queues on the same
   connection and the container never starts.
-- `HostConfig.AutoRemove` is not passed to `nerdctl create --rm`. Instead
-  the guest-agent removes the container itself after the exit code has been
-  saved — otherwise `docker run --rm` could not return a non-zero exit
-  code.
-- `--restart` policies are NOT passed to nerdctl either: nerdctl/containerd
-  arm their own supervisor that races the Docker semantics (it re-starts
-  containers the user stopped, since stop looks like exit 143 =
-  failure). The guest-agent's restart monitor (`restart.go`) owns the
-  policy: it reads the authoritative task state from containerd (nerdctl's
-  inspect reports `Status:""`/`Restarting` for policy containers),
+- `HostConfig.AutoRemove` is handled by the guest-agent itself: the
+  container is removed only after the exit code has been saved — otherwise
+  `docker run --rm` could not return a non-zero exit code.
+- `--restart` policies are owned by the guest-agent's restart monitor
+  (`restart.go`), not by any external supervisor: it reads the authoritative
+  task state from containerd,
   restarts with an exponential backoff that resets once the container is
   observed running, and clears the policy on any user stop/kill/rm.
   `docker inspect` reports `RestartPolicy`/`RestartCount` from the
@@ -262,13 +258,11 @@ reads tasks and their labels. When ports change:
 ### 4.5 Healthcheck
 
 The guest-agent saves the healthcheck config from
-`POST /containers/create` and runs periodic `nerdctl exec` checks itself.
+`POST /containers/create` and runs periodic checks itself through native
+containerd exec.
 The `(healthy)`/`(unhealthy)`/`(starting)` status is returned in
 `docker ps` and `docker inspect`, which lets `docker compose` use
-`depends_on: condition: service_healthy`. This was originally done because
-`nerdctl` 2.0.4 did not support `--health-cmd`; the flags appeared in 2.3.5,
-but the custom runner stayed — it is battle-tested and does not depend on
-nerdctl quirks.
+`depends_on: condition: service_healthy`.
 
 ### 4.6 CNI / per-project networking
 
@@ -276,25 +270,24 @@ Every Docker Compose project gets its own namespace and bridge network:
 
 - the subnet is deterministic: `10.10.<hash(project) % 250 + 1>.0/24`;
 - the bridge is `br-<sanitized-project>`;
-- the CNI conflist
-  `/etc/cni/net.d/nerdctl-<name>.conflist` is generated by the guest-agent
+- the CNI conflist under `/etc/cni/net.d/` is generated by the guest-agent
   before creating a container or a network.
 
 Compose labels (`com.docker.compose.project`,
 `com.docker.compose.network`, etc.) are persisted in
-`/mnt/anvil/networks/<name>.json`, because `nerdctl network inspect` does
-not return labels for bridge networks. These labels are merged into
+`/mnt/anvil/networks/<name>.json`. These labels are merged into
 `GET /networks` responses, and at startup the guest-agent restores the CNI
 conflist from the saved labels — otherwise after a cold boot Compose
 considers the network "external" and refuses to use it.
 
 ### 4.7 Image canonicalization
 
-The Docker CLI often passes incomplete refs (`postgres:15.5`). `nerdctl`
-stores images under the full name
+The Docker CLI often passes incomplete refs (`postgres:15.5`), while
+containerd stores images under the full canonical name
 (`docker.io/library/postgres:15.5`). The guest-agent canonicalizes the ref
-before pull/lookup so that `docker compose` does not get
-`no such image`.
+before pull/lookup so that `docker compose` does not get `no such image`;
+locally built images (whose exporter may register raw names) are matched
+across namespaces in both forms.
 
 ## 5. Initramfs and stage2
 
@@ -304,12 +297,12 @@ The base is the Alpine initramfs-virt. Inside a Linux container
 (`alpine:3.20`) the rootfs is assembled with:
 
 - busybox + basic applets;
-- containerd, nerdctl, runc, CNI plugins;
+- containerd, runc, CNI plugins;
 - guest-agent;
 - Alpine linux-virt kernel modules: vsock, virtiofs, overlayfs, bridge,
   veth, netfilter/xt/nft modules;
 - iptables + libmnl/libnftnl/libxtables;
-- GNU tar + libacl/libattr for `nerdctl cp`;
+- GNU tar + libacl/libattr for `docker cp` (archive extract/import);
 - buildkitd/buildctl/qemu emulators as a single `/opt/buildkit.tar.zst`:
   build-only binaries do not ride through kernel initramfs unpack and the
   tmpfs-root copy on every boot. stage2 extracts the tarball to the
@@ -336,17 +329,16 @@ tmpfs root.
    - third — tmpfs (last fallback).
 
    This matters: previously the disk was mounted only at
-   `/var/lib/containerd`, while `/var/lib/nerdctl` (volumes, metadata) and
-   `/var/lib/cni` stayed on the tmpfs root. When volumes filled up (e.g.
-   PostgreSQL), tmpfs ran out and `docker ps` slowed down because of an
-   overflowing/fragmented `nerdctl` state. Now all of `/var/lib` is
-   persistent.
+   `/var/lib/containerd`, while the rest of `/var/lib` stayed on the tmpfs
+   root. When volumes filled up (e.g. PostgreSQL), tmpfs ran out. Now all
+   of `/var/lib` is persistent (a lesson from the early nerdctl-based
+   design).
 4. Loads the netfilter/bridge/veth modules;
 5. Adds an iptables MASQUERADE rule for DNATed TCP (fixes asymmetric
    routing under VZ NAT);
 6. Starts containerd and immediately `exec`s the guest-agent — the
    containerd-socket wait, the orphaned-container cleanup (low-level `ctr`,
-   not `nerdctl rm`, to avoid waiting on a hung shim) and the DHCP lease
+   not the containerd client's rm, to avoid waiting on a hung shim) and the DHCP lease
    wait all run inside the agent (`runBootFinalize`) after its control
    channel is up. The Docker API server on vsock:1025 and exec'd commands
    wait on that finalize (bounded), so container operations never race a
@@ -450,8 +442,8 @@ A virtio-blk disk `~/.anvil-vz/containerd-disk.img` (ext4) is used. Why:
 #### Writeback cache and synchronization mode
 
 By default `VZDiskImageStorageDeviceAttachment` works in `.full` mode:
-every guest fsync triggers a flush on the host. For nerdctl/containerd,
-which constantly issue small metadata writes, this resulted in
+every guest fsync triggers a flush on the host. For containerd, which
+constantly issues small metadata writes, this resulted in
 `docker stop`/`docker compose down` taking the full graceful timeout of 10 s
 each, and `docker run --rm alpine` — 4+ s.
 

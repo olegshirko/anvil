@@ -70,10 +70,10 @@ and `buildkit.sock`), and the guest side is `main.go`, `dockerapi.go`, `buildkit
 `PortForwarder.swift`, which does a replace (open new, close gone). TCP goes host listener
 → guest port proxy (`portproxy.go`, length-prefixed JSON header naming
 `containerIP:containerPort`) because the host has no route into `10.10.x`; UDP is relayed
-straight to `guestIP:hostPort`. Ports are deliberately **not** passed to nerdctl — nerdctl
-reserves them at create time, which breaks `docker compose up` over live containers. The
-mappings are persisted into nerdctl's `network-config.json` so ps/inspect/scanner see them,
-and conflict checks live in `main.go` at start time.
+straight to `guestIP:hostPort`. Host ports are deliberately never bound at create time —
+that breaks `docker compose up` over live containers. The mappings are persisted in the
+guest-agent's own store so ps/inspect/scanner see them, and conflict checks live at start
+time.
 
 **Snapshot resume, not reboot.** `VMLifecycleManager` + `SnapshotManager` pause the VM into
 `~/.anvil-vz/snapshots/default.vzstate` and restore from it. The snapshot is keyed by a
@@ -93,16 +93,14 @@ The Docker API and exec wait on that finalize (bounded); `status`/`health` does 
 - `/_ping` must return `Ostype` and `Api-Version` headers; we advertise 1.51 / min 1.24.
 - `POST /containers/{id}/wait` must send headers immediately (chunked) *then* block — the
   CLI calls `/wait` before `/start` on the same connection.
-- `AutoRemove` and `--restart` are handled by the agent, not passed to nerdctl. nerdctl's
-  own supervisor races Docker semantics; `restart.go` reads authoritative task state from
-  containerd and owns the policy.
+- `AutoRemove` and `--restart` are handled by the agent itself; `restart.go` reads
+  authoritative task state from containerd and owns the policy.
 - Hijacked exec/attach stdin is a raw byte stream (only output is multiplexed), and the
   stdin pipe must close on output EOF or buildx deadlocks.
 - Image refs are canonicalized before pull/lookup (`postgres:15.5` →
   `docker.io/library/postgres:15.5`).
-- Compose network labels are persisted to `/mnt/anvil/networks/<name>.json` — `nerdctl
-  network inspect` does not return labels for bridge networks, and without them compose
-  treats the network as external after a cold boot.
+- Compose network labels are persisted to `/mnt/anvil/networks/<name>.json`; without them
+  compose treats the network as external after a cold boot.
 - Each compose project gets its own containerd namespace and CNI bridge; subnet is
   deterministic: `10.10.<hash(project) % 250 + 1>.0/24`.
 

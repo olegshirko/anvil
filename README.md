@@ -137,7 +137,7 @@ gets proxied, byte for byte, into the VM:
 
 What a `docker run` actually does: the CLI POSTs to `docker.sock` →
 vz-runner pumps the bytes over virtio-vsock → guest-agent translates the
-Docker API into nerdctl/containerd calls, tracks ports and policies →
+Docker API into native containerd calls, tracks ports and policies →
 the port scanner pushes the new mappings back over vsock → vz-runner
 opens a `localhost` listener and relays into the guest. No daemon chain
 on the host, no network stack in userspace.
@@ -167,11 +167,13 @@ Why it's fast — the decisions that matter:
   `-v $HOME/...:/path` and compose relative volumes need no rewriting.
 - **Per-project networking.** Each compose project gets its own containerd
   namespace and CNI bridge; subnets are deterministic per project name.
-- **`docker build` two ways.** The buildkitd socket is forwarded to the
-  host (`~/.anvil-vz/buildkit.sock`) so `docker buildx build` works via
-  the remote driver without pulling a moby/buildkit container; the
-  classic `POST /build` path runs `nerdctl build` in the VM. buildkitd
-  starts lazily — nothing runs until your first build.
+- **`docker build`, natively.** buildkitd runs in the guest and is reached
+  two ways: the socket is forwarded to the host
+  (`~/.anvil-vz/buildkit.sock`) for the buildx remote driver, and plain
+  `docker build` / `docker compose build` go through a gRPC bridge on the
+  Docker API socket straight into the same buildkitd — no moby/buildkit
+  container is ever pulled. buildkitd starts lazily — nothing runs until
+  your first build.
 
 The full rationale — every trade-off, benchmark, and post-mortem — is in
 [ARCHITECTURE.md](ARCHITECTURE.md).

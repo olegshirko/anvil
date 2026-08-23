@@ -206,7 +206,7 @@ func containerStatsReading(ctx context.Context, id string) map[string]interface{
 }
 
 // connectContainerNetwork attaches a running container to another network.
-// nerdctl has no `network connect` subcommand, so live attach is not
+// Live network attach is not
 // supported by the runtime; return a Docker-shaped, actionable error
 // instead of a bare 404.
 func connectContainerNetwork(network, container string) error {
@@ -214,7 +214,7 @@ func connectContainerNetwork(network, container string) error {
 }
 
 // disconnectContainerNetwork detaches a container from a network.
-// Not supported by the runtime (nerdctl has no `network disconnect`).
+// Not supported by the runtime.
 func disconnectContainerNetwork(network, container string) error {
 	return fmt.Errorf("network disconnect is not supported by the runtime; recreate the container without --network %s", network)
 }

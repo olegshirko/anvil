@@ -162,7 +162,7 @@ func loadFromMirror(ctx context.Context, ref, ns string) error {
 // namespace. If the image already exists there, it returns nil. If it exists
 // in another namespace, the image is streamed into the target namespace
 // (containerd's content store is namespaced, so a bare metadata copy would
-// leave a dangling pointer and nerdctl would fall back to a registry pull).
+// leave a dangling pointer pointing at blobs the target namespace cannot see).
 // Otherwise it is pulled into the target namespace.
 func ensureImageInNamespace(ctx context.Context, ref, targetNs string) error {
 	cl, err := pc.get(ctx)
@@ -675,7 +675,7 @@ func findImageNamespace(ctx context.Context, ref string) string {
 	// archives under an unnormalized name. A tagless ref must NOT match an
 	// image with a different tag: a namespace holding only "nginx:alpine"
 	// does not satisfy a request for "nginx" (= nginx:latest), and returning
-	// it would make the subsequent nerdctl inspect in that namespace fail
+	// it would make the subsequent image lookup in that namespace fail
 	// with "no such image".
 	canonical := canonicalizeImageRef(ref)
 	// buildkit's image exporter registers the name attribute verbatim, so a

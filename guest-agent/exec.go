@@ -171,7 +171,7 @@ func startDetachedExec(id string) error {
 	return nil
 }
 
-// handleExecStart hijacks the HTTP connection, runs nerdctl exec, and streams
+// handleExecStart hijacks the HTTP connection, runs a containerd exec process, and streams
 // stdout/stderr using Docker's raw-stream multiplexing format.
 func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	spec := execs.get(id)

@@ -316,7 +316,7 @@ func runExec(args []string) Response {
 
 	// Drain stdout and stderr concurrently: sequential reads deadlock as soon
 	// as the child writes more than a pipe buffer (64 KiB) to stderr while
-	// stdout stays open (e.g. nerdctl compose progress output).
+	// stdout stays open (e.g. docker compose progress output).
 	var outBuf, errBuf bytes.Buffer
 	var wg sync.WaitGroup
 	wg.Add(2)

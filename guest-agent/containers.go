@@ -517,7 +517,7 @@ func containerStatus(ns, name string) string {
 	return status
 }
 
-func isNerdctlContainerRunning(ns, name string) bool {
+func isContainerRunning(ns, name string) bool {
 	running, _, ok := func() (bool, string, bool) {
 		ctx := context.Background()
 		id := resolveContainerdIDByName(ctx, ns, name)
@@ -736,7 +736,7 @@ func pruneStaleContainerMeta() {
 }
 
 // containerHostPorts returns the TCP host ports published by the container,
-// read from the nerdctl port-mapping metadata.
+// read from the agent-persisted port-mapping metadata.
 func containerHostPorts(ctx context.Context, ns, containerdID string) []int {
 	cl, err := pc.get(ctx)
 	if err != nil {
@@ -796,8 +796,8 @@ func startDockerContainer(ctx context.Context, id string) error {
 	// docker --link: append alias -> target-IP entries to THIS container's
 	// /etc/hosts BEFORE the task runs, so the very first lookup inside the
 	// container already resolves (legacy link semantics are plain /etc/hosts
-	// records). nerdctl prepares the hosts file at create; the post-start
-	// application below covers restarts and any nerdctl rewrites.
+	// records). The hosts file is prepared at create; the post-start
+	// application below covers restarts.
 	if links := pendingLinkEntries(dockerID(ns, containerdID)); len(links) > 0 {
 		applyLinkAliases(ctx, ns, containerdID, links)
 	}
@@ -807,7 +807,7 @@ func startDockerContainer(ctx context.Context, id string) error {
 	}
 	// Service-name DNS: append the container's compose aliases (e.g. "web")
 	// to the /etc/hosts bind mounts of every running container on the same
-	// network. nerdctl has no --network-alias, and compose resolves service
+	// network. compose resolves service
 	// dependencies by name (`db`, `web`), not by container name.
 	if len(pendingNetworkAliases(containerdID)) > 0 {
 		go applyNetworkAliases(ns, containerdID)
@@ -824,7 +824,7 @@ func startDockerContainer(ctx context.Context, id string) error {
 	}
 
 	// For AutoRemove containers we wait for the exit code ourselves and then
-	// delete the container. nerdctl --rm would delete too early for /wait.
+	// delete the container. Deleting earlier would break /wait.
 	if isAutoRemove(did) {
 		go func() {
 			code, _ := waitContainerTask(context.Background(), ns, containerdID)
@@ -842,7 +842,7 @@ func startDockerContainer(ctx context.Context, id string) error {
 }
 
 // stopDockerContainer stops a container by Docker ID or name and waits until
-// the containerd task actually reaches the stopped state. nerdctl stop can
+// the containerd task actually reaches the stopped state.
 // return before the task exits, which makes a subsequent `docker rm` fail with
 // "container is in running status".
 func stopDockerContainer(ctx context.Context, id string, timeout int) error {
