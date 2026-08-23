@@ -148,9 +148,6 @@ func streamTaskLogToTTY(out io.Writer, ns, id string, follow bool, tty bool) {
 			_, writeErr = out.Write(line)
 		} else {
 			writeErr = writeDockerStream(out, stream, line)
-			if writeErr == nil {
-				writeErr = writeDockerStream(out, stream, []byte("\n"))
-			}
 		}
 		if writeErr != nil {
 			panic(errWriteFailed) // unwind readTaskLog's follow loop
@@ -165,18 +162,27 @@ func streamTaskLogToTTY(out io.Writer, ns, id string, follow bool, tty bool) {
 	}()
 
 	logPath := containerLogPath(ns, id)
-	// Attach often arrives before the client issues start. Wait briefly for
-	// the container to leave the "created" state, otherwise a short-lived
-	// container may start, print and exit while we are still replaying
-	// nothing — and its output is lost.
-	for i := 0; i < 100; i++ {
-		status := containerStatus(ns, id)
-		if status != "" && status != "created" && status != "paused" {
-			break
+
+	// Follow mode must end when the task dies (docker run attaches BEFORE
+	// start, so "not running yet" alone is not a stop condition — only a
+	// task that has actually left the running state ends the stream).
+	wasRunning := false
+	stop := func() bool {
+		if !follow {
+			return true
 		}
-		time.Sleep(50 * time.Millisecond)
+		running, status, ok := containerTaskState(context.Background(), ns, id)
+		if ok && running {
+			wasRunning = true
+			return false
+		}
+		if !wasRunning && (!ok || status == "" || status == "created" || status == "paused") {
+			return false // created but not started yet; keep waiting
+		}
+		return true
 	}
-	_ = readTaskLog(logPath, logReadOptions{follow: follow, tail: -1}, emit)
+
+	_ = readTaskLog(logPath, logReadOptions{follow: follow, tail: -1, stop: stop}, emit)
 }
 
 // errWriteFailed unwinds readTaskLog when the HTTP client disconnects.
@@ -272,11 +278,11 @@ func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
 	flusher, _ := w.(http.Flusher)
 	emit := func(stream byte, line []byte) {
 		writeDockerStream(w, stream, line)
-		writeDockerStream(w, stream, []byte("\n"))
 		if flusher != nil {
 			flusher.Flush()
 		}
 	}
+	opts.stop = func() bool { return !opts.follow }
 	_ = readTaskLog(containerLogPath(ns, containerdID), opts, emit)
 }
 

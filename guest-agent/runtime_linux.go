@@ -118,16 +118,15 @@ func (m *cniManager) forConflist(path string) (cniclient.CNI, error) {
 	if c, ok := m.byFile[path]; ok {
 		return c, nil
 	}
+	// WithConfListFile parses the conflist and registers the network right
+	// away. Do NOT call Load afterwards: it resets the network list.
 	c, err := cniclient.New(
-		cniclient.WithConfListFile(path),
 		cniclient.WithPluginDir([]string{cniBinDir}),
 		cniclient.WithInterfacePrefix("eth"),
+		cniclient.WithConfListFile(path),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("cni init %s: %w", path, err)
-	}
-	if err := c.Load(cniclient.WithPluginDir([]string{cniBinDir})); err != nil {
-		return nil, fmt.Errorf("cni load %s: %w", path, err)
 	}
 	m.byFile[path] = c
 	return c, nil
@@ -170,13 +169,7 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 	if err != nil {
 		return "", "", err
 	}
-	opts := []cniclient.NamespaceOpts{
-		cniclient.WithLabels(map[string]string{
-			"containerID":   id,
-			"namespace":     ns,
-			"anvilNetwork":  netName,
-		}),
-	}
+	var opts []cniclient.NamespaceOpts
 	if len(ports) > 0 {
 		pms := make([]cniclient.PortMapping, 0, len(ports))
 		for _, p := range ports {
@@ -212,9 +205,7 @@ func detachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 	if err != nil {
 		return err
 	}
-	opts := []cniclient.NamespaceOpts{
-		cniclient.WithLabels(map[string]string{"containerID": id, "namespace": ns}),
-	}
+	var opts []cniclient.NamespaceOpts
 	if len(ports) > 0 {
 		pms := make([]cniclient.PortMapping, 0, len(ports))
 		for _, p := range ports {

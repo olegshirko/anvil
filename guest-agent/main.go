@@ -62,8 +62,8 @@ func main() {
 
 	// Hidden logging subcommand: the containerd shim spawns us as the
 	// binary-v2 task logger (fd3/fd4 = stdout/stderr, fd5 = ready pipe).
-	// Invoked as: guest-agent --log-json <path> log-path <path>
-	if len(os.Args) > 3 && os.Args[1] == "--log-json" {
+	// Invoked as: guest-agent --log-json <path>
+	if len(os.Args) >= 3 && os.Args[1] == "--log-json" {
 		if err := runJSONLogger(os.Args[2]); err != nil {
 			log.Fatalf("log-json: %v", err)
 		}

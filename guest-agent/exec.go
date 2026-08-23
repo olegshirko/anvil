@@ -265,8 +265,6 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		spec.setExit(126)
 		return
 	}
-	stdoutW.Close()
-	stderrW.Close()
 
 	var wg sync.WaitGroup
 	writeMu := &sync.Mutex{}
@@ -294,6 +292,14 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	go stream(stdoutR, 1)
 	go stream(stderrR, 2)
 
+	if serr := process.Start(nsCtx); serr != nil {
+		wg.Wait()
+		stdoutR.Close()
+		stderrR.Close()
+		spec.setExit(126)
+		return
+	}
+
 	exitCh, werr := process.Wait(nsCtx)
 	if werr != nil {
 		wg.Wait()
@@ -302,7 +308,12 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	st := <-exitCh
 
-	// Close stdin so the client sees EOF semantics; then drain output.
+	// Wait for the client-side fifo copy goroutines to drain the process
+	// output into our pipes, then close the write ends so the stream
+	// readers see EOF and finish.
+	process.IO().Wait()
+	stdoutW.Close()
+	stderrW.Close()
 	if stdinWriteCloser != nil {
 		stdinWriteCloser.Close()
 	}
@@ -315,6 +326,8 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		exitCode = int(st.ExitCode())
 	}
 	process.Delete(context.Background()) //nolint:errcheck
+	stdoutR.Close()
+	stderrR.Close()
 	spec.setExit(exitCode)
 
 	bufrw.Flush()

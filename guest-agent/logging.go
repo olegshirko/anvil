@@ -135,8 +135,9 @@ type logReadOptions struct {
 	follow     bool
 	tail       int // -1 = all records
 	timestamps bool
-	since      time.Time // zero = no lower bound
-	until      time.Time // zero = no upper bound
+	since      time.Time    // zero = no lower bound
+	until      time.Time    // zero = no upper bound
+	stop       func() bool  // polled during follow; true ends the stream
 }
 
 // readTaskLog replays the container's json-file log. Each decoded record is
@@ -190,15 +191,32 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	if !opts.follow {
 		return nil
 	}
-	f, err := os.Open(logPath)
-	if err != nil {
-		return nil // nothing to follow
+
+	// The log file appears only when the task starts (the shim spawns the
+	// logging binary then). docker run attaches BEFORE start, so poll until
+	// the file shows up or the stop condition fires.
+	var f *os.File
+	for {
+		var oerr error
+		f, oerr = os.Open(logPath)
+		if oerr == nil {
+			break
+		}
+		if opts.stop != nil && opts.stop() {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	defer f.Close()
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		return err
 	}
 	br := bufio.NewReader(f)
+
+	// The stop condition can fire a moment before the logging binary
+	// finishes flushing; require it three times in a row (~300 ms) so the
+	// tail of the output is not cut off.
+	stopCount := 0
 	for {
 		raw, err := br.ReadBytes('\n')
 		if len(raw) > 0 {
@@ -208,7 +226,17 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 			}
 		}
 		if err != nil {
+			if opts.stop != nil && opts.stop() {
+				stopCount++
+				if stopCount >= 3 {
+					return nil
+				}
+			} else {
+				stopCount = 0
+			}
 			time.Sleep(100 * time.Millisecond)
+		} else {
+			stopCount = 0
 		}
 	}
 }

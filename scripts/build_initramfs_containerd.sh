@@ -108,7 +108,7 @@ for applet in mount umount mkdir mknod sleep sh insmod modprobe \
               uname id cat ls ps echo printf chmod chown \
               kill killall pwd whoami hostname udhcpc ifconfig \
               ip grep ntpd switch_root cp rm mv head mountpoint \
-              tar gzip gunzip dirname sync du date awk touch find fstrim; do
+              tar gzip gunzip dirname sync du date awk touch find fstrim ln; do
     ln -sf busybox "bin/$applet"
 done
 
@@ -161,6 +161,14 @@ cat > etc/buildkit/buildkitd.toml <<'BKTEOF'
 [worker.containerd]
   enabled = true
   namespace = "default"
+
+# BuildKit resolves registry auth endpoints itself; its embedded resolver
+# intermittently times out on auth.docker.io behind the VZ NAT DNS forwarder
+# while every other process in the VM resolves fine. Point it at public
+# resolvers directly (reachable regardless of which network the host is on,
+# same fallback the pre-lease resolv.conf uses).
+[dns]
+  nameservers = ["8.8.8.8", "8.8.4.4", "1.1.1.1"]
 BKTEOF
 # UPX lives in PATH in CI (apk add upx); the offline Lima build VM has no
 # package network access, so fall back to the prebuilt static binary fetched

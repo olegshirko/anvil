@@ -375,15 +375,18 @@ func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user,
 		stderrR.Close()
 		return nil, err
 	}
-	// Close write ends in the parent; the readers see EOF when exec exits.
-	stdoutW.Close()
-	stderrW.Close()
-
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 	wctx, cancel := context.WithTimeout(nsCtx, timeout)
 	defer cancel()
+
+	if serr := process.Start(wctx); serr != nil {
+		process.Delete(context.Background()) //nolint:errcheck
+		stdoutR.Close()
+		stderrR.Close()
+		return nil, fmt.Errorf("exec start: %w", serr)
+	}
 
 	exitCh, werr := process.Wait(wctx)
 	if werr != nil {
@@ -412,12 +415,27 @@ func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user,
 	go readAll(stdoutR, &outBuf, done1)
 	go readAll(stderrR, &errBuf, done2)
 
-	st, waited := <-exitCh
-	if !waited {
-		cancel()
+	var st client.ExitStatus
+	select {
+	case s, ok := <-exitCh:
+		if !ok {
+			return nil, fmt.Errorf("exec wait cancelled")
+		}
+		st = s
+	case <-wctx.Done():
+		kctx, kcancel := context.WithTimeout(nsCtx, 3*time.Second)
+		process.Kill(kctx, syscall.SIGKILL) //nolint:errcheck
+		kcancel()
+		stdoutW.Close()
+		stderrW.Close()
 		return &simpleExecResult{stdout: outBuf.String(), stderr: errBuf.String(), exitCode: 124},
 			fmt.Errorf("exec timed out after %s", timeout)
 	}
+
+	// Drain the client-side fifo copies before closing our write ends.
+	process.IO().Wait()
+	stdoutW.Close()
+	stderrW.Close()
 	<-done1
 	<-done2
 
