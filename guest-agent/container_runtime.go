@@ -284,6 +284,21 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 
 	opts := []oci.SpecOpts{
 		oci.WithProcessArgs(argv...),
+		// Private cgroup namespace (docker default on cgroup v2): runc then
+		// mounts the container's own cgroup subtree at /sys/fs/cgroup, so
+		// limits like memory.max are visible inside.
+		func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+			s.Linux.Namespaces = append(s.Linux.Namespaces, specs.LinuxNamespace{Type: specs.CgroupNamespace})
+			// runc swaps this for the container's own cgroup2 subtree when
+			// the cgroup namespace is private.
+			s.Mounts = append(s.Mounts, specs.Mount{
+				Destination: "/sys/fs/cgroup",
+				Type:        "cgroup",
+				Source:      "cgroup",
+				Options:     []string{"ro", "nosuid", "nodev", "noexec", "relatime"},
+			})
+			return nil
+		},
 		oci.WithEnv(env),
 		oci.WithProcessCwd(cwd),
 		oci.WithHostname(hostname),
@@ -341,7 +356,20 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 	if len(mounts) > 0 {
 		opts = append(opts, oci.WithMounts(mounts))
 	}
-	if !hostNet {
+	if hostNet {
+		// Drop the default (fresh, empty) network namespace so the task
+		// shares the guest's own netns — that is what host networking is.
+		opts = append(opts, func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+			kept := s.Linux.Namespaces[:0]
+			for _, n := range s.Linux.Namespaces {
+				if n.Type != specs.NetworkNamespace {
+					kept = append(kept, n)
+				}
+			}
+			s.Linux.Namespaces = kept
+			return nil
+		})
+	} else {
 		opts = append(opts, oci.WithLinuxNamespace(specs.LinuxNamespace{
 			Type: specs.NetworkNamespace,
 			Path: netnsPathFor(id),

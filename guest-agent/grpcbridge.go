@@ -2,14 +2,21 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	control "github.com/moby/buildkit/api/services/control"
 	pb "github.com/moby/buildkit/frontend/gateway/pb"
+	solverpb "github.com/moby/buildkit/solver/pb"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -311,7 +318,80 @@ type llbBridge struct {
 func (b *llbBridge) client() pb.LLBBridgeClient { return pb.NewLLBBridgeClient(b.cc) }
 
 func (b *llbBridge) ResolveImageConfig(ctx context.Context, req *pb.ResolveImageConfigRequest) (*pb.ResolveImageConfigResponse, error) {
+	if resp, ok := localImageConfig(ctx, req.Ref, req.Platform); ok {
+		return resp, nil
+	}
 	return b.client().ResolveImageConfig(outgoing(ctx), req)
+}
+
+// localImageConfig answers a FROM resolution from the guest's containerd
+// image store when the image is already present — Docker semantics (a local
+// base image is used as-is) and, critically, a build keeps working when the
+// registry is unreachable (the VZ NAT network path to Docker Hub is flaky).
+func localImageConfig(ctx context.Context, ref string, platform *solverpb.Platform) (*pb.ResolveImageConfigResponse, bool) {
+	if ref == "" || strings.HasPrefix(ref, "sha256:") {
+		return nil, false
+	}
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return nil, false
+	}
+	canonical := canonicalizeImageRef(ref)
+	ns := findImageNamespace(ctx, ref)
+	if ns == "" {
+		return nil, false
+	}
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	img, err := cl.GetImage(nsCtx, canonical)
+	if err != nil {
+		return nil, false
+	}
+	cstore := cl.ContentStore()
+	// The image target may be an index (multi-arch): pick the manifest
+	// matching the platform, defaulting to the first arm64/linux child.
+	target := img.Target()
+	if images.IsIndexType(target.MediaType) {
+		var idx ocispec.Index
+		if data, rerr := content.ReadBlob(nsCtx, cstore, target); rerr == nil {
+			if json.Unmarshal(data, &idx) == nil {
+				for _, m := range idx.Manifests {
+					if m.Platform == nil {
+						continue
+					}
+					if platformMatches(m.Platform, platform) {
+						target = m
+						break
+					}
+				}
+			}
+		}
+	}
+	if !images.IsManifestType(target.MediaType) {
+		return nil, false
+	}
+	var man ocispec.Manifest
+	if data, rerr := content.ReadBlob(nsCtx, cstore, target); rerr != nil {
+		return nil, false
+	} else if json.Unmarshal(data, &man) != nil {
+		return nil, false
+	}
+	cfg, cerr := content.ReadBlob(nsCtx, cstore, man.Config)
+	if cerr != nil {
+		return nil, false
+	}
+	debugLog("grpc-bridge: resolved %s from local store (%s)", ref, ns)
+	return &pb.ResolveImageConfigResponse{
+		Digest: string(target.Digest),
+		Config: cfg,
+		Ref:    canonical,
+	}, true
+}
+
+func platformMatches(p *ocispec.Platform, want *solverpb.Platform) bool {
+	if want == nil {
+		return p.Architecture == "arm64" || p.Architecture == runtime.GOARCH
+	}
+	return p.OS == want.OS && p.Architecture == want.Architecture
 }
 
 func (b *llbBridge) ResolveSourceMeta(ctx context.Context, req *pb.ResolveSourceMetaRequest) (*pb.ResolveSourceMetaResponse, error) {

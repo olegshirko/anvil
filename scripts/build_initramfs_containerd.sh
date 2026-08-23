@@ -484,9 +484,18 @@ bound|renew)
     ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}" ${broadcast:+broadcast $broadcast} up
     # busybox in this initramfs has no `route` applet; `ip route` is present.
     for r in $router; do ip route replace default via "$r" dev "$interface"; done
+    # Public resolvers FIRST, the NAT gateway's forwarder LAST: Go's pure
+    # resolver ignores "single-request" and sends A/AAAA in parallel, and the
+    # VZ NAT DNS forwarder sporadically drops one of the two — with
+    # attempts:2 the query is then retried on the next (public) server
+    # instead of exhausting every attempt on the broken forwarder. The lease
+    # DNS stays reachable for VPN/restricted networks where public UDP 53 is
+    # blocked.
     : > /etc/resolv.conf
+    echo "nameserver 8.8.8.8" > /etc/resolv.conf
+    echo "nameserver 1.1.1.1" >> /etc/resolv.conf
     for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done
-    echo "options single-request timeout:1 attempts:3" >> /etc/resolv.conf
+    echo "options timeout:1 attempts:2" >> /etc/resolv.conf
     ;;
 deconfig)
     ifconfig "$interface" 0.0.0.0 up

@@ -67,7 +67,9 @@ func ensureBuildkitd() error {
 	if err := os.MkdirAll("/var/lib/buildkit", 0o755); err != nil {
 		return err
 	}
-	logFile, err := os.OpenFile("/tmp/buildkitd.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	// The log lives on the virtiofs share so host-side debugging does not
+	// need guest shell access.
+	logFile, err := os.OpenFile("/mnt/anvil/buildkitd.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}

@@ -379,7 +379,10 @@ func runSimpleExec(ctx context.Context, ns, id string, argv []string, user, cwd 
 }
 
 // runSimpleExecStdin additionally feeds the given bytes to the exec's stdin
-// (nil = closed stdin).
+// (nil = closed stdin). Mirrors the lifecycle of handleExecStart (exec.go),
+// the battle-tested path: create with attached streams, Start, Wait, drain
+// the cio copiers via IO().Wait, then close the parent write ends so the
+// pipe readers see EOF.
 func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user, cwd string, stdin []byte, timeout time.Duration) (*simpleExecResult, error) {
 	cl, err := pc.get(ctx)
 	if err != nil {
@@ -433,23 +436,6 @@ func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user,
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	wctx, cancel := context.WithTimeout(nsCtx, timeout)
-	defer cancel()
-
-	if serr := process.Start(wctx); serr != nil {
-		process.Delete(context.Background()) //nolint:errcheck
-		stdoutR.Close()
-		stderrR.Close()
-		return nil, fmt.Errorf("exec start: %w", serr)
-	}
-
-	exitCh, werr := process.Wait(wctx)
-	if werr != nil {
-		process.Delete(wctx) //nolint:errcheck
-		stdoutR.Close()
-		stderrR.Close()
-		return nil, werr
-	}
 
 	var outBuf, errBuf strings.Builder
 	readAll := func(r *os.File, sb *strings.Builder, done chan struct{}) {
@@ -470,6 +456,29 @@ func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user,
 	go readAll(stdoutR, &outBuf, done1)
 	go readAll(stderrR, &errBuf, done2)
 
+	if serr := process.Start(nsCtx); serr != nil {
+		stdoutW.Close()
+		stderrW.Close()
+		<-done1
+		<-done2
+		process.Delete(context.Background()) //nolint:errcheck
+		stdoutR.Close()
+		stderrR.Close()
+		return nil, fmt.Errorf("exec start: %w", serr)
+	}
+
+	exitCh, werr := process.Wait(nsCtx)
+	if werr != nil {
+		stdoutW.Close()
+		stderrW.Close()
+		<-done1
+		<-done2
+		process.Delete(context.Background()) //nolint:errcheck
+		stdoutR.Close()
+		stderrR.Close()
+		return nil, werr
+	}
+
 	var st client.ExitStatus
 	select {
 	case s, ok := <-exitCh:
@@ -477,17 +486,23 @@ func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user,
 			return nil, fmt.Errorf("exec wait cancelled")
 		}
 		st = s
-	case <-wctx.Done():
+	case <-time.After(timeout):
 		kctx, kcancel := context.WithTimeout(nsCtx, 3*time.Second)
 		process.Kill(kctx, syscall.SIGKILL) //nolint:errcheck
 		kcancel()
 		stdoutW.Close()
 		stderrW.Close()
+		<-done1
+		<-done2
+		process.Delete(context.Background()) //nolint:errcheck
+		stdoutR.Close()
+		stderrR.Close()
 		return &simpleExecResult{stdout: outBuf.String(), stderr: errBuf.String(), exitCode: 124},
 			fmt.Errorf("exec timed out after %s", timeout)
 	}
 
-	// Drain the client-side fifo copies before closing our write ends.
+	// Drain the client-side fifo copiers before closing our write ends,
+	// exactly like handleExecStart.
 	process.IO().Wait()
 	stdoutW.Close()
 	stderrW.Close()

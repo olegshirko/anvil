@@ -161,21 +161,29 @@ func createContainerTar(ns, containerdID, srcPath string) (string, error) {
 }
 
 // extractTarIntoContainer extracts a host-side tar stream into the container.
-// Running containers get the stream piped to an in-container `tar -xf -`;
-// stopped containers have their rootfs snapshot mounted and extracted on the
-// guest directly (the buildx docker-container driver stages files this way).
+// An in-container `tar -xf -` via exec-with-stdin is NOT used: containerd's
+// cio stdin fifo does not deliver EOF reliably for one-shot writers, so the
+// extract hangs. Running containers get the tar extracted straight into the
+// task's live rootfs mount; stopped containers get their rootfs snapshot
+// mounted (the buildx docker-container driver stages files this way).
 func extractTarIntoContainer(ns, containerdID string, tarStream []byte, dstPath string) error {
-	script := fmt.Sprintf("mkdir -p %s && tar -xf - -C %s", shellescape(dstPath), shellescape(dstPath))
 	running, _, stateOK := containerTaskState(context.Background(), ns, containerdID)
 	if stateOK && running {
-		res, err := runSimpleExecStdin(context.Background(), ns, containerdID,
-			[]string{"sh", "-c", script}, "0", "/", tarStream, 5*time.Minute)
-		if err != nil || res.exitCode != 0 {
-			return fmt.Errorf("tar extract failed (%d): %s%s", codeOf(res), stripANSI(outOf(res)), stripANSI(errOf(res)))
+		rootfs := filepath.Join("/run/containerd/io.containerd.runtime.v2.task", ns, containerdID, "rootfs")
+		if _, err := os.Stat(rootfs); err == nil {
+			target := filepath.Join(rootfs, filepath.Clean("/"+dstPath))
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			extract := exec.Command("/bin/tar", "-xf", "-", "-C", target)
+			extract.Stdin = strings.NewReader(string(tarStream))
+			if out, err := extract.CombinedOutput(); err != nil {
+				return fmt.Errorf("tar extract: %v: %s", err, stripANSI(string(out)))
+			}
+			return nil
 		}
-		return nil
+		// Fall through to the snapshot mount if the runtime dir is gone.
 	}
-	// Not running: mount the rootfs snapshot and extract there.
 	return extractTarIntoSnapshot(ns, containerdID, tarStream, dstPath)
 }
 
