@@ -18,6 +18,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/platforms"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -273,6 +274,22 @@ func pullImageIntoNamespace(ctx context.Context, canonicalRef, ns string) error 
 	return err
 }
 
+// saveScratchNs stages images for docker save so every blob sits in a
+// single namespace before the archive export.
+const saveScratchNs = "anvil-save-tmp"
+
+// pullImageAllPlatforms pulls every platform of a (possibly multi-arch)
+// image so the full index can be exported by docker save.
+func pullImageAllPlatforms(ctx context.Context, canonicalRef, ns string) error {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return fmt.Errorf("containerd client: %w", err)
+	}
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	_, err = cl.Pull(nsCtx, canonicalRef, client.WithPlatformMatcher(platforms.All))
+	return err
+}
+
 // putImage creates or updates an image record.
 func putImage(cl *client.Client, nsCtx context.Context, img images.Image) error {
 	if _, err := cl.ImageService().Create(nsCtx, img); err != nil {
@@ -283,12 +300,182 @@ func putImage(cl *client.Client, nsCtx context.Context, img images.Image) error 
 	return nil
 }
 
+// blobCopier copies image trees between containerd namespaces, resolving
+// each blob in any namespace (image records and their blobs often live in
+// different ones after projects are pruned and content is GC'd).
+type blobCopier struct {
+	cs       content.Store
+	cl       *client.Client
+	srcCtxs  []context.Context
+	dstCtx   context.Context
+}
+
+func newBlobCopier(ctx context.Context, cl *client.Client, srcNs, dstNs string) *blobCopier {
+	cs := cl.ContentStore()
+	srcCtxs := []context.Context{namespaces.WithNamespace(ctx, srcNs)}
+	if nss, lerr := cl.NamespaceService().List(ctx); lerr == nil {
+		for _, ns := range nss {
+			if ns != srcNs && ns != dstNs {
+				srcCtxs = append(srcCtxs, namespaces.WithNamespace(ctx, ns))
+			}
+		}
+	}
+	return &blobCopier{
+		cs:      cs,
+		cl:      cl,
+		srcCtxs: srcCtxs,
+		dstCtx:  namespaces.WithNamespace(ctx, dstNs),
+	}
+}
+
+func (bc *blobCopier) blobCtx(d ocispec.Descriptor) context.Context {
+	for _, c := range bc.srcCtxs {
+		if _, ierr := bc.cs.Info(c, d.Digest); ierr == nil {
+			return c
+		}
+	}
+	return bc.srcCtxs[0]
+}
+
+// copyTree copies d and everything below it into the destination namespace.
+func (bc *blobCopier) copyTree(d ocispec.Descriptor) error {
+	if _, ierr := bc.cs.Info(bc.dstCtx, d.Digest); ierr == nil {
+		return nil // blob already visible in the destination namespace
+	}
+	bctx := bc.blobCtx(d)
+	switch d.MediaType {
+	case ocispec.MediaTypeImageIndex, images.MediaTypeDockerSchema2ManifestList:
+		var idx ocispec.Index
+		if data, rerr := readBlobAll(bctx, bc.cs, d); rerr == nil {
+			if jerr := json.Unmarshal(data, &idx); jerr == nil {
+				for _, child := range idx.Manifests {
+					if cerr := bc.copyTree(child); cerr != nil {
+						return cerr
+					}
+				}
+			}
+		}
+	case ocispec.MediaTypeImageManifest, images.MediaTypeDockerSchema2Manifest:
+		var man ocispec.Manifest
+		if data, rerr := readBlobAll(bctx, bc.cs, d); rerr == nil {
+			if jerr := json.Unmarshal(data, &man); jerr == nil {
+				if cerr := bc.copyTree(man.Config); cerr != nil {
+					return cerr
+				}
+				for _, layer := range man.Layers {
+					if cerr := bc.copyTree(layer); cerr != nil {
+						return cerr
+					}
+				}
+			}
+		}
+	}
+	return bc.copyBlob(bctx, d)
+}
+
+func (bc *blobCopier) copyBlob(bctx context.Context, d ocispec.Descriptor) error {
+	w, err := bc.cs.Writer(bc.dstCtx, content.WithDescriptor(d), content.WithRef("anvil-copy-"+d.Digest.String()))
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+	// A writer handed an existing ingest ref resumes at its last offset;
+	// always restart from zero so the copy is exactly the descriptor bytes.
+	if err := w.Truncate(0); err != nil {
+		return fmt.Errorf("truncate ingest: %w", err)
+	}
+	ra, err := bc.cs.ReaderAt(bctx, d)
+	if err != nil {
+		return err
+	}
+	defer ra.Close()
+	if ra.Size() != d.Size {
+		debugLog("copyBlob size mismatch for %s: blob=%d descriptor=%d", d.Digest, ra.Size(), d.Size)
+	}
+	if _, err := io.Copy(w, io.NewSectionReader(ra, 0, ra.Size())); err != nil {
+		return err
+	}
+	return w.Commit(bc.dstCtx, d.Size, d.Digest)
+}
+
+// writeBlob ingests raw bytes as a content blob and returns its descriptor.
+func (bc *blobCopier) writeBlob(data []byte, mediaType string) (ocispec.Descriptor, error) {
+	d := ocispec.Descriptor{
+		MediaType: mediaType,
+		Digest:    digest.FromBytes(data),
+		Size:      int64(len(data)),
+	}
+	if _, ierr := bc.cs.Info(bc.dstCtx, d.Digest); ierr == nil {
+		return d, nil
+	}
+	w, err := bc.cs.Writer(bc.dstCtx, content.WithDescriptor(d), content.WithRef("anvil-write-"+d.Digest.String()))
+	if err != nil {
+		return d, err
+	}
+	defer w.Close()
+	if err := w.Truncate(0); err != nil {
+		return d, err
+	}
+	if _, err := w.Write(data); err != nil {
+		return d, err
+	}
+	return d, w.Commit(bc.dstCtx, d.Size, d.Digest)
+}
+
+// stageTreeForExport copies an image tree for docker save. Multi-arch
+// indexes frequently have blobs missing locally (only the native platform
+// was ever pulled), so incomplete child manifests are dropped and the index
+// is rebuilt from the complete ones instead of failing the whole export.
+func stageTreeForExport(bc *blobCopier, target ocispec.Descriptor) (ocispec.Descriptor, error) {
+	switch target.MediaType {
+	case ocispec.MediaTypeImageIndex, images.MediaTypeDockerSchema2ManifestList:
+		var idx ocispec.Index
+		data, rerr := readBlobAll(bc.blobCtx(target), bc.cs, target)
+		if rerr != nil {
+			return target, fmt.Errorf("read index: %w", rerr)
+		}
+		if jerr := json.Unmarshal(data, &idx); jerr != nil {
+			return target, fmt.Errorf("parse index: %w", jerr)
+		}
+		debugLog("save: index %s mediaType=%s manifests=%d", target.Digest, target.MediaType, len(idx.Manifests))
+		kept := make([]ocispec.Descriptor, 0, len(idx.Manifests))
+		for _, child := range idx.Manifests {
+			if cerr := bc.copyTree(child); cerr != nil {
+				debugLog("save: skipping incomplete manifest %s: %v", child.Digest, cerr)
+				continue
+			}
+			kept = append(kept, child)
+		}
+		if len(kept) == 0 {
+			return target, fmt.Errorf("no complete manifests in index %s", target.Digest)
+		}
+		if len(kept) == len(idx.Manifests) {
+			// Children are copied above; the index blob itself still needs
+			// to land in the destination namespace for the export.
+			if cerr := bc.copyBlob(bc.blobCtx(target), target); cerr != nil {
+				return target, cerr
+			}
+			return target, nil
+		}
+		newIdx := idx
+		newIdx.Manifests = kept
+		data, merr := json.Marshal(newIdx)
+		if merr != nil {
+			return target, merr
+		}
+		return bc.writeBlob(data, ocispec.MediaTypeImageIndex)
+	default:
+		if cerr := bc.copyTree(target); cerr != nil {
+			return target, cerr
+		}
+		return target, nil
+	}
+}
+
 // copyImageBetweenNamespaces copies an image from one containerd namespace
-// to another by walking the descriptor tree (index -> manifests -> config and
-// layers) and copying every blob through the content store. The legacy
-// Export/Import round-trip cannot handle index (multi-arch) images: the tar
-// it produces has neither manifest.json nor an OCI layout, so Import fails
-// with "unrecognized image format".
+// to another. The legacy Export/Import round-trip cannot handle index
+// (multi-arch) images, so the descriptor tree is walked and every blob is
+// copied through the content store instead.
 func copyImageBetweenNamespaces(srcNs, ref, targetNs string) error {
 	ctx := context.Background()
 	cl, err := pc.get(ctx)
@@ -296,7 +483,6 @@ func copyImageBetweenNamespaces(srcNs, ref, targetNs string) error {
 		return fmt.Errorf("containerd client: %w", err)
 	}
 	srcCtx := namespaces.WithNamespace(ctx, srcNs)
-	dstCtx := namespaces.WithNamespace(ctx, targetNs)
 	canonical := canonicalizeImageRef(ref)
 	var img images.Image
 	found := false
@@ -310,67 +496,11 @@ func copyImageBetweenNamespaces(srcNs, ref, targetNs string) error {
 	if !found {
 		return fmt.Errorf("image %s not found in namespace %s", ref, srcNs)
 	}
-
-	cs := cl.ContentStore()
-	// An image record may live in one namespace while some of its blobs sit
-	// in another (records are cheap metadata; pulls and unpacks move blobs
-	// around). Resolve each blob in any namespace, preferring srcNs.
-	srcCtxs := []context.Context{srcCtx}
-	if nss, lerr := cl.NamespaceService().List(ctx); lerr == nil {
-		for _, ns := range nss {
-			if ns != srcNs && ns != targetNs {
-				srcCtxs = append(srcCtxs, namespaces.WithNamespace(ctx, ns))
-			}
-		}
-	}
-	blobCtx := func(d ocispec.Descriptor) context.Context {
-		for _, c := range srcCtxs {
-			if _, ierr := cs.Info(c, d.Digest); ierr == nil {
-				return c
-			}
-		}
-		return srcCtxs[0]
-	}
-	var copyDesc func(d ocispec.Descriptor) error
-	copyDesc = func(d ocispec.Descriptor) error {
-		if _, ierr := cs.Info(dstCtx, d.Digest); ierr == nil {
-			return nil // blob already visible in the target namespace
-		}
-		bctx := blobCtx(d)
-		// Recurse into child descriptors for indexes and manifests.
-		switch d.MediaType {
-		case ocispec.MediaTypeImageIndex, images.MediaTypeDockerSchema2ManifestList:
-			var idx ocispec.Index
-			if data, rerr := readBlobAll(bctx, cs, d); rerr == nil {
-				if jerr := json.Unmarshal(data, &idx); jerr == nil {
-					for _, child := range idx.Manifests {
-						if cerr := copyDesc(child); cerr != nil {
-							return cerr
-						}
-					}
-				}
-			}
-		case ocispec.MediaTypeImageManifest, images.MediaTypeDockerSchema2Manifest:
-			var man ocispec.Manifest
-			if data, rerr := readBlobAll(bctx, cs, d); rerr == nil {
-				if jerr := json.Unmarshal(data, &man); jerr == nil {
-					if cerr := copyDesc(man.Config); cerr != nil {
-						return cerr
-					}
-					for _, layer := range man.Layers {
-						if cerr := copyDesc(layer); cerr != nil {
-							return cerr
-						}
-					}
-				}
-			}
-		}
-		return copyBlob(bctx, dstCtx, cs, d)
-	}
-	if err := copyDesc(img.Target); err != nil {
+	bc := newBlobCopier(ctx, cl, srcNs, targetNs)
+	if err := bc.copyTree(img.Target); err != nil {
 		return err
 	}
-	if err := putImage(cl, dstCtx, images.Image{Name: canonical, Target: img.Target, Labels: img.Labels}); err != nil {
+	if err := putImage(cl, bc.dstCtx, images.Image{Name: canonical, Target: img.Target, Labels: img.Labels}); err != nil {
 		return fmt.Errorf("put image: %w", err)
 	}
 	return nil
@@ -389,28 +519,30 @@ func readBlobAll(ctx context.Context, cs content.Store, d ocispec.Descriptor) ([
 	return buf, nil
 }
 
-func copyBlob(srcCtx, dstCtx context.Context, cs content.Store, d ocispec.Descriptor) error {
-	w, err := cs.Writer(dstCtx, content.WithDescriptor(d), content.WithRef("copy-"+d.Digest.String()))
+func copyBlob(srcCtx, dstCtx context.Context, cs content.Store, cl *client.Client, d ocispec.Descriptor) error {
+	_ = cl
+	w, err := cs.Writer(dstCtx, content.WithDescriptor(d), content.WithRef("anvil-copy-"+d.Digest.String()))
 	if err != nil {
 		return err
 	}
 	defer w.Close()
-	if err := copyBlobContent(srcCtx, cs, w, d); err != nil {
-		return err
+	// A writer handed an existing ingest ref resumes at its last offset;
+	// always restart from zero so the copy is exactly the descriptor bytes.
+	if err := w.Truncate(0); err != nil {
+		return fmt.Errorf("truncate ingest: %w", err)
 	}
-	return w.Commit(dstCtx, d.Size, d.Digest)
-}
-
-func copyBlobContent(srcCtx context.Context, cs content.Store, w content.Writer, d ocispec.Descriptor) error {
 	ra, err := cs.ReaderAt(srcCtx, d)
 	if err != nil {
 		return err
 	}
 	defer ra.Close()
+	if ra.Size() != d.Size {
+		debugLog("copyBlob size mismatch for %s: blob=%d descriptor=%d", d.Digest, ra.Size(), d.Size)
+	}
 	if _, err := io.Copy(w, io.NewSectionReader(ra, 0, ra.Size())); err != nil {
 		return err
 	}
-	return nil
+	return w.Commit(dstCtx, d.Size, d.Digest)
 }
 
 // listDockerImages collects images from all namespaces and returns a
@@ -552,7 +684,11 @@ func findImageNamespace(ctx context.Context, ref string) string {
 			variants = append(variants, ref+":latest")
 		}
 	}
+	cstore := cl.ContentStore()
 	for _, ns := range nss {
+		if ns == saveScratchNs {
+			continue // internal staging namespace
+		}
 		nsCtx := namespaces.WithNamespace(ctx, ns)
 		images, err := cl.ListImages(nsCtx)
 		if err != nil {
@@ -561,11 +697,23 @@ func findImageNamespace(ctx context.Context, ref string) string {
 		}
 		for _, img := range images {
 			name := img.Name()
+			matched := false
 			for _, v := range variants {
 				if name == v {
-					return ns
+					matched = true
+					break
 				}
 			}
+			if !matched {
+				continue
+			}
+			// Skip dangling records: the name exists but its target blob
+			// has been garbage-collected in that namespace.
+			if _, cerr := cstore.Info(nsCtx, img.Target().Digest); cerr != nil {
+				debugLog("image %s in namespace %s is dangling, skipping", name, ns)
+				continue
+			}
+			return ns
 		}
 	}
 	debugLog("findImageNamespace: no namespace for %s", ref)
@@ -648,29 +796,63 @@ func streamImageSave(ctx context.Context, w http.ResponseWriter, names []string)
 	}
 
 	log.Printf("[docker-api] saving images %v from ns=%q", names, ns)
-	nsCtx := namespaces.WithNamespace(ctx, ns)
-	for _, name := range names {
-		for _, candidate := range []string{canonicalizeImageRef(name), name} {
-			img, gerr := cl.GetImage(nsCtx, candidate)
-			if gerr != nil {
-				continue
+	// Export needs every blob in ONE namespace, but records and blobs are
+	// frequently spread across namespaces. Stage the images into a scratch
+	// namespace with the cross-namespace blob copier, export from there and
+	// drop the namespace afterwards.
+	scratchNs := saveScratchNs
+	dropScratch := func() {
+		// Remove the image records first so the namespace delete is not
+		// blocked by leftover references; blob bytes are dropped with it.
+		sctx := namespaces.WithNamespace(ctx, scratchNs)
+		if imgs, lerr := cl.ListImages(sctx); lerr == nil {
+			for _, im := range imgs {
+				_ = cl.ImageService().Delete(sctx, im.Name())
 			}
-			imgs = append(imgs, images.Image{
-				Name:   canonicalizeImageRef(name),
-				Labels: img.Labels(),
-				Target: img.Target(),
-			})
-			break
 		}
+		_ = cl.NamespaceService().Delete(ctx, scratchNs) //nolint:errcheck
+	}
+	dropScratch() // stale leftovers from a previous run
+	scratchCtx := namespaces.WithNamespace(ctx, scratchNs)
+	bc := newBlobCopier(ctx, cl, ns, scratchNs)
+	for _, name := range names {
+		canonical := canonicalizeImageRef(name)
+		srcCtx := namespaces.WithNamespace(ctx, ns)
+		var src images.Image
+		for _, candidate := range []string{canonical, name} {
+			if g, gerr := cl.GetImage(srcCtx, candidate); gerr == nil {
+				src = images.Image{Name: g.Name(), Target: g.Target(), Labels: g.Labels()}
+				break
+			}
+		}
+		if src.Name == "" {
+			dropScratch()
+			http.Error(w, fmt.Sprintf(`{"message":"No such image: %s"}`, name), http.StatusNotFound)
+			return
+		}
+		target, serr := stageTreeForExport(bc, src.Target)
+		if serr != nil {
+			dropScratch()
+			http.Error(w, fmt.Sprintf(`{"message":"save %s: %s"}`, name, serr.Error()), http.StatusInternalServerError)
+			return
+		}
+		if perr := putImage(cl, scratchCtx, images.Image{Name: canonical, Target: target}); perr != nil {
+			dropScratch()
+			http.Error(w, fmt.Sprintf(`{"message":"save %s: %s"}`, name, perr.Error()), http.StatusInternalServerError)
+			return
+		}
+		imgs = append(imgs, images.Image{Name: canonical, Target: target})
 	}
 	if len(imgs) == 0 {
+		dropScratch()
 		http.Error(w, `{"message":"save failed: no image records"}`, http.StatusInternalServerError)
 		return
 	}
+	defer dropScratch()
 
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.WriteHeader(http.StatusOK)
-	if err := cl.Export(nsCtx, w, archive.WithImages(imgs)); err != nil {
+	if err := cl.Export(scratchCtx, w, archive.WithImages(imgs), archive.WithAllPlatforms()); err != nil {
 		// Headers are already sent; the client sees the truncated stream.
 		log.Printf("[docker-api] save %v failed: %v", names, stripANSI(err.Error()))
 	}
