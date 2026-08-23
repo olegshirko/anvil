@@ -199,6 +199,13 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs string) error {
 	candidates := []string{canonicalRef}
 	if ref != canonicalRef {
 		candidates = append(candidates, ref)
+		// Raw form with an explicit tag, registered verbatim by buildkit's
+		// image exporter (see findImageNamespace).
+		if !strings.Contains(ref, "@") {
+			if _, tag, ok := strings.Cut(ref, ":"); !ok || tag == "" {
+				candidates = append(candidates, ref+":latest")
+			}
+		}
 	}
 	for _, ns := range nss {
 		if ns == targetNs {
@@ -446,6 +453,15 @@ func findImageNamespace(ctx context.Context, ref string) string {
 	// it would make the subsequent nerdctl inspect in that namespace fail
 	// with "no such image".
 	canonical := canonicalizeImageRef(ref)
+	// buildkit's image exporter registers the name attribute verbatim, so a
+	// locally built "myapp" is stored as "myapp:latest" without the
+	// docker.io/library prefix — match that raw-with-tag form too.
+	variants := []string{canonical, ref}
+	if canonical != ref && !strings.Contains(ref, "@") {
+		if _, tag, ok := strings.Cut(ref, ":"); !ok || tag == "" {
+			variants = append(variants, ref+":latest")
+		}
+	}
 	for _, ns := range nss {
 		nsCtx := namespaces.WithNamespace(ctx, ns)
 		images, err := cl.ListImages(nsCtx)
@@ -455,8 +471,10 @@ func findImageNamespace(ctx context.Context, ref string) string {
 		}
 		for _, img := range images {
 			name := img.Name()
-			if name == canonical || name == ref {
-				return ns
+			for _, v := range variants {
+				if name == v {
+					return ns
+				}
 			}
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"sync"
@@ -183,4 +184,61 @@ func pruneBuildCache() (int64, error) {
 		return reclaimed, fmt.Errorf("buildkit prune: %w", err)
 	}
 	return reclaimed, nil
+}
+
+// handleBuildkitGRPC implements the dockerd-style gRPC hijack endpoints
+// (/grpc). buildx's "docker" driver probes POST /grpc with an h2c upgrade:
+// if the daemon accepts, the driver talks the full buildkit control gRPC
+// API over the hijacked connection. Without this endpoint docker CLI 29
+// synthesizes a docker-container "context builder" for the docker context
+// instead, spawning a buildkitd-in-container that cannot resolve registries
+// behind the VZ NAT DNS forwarder. The connection is served by a control-API
+// proxy onto the guest's own buildkitd (see grpcbridge.go).
+func handleBuildkitGRPC(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"message":"grpc hijack requires POST"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, `{"message":"hijacking not supported"}`, http.StatusInternalServerError)
+		return
+	}
+	// /session carries the client's buildkit session (context upload, secret
+	// providers): tunnel the raw hijacked connection through a
+	// control.Session stream so buildkitd registers it.
+	if r.URL.Path == "/session" {
+		conn, bufrw, err := hj.Hijack()
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(bufrw, "HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n")
+		if err := bufrw.Flush(); err != nil {
+			conn.Close()
+			return
+		}
+		go bridgeSession(prefixConn{Conn: conn, r: io.MultiReader(bufrw.Reader, conn)}, r.Header)
+		return
+	}
+	conn, bufrw, err := hj.Hijack()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	proto := r.Header.Get("Upgrade")
+	if proto == "" {
+		proto = "h2c"
+	}
+	fmt.Fprintf(bufrw, "HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: %s\r\n\r\n", proto)
+	if err := bufrw.Flush(); err != nil {
+		conn.Close()
+		return
+	}
+	// The client may have pipelined bytes after the upgrade request (the
+	// HTTP/2 preface); the bufio reader holds them, so it is passed to the
+	// gRPC bridge alongside the raw connection.
+	if err := serveBuildkitGRPC(conn, bufrw.Reader); err != nil {
+		log.Printf("[buildkit] grpc bridge: %v", err)
+	}
 }

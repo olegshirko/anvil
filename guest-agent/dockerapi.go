@@ -380,6 +380,13 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			w.Header().Set("Ostype", "linux")
 			w.Header().Set("Docker-Experimental", "false")
 			w.Header().Set("Builder-Version", "2")
+			// Real dockerd 23+ reports its integrated buildkit here; buildx
+			// checks this header to decide whether the daemon can build via
+			// the classic POST /build path (docker driver). Without it docker
+			// CLI 29 synthesizes a docker-container "context builder" for
+			// every `docker build`, spawning a buildkitd-in-container that
+			// cannot resolve registries behind the VZ NAT DNS forwarder.
+			w.Header().Set("BuildKit-Version", "v0.32.2")
 			w.Header().Set("Server", "Docker/anvil (guest-agent)")
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("OK"))
@@ -531,6 +538,8 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			handleEvents(w, r)
 		case path == "/build" && r.Method == http.MethodPost:
 			handleBuild(w, r)
+		case (path == "/grpc" || path == "/session") && r.Method == http.MethodPost:
+			handleBuildkitGRPC(w, r)
 		case path == "/images/get" && r.Method == http.MethodGet:
 			handleImagesGet(w, r)
 		case isGet && r.Method == http.MethodGet:
