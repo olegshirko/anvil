@@ -99,7 +99,21 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 	}
 
 	if !usesHostNetworkName(netName) {
+		// Self-healing attach: the exit watcher's CNI detach is asynchronous,
+		// so a restart (the monitor, docker restart, compose) can race it and
+		// hit a leftover veth ("eth0 peer already exists") or a torn-down
+		// iptables chain ("No chain/target/match by that name"). On any
+		// attach failure, run the matching DEL to clear the stale endpoint
+		// state and attach again.
 		ip, mac, aerr := attachNetwork(ctx, netName, ns, id, netnsPathFor(id), ports)
+		if aerr != nil {
+			time.Sleep(200 * time.Millisecond)
+			dctx, dcancel := context.WithTimeout(ctx, 10*time.Second)
+			detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports) //nolint:errcheck
+			dcancel()
+			time.Sleep(100 * time.Millisecond)
+			ip, mac, aerr = attachNetwork(ctx, netName, ns, id, netnsPathFor(id), ports)
+		}
 		if aerr != nil {
 			return fmt.Errorf("cni attach: %w", aerr)
 		}

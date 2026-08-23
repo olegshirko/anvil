@@ -345,8 +345,6 @@ func runExec(args []string) Response {
 	}
 }
 
-
-
 // findHostPortConflict checks whether any requested host port is already used
 // by a running container in any namespace. It returns the first conflict found.
 // The container excludeID is skipped: it is the one being started.

@@ -187,7 +187,10 @@ func maybeRestartContainers() {
 			restarts.clear(did)
 			continue
 		}
-		if p.name == "on-failure" && p.max >= 0 && restarts.bumpRetries(did) > p.max {
+		// The retry budget counts restart ATTEMPTS (below), not monitor
+		// polling cycles — a failed start that is retried with backoff
+		// must not burn the on-failure:N budget once per second.
+		if p.name == "on-failure" && p.max >= 0 && restarts.countFor(did) >= p.max {
 			restarts.clear(did)
 			continue
 		}

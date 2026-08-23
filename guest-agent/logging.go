@@ -53,6 +53,13 @@ func runJSONLogger(path string) error {
 		ready.Close()
 	}
 
+	// The shim never closes the stream fds, so the readers never see EOF
+	// while the task record exists — a trailing partial line (printf
+	// without newline, `... | head -c N`) would be lost forever. Flush
+	// partials that have sat for a couple of seconds; full lines stream
+	// immediately as before.
+	startPartialFlusher(out)
+
 	var wg sync.WaitGroup
 	for _, s := range []struct {
 		name string
@@ -60,7 +67,7 @@ func runJSONLogger(path string) error {
 	}{
 		{"stdout", 3},
 		{"stderr", 4},
-	}	{
+	} {
 		wg.Add(1)
 		go func(name string, fd uintptr) {
 			defer wg.Done()
@@ -75,9 +82,66 @@ func runJSONLogger(path string) error {
 	return nil
 }
 
+// partialBuf holds a stream's unterminated tail so the owner watcher can
+// flush it after container exit.
+type partialBuf struct {
+	mu    sync.Mutex
+	b     bytes.Buffer
+	since time.Time
+}
+
+var (
+	partialMu      sync.Mutex
+	partialBufs    = map[string]*partialBuf{}
+	partialFlushed bool
+)
+
+func regPartial(stream string, data []byte) {
+	partialMu.Lock()
+	defer partialMu.Unlock()
+	if partialFlushed {
+		return
+	}
+	pb := partialBufs[stream]
+	if pb == nil {
+		pb = &partialBuf{}
+		partialBufs[stream] = pb
+	}
+	if pb.b.Len() == 0 {
+		pb.since = time.Now()
+	}
+	pb.b.Write(data)
+}
+
+// startPartialFlusher periodically emits registered partial lines that
+// have not grown for two seconds.
+func startPartialFlusher(out io.Writer) {
+	go func() {
+		for {
+			time.Sleep(500 * time.Millisecond)
+			partialMu.Lock()
+			for stream, pb := range partialBufs {
+				pb.mu.Lock()
+				if pb.b.Len() > 0 && time.Since(pb.since) > 2*time.Second {
+					rec, _ := json.Marshal(logLine{
+						Log:    pb.b.String(),
+						Stream: stream,
+						Time:   time.Now().UTC(),
+					})
+					out.Write(append(rec, '\n'))
+					pb.b.Reset()
+				}
+				pb.mu.Unlock()
+			}
+			partialMu.Unlock()
+		}
+	}()
+}
+
 // writeStream splits the raw stream into newline-terminated records. A
-// trailing partial line is flushed once the stream closes so short-lived
-// containers using print (no newline) are still captured.
+// trailing partial line is registered with the partial-flush registry (the
+// owner watcher emits it after container exit) and flushed directly if the
+// stream reaches real EOF.
 func writeStream(out io.Writer, stream string, r io.Reader) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var buf bytes.Buffer
@@ -105,14 +169,15 @@ func writeStream(out io.Writer, stream string, r io.Reader) {
 				}
 			} else {
 				buf.Write(chunk)
+				regPartial(stream, chunk)
 			}
 		}
 		if err != nil {
-			break
+			if buf.Len() > 0 {
+				flush(buf.Bytes())
+			}
+			return
 		}
-	}
-	if buf.Len() > 0 {
-		flush(buf.Bytes())
 	}
 }
 
@@ -135,9 +200,9 @@ type logReadOptions struct {
 	follow     bool
 	tail       int // -1 = all records
 	timestamps bool
-	since      time.Time    // zero = no lower bound
-	until      time.Time    // zero = no upper bound
-	stop       func() bool  // polled during follow; true ends the stream
+	since      time.Time   // zero = no lower bound
+	until      time.Time   // zero = no upper bound
+	stop       func() bool // polled during follow; true ends the stream
 }
 
 // readTaskLog replays the container's json-file log. Each decoded record is
@@ -218,10 +283,11 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	// an empty/quiet log at stop time gets a grace period before giving up.
 	var pending []byte // partial line carried between polls
 	off := int64(len(data))
-	var emptyDeadline time.Time
+	var quietSince time.Time
+	var stopDeadline time.Time
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		if chunk, next, cerr := readLogFrom(logPath, off); cerr == nil {
+		if chunk, next, cerr := readLogFrom(logPath, off); cerr == nil && len(chunk) > 0 {
 			pending = append(pending, chunk...)
 			for {
 				idx := bytes.IndexByte(pending, '\n')
@@ -235,16 +301,19 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 				pending = pending[idx+1:]
 			}
 			off = next
+			quietSince = time.Time{} // fresh bytes: restart the quiet clock
 		}
 		if stopFired() {
-			if fi, serr := os.Stat(logPath); serr == nil && fi.Size() == off {
-				if emptyDeadline.IsZero() {
-					emptyDeadline = time.Now().Add(2 * time.Second)
-				}
-				if time.Now().After(emptyDeadline) {
-					return nil
-				}
-			} else {
+			if stopDeadline.IsZero() {
+				stopDeadline = time.Now().Add(5 * time.Second)
+			}
+			if quietSince.IsZero() {
+				quietSince = time.Now()
+			}
+			// The logging binary's final flush can land after the task
+			// exit is observable; end only once no new bytes arrived for
+			// a second (or the hard stop deadline passes).
+			if time.Since(quietSince) >= 2*time.Second || time.Now().After(stopDeadline) {
 				return nil
 			}
 		}
@@ -281,4 +350,3 @@ func readLogFrom(path string, off int64) ([]byte, int64, error) {
 	}
 	return buf[:n], off + int64(n), nil
 }
-

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
@@ -22,6 +23,7 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/errdefs"
 )
 
@@ -234,10 +236,17 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs string) error {
 				debugLog("image %s in namespace %s is dangling (no content for %s), skipping", name, ns, img.Target().Digest)
 				continue
 			}
-			if err := copyImageBetweenNamespaces(ns, name, targetNs); err != nil {
-				// The record looked complete but some blobs are missing
-				// (partially GC'd namespace); try the next namespace.
-				debugLog("copy image %s from %s failed, trying next namespace: %v", name, ns, err)
+			copyErr := copyImageBetweenNamespaces(ns, name, targetNs)
+			if copyErr != nil {
+				// The record looked complete but some blobs are missing —
+				// either a partially GC'd namespace or a buildkitd export
+				// that had not fully landed yet. Give it a moment and try
+				// once more before moving to the next namespace.
+				time.Sleep(500 * time.Millisecond)
+				copyErr = copyImageBetweenNamespaces(ns, name, targetNs)
+			}
+			if copyErr != nil {
+				debugLog("copy image %s from %s failed, trying next namespace: %v", name, ns, copyErr)
 				continue
 			}
 			log.Printf("[images] streamed %s from %s to %s", name, ns, targetNs)
@@ -434,7 +443,16 @@ func (bc *blobCopier) copyBlob(bctx context.Context, d ocispec.Descriptor, gcLab
 	if gcLabels != nil {
 		commitOpts = append(commitOpts, content.WithLabels(gcLabels))
 	}
-	return w.Commit(bc.dstCtx, d.Size, d.Digest, commitOpts...)
+	if cerr := w.Commit(bc.dstCtx, d.Size, d.Digest, commitOpts...); cerr != nil {
+		if !errdefs.IsAlreadyExists(cerr) {
+			return cerr
+		}
+		debugLog("copyBlob: %s commit: already exists", d.Digest)
+	}
+	if _, ierr := bc.cs.Info(bc.dstCtx, d.Digest); ierr != nil {
+		debugLog("copyBlob: %s NOT VISIBLE right after commit: %v", d.Digest, ierr)
+	}
+	return nil
 }
 
 // writeBlob ingests raw bytes as a content blob and returns its descriptor.
@@ -485,6 +503,13 @@ func stageTreeForExport(bc *blobCopier, target ocispec.Descriptor) (ocispec.Desc
 		for _, child := range idx.Manifests {
 			if cerr := bc.copyTree(child); cerr != nil {
 				debugLog("save: skipping incomplete manifest %s: %v", child.Digest, cerr)
+				continue
+			}
+			// copyTree may claim "already in destination" from stale
+			// scratch-namespace leftovers; only keep the child if it is
+			// genuinely visible now, otherwise the export fails on it.
+			if _, ierr := bc.cs.Info(bc.dstCtx, child.Digest); ierr != nil {
+				debugLog("save: manifest %s copied but not visible, skipping", child.Digest)
 				continue
 			}
 			kept = append(kept, child)
@@ -547,12 +572,16 @@ func copyImageBetweenNamespaces(srcNs, ref, targetNs string) error {
 	// blobs are copied; a concurrent GC pass triggered by an unrelated image
 	// delete would sweep the fresh, still-unreferenced blobs. A lease pins
 	// them until the record is in place.
-	var releaseLease func(context.Context) error
-	leaseCtx, release, lerr := cl.WithLease(ctx)
+	// NOTE: the lease must live in the TARGET namespace — a lease created
+	// in a namespace-less (default) context does not pin blobs written to
+	// another namespace.
+	targetCtx := namespaces.WithNamespace(ctx, targetNs)
+	leaseCtx, release, lerr := cl.WithLease(targetCtx)
 	if lerr == nil {
-		ctx = leaseCtx
-		releaseLease = release
-		defer releaseLease(context.Background()) //nolint:errcheck
+		if leaseID, ok := leases.FromContext(leaseCtx); ok {
+			ctx = leases.WithLease(ctx, leaseID)
+		}
+		defer release(context.Background()) //nolint:errcheck
 	}
 	bc := newBlobCopier(ctx, cl, srcNs, targetNs)
 	if err := bc.copyTree(img.Target); err != nil {
@@ -877,7 +906,13 @@ func handleImagesGet(w http.ResponseWriter, r *http.Request) {
 	streamImageSave(r.Context(), w, names)
 }
 
+// saveMu serializes docker save: all saves share one scratch namespace,
+// and a concurrent save's cleanup would gut another's staging.
+var saveMu sync.Mutex
+
 func streamImageSave(ctx context.Context, w http.ResponseWriter, names []string) {
+	saveMu.Lock()
+	defer saveMu.Unlock()
 	// Verify all images exist first so a missing one is a clean 404 instead
 	// of a failed stream mid-response.
 	ns := "default"
