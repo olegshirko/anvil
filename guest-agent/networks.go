@@ -373,7 +373,13 @@ func removeDockerNetwork(ctx context.Context, name string) error {
 		nss = append([]string{"default"}, nss...)
 	}
 
-	path := cniConflistPath(name)
+	// The conflist file is keyed by network NAME; when the client sent a
+	// network ID, inspectDockerNetwork already resolved it above.
+	fileName := name
+	if netName != "" {
+		fileName = netName
+	}
+	path := cniConflistPath(fileName)
 	if _, statErr := os.Stat(path); statErr != nil {
 		return fmt.Errorf("No such network: %s", name)
 	}

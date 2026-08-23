@@ -13,11 +13,13 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/images/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	digest "github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/containerd/errdefs"
 )
@@ -207,17 +209,29 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs string) error {
 			}
 		}
 	}
+	cstore := cl.ContentStore()
 	for _, ns := range nss {
 		if ns == targetNs {
 			continue
 		}
 		nsCtx := namespaces.WithNamespace(ctx, ns)
 		for _, name := range candidates {
-			if _, err := cl.GetImage(nsCtx, name); err != nil {
+			img, err := cl.GetImage(nsCtx, name)
+			if err != nil {
+				continue
+			}
+			// Skip dangling records: the image name exists but its content
+			// has been GC'd in that namespace (stale records left by old
+			// projects). Copying from there would fail mid-tree.
+			if _, cerr := cstore.Info(nsCtx, img.Target().Digest); cerr != nil {
+				debugLog("image %s in namespace %s is dangling (no content for %s), skipping", name, ns, img.Target().Digest)
 				continue
 			}
 			if err := copyImageBetweenNamespaces(ns, name, targetNs); err != nil {
-				return fmt.Errorf("copy image %s from %s to %s: %w", name, ns, targetNs, err)
+				// The record looked complete but some blobs are missing
+				// (partially GC'd namespace); try the next namespace.
+				debugLog("copy image %s from %s failed, trying next namespace: %v", name, ns, err)
+				continue
 			}
 			log.Printf("[images] streamed %s from %s to %s", name, ns, targetNs)
 			return nil
@@ -269,11 +283,12 @@ func putImage(cl *client.Client, nsCtx context.Context, img images.Image) error 
 	return nil
 }
 
-// copyImageBetweenNamespaces streams an image from one containerd namespace
-// to another via Export/Import, so that both the image records and the
-// content store entries exist in the target namespace. containerd's content
-// store is namespaced: a metadata-only copy would reference blobs the target
-// namespace cannot see.
+// copyImageBetweenNamespaces copies an image from one containerd namespace
+// to another by walking the descriptor tree (index -> manifests -> config and
+// layers) and copying every blob through the content store. The legacy
+// Export/Import round-trip cannot handle index (multi-arch) images: the tar
+// it produces has neither manifest.json nor an OCI layout, so Import fails
+// with "unrecognized image format".
 func copyImageBetweenNamespaces(srcNs, ref, targetNs string) error {
 	ctx := context.Background()
 	cl, err := pc.get(ctx)
@@ -281,44 +296,119 @@ func copyImageBetweenNamespaces(srcNs, ref, targetNs string) error {
 		return fmt.Errorf("containerd client: %w", err)
 	}
 	srcCtx := namespaces.WithNamespace(ctx, srcNs)
+	dstCtx := namespaces.WithNamespace(ctx, targetNs)
 	canonical := canonicalizeImageRef(ref)
-	var imgs []images.Image
+	var img images.Image
+	found := false
 	for _, name := range []string{canonical, ref} {
-		if img, gerr := cl.GetImage(srcCtx, name); gerr == nil {
-			imgs = append(imgs, images.Image{
-				Name:   name,
-				Labels: img.Labels(),
-				Target: img.Target(),
-			})
+		if g, gerr := cl.GetImage(srcCtx, name); gerr == nil {
+			img = images.Image{Name: name, Target: g.Target(), Labels: g.Labels()}
+			found = true
+			break
 		}
 	}
-	if len(imgs) == 0 {
+	if !found {
 		return fmt.Errorf("image %s not found in namespace %s", ref, srcNs)
 	}
 
-	pr, pw := io.Pipe()
-	exportDone := make(chan error, 1)
-	go func() {
-		exportDone <- cl.Export(srcCtx, pw, archive.WithImages(imgs))
-		pw.Close() //nolint:errcheck
-	}()
+	cs := cl.ContentStore()
+	// An image record may live in one namespace while some of its blobs sit
+	// in another (records are cheap metadata; pulls and unpacks move blobs
+	// around). Resolve each blob in any namespace, preferring srcNs.
+	srcCtxs := []context.Context{srcCtx}
+	if nss, lerr := cl.NamespaceService().List(ctx); lerr == nil {
+		for _, ns := range nss {
+			if ns != srcNs && ns != targetNs {
+				srcCtxs = append(srcCtxs, namespaces.WithNamespace(ctx, ns))
+			}
+		}
+	}
+	blobCtx := func(d ocispec.Descriptor) context.Context {
+		for _, c := range srcCtxs {
+			if _, ierr := cs.Info(c, d.Digest); ierr == nil {
+				return c
+			}
+		}
+		return srcCtxs[0]
+	}
+	var copyDesc func(d ocispec.Descriptor) error
+	copyDesc = func(d ocispec.Descriptor) error {
+		if _, ierr := cs.Info(dstCtx, d.Digest); ierr == nil {
+			return nil // blob already visible in the target namespace
+		}
+		bctx := blobCtx(d)
+		// Recurse into child descriptors for indexes and manifests.
+		switch d.MediaType {
+		case ocispec.MediaTypeImageIndex, images.MediaTypeDockerSchema2ManifestList:
+			var idx ocispec.Index
+			if data, rerr := readBlobAll(bctx, cs, d); rerr == nil {
+				if jerr := json.Unmarshal(data, &idx); jerr == nil {
+					for _, child := range idx.Manifests {
+						if cerr := copyDesc(child); cerr != nil {
+							return cerr
+						}
+					}
+				}
+			}
+		case ocispec.MediaTypeImageManifest, images.MediaTypeDockerSchema2Manifest:
+			var man ocispec.Manifest
+			if data, rerr := readBlobAll(bctx, cs, d); rerr == nil {
+				if jerr := json.Unmarshal(data, &man); jerr == nil {
+					if cerr := copyDesc(man.Config); cerr != nil {
+						return cerr
+					}
+					for _, layer := range man.Layers {
+						if cerr := copyDesc(layer); cerr != nil {
+							return cerr
+						}
+					}
+				}
+			}
+		}
+		return copyBlob(bctx, dstCtx, cs, d)
+	}
+	if err := copyDesc(img.Target); err != nil {
+		return err
+	}
+	if err := putImage(cl, dstCtx, images.Image{Name: canonical, Target: img.Target, Labels: img.Labels}); err != nil {
+		return fmt.Errorf("put image: %w", err)
+	}
+	return nil
+}
 
-	dstCtx := namespaces.WithNamespace(ctx, targetNs)
-	imported, ierr := cl.Import(dstCtx, pr,
-		client.WithSkipMissing(),
-		client.WithDigestRef(func(d digest.Digest) string {
-			return "docker.io/imported/anvil-image:" + d.Encoded()[:12]
-		}),
-		client.WithSkipDigestRef(func(name string) bool { return name != "" }),
-	)
-	if werr := <-exportDone; werr != nil && ierr == nil {
-		ierr = fmt.Errorf("export: %w", werr)
+func readBlobAll(ctx context.Context, cs content.Store, d ocispec.Descriptor) ([]byte, error) {
+	ra, err := cs.ReaderAt(ctx, d)
+	if err != nil {
+		return nil, err
 	}
-	if ierr != nil {
-		return fmt.Errorf("stream copy: %w", ierr)
+	defer ra.Close()
+	buf := make([]byte, ra.Size())
+	if _, err := io.ReadFull(io.NewSectionReader(ra, 0, ra.Size()), buf); err != nil {
+		return nil, err
 	}
-	for i := range imported {
-		putImage(cl, dstCtx, imported[i]) //nolint:errcheck
+	return buf, nil
+}
+
+func copyBlob(srcCtx, dstCtx context.Context, cs content.Store, d ocispec.Descriptor) error {
+	w, err := cs.Writer(dstCtx, content.WithDescriptor(d), content.WithRef("copy-"+d.Digest.String()))
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+	if err := copyBlobContent(srcCtx, cs, w, d); err != nil {
+		return err
+	}
+	return w.Commit(dstCtx, d.Size, d.Digest)
+}
+
+func copyBlobContent(srcCtx context.Context, cs content.Store, w content.Writer, d ocispec.Descriptor) error {
+	ra, err := cs.ReaderAt(srcCtx, d)
+	if err != nil {
+		return err
+	}
+	defer ra.Close()
+	if _, err := io.Copy(w, io.NewSectionReader(ra, 0, ra.Size())); err != nil {
+		return err
 	}
 	return nil
 }

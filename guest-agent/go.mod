@@ -12,6 +12,7 @@ require (
 	github.com/mdlayher/vsock v1.2.1
 	github.com/moby/buildkit v0.25.1
 	github.com/opencontainers/go-digest v1.0.0
+	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/runtime-spec v1.3.0
 	golang.org/x/sys v0.46.0
 	google.golang.org/grpc v1.80.0
@@ -50,7 +51,6 @@ require (
 	github.com/moby/sys/signal v0.7.1 // indirect
 	github.com/moby/sys/user v0.4.0 // indirect
 	github.com/moby/sys/userns v0.1.0 // indirect
-	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/petermattis/goid v0.0.0-20240813172612-4fcff4a6cae7 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
