@@ -63,8 +63,9 @@ func cmdDoctor() {
     let ctx = shell("docker", "context", "show").trimmingCharacters(in: .whitespacesAndNewlines)
     check("docker context", ctx == "anvil", "current: \(ctx)")
     check("docker.sock", FileManager.default.fileExists(atPath: dockerSocketPath), dockerSocketPath)
+    var ping = ""
     if FileManager.default.fileExists(atPath: dockerSocketPath) {
-        let ping = shell("curl", "-sf", "--unix-socket", dockerSocketPath, "http://localhost/_ping")
+        ping = shell("curl", "-sf", "--unix-socket", dockerSocketPath, "http://localhost/_ping")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         check("docker api", ping == "OK", ping.isEmpty ? "no answer on /_ping" : ping)
     }
@@ -72,6 +73,23 @@ func cmdDoctor() {
     // Host /Users share for bind mounts.
     check("/Users share", usersSharePath() != nil,
           usersSharePath() != nil ? "/Users available in the guest" : "disabled (ANVIL_SHARE_USERS=0)")
+
+    // Inside-container sanity: a fresh container must have its loopback UP
+    // (the CNI loopback plugin's job). Skipped when no local image exists —
+    // doctor must stay usable offline. --pull=never keeps the check fast.
+    if ping == "OK" {
+        let lo = shell("docker", "run", "--rm", "--pull=never", "alpine",
+                       "ip", "link", "show", "lo")
+        let loUp = lo.contains("<LOOPBACK,UP,LOWER_UP>")
+        if lo.isEmpty {
+            check("container lo", true, "skipped (no local alpine image)")
+        } else {
+            // Loopback devices report "state UNKNOWN"; UP lives in the
+            // interface flags: <LOOPBACK,UP,LOWER_UP>.
+            check("container lo", loUp,
+                  loUp ? "127.0.0.1 answers in containers" : "lo is DOWN inside containers")
+        }
+    }
 
     if failures > 0 {
         print("\n\(failures) check(s) failed")
