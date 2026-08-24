@@ -4,47 +4,31 @@ import (
 	"context"
 	"log"
 	"os"
-	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 )
 
-// Compose resolves services by their service name ("db", "web"), which the
-// CLI passes as Aliases in the create request's NetworkingConfig. We remember
-// the aliases at create time and, once the container starts and has a CNI
-// address, append "<ip> <aliases...>" to the /etc/hosts bind mounts of every
-// running container on the same network. Each container's /etc/hosts is a
-// bind mount of the file under its anvil metadata directory
-// (/var/lib/anvil/containers/<ns>/<id>/hosts).
+// Cross-container name resolution. Docker serves 127.0.0.11 (an embedded
+// DNS resolver) that answers container names and network aliases; we emulate
+// the resolver's observable behaviour with a managed section of each
+// container's /etc/hosts bind mount:
+//
+//	# BEGIN ANVIL NETWORK ENTRIES
+//	10.10.5.3	kafka-1 kafka
+//	10.10.5.4	kafka-2 kafka
+//	# END ANVIL NETWORK ENTRIES
+//
+// Whenever a container joins (start) or leaves (stop/delete) a network, the
+// whole section is REGENERATED for every member of that network from the
+// persisted container metadata (name + compose aliases) and live CNI
+// addresses. Regeneration — not appending — is what makes the mesh complete:
+// a container created after its peers still resolves them, and a stopped
+// container's entries disappear everywhere at once.
 
-var networkAliases = struct {
-	mu sync.Mutex
-	m  map[string][]string // dockerID -> aliases
-}{m: make(map[string][]string)}
-
-func setNetworkAliases(dockerID string, aliases []string) {
-	networkAliases.mu.Lock()
-	networkAliases.m[dockerID] = aliases
-	networkAliases.mu.Unlock()
-}
-
-func pendingNetworkAliases(containerdID string) []string {
-	networkAliases.mu.Lock()
-	defer networkAliases.mu.Unlock()
-	for _, aliases := range networkAliases.m {
-		if len(aliases) > 0 {
-			return aliases
-		}
-	}
-	return nil
-}
-
-func clearNetworkAliases(dockerID string) {
-	networkAliases.mu.Lock()
-	delete(networkAliases.m, dockerID)
-	networkAliases.mu.Unlock()
-}
+const (
+	netHostsBegin = "# BEGIN ANVIL NETWORK ENTRIES"
+	netHostsEnd   = "# END ANVIL NETWORK ENTRIES"
+)
 
 // requestedNetworkAliases extracts service aliases from the create request.
 // Compose sends them per endpoint network; any non-empty list is used.
@@ -63,58 +47,79 @@ func requestedNetworkAliases(req dockerCreateRequest) []string {
 	return out
 }
 
-var hostsEntryRe = regexp.MustCompile(`(?m)^(\d+\.\d+\.\d+\.\d+)\s+.*$`)
-
-// applyNetworkAliases resolves the container's CNI address and appends the
-// alias entry to the hosts file of every container directory in the same
-// namespace (per-project networks map 1:1 to namespaces here). Idempotent:
-// an entry for the alias is replaced, not duplicated.
-func applyNetworkAliases(ns, containerdID string) {
-	aliases := func() []string {
-		networkAliases.mu.Lock()
-		defer networkAliases.mu.Unlock()
-		// Keyed by dockerID; find by matching is overkill — pop the first
-		// pending set (create→start is serialized per container).
-		for did, a := range networkAliases.m {
-			delete(networkAliases.m, did)
-			return a
-		}
-		return nil
-	}()
-	if len(aliases) == 0 {
+// refreshHostsForContainer regenerates the managed hosts sections of every
+// network the container belongs to. Called after start (the CNI address is
+// only known then) and after stop/delete/rename.
+func refreshHostsForContainer(ns, containerdID string) {
+	meta, err := loadContainerMeta(ns, containerdID)
+	if err != nil {
 		return
 	}
+	for _, net := range meta.Networks {
+		refreshNetworkHosts(net)
+	}
+}
 
-	ip := containerAddress(ns, containerdID)
-	if ip == "" {
-		log.Printf("[net-alias] no address for %s/%s, aliases %v dropped", ns, containerdID[:12], aliases)
+// refreshNetworkHosts regenerates the managed section of the hosts file of
+// every container on the network. Members come from persisted metadata
+// (create-time network membership); entries only for members that currently
+// have a CNI address (running tasks — net.json is removed on stop).
+func refreshNetworkHosts(network string) {
+	metas, err := containerMetas()
+	if err != nil {
 		return
 	}
-	entry := ip + "\t" + strings.Join(aliases, " ")
-
-	matches, _ := filepath.Glob(containerMetaDir(ns, "*") + "/hosts")
-	for _, hostsPath := range matches {
-		data, err := os.ReadFile(hostsPath)
-		if err != nil {
+	var members []*containerMeta
+	var entries []string
+	for _, m := range metas {
+		if !stringIn(m.Networks, network) {
 			continue
 		}
-		content := string(data)
-		// Skip containers that already know every alias.
-		if strings.Contains(content, "\t"+aliases[0]+" ") || strings.HasSuffix(strings.TrimSpace(strings.Split(content, "\n")[len(strings.Split(content, "\n"))-1]), aliases[0]) {
-			if strings.Contains(content, aliases[0]) {
-				continue
-			}
-		}
-		if !strings.HasSuffix(content, "\n") {
-			content += "\n"
-		}
-		content += entry + "\n"
-		if err := os.WriteFile(hostsPath, []byte(content), 0o644); err != nil {
-			log.Printf("[net-alias] write %s: %v", hostsPath, err)
+		members = append(members, m)
+		names := append([]string{m.Name}, m.Aliases...)
+		if ip := containerAddress(m.Namespace, m.ID); ip != "" && containerOnNetwork(m.Namespace, m.ID, network) {
+			entries = append(entries, ip+"\t"+strings.Join(dedupeStrings(names), " "))
 		}
 	}
-	log.Printf("[net-alias] %s/%s (%s) aliased as %v across %d hosts files",
-		ns, containerdID[:12], ip, aliases, len(matches))
+	block := ""
+	if len(entries) > 0 {
+		block = netHostsBegin + "\n" + strings.Join(entries, "\n") + "\n" + netHostsEnd + "\n"
+	}
+	for _, m := range members {
+		rewriteHostsManagedSection(containerHostsPath(m.Namespace, m.ID), block)
+	}
+	log.Printf("[net-alias] network %s refreshed: %d entries across %d members", network, len(entries), len(members))
+}
+
+// containerOnNetwork reports whether the container's live CNI endpoint
+// (net.json) is currently attached to the named network.
+func containerOnNetwork(ns, id, network string) bool {
+	if ni, ok := loadNetInfo(ns, id); ok {
+		return ni.Network == network
+	}
+	return false
+}
+
+// rewriteHostsManagedSection replaces the anvil-managed block of a hosts
+// file (everything between the markers) with block. Files without markers
+// (freshly created) simply get the block appended.
+func rewriteHostsManagedSection(path, block string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return // not created yet; create will include nothing stale
+	}
+	content := string(data)
+	begin := strings.Index(content, netHostsBegin)
+	end := strings.LastIndex(content, netHostsEnd)
+	if begin >= 0 && end > begin {
+		rest := content[end+len(netHostsEnd):]
+		content = strings.TrimRight(content[:begin], "\n") + "\n" + block + strings.TrimLeft(rest, "\n")
+	} else {
+		content = strings.TrimRight(content, "\n") + "\n" + block
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		log.Printf("[net-alias] write %s: %v", path, err)
+	}
 }
 
 // Container --link entries, remembered at create and applied at start
@@ -218,4 +223,13 @@ func containerAddress(ns, containerdID string) string {
 	}
 	_, ip := containerNetworkInfo(ns, containerdID, "")
 	return ip
+}
+
+func stringIn(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }

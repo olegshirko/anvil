@@ -1130,6 +1130,61 @@ def test_compose_lifecycle_verbs() -> None:
                            capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
 
 
+def test_container_dns_mesh() -> None:
+    """Cross-container name resolution: container NAMES (not just compose
+    aliases) resolve on a shared network, a container created LATER resolves
+    earlier peers, and stopped containers stop resolving everywhere."""
+    net = f"{PREFIX}-mesh"
+    m1, m2 = f"{PREFIX}-m1", f"{PREFIX}-m2"
+    try:
+        docker("network", "create", net)
+        docker("run", "-d", "--name", m1, "--network", net, "alpine", "sleep", "120")
+        # A container created after m1 must resolve m1 by NAME.
+        out = docker("run", "--rm", "--network", net, "alpine",
+                     "getent", "hosts", m1, timeout=60.0)
+        if m1 not in out.stdout:
+            raise RuntimeError(f"later container cannot resolve {m1}: {out.stdout!r}")
+        # Aliases propagate to already-running peers, and m2's own name works.
+        docker("run", "-d", "--name", m2, "--network", net,
+               "--network-alias", "svc2", "alpine", "sleep", "120")
+        out = docker("exec", m1, "getent", "hosts", "svc2", timeout=60.0)
+        if "svc2" not in out.stdout:
+            raise RuntimeError(f"alias not visible to earlier peer: {out.stdout!r}")
+        out = docker("exec", m1, "getent", "hosts", m2, timeout=60.0)
+        if m2 not in out.stdout:
+            raise RuntimeError(f"peer name missing: {out.stdout!r}")
+        # Stopping a member removes its entries from the peers' hosts files.
+        docker("stop", "-t", "1", m2, timeout=60.0)
+        time.sleep(2.0)
+        gone = docker("exec", m1, "sh", "-c",
+                      f"getent hosts {m2} || echo GONE", timeout=60.0)
+        if "GONE" not in gone.stdout:
+            raise RuntimeError(f"stopped container still resolves: {gone.stdout!r}")
+    finally:
+        cleanup(m1, m2)
+        docker("network", "rm", net, check=False, timeout=30.0)
+    record("cross-container DNS mesh", "PASS",
+           "names+aliases resolve both directions; stop removes entries")
+
+
+def test_image_run_dir_content() -> None:
+    """Image content under /run must not be masked (containerd's default
+    spec mounts an empty tmpfs over /run; postgres ships /var/run/postgresql
+    and fails to create its lock file when it is hidden)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "Dockerfile").write_text(
+            "FROM alpine\nRUN mkdir -p /run/anviltest && echo run-ok > /run/anviltest/f\n")
+        tag = f"{PREFIX}-rundir:1"
+        try:
+            docker("build", "-t", tag, tmp, timeout=600.0)
+            out = docker("run", "--rm", tag, "cat", "/run/anviltest/f")
+            if out.stdout.strip() != "run-ok":
+                raise RuntimeError(f"image /run content masked: {out.stdout!r}")
+        finally:
+            docker("rmi", "-f", tag, check=False, timeout=60.0)
+    record("image /run content visible", "PASS", "no tmpfs masks image /run")
+
+
 def test_system_prune() -> None:
     name = f"{PREFIX}-prune"
     try:
@@ -1549,6 +1604,8 @@ TESTS = [
     ("cp", test_cp),
     ("cp directories", test_cp_directory),
     ("cp stopped container", test_cp_stopped_container),
+    ("cross-container DNS mesh", test_container_dns_mesh),
+    ("image /run content visible", test_image_run_dir_content),
     ("restart on-failure budget", test_restart_policy_budget),
     ("bind mount /Users", test_bind_mount_users_share),
     ("named volume", test_named_volume_persistence),

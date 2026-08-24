@@ -284,6 +284,12 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 
 	opts := []oci.SpecOpts{
 		oci.WithProcessArgs(argv...),
+		// containerd's default spec mounts an empty tmpfs over /run, which
+		// hides image content placed there (/var/run -> /run), breaking
+		// images like postgres that ship /var/run/postgresql. Docker does
+		// not mask /run; user --tmpfs /run mounts are added later and are
+		// not affected by this removal.
+		oci.WithoutRunMount,
 		// Private cgroup namespace (docker default on cgroup v2): runc then
 		// mounts the container's own cgroup subtree at /sys/fs/cgroup, so
 		// limits like memory.max are visible inside.
@@ -453,6 +459,7 @@ func createNativeContainer(ctx context.Context, ns, name string, req dockerCreat
 		ImageRef:         imgRef,
 		Ports:            portMappings,
 		Networks:         []string{effectiveNetworkName(req.HostConfig.NetworkMode)},
+		Aliases:          requestedNetworkAliases(req),
 		TTY:              req.Tty,
 		AutoRemove:       req.HostConfig.AutoRemove,
 		StopSignal:       req.StopSignal,

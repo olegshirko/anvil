@@ -623,10 +623,6 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name st
 	}
 
 	dockerID := dockerID(ns, containerdID)
-	// Remember compose service aliases for the start-time /etc/hosts update.
-	if aliases := requestedNetworkAliases(req); len(aliases) > 0 {
-		setNetworkAliases(dockerID, aliases)
-	}
 	// Remember docker --link specs for the start-time hosts update.
 	if len(req.HostConfig.Links) > 0 {
 		setContainerLinks(dockerID, req.HostConfig.Links)
@@ -805,13 +801,11 @@ func startDockerContainer(ctx context.Context, id string) error {
 	if err := startNativeTask(ctx, ns, containerdID); err != nil {
 		return err
 	}
-	// Service-name DNS: append the container's compose aliases (e.g. "web")
-	// to the /etc/hosts bind mounts of every running container on the same
-	// network. compose resolves service
-	// dependencies by name (`db`, `web`), not by container name.
-	if len(pendingNetworkAliases(containerdID)) > 0 {
-		go applyNetworkAliases(ns, containerdID)
-	}
+	// Cross-container name resolution: regenerate the managed /etc/hosts
+	// section for every network this container joined. Runs after the CNI
+	// attach, so the address is known; done in the background so start is
+	// not delayed by the mesh rewrite.
+	go refreshHostsForContainer(ns, containerdID)
 	// docker --link: append alias -> target-IP entries to THIS container's
 	// /etc/hosts (legacy link semantics are plain /etc/hosts records).
 	if links := pendingLinkEntries(dockerID(ns, containerdID)); len(links) > 0 {
@@ -986,6 +980,7 @@ func renameDockerContainer(ctx context.Context, id string, newName string) error
 	if meta, merr := loadContainerMeta(ns, containerdID); merr == nil {
 		meta.Name = newName
 		saveContainerMeta(meta)
+		refreshHostsForContainer(ns, containerdID)
 	}
 	debugLog("[docker-api] renamed %s/%s: %s -> %s", ns, truncateID(containerdID), oldName, newName)
 	return nil

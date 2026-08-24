@@ -488,9 +488,12 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			status, err := pullDockerImage(r.Context(), image)
 			w.Header().Set("Content-Type", "application/json")
 			if err != nil {
-				// Docker CLI expects a stream of progress objects; send one error line.
-				json.NewEncoder(w).Encode(map[string]string{
-					"status": fmt.Sprintf("error pulling %s: %s", image, err.Error()),
+				// The progress stream must carry the failure in "error"
+				// (with errorDetail): a plain status line makes the CLI
+				// print the error but still exit 0, masking the failure.
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error":       fmt.Sprintf("error pulling %s: %s", image, err.Error()),
+					"errorDetail": map[string]string{"message": err.Error()},
 				})
 				return
 			}

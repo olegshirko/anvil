@@ -174,17 +174,19 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs string) error {
 
 	canonicalRef := canonicalizeImageRef(ref)
 
-	// Fast path: image already exists in target namespace AND its content is
-	// actually there (records left by interrupted copies or partial GCs
-	// would otherwise pass the check and fail the unpack later).
+	// Fast path: image already exists in target namespace AND its content
+	// is actually there (records left by interrupted copies or partial GCs
+	// would otherwise pass the check and fail the unpack later). The whole
+	// descriptor tree must be visible — a manifest-only check passes while
+	// the layers have been collected.
 	targetCtx := namespaces.WithNamespace(ctx, targetNs)
 	if img, err := cl.GetImage(targetCtx, canonicalRef); err == nil {
-		if _, cerr := cl.ContentStore().Info(targetCtx, img.Target().Digest); cerr == nil {
+		if missing := imageTreeMissing(cl, targetCtx, img.Target()); len(missing) == 0 {
 			log.Printf("[images] %s already in namespace %s", canonicalRef, targetNs)
 			return nil
 		}
 		debugLog("image %s in namespace %s is dangling, refreshing", canonicalRef, targetNs)
-		_ = cl.ImageService().Delete(targetCtx, canonicalRef)
+		deleteImageTree(cl, targetCtx, canonicalRef, img.Target())
 	}
 
 	// Images imported from OCI archives may be registered under the raw,
@@ -296,10 +298,208 @@ func pullImageIntoNamespace(ctx context.Context, canonicalRef, ns string) error 
 		return fmt.Errorf("containerd client: %w", err)
 	}
 	nsCtx := namespaces.WithNamespace(ctx, ns)
-	_, err = cl.Pull(nsCtx, canonicalRef,
-		client.WithPullUnpack,
-	)
-	return err
+	// A leftover manifest blob from an interrupted copy or a partial GC
+	// makes the fetcher skip re-ingesting it — and with it, skip setting
+	// the gc.ref labels that pin the freshly fetched children. After the
+	// pull lease is released, the next GC pass then collects the layers
+	// while the record stays (dangling). Drop record AND visible tree
+	// blobs first so the pull re-ingests everything with full labels.
+	if img, gerr := cl.GetImage(nsCtx, canonicalRef); gerr == nil {
+		if missing := imageTreeMissing(cl, nsCtx, img.Target()); len(missing) > 0 {
+			debugLog("pull %s: record in ns %s dangling (%d blobs missing), dropping before pull",
+				canonicalRef, ns, len(missing))
+			deleteImageTree(cl, nsCtx, canonicalRef, img.Target())
+		}
+	}
+	// Verify the tree after each attempt and re-pull (bounded): a long GC
+	// pass started by an earlier synchronous rmi can snapshot its roots
+	// before this pull commits and sweep the fresh blobs afterwards — by
+	// the next attempt that pass has finished. NOTE: no outer lease here —
+	// wrapping Pull in our own lease makes the committed image record
+	// lease-scoped, and releasing it deletes the record outright.
+	for attempt := 1; ; attempt++ {
+		img, perr := cl.Pull(nsCtx, canonicalRef, client.WithPullUnpack)
+		if perr != nil {
+			return perr
+		}
+		// Pin the tree explicitly: the fetch path does not reliably set the
+		// containerd.io/gc.ref.content.* labels on pre-existing parents,
+		// so the first GC pass after the pull's internal lease is released
+		// collects the children while the record stays (dangling).
+		labelImageTree(cl.ContentStore(), nsCtx, img.Target())
+		missing := imageTreeMissing(cl, nsCtx, img.Target())
+		if len(missing) == 0 {
+			return nil
+		}
+		if attempt >= 5 {
+			return fmt.Errorf("pull %s into %s: %d tree blobs missing after %d attempts",
+				canonicalRef, ns, len(missing), attempt)
+		}
+		debugLog("pull %s: %d blobs missing after attempt %d, re-pulling", canonicalRef, len(missing), attempt)
+		deleteImageTree(cl, nsCtx, canonicalRef, img.Target())
+		time.Sleep(750 * time.Millisecond)
+	}
+}
+
+// imageTreeMissing returns descriptors of the image tree that are not
+// visible in nsCtx (empty = the record is healthy). For a multi-arch index
+// only the subtree of every VISIBLE platform manifest is required — a
+// platform pull (the default) fetches just one subtree — but at least one
+// manifest must be complete.
+func imageTreeMissing(cl *client.Client, nsCtx context.Context, target ocispec.Descriptor) []string {
+	cs := cl.ContentStore()
+	var missing []string
+	walkManifest := func(d ocispec.Descriptor) {
+		if _, err := cs.Info(nsCtx, d.Digest); err != nil {
+			missing = append(missing, d.Digest.String())
+			return
+		}
+		data, err := readBlobAll(nsCtx, cs, d)
+		if err != nil {
+			missing = append(missing, d.Digest.String())
+			return
+		}
+		var man ocispec.Manifest
+		if json.Unmarshal(data, &man) != nil {
+			missing = append(missing, d.Digest.String())
+			return
+		}
+		for _, kid := range append([]ocispec.Descriptor{man.Config}, man.Layers...) {
+			if _, err := cs.Info(nsCtx, kid.Digest); err != nil {
+				missing = append(missing, kid.Digest.String())
+			}
+		}
+	}
+	switch target.MediaType {
+	case ocispec.MediaTypeImageIndex, images.MediaTypeDockerSchema2ManifestList:
+		data, err := readBlobAll(nsCtx, cs, target)
+		if err != nil {
+			return []string{target.Digest.String()}
+		}
+		var idx ocispec.Index
+		if json.Unmarshal(data, &idx) != nil {
+			return []string{target.Digest.String()}
+		}
+		complete, visible := 0, 0
+		for _, child := range idx.Manifests {
+			if _, err := cs.Info(nsCtx, child.Digest); err != nil {
+				continue // platform subtree not fetched — fine
+			}
+			visible++
+			before := len(missing)
+			walkManifest(child)
+			if len(missing) == before {
+				complete++
+			}
+		}
+		if visible > 0 && complete == 0 && len(missing) == 0 {
+			// Every visible manifest is broken but reported nothing?
+			// Defensive: treat as missing.
+			missing = append(missing, target.Digest.String())
+		}
+	default:
+		walkManifest(target)
+	}
+	return missing
+}
+
+// gcRefLabel is the containerd label key prefix that pins a child blob to
+// its parent in the content store (the GC walks these edges).
+func gcRefLabel(d digest.Digest) string {
+	return "containerd.io/gc.ref.content." + d.String()
+}
+
+// labelImageTree walks the descriptor tree and stamps gc.ref.content labels
+// on every parent, making the tree explicitly reachable from the top blob
+// regardless of whether the fetcher labelled it.
+func labelImageTree(cs content.Store, ctx context.Context, target ocispec.Descriptor) {
+	label := func(parent ocispec.Descriptor, children ...ocispec.Descriptor) {
+		info, err := cs.Info(ctx, parent.Digest)
+		if err != nil {
+			return
+		}
+		changed := false
+		for _, c := range children {
+			key := gcRefLabel(c.Digest)
+			if info.Labels == nil {
+				info.Labels = map[string]string{}
+			}
+			if _, ok := info.Labels[key]; !ok {
+				info.Labels[key] = c.Digest.String()
+				changed = true
+			}
+		}
+		if changed {
+			if _, uerr := cs.Update(ctx, info, "labels"); uerr != nil {
+				debugLog("labelImageTree: update %s: %v", parent.Digest, uerr)
+			}
+		}
+	}
+	var visit func(d ocispec.Descriptor)
+	visit = func(d ocispec.Descriptor) {
+		switch d.MediaType {
+		case ocispec.MediaTypeImageIndex, images.MediaTypeDockerSchema2ManifestList:
+			if data, rerr := readBlobAll(ctx, cs, d); rerr == nil {
+				var idx ocispec.Index
+				if json.Unmarshal(data, &idx) == nil {
+					label(d, idx.Manifests...)
+					for _, child := range idx.Manifests {
+						visit(child)
+					}
+				}
+			}
+		case ocispec.MediaTypeImageManifest, images.MediaTypeDockerSchema2Manifest:
+			if data, rerr := readBlobAll(ctx, cs, d); rerr == nil {
+				var man ocispec.Manifest
+				if json.Unmarshal(data, &man) == nil {
+					kids := append([]ocispec.Descriptor{man.Config}, man.Layers...)
+					label(d, kids...)
+				}
+			}
+		}
+	}
+	visit(target)
+}
+
+// deleteImageTree removes the image record plus every tree blob that is
+// still visible in the namespace, so a re-pull ingests from scratch.
+func deleteImageTree(cl *client.Client, nsCtx context.Context, name string, target ocispec.Descriptor) {
+	if derr := cl.ImageService().Delete(nsCtx, name); derr != nil {
+		debugLog("deleteImageTree: record %s: %v", name, derr)
+	}
+	cs := cl.ContentStore()
+	var walk func(d ocispec.Descriptor)
+	walk = func(d ocispec.Descriptor) {
+		info, err := cs.Info(nsCtx, d.Digest)
+		if err != nil {
+			return
+		}
+		switch d.MediaType {
+		case ocispec.MediaTypeImageIndex, images.MediaTypeDockerSchema2ManifestList:
+			if data, rerr := readBlobAll(nsCtx, cs, d); rerr == nil {
+				var idx ocispec.Index
+				if json.Unmarshal(data, &idx) == nil {
+					for _, child := range idx.Manifests {
+						walk(child)
+					}
+				}
+			}
+		case ocispec.MediaTypeImageManifest, images.MediaTypeDockerSchema2Manifest:
+			if data, rerr := readBlobAll(nsCtx, cs, d); rerr == nil {
+				var man ocispec.Manifest
+				if json.Unmarshal(data, &man) == nil {
+					walk(man.Config)
+					for _, layer := range man.Layers {
+						walk(layer)
+					}
+				}
+			}
+		}
+		if derr := cs.Delete(nsCtx, info.Digest); derr != nil {
+			debugLog("deleteImageTree: blob %s: %v", d.Digest, derr)
+		}
+	}
+	walk(target)
 }
 
 // saveScratchNs stages images for docker save so every blob sits in a
@@ -314,6 +514,13 @@ func pullImageAllPlatforms(ctx context.Context, canonicalRef, ns string) error {
 		return fmt.Errorf("containerd client: %w", err)
 	}
 	nsCtx := namespaces.WithNamespace(ctx, ns)
+	leaseCtx, release, lerr := cl.WithLease(nsCtx)
+	if lerr == nil {
+		if leaseID, ok := leases.FromContext(leaseCtx); ok {
+			nsCtx = leases.WithLease(nsCtx, leaseID)
+		}
+		defer release(context.Background())
+	}
 	_, err = cl.Pull(nsCtx, canonicalRef, client.WithPlatformMatcher(platforms.All))
 	return err
 }
@@ -853,7 +1060,31 @@ func findImageNamespace(ctx context.Context, ref string) string {
 // tagDockerImage creates a new image record pointing at the same content —
 // containerd tags are just additional names for a target descriptor.
 func tagDockerImage(ctx context.Context, source, target string) error {
-	ns := findImageNamespace(ctx, source)
+	// Prefer a namespace where the source's WHOLE tree is visible: records
+	// left dangling by partial GCs must not seed a dangling tag.
+	ns := ""
+	for _, cand := range findAllImageNamespaces(ctx, source) {
+		candCtx := namespaces.WithNamespace(ctx, cand)
+		cl, err := pc.get(ctx)
+		if err != nil {
+			return fmt.Errorf("containerd client: %w", err)
+		}
+		if img, gerr := cl.GetImage(candCtx, canonicalizeImageRef(source)); gerr == nil {
+			if len(imageTreeMissing(cl, candCtx, img.Target())) == 0 {
+				ns = cand
+				break
+			}
+		}
+	}
+	if ns == "" {
+		// Every record is dangling (a GC pass raced earlier pulls). Re-pull
+		// the SOURCE into the default namespace — the retrying pull path
+		// re-ingests a fully labelled tree — and tag from there.
+		if perr := pullImageIntoNamespace(ctx, canonicalizeImageRef(source), "default"); perr != nil {
+			debugLog("tag %s: healing pull: %v", source, perr)
+		}
+		ns = findImageNamespace(ctx, source)
+	}
 	if ns == "" {
 		ns = "default"
 	}

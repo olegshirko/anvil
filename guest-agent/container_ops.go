@@ -291,6 +291,9 @@ func teardownNetwork(ctx context.Context, ns, id string) {
 	detachNetwork(dctx, ni.Network, ns, id, netnsPathFor(id), ports) //nolint:errcheck
 	cancel()
 	removeNetInfo(ns, id)
+	// The endpoint is gone — drop the container's name/aliases from the
+	// hosts files of its network peers.
+	refreshHostsForContainer(ns, id)
 }
 
 // logOnlyIO mirrors cio.LogURI but can flag the IO config as a terminal,
@@ -369,6 +372,13 @@ func deleteNativeContainer(ctx context.Context, ns, id string, force bool) error
 
 	releaseNamedNetNS(id)
 	deleteContainerMeta(ns, id)
+	// Refresh the hosts files of the deleted container's network peers
+	// (its own metadata is gone, so iterate its former networks directly).
+	if meta != nil {
+		for _, net := range meta.Networks {
+			refreshNetworkHosts(net)
+		}
+	}
 	if meta != nil {
 		for _, v := range meta.AnonymousVolumes {
 			os.RemoveAll(volumeDataDir(ns, v))
