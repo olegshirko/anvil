@@ -1050,6 +1050,32 @@ def test_save_multiple_images() -> None:
             docker("rmi", "-f", t, check=False, timeout=60.0)
 
 
+def test_cp_stopped_container() -> None:
+    """docker cp into and out of a STOPPED container (snapshot extraction
+    path, not the live task rootfs)."""
+    name = f"{PREFIX}-cpstop"
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "cp-stopped.txt"
+        src.write_text("stopped-payload\n")
+        back = Path(tmp) / "cp-stopped-back.txt"
+        try:
+            docker("create", "--name", name, "alpine", "sleep", "300")
+            docker("cp", str(src), f"{name}:/tmp/in.txt")
+            # cp out of the still-stopped container
+            docker("cp", f"{name}:/tmp/in.txt", str(back))
+            if back.read_text() != "stopped-payload\n":
+                raise RuntimeError("cp out of stopped: content mismatch")
+            # the copied file must be visible once the container starts
+            docker("start", name, timeout=60.0)
+            out = docker("exec", name, "cat", "/tmp/in.txt", timeout=60.0)
+            if "stopped-payload" not in out.stdout:
+                raise RuntimeError(f"cp into stopped: {out.stdout!r}")
+            record("docker cp on stopped container", "PASS",
+                   "copy in/out of created-but-not-started container")
+        finally:
+            cleanup(name)
+
+
 def test_cp_directory() -> None:
     name = f"{PREFIX}-cpdir"
     with tempfile.TemporaryDirectory() as tmp:
@@ -1254,6 +1280,42 @@ def test_restart_policy_always() -> None:
     record("--restart=always/unless-stopped", "PASS", "restart on exit 0, stop wins")
 
 
+def test_restart_policy_budget() -> None:
+    """--restart=on-failure:N must cap RESTART ATTEMPTS, not polling cycles:
+    an always-failing container settles in exited after N attempts."""
+    name = f"{PREFIX}-rstbudget"
+    try:
+        docker("run", "-d", "--name", name, "--restart", "on-failure:2",
+               "alpine", "sh", "-c", "exit 7")
+        # Wait past any further restart attempt: after the budget is spent
+        # the container must stay exited for good.
+        settled = False
+        deadline = time.time() + 40.0
+        while time.time() < deadline:
+            st = docker("inspect", "--format",
+                        "{{.State.Status}}/{{.State.ExitCode}}", name,
+                        check=False).stdout.strip()
+            if st == "exited/7":
+                # require the exited state to hold (no more restarts)
+                time.sleep(5.0)
+                st2 = docker("inspect", "--format",
+                             "{{.State.Status}}/{{.State.ExitCode}}", name,
+                             check=False).stdout.strip()
+                if st2 == "exited/7":
+                    settled = True
+                    break
+            time.sleep(1.0)
+        if not settled:
+            st = docker("inspect", "--format",
+                        "{{.State.Status}}/{{.State.RestartCount}}",
+                        name, check=False).stdout.strip()
+            raise RuntimeError(f"on-failure:2 budget not honored: {st!r}")
+        record("--restart=on-failure:N attempt budget", "PASS",
+               "always-failing container settles exited after N attempts")
+    finally:
+        cleanup(name)
+
+
 def test_docker_wait() -> None:
     """docker wait returns the container's exit code (blocking and on an
     already-exited container)."""
@@ -1428,18 +1490,20 @@ def test_buildx_remote_load() -> None:
     builder here is the docker-container driver (moby/buildkit in a
     container) which pulls every layer from the registry."""
     docker("buildx", "use", "anvil-remote")
+    ready = False
     for _ in range(30):
         insp = docker("buildx", "inspect", "--bootstrap", "anvil-remote",
                       timeout=60.0, check=False)
         if insp.returncode == 0:
+            ready = True
             break
         time.sleep(1.0)
+    if not ready:
+        raise RuntimeError("anvil-remote builder not ready: see daemon.log")
     if not _host_auth_dns_ok():
         record("buildx remote driver --load", "SKIP",
                "host DNS for auth.docker.io is broken (buildx fetches tokens host-side)")
         return
-    else:
-        raise RuntimeError("anvil-remote builder not ready: see daemon.log")
     tag = f"{PREFIX}-bx:1"
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "Dockerfile").write_text('FROM alpine\nCMD ["echo", "bx-ok"]\n')
@@ -1484,6 +1548,8 @@ TESTS = [
     ("exec -d/-w", test_exec_detached_and_flags),
     ("cp", test_cp),
     ("cp directories", test_cp_directory),
+    ("cp stopped container", test_cp_stopped_container),
+    ("restart on-failure budget", test_restart_policy_budget),
     ("bind mount /Users", test_bind_mount_users_share),
     ("named volume", test_named_volume_persistence),
     ("images tag/rmi", test_images_tag_rmi),

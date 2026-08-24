@@ -107,8 +107,35 @@ func handleArchivePut(w http.ResponseWriter, r *http.Request, ns, containerdID, 
 	w.WriteHeader(http.StatusOK)
 }
 
-// statContainerPath runs stat inside the container and returns a Docker-compatible stat.
+// statContainerPath stats the path and returns a Docker-compatible stat.
+// Running containers are stat'ed via exec; stopped ones get their rootfs
+// snapshot mounted temporarily (no task exists to exec in).
 func statContainerPath(ns, containerdID, path string) (dockerPathStat, error) {
+	if running, _, stateOK := containerTaskState(context.Background(), ns, containerdID); stateOK && !running {
+		var stat dockerPathStat
+		err := withRootfsMount(ns, containerdID, func(root string) error {
+			fi, err := os.Lstat(filepath.Join(root, filepath.Clean("/"+path)))
+			if err != nil {
+				return err
+			}
+			stat = dockerPathStat{
+				Name:       filepath.Base(fi.Name()),
+				Size:       fi.Size(),
+				Mode:       uint32(fi.Mode().Perm()),
+				Mtime:      fi.ModTime().UTC().Format(time.RFC3339),
+			}
+			if fi.Mode()&os.ModeSymlink != 0 {
+				if tgt, err := os.Readlink(filepath.Join(root, filepath.Clean("/"+path))); err == nil {
+					stat.LinkTarget = tgt
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return dockerPathStat{}, fmt.Errorf("stat failed: %v", err)
+		}
+		return stat, nil
+	}
 	script := fmt.Sprintf("stat -c '%%n|%%s|%%a|%%Y|%%N' %s", shellescape(path))
 	res, err := runSimpleExec(context.Background(), ns, containerdID,
 		[]string{"sh", "-c", script}, "0", "", 30*time.Second)
@@ -137,8 +164,33 @@ func statContainerPath(ns, containerdID, path string) (dockerPathStat, error) {
 }
 
 // createContainerTar archives the given path inside the container to a
-// temporary host file by piping the in-container tar stream out through exec.
+// temporary host file. Running containers stream the in-container tar out
+// through exec; stopped ones get their rootfs snapshot mounted and are
+// archived directly on the guest.
 func createContainerTar(ns, containerdID, srcPath string) (string, error) {
+	if running, _, stateOK := containerTaskState(context.Background(), ns, containerdID); stateOK && !running {
+		var tmp string
+		err := withRootfsMount(ns, containerdID, func(root string) error {
+			base := filepath.Base(srcPath)
+			dir := filepath.Dir(filepath.Clean("/" + srcPath))
+			f, ferr := os.CreateTemp("/tmp", "anvil-cp-out-*.tar")
+			if ferr != nil {
+				return ferr
+			}
+			defer f.Close()
+			tarCmd := exec.Command("/bin/tar", "-cf", f.Name(), "-C", filepath.Join(root, dir), base)
+			if out, terr := tarCmd.CombinedOutput(); terr != nil {
+				os.Remove(f.Name())
+				return fmt.Errorf("tar create: %v: %s", terr, stripANSI(string(out)))
+			}
+			tmp = f.Name()
+			return nil
+		})
+		if err != nil {
+			return "", err
+		}
+		return tmp, nil
+	}
 	base := filepath.Base(srcPath)
 	dir := filepath.Dir(srcPath)
 	script := fmt.Sprintf("tar -cf - -C %s %s", shellescape(dir), shellescape(base))
@@ -187,9 +239,10 @@ func extractTarIntoContainer(ns, containerdID string, tarStream []byte, dstPath 
 	return extractTarIntoSnapshot(ns, containerdID, tarStream, dstPath)
 }
 
-// extractTarIntoSnapshot mounts a stopped container's rootfs snapshot on the
-// guest, extracts the tar stream into dstPath inside it, and unmounts.
-func extractTarIntoSnapshot(ns, containerdID string, tarStream []byte, dstPath string) error {
+// withRootfsMount mounts a stopped container's rootfs snapshot at a temporary
+// directory and calls fn with the mount root. Snapshotter mounts require the
+// container to have no live task.
+func withRootfsMount(ns, containerdID string, fn func(root string) error) error {
 	cl, err := pc.get(context.Background())
 	if err != nil {
 		return err
@@ -220,17 +273,24 @@ func extractTarIntoSnapshot(ns, containerdID string, tarStream []byte, dstPath s
 		return fmt.Errorf("mount rootfs: %w", err)
 	}
 	defer unmountAll(root)
+	return fn(root)
+}
 
-	target := filepath.Join(root, filepath.Clean("/"+dstPath))
-	if err := os.MkdirAll(target, 0o755); err != nil {
-		return err
-	}
-	extract := exec.Command("/bin/tar", "-xf", "-", "-C", target)
-	extract.Stdin = strings.NewReader(string(tarStream))
-	if out, err := extract.CombinedOutput(); err != nil {
-		return fmt.Errorf("tar extract: %v: %s", err, stripANSI(string(out)))
-	}
-	return nil
+// extractTarIntoSnapshot mounts a stopped container's rootfs snapshot on the
+// guest, extracts the tar stream into dstPath inside it, and unmounts.
+func extractTarIntoSnapshot(ns, containerdID string, tarStream []byte, dstPath string) error {
+	return withRootfsMount(ns, containerdID, func(root string) error {
+		target := filepath.Join(root, filepath.Clean("/"+dstPath))
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			return err
+		}
+		extract := exec.Command("/bin/tar", "-xf", "-", "-C", target)
+		extract.Stdin = strings.NewReader(string(tarStream))
+		if out, err := extract.CombinedOutput(); err != nil {
+			return fmt.Errorf("tar extract: %v: %s", err, stripANSI(string(out)))
+		}
+		return nil
+	})
 }
 
 // shellescape escapes a path for use in shell arguments.
