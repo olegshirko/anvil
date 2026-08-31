@@ -392,10 +392,12 @@ func imageTreeMissing(cl *client.Client, nsCtx context.Context, target ocispec.D
 				complete++
 			}
 		}
-		if visible > 0 && complete == 0 && len(missing) == 0 {
-			// Every visible manifest is broken but reported nothing?
-			// Defensive: treat as missing.
-			missing = append(missing, target.Digest.String())
+		if complete == 0 {
+			// An index whose platform subtrees are all absent (or broken)
+			// is not usable: nothing can be unpacked or exported from it.
+			for _, child := range idx.Manifests {
+				missing = append(missing, child.Digest.String())
+			}
 		}
 	default:
 		walkManifest(target)
@@ -1111,10 +1113,32 @@ func tagDockerImage(ctx context.Context, source, target string) error {
 	}
 	// Tags must be globally visible: mirror the new tag into the default
 	// namespace so multi-image operations (save a b) resolve every name in
-	// one namespace.
+	// one namespace. The mirror copies the TREE (under a lease), so the
+	// tag is not left dangling when a racing GC pass sweeps the source
+	// namespace right after the records are created.
 	if ns != "default" {
 		if err := ensureImageInNamespace(ctx, target, "default"); err != nil {
 			log.Printf("[images] mirror tag %s to default: %v", target, err)
+			// The source tree was swept mid-copy. Re-pull the SOURCE into
+			// default (works for registry-backed refs) and re-tag from the
+			// fresh copy; otherwise remove the tag records we just made so
+			// no dangling tag is left behind.
+			if perr := pullImageIntoNamespace(ctx, canonicalizeImageRef(source), "default"); perr != nil {
+				for _, name := range []string{canonicalTarget, target} {
+					_ = cl.ImageService().Delete(nsCtx, name)
+				}
+				return fmt.Errorf("tag %s: source content missing: %w", target, err)
+			}
+			dctx := namespaces.WithNamespace(ctx, "default")
+			if dimg, dgerr := cl.GetImage(dctx, canonicalizeImageRef(source)); dgerr == nil {
+				for _, name := range []string{canonicalTarget, target} {
+					if name == "" {
+						continue
+					}
+					_ = putImage(cl, dctx, images.Image{Name: name, Target: dimg.Target(), Labels: dimg.Labels()})
+				}
+				return nil
+			}
 		}
 	}
 	return nil
