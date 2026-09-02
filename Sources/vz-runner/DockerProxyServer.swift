@@ -18,6 +18,12 @@ final class DockerProxyServer {
 
     var onClientConnect: (() -> Void)?
     var onClientDisconnect: (() -> Void)?
+    /// Fired when the guest-side vsock listener could not be reached before
+    /// the retry deadline — the strongest host-side signal that the guest is
+    /// dead or wedged (a kernel panic does NOT produce a VZ didStop callback).
+    var onVsockConnectFailure: (() -> Void)?
+    /// Fired when a vsock connection to the guest was established.
+    var onVsockConnectSuccess: (() -> Void)?
 
     init(socketPath: String, port: UInt32 = dockerAPIPort, deviceProvider: @escaping () -> VZVirtioSocketDevice?, resumeProvider: @escaping () -> Void = {}, debug: Bool = false) {
         self.socketPath = socketPath
@@ -33,7 +39,7 @@ final class DockerProxyServer {
 
     /// Bind the unix socket and start accepting connections on a background queue.
     func start() {
-        stop()
+        closeListener()
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -84,6 +90,17 @@ final class DockerProxyServer {
 
     /// Close the listening socket and remove the path.
     func stop() {
+        closeListener()
+        // Liveness callbacks are dropped too: clients of a stopped proxy may
+        // still be inside their vsock retry loop, and their failure callbacks
+        // must not be mistaken for a crash of the (new) VM the daemon is
+        // starting. (Not in closeListener: start() reuses it and would wipe
+        // freshly attached callbacks.)
+        onVsockConnectFailure = nil
+        onVsockConnectSuccess = nil
+    }
+
+    private func closeListener() {
         lock.lock()
         if fd >= 0 {
             close(fd)
@@ -137,7 +154,13 @@ final class DockerProxyServer {
         }
         guard let conn = vsockConn else {
             print("[docker-proxy] vsock connect failed, closing client")
+            DispatchQueue.main.async { [weak self] in
+                self?.onVsockConnectFailure?()
+            }
             return
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.onVsockConnectSuccess?()
         }
         if debug {
             print("[docker-proxy] vsock connected, proxying")

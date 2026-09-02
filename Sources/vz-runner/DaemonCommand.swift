@@ -148,6 +148,17 @@ enum DaemonCommand {
         private var portForwarder: PortForwarder?
         private var idleTimer: Timer?
         private var isShuttingDown = false
+        private var restartAttempts = 0
+        private var isRestartingVM = false
+        /// When the VM last became ready; strike-based crash detection is
+        /// ignored for a short grace window after readiness — the guest's
+        /// Docker API server binds up to ~10 s after the agent control
+        /// channel, and boot-time connect failures must not count as a crash.
+        private var becameReadyAt: Date?
+        /// Consecutive vsock-connect failures from the proxies. A guest kernel
+        /// panic does NOT fire VZ's didStop delegate, so an unreachable guest
+        /// (connect retries exhausted) is the crash signal for that case.
+        private var guestUnreachableStrikes = 0
         private let cacheManager: ContainerdCacheManager?
         private var clientTracker: ClientTracker?
 
@@ -241,6 +252,15 @@ enum DaemonCommand {
         // MARK: - VMLifecycleManagerDelegate
 
         func vmLifecycleManagerDidBecomeReady(_ manager: VMLifecycleManager) {
+            // The VM came back (first boot or crash restart). Backoff is NOT
+            // reset here: on the restore path readiness fires right after
+            // vm.resume, before the guest has done anything — resetting now
+            // would make a panics-right-after-restore loop never reach the
+            // fresh-boot escape. The counter is zeroed in handleVMCrash when
+            // the VM had stayed up for a while.
+            guestUnreachableStrikes = 0
+            becameReadyAt = Date()
+
             // Host-port availability endpoint for the guest-agent is now
             // attached inside manager.start() before start/restore (its
             // listener must predate the guest dialing out).
@@ -295,6 +315,7 @@ enum DaemonCommand {
             dockerProxy.onClientDisconnect = {
                 tracker.disconnect()
             }
+            attachGuestLivenessHooks(dockerProxy)
             dockerProxy.start()
             self.dockerProxyServer = dockerProxy
             print("[anvil] docker proxy socket: \(dockerSocketPath)")
@@ -323,6 +344,7 @@ enum DaemonCommand {
             buildkitProxy.onClientDisconnect = {
                 tracker.disconnect()
             }
+            attachGuestLivenessHooks(buildkitProxy)
             buildkitProxy.start()
             self.buildkitProxyServer = buildkitProxy
             print("[anvil] buildkit proxy socket: \(buildkitSocketPath)")
@@ -338,14 +360,87 @@ enum DaemonCommand {
             }
         }
 
+        /// A proxy client could not reach the guest within its connect retry
+        /// window. Two strikes in a row (no successful connect between them)
+        /// treat the VM as crashed and restart it; a single exhausted window
+        /// may also just be a wedged-but-recovering guest.
+        private func attachGuestLivenessHooks(_ proxy: DockerProxyServer) {
+            proxy.onVsockConnectFailure = { [weak self] in
+                guard let self = self else { return }
+                DispatchQueue.main.async {
+                    guard !self.isShuttingDown, !self.isRestartingVM else { return }
+                    if let ready = self.becameReadyAt, Date().timeIntervalSince(ready) < 20 {
+                        return // still settling after boot
+                    }
+                    self.guestUnreachableStrikes += 1
+                    print("[anvil] guest unreachable via proxy (\(self.guestUnreachableStrikes)/2)")
+                    if self.guestUnreachableStrikes >= 2 {
+                        self.handleVMCrash()
+                    }
+                }
+            }
+            proxy.onVsockConnectSuccess = { [weak self] in
+                self?.guestUnreachableStrikes = 0
+            }
+        }
+
         func vmLifecycleManager(_ manager: VMLifecycleManager, didFailWithError error: Error) {
             print("[anvil] daemon VM failed: \(error)")
-            shutdown()
+            handleVMCrash()
         }
 
         func vmLifecycleManagerDidStop(_ manager: VMLifecycleManager) {
             print("[anvil] daemon VM stopped")
-            shutdown()
+            handleVMCrash()
+        }
+
+        // A crashed VM must not take the daemon (and the docker context) with
+        // it: restart the VM with exponential backoff instead of exiting. A
+        // stopped VM object is unusable, but VMLifecycleManager.start() builds
+        // a fresh one and restores from the last snapshot.
+        private func handleVMCrash() {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                guard !self.isShuttingDown, !self.isRestartingVM else { return }
+                self.isRestartingVM = true
+                self.guestUnreachableStrikes = 0
+                self.idleTimer?.invalidate()
+
+                // A VM that stayed up for a while before crashing is a NEW
+                // incident, not part of a boot-crash loop: zero the attempt
+                // counter so a healthy-then-crashed VM retries from the short
+                // backoff (and never hits the fresh-boot discard).
+                if let ready = self.becameReadyAt, Date().timeIntervalSince(ready) >= 60 {
+                    self.restartAttempts = 0
+                }
+
+                // Drop the host-side bindings: they point at the dead VM's
+                // socket device. Clients get EOF and retry; everything is
+                // re-bound when the restarted VM becomes ready.
+                self.server?.stop()
+                self.dockerProxyServer?.stop()
+                self.buildkitProxyServer?.stop()
+                self.portForwarder?.stop()
+                self.server = nil
+                self.dockerProxyServer = nil
+                self.buildkitProxyServer = nil
+                self.portForwarder = nil
+                self.clientTracker = nil
+
+                let delay = daemonRestartDelay(attempt: self.restartAttempts)
+                // Two crashes in a row restoring the same snapshot smells like
+                // a poisoned snapshot (guest panics right after restore);
+                // the third attempt discards it and cold-boots instead of
+                // looping forever.
+                let forceFresh = self.restartAttempts >= 2
+                self.restartAttempts += 1
+                print("[anvil] VM crashed; restarting in \(String(format: "%.0f", delay))s (attempt \(self.restartAttempts))\(forceFresh ? ", discarding snapshot" : "")")
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self = self, !self.isShuttingDown else { return }
+                    self.isRestartingVM = false
+                    self.manager.start(fresh: forceFresh)
+                }
+            }
         }
 
         // MARK: - Idle handling
@@ -385,3 +480,10 @@ enum DaemonCommand {
 }
 
 private let daemonPIDFile = stateDir.appendingPathComponent("daemon.pid")
+
+/// Exponential backoff for VM crash restarts: 1s doubling to a 60s cap.
+/// Free function (not a Daemon method) so unit tests can exercise it.
+func daemonRestartDelay(attempt: Int) -> TimeInterval {
+    let delay = TimeInterval(1 << min(max(attempt, 0), 6))
+    return min(delay, 60)
+}

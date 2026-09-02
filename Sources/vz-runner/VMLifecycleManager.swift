@@ -74,8 +74,15 @@ final class VMLifecycleManager: NSObject {
 
     // MARK: - Public lifecycle
 
-    /// Start the VM. Tries restore from snapshot first; falls back to cold boot.
-    func start() {
+    /// Set when crash-loop recovery demands a cold boot (the snapshot itself
+    /// may be poisoned by a guest that panics right after restore).
+    private var forceFreshBoot = false
+
+    /// Start the VM. Tries restore from snapshot first; falls back to cold
+    /// boot. Pass `fresh: true` to skip the snapshot entirely (crash-loop
+    /// recovery invalidates a possibly poisoned snapshot).
+    func start(fresh: Bool = false) {
+        forceFreshBoot = fresh
         writeHostTimeFile()
         startHostTimeRefresher()
         configureAndCreateVM { [weak self] result in
@@ -270,6 +277,12 @@ final class VMLifecycleManager: NSObject {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
 
+            // Drop the previous VM first. A crashed/stopped VM still holds its
+            // disk attachments; keeping the reference while creating the next
+            // VM leads to multi-minute stalls and "storage device attachment
+            // is invalid" on the new instance.
+            self.vm = nil
+
             let hashMatches = self.snapshot.configHashMatches(
                 kernel: self.args.kernelPath,
                 initrd: self.args.initrdPath,
@@ -278,14 +291,15 @@ final class VMLifecycleManager: NSObject {
                 containerdDiskPath: self.args.containerdDiskPath,
                 usersSharePath: usersSharePath()
             )
-            print("[anvil] snapshot exists=\(self.snapshot.hasSnapshot) hashMatches=\(hashMatches)")
+            let freshBoot = self.args.fresh || self.forceFreshBoot
+            print("[anvil] snapshot exists=\(self.snapshot.hasSnapshot) hashMatches=\(hashMatches) forcedFresh=\(self.forceFreshBoot)")
 
             var canRestore = self.args.useAgent
-                && !self.args.fresh
+                && !freshBoot
                 && self.snapshot.hasSnapshot
                 && hashMatches
 
-            if self.args.fresh {
+            if freshBoot {
                 self.snapshot.removeSnapshot()
             } else if !hashMatches {
                 self.snapshot.removeSnapshot()
@@ -331,6 +345,7 @@ final class VMLifecycleManager: NSObject {
         )
         let canRestore = args.useAgent
             && !args.fresh
+            && !forceFreshBoot
             && snapshot.hasSnapshot
             && hashMatches
 
