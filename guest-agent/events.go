@@ -221,7 +221,9 @@ func startEventRecorder() {
 				if env == nil {
 					continue
 				}
-				if ev, ok := translateDockerEvent(ctx, cl, env); ok {
+				ev, ok := translateDockerEvent(ctx, cl, env)
+				debugLog("[events] recorder: topic=%s ns=%s ok=%v action=%s", env.Topic, env.Namespace, ok, ev.Action)
+				if ok {
 					eventLogRecord(ev)
 				}
 			}
