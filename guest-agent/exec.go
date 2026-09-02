@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -36,6 +37,23 @@ type execSpec struct {
 	mu       sync.Mutex
 	running  bool
 	exitCode int
+	// proc is the containerd exec process while it runs; kept for TTY resize
+	// (POST /exec/{id}/resize) between start and exit.
+	proc client.Process
+}
+
+// setProcess records (or clears with nil) the live containerd exec process.
+func (s *execSpec) setProcess(p client.Process) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.proc = p
+}
+
+// currentProcess returns the live exec process, or nil when not running.
+func (s *execSpec) currentProcess() client.Process {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.proc
 }
 
 func (s *execSpec) setExit(code int) {
@@ -251,20 +269,24 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	pspec := &specs.Process{
-		Args: spec.Cmd,
-		Env:  mergeEnv([]string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}, spec.Env),
-		Cwd:  defaultString(spec.WorkingDir, "/"),
-		User: execUserFor(nsCtx, container, spec.User),
+		Args:     spec.Cmd,
+		Env:      mergeEnv([]string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}, spec.Env),
+		Cwd:      defaultString(spec.WorkingDir, "/"),
+		User:     execUserFor(nsCtx, container, spec.User),
 		Terminal: spec.Tty,
 	}
 
 	execID := newExecID()
 	process, xerr := task.Exec(nsCtx, execID, pspec, cio.NewCreator(cio.WithStreams(stdinR, stdoutW, stderrW)))
 	if xerr != nil {
-		stdoutR.Close(); stdoutW.Close(); stderrR.Close(); stderrW.Close()
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
 		spec.setExit(126)
 		return
 	}
+	spec.setProcess(process)
 
 	var wg sync.WaitGroup
 	writeMu := &sync.Mutex{}
@@ -325,6 +347,7 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	} else {
 		exitCode = int(st.ExitCode())
 	}
+	spec.setProcess(nil)
 	process.Delete(context.Background()) //nolint:errcheck
 	stdoutR.Close()
 	stderrR.Close()

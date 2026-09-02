@@ -53,8 +53,8 @@ func TestSplitImageTag(t *testing.T) {
 
 func TestSplitRepoTag(t *testing.T) {
 	cases := map[string][2]string{
-		"docker.io/library/nginx:latest":    {"docker.io/library/nginx", "latest"},
-		"ghcr.io/foo/bar":                   {"ghcr.io/foo/bar", ""},
+		"docker.io/library/nginx:latest":        {"docker.io/library/nginx", "latest"},
+		"ghcr.io/foo/bar":                       {"ghcr.io/foo/bar", ""},
 		"docker.io/library/postgres@sha256:abc": {"docker.io/library/postgres", ""},
 	}
 	for in, want := range cases {

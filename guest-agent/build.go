@@ -12,8 +12,12 @@ import (
 	"strings"
 	"time"
 
-	bkclient "github.com/moby/buildkit/client"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
+	"github.com/docker/cli/cli/config/configfile"
+	configtypes "github.com/docker/cli/cli/config/types"
+	bkclient "github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/session/auth/authprovider"
 )
 
 // handleBuild implements POST /build (classic Docker build API). The client
@@ -83,6 +87,14 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 		frontendAttrs["platform"] = platform
 	}
 	quiet := q.Get("q") == "1" || q.Get("q") == "true"
+
+	// Private registries: attach the request's X-Registry-Auth credentials to
+	// the buildkit session so FROM pulls (and --push exports in the future)
+	// authenticate like the CLI's own driver does.
+	var sessionAttachables []session.Attachable
+	if a := parseRegistryAuth(r); !a.empty() {
+		sessionAttachables = append(sessionAttachables, buildAuthAttachable(a))
+	}
 
 	log.Printf("[docker-api] build ctx=%s tags=%q", ctxDir, tags)
 
@@ -158,6 +170,7 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 				"dockerfile": filepath.Dir(filepath.Join(ctxDir, dockerfile)),
 			},
 			Exports: exports,
+			Session: sessionAttachables,
 		}
 		_, berr = c.Solve(ctx, nil, solveOpts, statusCh)
 		<-done
@@ -198,6 +211,33 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 	if flusher != nil {
 		flusher.Flush()
 	}
+}
+
+// buildAuthAttachable wraps request credentials in buildkit's auth session
+// provider. The same AuthConfig is registered under every key form the
+// authprovider may look up (raw server address, bare host, Docker Hub v1
+// canonical URL) so host normalization never misses the entry.
+func buildAuthAttachable(a *registryAuth) session.Attachable {
+	ac := configtypes.AuthConfig{
+		Username:      a.Username,
+		Password:      a.Password,
+		IdentityToken: a.IdentityToken,
+	}
+	cf := configfile.New("")
+	host := registryHostOf(a.ServerAddress)
+	keys := map[string]bool{a.ServerAddress: true, host: true}
+	if a.ServerAddress == "" || host == "docker.io" {
+		keys["https://index.docker.io/v1/"] = true
+		keys["index.docker.io"] = true
+		keys["registry-1.docker.io"] = true
+		keys["docker.io"] = true
+	}
+	for k := range keys {
+		if k != "" {
+			cf.AuthConfigs[k] = ac
+		}
+	}
+	return authprovider.NewDockerAuthProvider(authprovider.DockerAuthProviderConfig{ConfigFile: cf})
 }
 
 // parseKVParam decodes a JSON object of string→string parameters sent by the

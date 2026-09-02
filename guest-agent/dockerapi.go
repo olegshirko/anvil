@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/mdlayher/vsock"
 )
 
@@ -303,7 +304,8 @@ func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
 	opts.stop = func() bool {
 		return r.Context().Err() != nil || baseStop()
 	}
-	_ = readTaskLog(containerLogPath(ns, containerdID), opts, emit)
+	err = readTaskLog(containerLogPath(ns, containerdID), opts, emit)
+	debugLog("logs %s: readTaskLog done err=%v follow=%v ctxErr=%v", containerdID, err, opts.follow, r.Context().Err())
 }
 
 // parseLogTime accepts unix seconds (optionally fractional) and RFC3339.
@@ -360,6 +362,8 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		archiveID, isArchive := containerSubresource("/containers/", "/archive")
 		execStartID, isExecStart := containerSubresource("/exec/", "/start")
 		execInspectID, isExecInspect := containerSubresource("/exec/", "/json")
+		execResizeID, isExecResize := containerSubresource("/exec/", "/resize")
+		resizeID, isResize := containerSubresource("/containers/", "/resize")
 		netConnectID, isNetConnect := containerSubresource("/networks/", "/connect")
 		netDisconnectID, isNetDisconnect := containerSubresource("/networks/", "/disconnect")
 
@@ -496,7 +500,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				http.Error(w, `{"message":"missing fromImage"}`, http.StatusBadRequest)
 				return
 			}
-			status, err := pullDockerImage(r.Context(), image)
+			status, err := pullDockerImage(r.Context(), image, parseRegistryAuth(r))
 			w.Header().Set("Content-Type", "application/json")
 			if err != nil {
 				// The progress stream must carry the failure in "error"
@@ -527,7 +531,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			w.WriteHeader(http.StatusCreated)
 		case isPush && r.Method == http.MethodPost:
 			w.Header().Set("Content-Type", "application/json")
-			if err := pushDockerImage(r.Context(), pushName, w); err != nil {
+			if err := pushDockerImage(r.Context(), pushName, parseRegistryAuth(r), w); err != nil {
 				fmt.Fprintf(w, "{\"status\":\"error pushing %s: %s\"}\n", pushName, err.Error())
 				return
 			}
@@ -557,6 +561,8 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			})
 		case path == "/images/load" && r.Method == http.MethodPost:
 			handleImageLoad(w, r)
+		case path == "/auth" && r.Method == http.MethodPost:
+			handleAuth(w, r)
 		case path == "/events" && r.Method == http.MethodGet:
 			handleEvents(w, r)
 		case path == "/build" && r.Method == http.MethodPost:
@@ -711,7 +717,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				return
 			}
 			name := r.URL.Query().Get("name")
-			id, err := createDockerContainer(r.Context(), req, name)
+			id, err := createDockerContainer(r.Context(), req, name, parseRegistryAuth(r))
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
 				return
@@ -783,6 +789,10 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			handleContainerTop(r.Context(), w, topID)
 		case isStats && r.Method == http.MethodGet:
 			handleContainerStats(r.Context(), w, statsID, r.URL.Query().Get("stream") == "1")
+		case isResize && r.Method == http.MethodPost:
+			handleContainerResize(w, r, resizeID)
+		case isExecResize && r.Method == http.MethodPost:
+			handleExecResize(w, r, execResizeID)
 		case isAttach && r.Method == http.MethodPost:
 			handleAttach(w, r, attachID)
 		case isLogs && r.Method == http.MethodGet:
@@ -865,6 +875,83 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 	if err := srv.Serve(l); err != nil {
 		log.Printf("[docker-api] serve: %v", err)
 	}
+}
+
+// parseResizeQuery extracts the h/w terminal dimensions from a resize request.
+func parseResizeQuery(r *http.Request) (uint32, uint32, error) {
+	q := r.URL.Query()
+	h, herr := strconv.ParseUint(q.Get("h"), 10, 32)
+	w, werr := strconv.ParseUint(q.Get("w"), 10, 32)
+	if herr != nil || werr != nil || h == 0 || w == 0 {
+		return 0, 0, fmt.Errorf("invalid resize dimensions (h=%q w=%q)", q.Get("h"), q.Get("w"))
+	}
+	return uint32(w), uint32(h), nil
+}
+
+// handleContainerResize implements POST /containers/{id}/resize — resizes the
+// container task's TTY (SIGWINCH propagates through the shim to the process).
+func handleContainerResize(w http.ResponseWriter, r *http.Request, id string) {
+	cols, rows, err := parseResizeQuery(r)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+	ns, containerdID, _, err := resolveDockerID(r.Context(), id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+		return
+	}
+	cl, err := pc.get(r.Context())
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	nsCtx := namespaces.WithNamespace(r.Context(), ns)
+	container, err := cl.LoadContainer(nsCtx, containerdID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+		return
+	}
+	task, err := container.Task(nsCtx, nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"no running task: %s"}`, err.Error()), http.StatusConflict)
+		return
+	}
+	if err := task.Resize(nsCtx, cols, rows); err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"Message": ""}) //nolint:errcheck
+}
+
+// handleExecResize implements POST /exec/{id}/resize — resizes the exec
+// process's TTY while the exec session is running.
+func handleExecResize(w http.ResponseWriter, r *http.Request, id string) {
+	cols, rows, err := parseResizeQuery(r)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+	spec := execs.get(id)
+	if spec == nil {
+		http.Error(w, fmt.Sprintf(`{"message":"No such exec instance: %s"}`, id), http.StatusNotFound)
+		return
+	}
+	process := spec.currentProcess()
+	if process == nil {
+		http.Error(w, `{"message":"exec is not running"}`, http.StatusConflict)
+		return
+	}
+	nsCtx := namespaces.WithNamespace(context.Background(), spec.Namespace)
+	if err := process.Resize(nsCtx, cols, rows); err != nil {
+		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"Message": ""}) //nolint:errcheck
 }
 
 // pruneDockerContainers removes stopped/created containers and returns their

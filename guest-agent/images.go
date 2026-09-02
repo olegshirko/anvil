@@ -166,7 +166,7 @@ func loadFromMirror(ctx context.Context, ref, ns string) error {
 // (containerd's content store is namespaced, so a bare metadata copy would
 // leave a dangling pointer pointing at blobs the target namespace cannot see).
 // Otherwise it is pulled into the target namespace.
-func ensureImageInNamespace(ctx context.Context, ref, targetNs string) error {
+func ensureImageInNamespace(ctx context.Context, ref, targetNs string, auth *registryAuth) error {
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd client: %w", err)
@@ -266,7 +266,7 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs string) error {
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 		}
-		perr = pullImageIntoNamespace(ctx, canonicalRef, targetNs)
+		perr = pullImageIntoNamespace(ctx, canonicalRef, targetNs, auth)
 		if perr == nil {
 			break
 		}
@@ -292,7 +292,7 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs string) error {
 
 // pullImageIntoNamespace pulls an image into the given namespace's image and
 // content stores, unpacking its rootfs so containers can start immediately.
-func pullImageIntoNamespace(ctx context.Context, canonicalRef, ns string) error {
+func pullImageIntoNamespace(ctx context.Context, canonicalRef, ns string, auth *registryAuth) error {
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd client: %w", err)
@@ -317,8 +317,9 @@ func pullImageIntoNamespace(ctx context.Context, canonicalRef, ns string) error 
 	// the next attempt that pass has finished. NOTE: no outer lease here —
 	// wrapping Pull in our own lease makes the committed image record
 	// lease-scoped, and releasing it deletes the record outright.
+	authOpts := authResolverOpts(auth)
 	for attempt := 1; ; attempt++ {
-		img, perr := cl.Pull(nsCtx, canonicalRef, client.WithPullUnpack)
+		img, perr := cl.Pull(nsCtx, canonicalRef, append([]client.RemoteOpt{client.WithPullUnpack}, authOpts...)...)
 		if perr != nil {
 			return perr
 		}
@@ -1082,7 +1083,7 @@ func tagDockerImage(ctx context.Context, source, target string) error {
 		// Every record is dangling (a GC pass raced earlier pulls). Re-pull
 		// the SOURCE into the default namespace — the retrying pull path
 		// re-ingests a fully labelled tree — and tag from there.
-		if perr := pullImageIntoNamespace(ctx, canonicalizeImageRef(source), "default"); perr != nil {
+		if perr := pullImageIntoNamespace(ctx, canonicalizeImageRef(source), "default", nil); perr != nil {
 			debugLog("tag %s: healing pull: %v", source, perr)
 		}
 		ns = findImageNamespace(ctx, source)
@@ -1117,13 +1118,13 @@ func tagDockerImage(ctx context.Context, source, target string) error {
 	// tag is not left dangling when a racing GC pass sweeps the source
 	// namespace right after the records are created.
 	if ns != "default" {
-		if err := ensureImageInNamespace(ctx, target, "default"); err != nil {
+		if err := ensureImageInNamespace(ctx, target, "default", nil); err != nil {
 			log.Printf("[images] mirror tag %s to default: %v", target, err)
 			// The source tree was swept mid-copy. Re-pull the SOURCE into
 			// default (works for registry-backed refs) and re-tag from the
 			// fresh copy; otherwise remove the tag records we just made so
 			// no dangling tag is left behind.
-			if perr := pullImageIntoNamespace(ctx, canonicalizeImageRef(source), "default"); perr != nil {
+			if perr := pullImageIntoNamespace(ctx, canonicalizeImageRef(source), "default", nil); perr != nil {
 				for _, name := range []string{canonicalTarget, target} {
 					_ = cl.ImageService().Delete(nsCtx, name)
 				}
@@ -1480,7 +1481,7 @@ func inspectDockerImage(ctx context.Context, name string) (map[string]interface{
 
 // pushDockerImage pushes an image to its registry through containerd's
 // remote resolver, streaming minimal Docker-style status lines to w.
-func pushDockerImage(ctx context.Context, name string, w io.Writer) error {
+func pushDockerImage(ctx context.Context, name string, auth *registryAuth, w io.Writer) error {
 	ns := findImageNamespace(ctx, name)
 	if ns == "" {
 		ns = "default"
@@ -1499,7 +1500,7 @@ func pushDockerImage(ctx context.Context, name string, w io.Writer) error {
 	}
 	fmt.Fprintf(w, `{"status":"Pushing %s"}
 `, name)
-	if perr := cl.Push(nsCtx, canonicalizeImageRef(name), img.Target()); perr != nil {
+	if perr := cl.Push(nsCtx, canonicalizeImageRef(name), img.Target(), authResolverOpts(auth)...); perr != nil {
 		fmt.Fprintf(w, `{"errorDetail":{"message":%q}}
 `, stripANSI(perr.Error()))
 		return perr
@@ -1512,9 +1513,9 @@ func pushDockerImage(ctx context.Context, name string, w io.Writer) error {
 // pullDockerImage pulls an image natively into the default namespace. When
 // the registry pull fails it falls back to the docker-mirror GitHub release
 // and returns a status line describing which path produced the image.
-func pullDockerImage(ctx context.Context, image string) (string, error) {
+func pullDockerImage(ctx context.Context, image string, auth *registryAuth) (string, error) {
 	ns := "default"
-	if err := pullImageIntoNamespace(ctx, canonicalizeImageRef(image), ns); err == nil {
+	if err := pullImageIntoNamespace(ctx, canonicalizeImageRef(image), ns, auth); err == nil {
 		return fmt.Sprintf("Downloaded newer image for %s", image), nil
 	} else {
 		pullErr := err
