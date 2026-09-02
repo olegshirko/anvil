@@ -1,3 +1,20 @@
+## Unreleased
+
+### Added
+- d34b505 feat(guest-agent): registry authentication (docker login, private pull/push/build) and TTY resize endpoints
+- 2768e25 feat: docker events --since replay, doctor --json, generated changelog, Swift unit tests
+
+### Fixed
+- 2d86af3 fix(guest-agent): logs -f follow diagnostics; runtime artifacts moved under .anvil-run/
+- 385c76f fix(host): auto-restart crashed VM with backoff, vsock liveness strikes, snapshot invalidation after 2 failed restarts
+- 4eafef5 fix(guest-agent): docker logs -f ended after 30s; ANVIL_CPUS passthrough
+
+### Docs
+- 8fe51d7 docs: honest Current limitations section in README
+
+### Internal
+- 698f249 chore: LaunchAgent plist as sed template; gofmt gate in unit-tests
+
 # Changelog
 
 ## v1.0.55 (2026-08-16)
