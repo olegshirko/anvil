@@ -8,6 +8,9 @@
 - 2768e25 feat: docker events --since replay, doctor --json, generated changelog, Swift unit tests
 
 - f0e9819 fix(guest-agent): error responses were hand-concatenated JSON — quotes in validator messages broke the wire; writeJSONError marshals properly (101 sites)
+### Internal
+- 7704b21 refactor(guest-agent): the 566-line routing switch replaced with a declarative route table (router.go) and per-domain handler files api_{system,containers,images,networks,volumes}.go; matcher unit tests; events recorder debug instrumentation
+
 ### Fixed
 - 12b0c91 fix(guest-agent): --cpus set a cpuset pin instead of a CFS quota; cpuset now via WithCPUs/WithCPUsMems; hostname skipped under shared UTS
 - 2d86af3 fix(guest-agent): logs -f follow diagnostics; runtime artifacts moved under .anvil-run/
