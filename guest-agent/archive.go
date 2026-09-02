@@ -119,10 +119,10 @@ func statContainerPath(ns, containerdID, path string) (dockerPathStat, error) {
 				return err
 			}
 			stat = dockerPathStat{
-				Name:       filepath.Base(fi.Name()),
-				Size:       fi.Size(),
-				Mode:       uint32(fi.Mode().Perm()),
-				Mtime:      fi.ModTime().UTC().Format(time.RFC3339),
+				Name:  filepath.Base(fi.Name()),
+				Size:  fi.Size(),
+				Mode:  uint32(fi.Mode().Perm()),
+				Mtime: fi.ModTime().UTC().Format(time.RFC3339),
 			}
 			if fi.Mode()&os.ModeSymlink != 0 {
 				if tgt, err := os.Readlink(filepath.Join(root, filepath.Clean("/"+path))); err == nil {

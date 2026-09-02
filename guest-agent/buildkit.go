@@ -9,11 +9,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"time"
 
-	bkclient "github.com/moby/buildkit/client"
 	"github.com/mdlayher/vsock"
+	bkclient "github.com/moby/buildkit/client"
 )
 
 // buildkitd is started lazily: it idles at ~50 MB RSS, so it is launched on
@@ -69,7 +70,7 @@ func ensureBuildkitd() error {
 	}
 	// The log lives on the virtiofs share so host-side debugging does not
 	// need guest shell access.
-	logFile, err := os.OpenFile("/mnt/anvil/buildkitd.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logFile, err := os.OpenFile(filepath.Join(anvilRunDir, "buildkitd.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}

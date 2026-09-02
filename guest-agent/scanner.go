@@ -352,10 +352,10 @@ func generateCNIConfigWithLabels(ns string, extraLabels map[string]string) error
 	}
 
 	conf := map[string]interface{}{
-		"cniVersion":    cniVersion,
-		"name":          netName,
-		"anvilID":       networkID(ns),
-		"anvilLabels":   labels,
+		"cniVersion":  cniVersion,
+		"name":        netName,
+		"anvilID":     networkID(ns),
+		"anvilLabels": labels,
 		"plugins": []interface{}{
 			// The loopback plugin brings `lo` up inside the fresh netns —
 			// without it 127.0.0.1 does not answer inside containers.

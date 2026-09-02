@@ -203,6 +203,9 @@ type logReadOptions struct {
 	since      time.Time   // zero = no lower bound
 	until      time.Time   // zero = no upper bound
 	stop       func() bool // polled during follow; true ends the stream
+	// noStopWait bounds the follow when the log file never appears and no
+	// stop condition can fire (zero = 30s production default; tests shrink it).
+	noStopWait time.Duration
 }
 
 // readTaskLog replays the container's json-file log. Each decoded record is
@@ -291,7 +294,11 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	var fileSeen bool
 	var noStopDeadline time.Time
 	if opts.stop == nil {
-		noStopDeadline = time.Now().Add(30 * time.Second)
+		wait := opts.noStopWait
+		if wait <= 0 {
+			wait = 30 * time.Second
+		}
+		noStopDeadline = time.Now().Add(wait)
 	}
 	for {
 		if chunk, next, cerr := readLogFrom(logPath, off); cerr == nil {
@@ -324,6 +331,8 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 			// exit is observable; end only once no new bytes arrived for
 			// a second (or the hard stop deadline passes).
 			if time.Since(quietSince) >= 2*time.Second || time.Now().After(stopDeadline) {
+				debugLog("follow %s: ended by stop condition (quiet %v, hard deadline %v)",
+					logPath, time.Since(quietSince) >= 2*time.Second, time.Now().After(stopDeadline))
 				return nil
 			}
 		}

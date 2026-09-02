@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -12,7 +13,7 @@ import (
 // over: it points its own stdout/stderr at a managed descriptor and rotates
 // the log once it exceeds debugLogMaxBytes, keeping a single backup.
 const (
-	debugLogPath       = "/mnt/anvil/guest-agent.log"
+	debugLogPath       = anvilRunDir + "/guest-agent.log"
 	debugLogMaxBytes   = 50 << 20 // 50 MiB
 	debugLogCheckEvery = time.Minute
 )
@@ -50,7 +51,14 @@ func rotateDebugLog() error {
 	}
 	f, err := os.OpenFile(debugLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		return err
+		// The directory may not exist yet (first debug boot with the
+		// .anvil-run layout); create it and retry once.
+		if os.MkdirAll(filepath.Dir(debugLogPath), 0o755) != nil {
+			return err
+		}
+		if f, err = os.OpenFile(debugLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err != nil {
+			return err
+		}
 	}
 	// The log package and runtime panics write to fds 1/2, so dup covers
 	// both (see dupfd_*.go — dup3 on linux, dup2 elsewhere).

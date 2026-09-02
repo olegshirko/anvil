@@ -641,17 +641,24 @@ if mountpoint -q /var/lib; then
 fi
 
 if ! mountpoint -q /var/lib; then
-    mkdir -p /mnt/anvil/var-lib
+    mkdir -p /mnt/anvil/.anvil-run/var-lib
 
     # One-time migration: if an old tarball cache exists and the persisted root is
     # empty, extract the tarball into the virtiofs directory.
-    if [ -f /mnt/anvil/containerd-cache.tar.zst ] && [ -z "$(ls -A /mnt/anvil/var-lib 2>/dev/null)" ]; then
+    if [ -f /mnt/anvil/containerd-cache.tar.zst ] && [ -z "$(ls -A /mnt/anvil/.anvil-run/var-lib 2>/dev/null)" ]; then
         echo "[stage2] migrating containerd cache from tarball to virtiofs directory"
-        mkdir -p /mnt/anvil/var-lib/containerd
-        /bin/zstd -dc /mnt/anvil/containerd-cache.tar.zst | tar -xf - -C /mnt/anvil/var-lib/containerd
+        mkdir -p /mnt/anvil/.anvil-run/var-lib/containerd
+        /bin/zstd -dc /mnt/anvil/containerd-cache.tar.zst | tar -xf - -C /mnt/anvil/.anvil-run/var-lib/containerd
     fi
 
-    mount --bind /mnt/anvil/var-lib /var/lib
+    # One-time migration from the pre-.anvil-run layout: adopt an existing
+    # persisted root instead of stranding it on the share.
+    if [ -z "$(ls -A /mnt/anvil/.anvil-run/var-lib 2>/dev/null)" ] && [ -n "$(ls -A /mnt/anvil/var-lib 2>/dev/null)" ]; then
+        echo "[stage2] migrating /mnt/anvil/var-lib into /mnt/anvil/.anvil-run/var-lib"
+        mv /mnt/anvil/var-lib/* /mnt/anvil/.anvil-run/var-lib/ 2>/dev/null || true
+    fi
+
+    mount --bind /mnt/anvil/.anvil-run/var-lib /var/lib
     echo "[stage2] /var/lib bound to virtiofs share"
 fi
 bmark varlib_mount
@@ -717,7 +724,8 @@ if [ -f /mnt/anvil/.anvil-debug ]; then
     export ANVIL_DEBUG=1
     # Stream guest-agent stdout/stderr to the virtiofs share so debug logs are
     # inspectable on the host without entering the VM.
-    exec /bin/guest-agent >>/mnt/anvil/guest-agent.log 2>&1
+    mkdir -p /mnt/anvil/.anvil-run
+    exec /bin/guest-agent >>/mnt/anvil/.anvil-run/guest-agent.log 2>&1
 fi
 exec /bin/guest-agent
 STAGE2

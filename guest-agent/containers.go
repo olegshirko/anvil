@@ -583,7 +583,7 @@ func findContainerByName(ctx context.Context, ns, name string) (string, error) {
 
 // createDockerContainer creates a container natively via containerd and
 // returns its Docker ID.
-func createDockerContainer(ctx context.Context, req dockerCreateRequest, name string) (string, error) {
+func createDockerContainer(ctx context.Context, req dockerCreateRequest, name string, auth *registryAuth) (string, error) {
 	networkMode := req.HostConfig.NetworkMode
 	ns := namespaceFromNetwork(networkMode)
 	// Compose attaches containers to a network named <project>_<network>. The
@@ -606,7 +606,7 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name st
 	// store is shared, so when the image already exists elsewhere we copy its
 	// metadata instead of re-pulling, which avoids corrupting the shared content
 	// store when docker compose creates multiple containers in parallel.
-	if err := ensureImageInNamespace(ctx, req.Image, ns); err != nil {
+	if err := ensureImageInNamespace(ctx, req.Image, ns, auth); err != nil {
 		return "", err
 	}
 

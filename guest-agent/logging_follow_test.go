@@ -63,17 +63,17 @@ func TestFollowRunsUntilStopFires(t *testing.T) {
 // Without a stop condition, a follow on a task whose log file never appears
 // must still give up (bounded wait), instead of looping forever.
 func TestFollowWithoutStopGivesUpOnMissingFile(t *testing.T) {
-	if testing.Short() {
-		t.Skip("waits out the 30s missing-file deadline")
-	}
+	// Production default is 30s; the test shrinks it so the suite stays fast.
+	// The give-up must actually wait the deadline (not spin-exit instantly) —
+	// callers rely on the debounce for containers that start a beat later.
 	start := time.Now()
 	_ = readTaskLog(filepath.Join(t.TempDir(), "absent.json"), logReadOptions{
-		follow: true, tail: -1,
+		follow: true, tail: -1, noStopWait: 400 * time.Millisecond,
 	}, func(stream byte, line []byte) {})
-	if elapsed := time.Since(start); elapsed > 35*time.Second {
-		t.Errorf("missing-file wait took too long: %v", elapsed)
-	}
-	if elapsed := time.Since(start); elapsed < 29*time.Second {
+	if elapsed := time.Since(start); elapsed < 400*time.Millisecond {
 		t.Errorf("missing-file wait gave up too early: %v", elapsed)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("missing-file wait took too long: %v", elapsed)
 	}
 }

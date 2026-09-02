@@ -16,6 +16,12 @@ import (
 // anvilShareRoot is the virtiofs mount exposed by the host.
 const anvilShareRoot = "/mnt/anvil"
 
+// anvilRunDir is where runtime artifacts (logs, persisted network labels) go
+// on the share. In dev mode the share is the project root, so writing at the
+// share root litters the checkout — everything ephemeral lives under this
+// dot-directory instead.
+const anvilRunDir = anvilShareRoot + "/.anvil-run"
+
 // dockerNetwork matches the JSON returned by GET /networks.
 type dockerNetwork struct {
 	Id         string            `json:"Id"`
@@ -59,8 +65,8 @@ type dockerNetworkCreateRequest struct {
 // listing/inspecting needs. The conflists in /etc/cni/net.d are the single
 // source of truth for networks.
 type cniConflist struct {
-	Name    string `json:"name"`
-	AnvilID string `json:"anvilID"`
+	Name    string            `json:"name"`
+	AnvilID string            `json:"anvilID"`
 	Labels  map[string]string `json:"anvilLabels"`
 	Plugins []struct {
 		Type   string `json:"type"`
@@ -179,13 +185,12 @@ func inspectDockerNetwork(ctx context.Context, name string) (*dockerNetwork, err
 	return nil, fmt.Errorf("No such network: %s", name)
 }
 
-
 // networkLabelsPath returns the host-share path where we persist Compose labels
 // for a network. The conflist is the source of truth; it reliably returns the
 // labels passed at create time, so we keep our own copy.
 func networkLabelsPath(name string) string {
 	base := sanitizeCNIName(name)
-	return filepath.Join(anvilShareRoot, "networks", base+".json")
+	return filepath.Join(anvilRunDir, "networks", base+".json")
 }
 
 // saveNetworkLabels persists the labels for a network.
@@ -238,24 +243,38 @@ func mergeNetworkLabels(base, persisted map[string]string) map[string]string {
 // Docker Compose sees the network as "not created by compose" and refuses to
 // use it.
 func restoreNetworkConfigs() {
-	dir := filepath.Join(anvilShareRoot, "networks")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+	restored := map[string]bool{}
+	// Current location plus the pre-.anvil-run share root (labels persisted
+	// by older builds must still restore after upgrade).
+	for _, dir := range []string{
+		filepath.Join(anvilRunDir, "networks"),
+		filepath.Join(anvilShareRoot, "networks"),
+	} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
 			continue
 		}
-		name := strings.TrimSuffix(e.Name(), ".json")
-		labels := loadNetworkLabels(name)
-		if labels == nil {
-			labels = map[string]string{}
-		}
-		if err := generateCNIConfigWithLabels(name, labels); err != nil {
-			log.Printf("[docker-api] restore network config for %s: %v", name, err)
-		} else {
-			log.Printf("[docker-api] restored network config for %s", name)
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			name := strings.TrimSuffix(e.Name(), ".json")
+			if restored[name] {
+				continue
+			}
+			var labels map[string]string
+			if data, rerr := os.ReadFile(filepath.Join(dir, e.Name())); rerr == nil {
+				json.Unmarshal(data, &labels) //nolint:errcheck — empty labels on parse failure
+			}
+			if labels == nil {
+				labels = map[string]string{}
+			}
+			if err := generateCNIConfigWithLabels(name, labels); err != nil {
+				log.Printf("[docker-api] restore network config for %s: %v", name, err)
+			} else {
+				restored[name] = true
+				log.Printf("[docker-api] restored network config for %s", name)
+			}
 		}
 	}
 }
@@ -413,4 +432,3 @@ func removeStaleBridge(conflistPath string) {
 		debugLog("[docker-api] bridge cleanup %s: %v: %s", cl.Plugins[0].Bridge, err, out)
 	}
 }
-

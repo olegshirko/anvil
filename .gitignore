@@ -6,6 +6,9 @@
 *.log
 guest-agent.log
 .anvil-debug
+# Runtime artifacts the guest writes onto the virtiofs share (in dev the share
+# is the repo root): logs, persisted network labels, var-lib fallback.
+.anvil-run/
 networks/
 var-lib/
 containerd-root/

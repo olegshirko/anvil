@@ -95,9 +95,9 @@ const cniBinDir = "/opt/cni/bin"
 // is exactly one conflist in /etc/cni/net.d; attaching a container means
 // Setup against that single list with port-mapping capabilities.
 type cniManager struct {
-	mu       sync.Mutex
-	byFile   map[string]cniclient.CNI
-	confDir  string
+	mu      sync.Mutex
+	byFile  map[string]cniclient.CNI
+	confDir string
 }
 
 var cnim = &cniManager{
