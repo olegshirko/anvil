@@ -7,16 +7,20 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/oleg/GolandProjects/anvil/scripts/anvil-service.sh</string>
+        <string>@REPO_ROOT@/scripts/anvil-service.sh</string>
         <string>start</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <!-- No KeepAlive: launchd would supervise the anvil-service.sh wrapper,
+         which nohup's the daemon and always exits 0 — SuccessfulExit=false
+         can never trigger, it only fakes protection. VM crash recovery lives
+         inside the daemon (guestDidStop / vsock-unreachable restart). -->
     <key>KeepAlive</key>
     <false/>
     <key>StandardOutPath</key>
-    <string>/Users/oleg/.anvil-vz/launchagent.log</string>
+    <string>@HOME_DIR@/.anvil-vz/launchagent.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/oleg/.anvil-vz/launchagent.log</string>
+    <string>@HOME_DIR@/.anvil-vz/launchagent.log</string>
 </dict>
 </plist>

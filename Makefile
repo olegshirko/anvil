@@ -44,9 +44,13 @@ LAUNCHAGENT_PLIST := scripts/$(LAUNCHAGENT_LABEL).plist
 LAUNCHAGENT_DIR := $(HOME)/Library/LaunchAgents
 LAUNCHAGENT_DST := $(LAUNCHAGENT_DIR)/$(LAUNCHAGENT_LABEL).plist
 
+# The plist is a template (@REPO_ROOT@/@HOME_DIR@); the user's checkout path
+# and home are substituted at install time so no personal paths ship in git.
 service-install:
 	@mkdir -p "$(LAUNCHAGENT_DIR)"
-	cp "$(LAUNCHAGENT_PLIST)" "$(LAUNCHAGENT_DST)"
+	sed -e 's|@REPO_ROOT@|$(CURDIR)|g' -e 's|@HOME_DIR@|$(HOME)|g' \
+		"$(LAUNCHAGENT_PLIST)" > "$(LAUNCHAGENT_DST)"
+	@grep -q '@' "$(LAUNCHAGENT_DST)" && { echo "[anvil-service] unsubstituted placeholder in plist"; exit 1; } || true
 	launchctl unload "$(LAUNCHAGENT_DST)" 2>/dev/null || true
 	launchctl load "$(LAUNCHAGENT_DST)"
 	@echo "[anvil-service] LaunchAgent installed. It will start automatically on next login."
@@ -154,6 +158,7 @@ test: sign unit-tests
 # Unit tests: pure-Go guest-agent helpers (darwin-hostable) and Swift
 # ControlProtocol/snapshot-hash tests.
 unit-tests:
+	cd guest-agent && gofmt -l *.go | grep -q . && { echo "[unit-tests] gofmt violations:"; gofmt -l *.go; exit 1; } || true
 	cd guest-agent && go vet ./... && go test ./...
 	swift test
 
