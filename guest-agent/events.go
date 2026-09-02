@@ -44,12 +44,12 @@ type dockerEventActor struct {
 func handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, `{"message":"streaming not supported"}`, http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, "streaming not supported")
 		return
 	}
 	filter, err := parseEventFilters(r.URL.Query().Get("filters"))
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"invalid filters: %s"}`, err.Error()), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid filters: %s", err.Error()))
 		return
 	}
 	// `until` in the past → empty stream; in the future → a deadline that
@@ -68,7 +68,7 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	cl, err := pc.get(r.Context())
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 

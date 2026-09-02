@@ -30,12 +30,12 @@ type dockerPathStat struct {
 func handleContainerArchive(w http.ResponseWriter, r *http.Request, id string) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
-		http.Error(w, `{"message":"path is required"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "path is required")
 		return
 	}
 	ns, containerdID, _, err := resolveDockerID(r.Context(), id)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
 
@@ -47,14 +47,14 @@ func handleContainerArchive(w http.ResponseWriter, r *http.Request, id string) {
 	case http.MethodPut:
 		handleArchivePut(w, r, ns, containerdID, path)
 	default:
-		http.Error(w, `{"message":"method not allowed"}`, http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 
 func handleArchiveHead(w http.ResponseWriter, r *http.Request, ns, containerdID, path string) {
 	stat, err := statContainerPath(ns, containerdID, path)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
 	data, _ := json.Marshal(stat)
@@ -65,7 +65,7 @@ func handleArchiveHead(w http.ResponseWriter, r *http.Request, ns, containerdID,
 func handleArchiveGet(w http.ResponseWriter, r *http.Request, ns, containerdID, srcPath string) {
 	stat, err := statContainerPath(ns, containerdID, srcPath)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
 	statJSON, _ := json.Marshal(stat)
@@ -73,14 +73,14 @@ func handleArchiveGet(w http.ResponseWriter, r *http.Request, ns, containerdID, 
 
 	tmpFile, err := createContainerTar(ns, containerdID, srcPath)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer os.Remove(tmpFile)
 
 	f, err := os.Open(tmpFile)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer f.Close()
@@ -96,12 +96,12 @@ func handleArchivePut(w http.ResponseWriter, r *http.Request, ns, containerdID, 
 	// rootfs snapshot when it is not running.
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	if err := extractTarIntoContainer(ns, containerdID, body, dstPath); err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusOK)

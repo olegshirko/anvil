@@ -206,12 +206,12 @@ func pruneBuildCache() (int64, error) {
 // proxy onto the guest's own buildkitd (see grpcbridge.go).
 func handleBuildkitGRPC(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"message":"grpc hijack requires POST"}`, http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "grpc hijack requires POST")
 		return
 	}
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, `{"message":"hijacking not supported"}`, http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, "hijacking not supported")
 		return
 	}
 	// /session carries the client's buildkit session (context upload, secret
@@ -220,7 +220,7 @@ func handleBuildkitGRPC(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/session" {
 		conn, bufrw, err := hj.Hijack()
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		fmt.Fprintf(bufrw, "HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n")
@@ -233,7 +233,7 @@ func handleBuildkitGRPC(w http.ResponseWriter, r *http.Request) {
 	}
 	conn, bufrw, err := hj.Hijack()
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	proto := r.Header.Get("Upgrade")

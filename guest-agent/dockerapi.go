@@ -206,7 +206,7 @@ var errWriteFailed = errors.New("write failed")
 func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
 	ns, containerdID, _, err := resolveDockerID(r.Context(), id)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
 	// Keep AutoRemove from deleting the container (and its logs) while we
@@ -217,13 +217,13 @@ func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, `{"message":"hijacking not supported"}`, http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, "hijacking not supported")
 		return
 	}
 
 	conn, bufrw, err := hj.Hijack()
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer conn.Close()
@@ -252,7 +252,7 @@ func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
 func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
 	ns, containerdID, _, err := resolveDockerID(r.Context(), id)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
 
@@ -469,7 +469,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			filters := parseDockerFilters(r.URL.Query().Get("filters"))
 			containers, err := listDockerContainers(r.Context(), filters)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			if !all {
@@ -486,7 +486,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case path == "/containers/prune" && r.Method == http.MethodPost:
 			deleted, reclaimed, err := pruneDockerContainers(r.Context())
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -497,7 +497,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case path == "/images/json":
 			images, err := listDockerImages(r.Context())
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -508,7 +508,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				image += ":" + tag
 			}
 			if image == "" {
-				http.Error(w, `{"message":"missing fromImage"}`, http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, "missing fromImage")
 				return
 			}
 			status, err := pullDockerImage(r.Context(), image, parseRegistryAuth(r))
@@ -532,11 +532,11 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				target += ":" + tag
 			}
 			if target == "" {
-				http.Error(w, `{"message":"missing repo/tag"}`, http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, "missing repo/tag")
 				return
 			}
 			if err := tagDockerImage(r.Context(), tagName, target); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusCreated)
@@ -549,7 +549,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case isRMI:
 			// force=1 is docker rmi -f (compose down --rmi sends it).
 			if err := removeDockerImage(r.Context(), rmiName, r.URL.Query().Get("force") == "1"); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -562,7 +562,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			}
 			deleted, reclaimed, err := pruneDockerImages(r.Context(), dangling)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -587,7 +587,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case path == "/build/prune" && r.Method == http.MethodPost:
 			reclaimed, err := pruneBuildCache()
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -599,7 +599,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			log.Printf("[docker-api] image inspect %q (resolved ns=%q)", imageInspectName, findImageNamespace(r.Context(), imageInspectName))
 			info, err := inspectDockerImage(r.Context(), imageInspectName)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+				writeJSONError(w, http.StatusNotFound, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -608,7 +608,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			filters := parseDockerFilters(r.URL.Query().Get("filters"))
 			networks, err := listDockerNetworks(r.Context(), filters)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -616,12 +616,12 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case path == "/networks/create" && r.Method == http.MethodPost:
 			var req dockerNetworkCreateRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			nw, err := createDockerNetwork(r.Context(), req)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -629,14 +629,14 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case isNetworkInspect && r.Method == http.MethodGet:
 			nw, err := inspectDockerNetwork(r.Context(), networkInspectID)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+				writeJSONError(w, http.StatusNotFound, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(nw)
 		case isNetworkInspect && r.Method == http.MethodDelete:
 			if err := removeDockerNetwork(r.Context(), networkInspectID); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -645,11 +645,11 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				Container string `json:"Container"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Container == "" {
-				http.Error(w, `{"message":"missing Container"}`, http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, "missing Container")
 				return
 			}
 			if err := connectContainerNetwork(netConnectID, req.Container); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -658,18 +658,18 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				Container string `json:"Container"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Container == "" {
-				http.Error(w, `{"message":"missing Container"}`, http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, "missing Container")
 				return
 			}
 			if err := disconnectContainerNetwork(netDisconnectID, req.Container); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case path == "/networks/prune" && r.Method == http.MethodPost:
 			deleted, err := pruneDockerNetworks(r.Context())
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -678,7 +678,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			filters := parseDockerFilters(r.URL.Query().Get("filters"))
 			volumes, err := listDockerVolumes(r.Context(), filters)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -686,7 +686,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case path == "/volumes/prune" && r.Method == http.MethodPost:
 			deleted, reclaimed, err := pruneDockerVolumes(r.Context())
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -697,12 +697,12 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case path == "/volumes/create" && r.Method == http.MethodPost:
 			var req dockerVolumeCreateRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			vol, err := createDockerVolume(r.Context(), req)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -710,40 +710,40 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case isVolumeInspect && r.Method == http.MethodGet:
 			vol, err := inspectDockerVolume(r.Context(), volumeInspectName)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+				writeJSONError(w, http.StatusNotFound, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(vol)
 		case isVolumeInspect && r.Method == http.MethodDelete:
 			if err := removeDockerVolume(r.Context(), volumeInspectName); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case path == "/containers/create" && r.Method == http.MethodPost:
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"read body: %s"}`, err), http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("read body: %s", err))
 				return
 			}
 			if verr := validateHostConfig(body); verr != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, verr.Error()), http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, verr.Error())
 				return
 			}
 			if perr := validateCreatePlatform(r); perr != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, perr.Error()), http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, perr.Error())
 				return
 			}
 			var req dockerCreateRequest
 			if err := json.Unmarshal(body, &req); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err), http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			name := r.URL.Query().Get("name")
 			id, err := createDockerContainer(r.Context(), req, name, parseRegistryAuth(r))
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -753,7 +753,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			})
 		case isStart && r.Method == http.MethodPost:
 			if err := startDockerContainer(r.Context(), startID); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -765,7 +765,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				}
 			}
 			if err := stopDockerContainer(r.Context(), stopID, timeout); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -775,7 +775,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				signal = "SIGKILL"
 			}
 			if err := killDockerContainer(r.Context(), killID, signal); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -787,7 +787,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				}
 			}
 			if err := restartDockerContainer(r.Context(), restartID, timeout); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -796,19 +796,19 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case isRename && r.Method == http.MethodPost:
 			newName := strings.TrimPrefix(r.URL.Query().Get("name"), "/")
 			if err := renameDockerContainer(r.Context(), renameID, newName); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case isPause && r.Method == http.MethodPost:
 			if err := pauseDockerContainer(r.Context(), pauseID, true); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case isUnpause && r.Method == http.MethodPost:
 			if err := pauseDockerContainer(r.Context(), unpauseID, false); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -829,12 +829,12 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case isExecCreate && r.Method == http.MethodPost:
 			var req dockerExecCreateRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			id, err := createDockerExec(r.Context(), execCreateID, req)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+				writeJSONError(w, http.StatusNotFound, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -842,12 +842,12 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case isExecStart && r.Method == http.MethodPost:
 			var req dockerExecStartRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusBadRequest)
+				writeJSONError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			if req.Detach {
 				if err := startDetachedExec(execStartID); err != nil {
-					http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+					writeJSONError(w, http.StatusInternalServerError, err.Error())
 					return
 				}
 				w.WriteHeader(http.StatusOK)
@@ -857,7 +857,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case isExecInspect && r.Method == http.MethodGet:
 			info, err := inspectDockerExec(execInspectID)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+				writeJSONError(w, http.StatusNotFound, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -865,14 +865,14 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		case isDelete && r.Method == http.MethodDelete:
 			force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
 			if err := deleteDockerContainer(r.Context(), deleteID, force); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+				writeJSONError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case isInspect && r.Method == http.MethodGet:
 			inspect, err := inspectDockerContainer(r.Context(), inspectID)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+				writeJSONError(w, http.StatusNotFound, err.Error())
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -920,32 +920,32 @@ func parseResizeQuery(r *http.Request) (uint32, uint32, error) {
 func handleContainerResize(w http.ResponseWriter, r *http.Request, id string) {
 	cols, rows, err := parseResizeQuery(r)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	ns, containerdID, _, err := resolveDockerID(r.Context(), id)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
 	cl, err := pc.get(r.Context())
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	nsCtx := namespaces.WithNamespace(r.Context(), ns)
 	container, err := cl.LoadContainer(nsCtx, containerdID)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
 	task, err := container.Task(nsCtx, nil)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"no running task: %s"}`, err.Error()), http.StatusConflict)
+		writeJSONError(w, http.StatusConflict, fmt.Sprintf("no running task: %s", err.Error()))
 		return
 	}
 	if err := task.Resize(nsCtx, cols, rows); err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -958,22 +958,22 @@ func handleContainerResize(w http.ResponseWriter, r *http.Request, id string) {
 func handleExecResize(w http.ResponseWriter, r *http.Request, id string) {
 	cols, rows, err := parseResizeQuery(r)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	spec := execs.get(id)
 	if spec == nil {
-		http.Error(w, fmt.Sprintf(`{"message":"No such exec instance: %s"}`, id), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("No such exec instance: %s", id))
 		return
 	}
 	process := spec.currentProcess()
 	if process == nil {
-		http.Error(w, `{"message":"exec is not running"}`, http.StatusConflict)
+		writeJSONError(w, http.StatusConflict, "exec is not running")
 		return
 	}
 	nsCtx := namespaces.WithNamespace(context.Background(), spec.Namespace)
 	if err := process.Resize(nsCtx, cols, rows); err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1108,4 +1108,13 @@ func pruneDockerVolumes(ctx context.Context) ([]string, int64, error) {
 		deleted = append(deleted, v.Name)
 	}
 	return deleted, 0, nil
+}
+
+// writeJSONError writes a Docker-API style error body. Hand-concatenated
+// JSON breaks whenever the message itself contains quotes (e.g. %q-formatted
+// validator errors), so this always marshals properly.
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"message": message})
 }

@@ -67,12 +67,12 @@ func pauseDockerContainer(ctx context.Context, id string, pause bool) error {
 func handleContainerTop(ctx context.Context, w http.ResponseWriter, id string) {
 	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
 	pid, ok := containerTaskPid(ctx, ns, containerdID)
 	if !ok || pid <= 0 {
-		http.Error(w, `{"message":"container not running"}`, http.StatusConflict)
+		writeJSONError(w, http.StatusConflict, "container not running")
 		return
 	}
 	// Container processes are descendants of the task pid. /proc/<pid>/task/<pid>/children
@@ -223,7 +223,7 @@ func disconnectContainerNetwork(network, container string) error {
 func handleSystemDF(ctx context.Context, w http.ResponseWriter) {
 	images, err := listDockerImages(ctx)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	containers, _ := listDockerContainers(ctx, nil)

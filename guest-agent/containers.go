@@ -943,7 +943,7 @@ func handleContainerWait(w http.ResponseWriter, r *http.Request, id string) {
 			fmt.Fprintf(w, `{"StatusCode":%d}`, code)
 			return
 		}
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
 

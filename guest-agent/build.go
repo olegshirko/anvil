@@ -31,13 +31,13 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 		dockerfile = "Dockerfile"
 	}
 	if remote := q.Get("remote"); remote != "" {
-		http.Error(w, fmt.Sprintf(`{"message":"remote build contexts are not supported (%s)"}`, remote), http.StatusNotImplemented)
+		writeJSONError(w, http.StatusNotImplemented, fmt.Sprintf("remote build contexts are not supported (%s)", remote))
 		return
 	}
 
 	ctxDir := filepath.Join("/var/lib/anvil-build", fmt.Sprintf("%d", time.Now().UnixNano()))
 	if err := os.MkdirAll(ctxDir, 0o755); err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer os.RemoveAll(ctxDir)
@@ -45,7 +45,7 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 	// Extract the context tar (gzip/zstd are auto-detected).
 	ds, err := compression.DecompressStream(r.Body)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer ds.Close()
@@ -54,11 +54,11 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 	untar.Stdin = ds
 	untarOut, err := untar.CombinedOutput()
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"failed to extract build context: %s: %s"}`, err, stripANSI(string(untarOut))), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("failed to extract build context: %s: %s", err, stripANSI(string(untarOut))))
 		return
 	}
 	if _, err := os.Stat(filepath.Join(ctxDir, dockerfile)); err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"Cannot locate specified Dockerfile: %s"}`, dockerfile), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("Cannot locate specified Dockerfile: %s", dockerfile))
 		return
 	}
 
@@ -100,7 +100,7 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 
 	// buildkitd is started lazily on first use.
 	if err := ensureBuildkitd(); err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 

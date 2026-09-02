@@ -145,11 +145,11 @@ func authResolverOpts(a *registryAuth) []client.RemoteOpt {
 func handleAuth(w http.ResponseWriter, r *http.Request) {
 	var a registryAuth
 	if err := json.NewDecoder(r.Body).Decode(&a); err != nil {
-		http.Error(w, `{"message":"malformed auth payload"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "malformed auth payload")
 		return
 	}
 	if a.Username == "" && a.IdentityToken == "" {
-		http.Error(w, `{"message":"no credentials provided"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "no credentials provided")
 		return
 	}
 	// Identity tokens are issued by external providers (ECR helpers, OIDC);
@@ -161,7 +161,7 @@ func handleAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateRegistryLogin(r.Context(), &a); err != nil {
 		log.Printf("[registry-auth] login to %s failed: %v", a.ServerAddress, err)
-		http.Error(w, fmt.Sprintf(`{"message":"login failed: %s"}`, err.Error()), http.StatusUnauthorized)
+		writeJSONError(w, http.StatusUnauthorized, fmt.Sprintf("login failed: %s", err.Error()))
 		return
 	}
 	log.Printf("[registry-auth] login succeeded for %s", a.ServerAddress)

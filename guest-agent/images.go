@@ -1156,7 +1156,7 @@ func handleImageGet(w http.ResponseWriter, r *http.Request, name string) {
 func handleImagesGet(w http.ResponseWriter, r *http.Request) {
 	names := r.URL.Query()["names"]
 	if len(names) == 0 {
-		http.Error(w, `{"message":"no images specified"}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "no images specified")
 		return
 	}
 	streamImageSave(r.Context(), w, names)
@@ -1176,14 +1176,14 @@ func streamImageSave(ctx context.Context, w http.ResponseWriter, names []string)
 	for _, name := range names {
 		imgNs := findImageNamespace(ctx, name)
 		if imgNs == "" {
-			http.Error(w, fmt.Sprintf(`{"message":"No such image: %s"}`, name), http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
 			return
 		}
 		ns = imgNs
 	}
 	cl, err := pc.get(ctx)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1219,25 +1219,25 @@ func streamImageSave(ctx context.Context, w http.ResponseWriter, names []string)
 		}
 		if src.Name == "" {
 			dropScratch()
-			http.Error(w, fmt.Sprintf(`{"message":"No such image: %s"}`, name), http.StatusNotFound)
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("No such image: %s", name))
 			return
 		}
 		target, serr := stageTreeForExport(bc, src.Target)
 		if serr != nil {
 			dropScratch()
-			http.Error(w, fmt.Sprintf(`{"message":"save %s: %s"}`, name, serr.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("save %s: %s", name, serr.Error()))
 			return
 		}
 		if perr := putImage(cl, scratchCtx, images.Image{Name: canonical, Target: target}); perr != nil {
 			dropScratch()
-			http.Error(w, fmt.Sprintf(`{"message":"save %s: %s"}`, name, perr.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("save %s: %s", name, perr.Error()))
 			return
 		}
 		imgs = append(imgs, images.Image{Name: canonical, Target: target})
 	}
 	if len(imgs) == 0 {
 		dropScratch()
-		http.Error(w, `{"message":"save failed: no image records"}`, http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, "save failed: no image records")
 		return
 	}
 	defer dropScratch()
@@ -1540,7 +1540,7 @@ func handleImageLoad(w http.ResponseWriter, r *http.Request) {
 
 	cl, err := pc.get(r.Context())
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1548,7 +1548,7 @@ func handleImageLoad(w http.ResponseWriter, r *http.Request) {
 
 	ds, err := compression.DecompressStream(r.Body)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer ds.Close()
@@ -1571,7 +1571,7 @@ func handleImageLoad(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		log.Printf("[docker-api] import failed: %v", err)
-		http.Error(w, fmt.Sprintf(`{"message":"import failed: %s"}`, stripANSI(err.Error())), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("import failed: %s", stripANSI(err.Error())))
 		return
 	}
 

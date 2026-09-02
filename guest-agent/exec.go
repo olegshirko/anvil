@@ -194,19 +194,19 @@ func startDetachedExec(id string) error {
 func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	spec := execs.get(id)
 	if spec == nil {
-		http.Error(w, fmt.Sprintf(`{"message":"No such exec instance: %s"}`, id), http.StatusNotFound)
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("No such exec instance: %s", id))
 		return
 	}
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, `{"message":"hijacking not supported"}`, http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, "hijacking not supported")
 		return
 	}
 
 	conn, bufrw, err := hj.Hijack()
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer conn.Close()
