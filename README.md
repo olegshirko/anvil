@@ -139,6 +139,7 @@ intact).
 | Variable | Default | Purpose |
 |---|---|---|
 | `ANVIL_MEMORY` | `2` | VM RAM in GiB |
+| `ANVIL_CPUS` | — | VM CPU count (unset = vz-runner default of 2) |
 | `ANVIL_DISK_GB` | `64` | containerd disk size (sparse; existing disks only grow, guest fs is resized online) |
 | `ANVIL_SHARE_USERS` | `1` | Set to `0` to disable sharing the host `/Users` tree into the VM |
 | `DEBUG` | — | `1` enables guest-agent debug log (`guest-agent.log` on the share) |

@@ -39,6 +39,7 @@ else
     SHARE_ROOT="${SHARE_ROOT:-$STATE_DIR}"
 fi
 MEMORY_GB="${ANVIL_MEMORY:-2}"
+CPUS="${ANVIL_CPUS:-}"
 
 # Look for kernel/initrd. In a source tree, freshly built assets under
 # .download win over state-dir copies (which may be stale after rebuilds).
@@ -209,6 +210,7 @@ cmd_start() {
         --initrd "$INITRD_PATH" \
         --share "$SHARE_ROOT" \
         --memory "$MEMORY_GB" \
+        ${CPUS:+--cpus "$CPUS"} \
         --idle 600 \
         $disk_arg \
         $debug_arg \

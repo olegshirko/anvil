@@ -285,23 +285,33 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	off := int64(len(data))
 	var quietSince time.Time
 	var stopDeadline time.Time
-	deadline := time.Now().Add(30 * time.Second)
+	// A running container is followed indefinitely (docker logs -f must not
+	// end on a timer); the only bounded wait is for a log file that never
+	// appears while no stop condition can ever fire (callers without stop).
+	var fileSeen bool
+	var noStopDeadline time.Time
+	if opts.stop == nil {
+		noStopDeadline = time.Now().Add(30 * time.Second)
+	}
 	for {
-		if chunk, next, cerr := readLogFrom(logPath, off); cerr == nil && len(chunk) > 0 {
-			pending = append(pending, chunk...)
-			for {
-				idx := bytes.IndexByte(pending, '\n')
-				if idx < 0 {
-					break
+		if chunk, next, cerr := readLogFrom(logPath, off); cerr == nil {
+			fileSeen = true
+			if len(chunk) > 0 {
+				pending = append(pending, chunk...)
+				for {
+					idx := bytes.IndexByte(pending, '\n')
+					if idx < 0 {
+						break
+					}
+					var rec logLine
+					if json.Unmarshal(pending[:idx], &rec) == nil {
+						emitRecord(rec)
+					}
+					pending = pending[idx+1:]
 				}
-				var rec logLine
-				if json.Unmarshal(pending[:idx], &rec) == nil {
-					emitRecord(rec)
-				}
-				pending = pending[idx+1:]
+				off = next
+				quietSince = time.Time{} // fresh bytes: restart the quiet clock
 			}
-			off = next
-			quietSince = time.Time{} // fresh bytes: restart the quiet clock
 		}
 		if stopFired() {
 			if stopDeadline.IsZero() {
@@ -317,8 +327,8 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 				return nil
 			}
 		}
-		if time.Now().After(deadline) {
-			return nil // safety valve for a wedged stop condition
+		if !fileSeen && !noStopDeadline.IsZero() && time.Now().After(noStopDeadline) {
+			return nil // the task never started and no stop condition exists
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

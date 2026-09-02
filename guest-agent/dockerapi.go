@@ -286,12 +286,23 @@ func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
 
 	flusher, _ := w.(http.Flusher)
 	emit := func(stream byte, line []byte) {
-		writeDockerStream(w, stream, line)
+		if writeDockerStream(w, stream, line) != nil {
+			panic(errWriteFailed) // unwind readTaskLog's follow loop
+		}
 		if flusher != nil {
 			flusher.Flush()
 		}
 	}
-	opts.stop = taskExitedStopper(ns, containerdID, opts.follow)
+	defer func() {
+		recover() //nolint:errcheck — errWriteFailed unwinds the follow loop
+	}()
+	// A followed container may stay quiet forever; the follow loop then ends
+	// on client disconnect (context canceled) or container exit, not on a
+	// write error alone.
+	baseStop := taskExitedStopper(ns, containerdID, opts.follow)
+	opts.stop = func() bool {
+		return r.Context().Err() != nil || baseStop()
+	}
 	_ = readTaskLog(containerLogPath(ns, containerdID), opts, emit)
 }
 
