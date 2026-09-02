@@ -80,6 +80,10 @@ type containerMeta struct {
 	Mounts           []dockerMount      `json:"Mounts,omitempty"`
 	AnonymousVolumes []string           `json:"AnonymousVolumes,omitempty"`
 	Healthcheck      *dockerHealthcheck `json:"Healthcheck,omitempty"`
+	// HostConfig snapshot of the create request, echoed back by inspect for
+	// fields owned by the spec (memory, cpus, caps, ...) that have no other
+	// persisted representation.
+	HostConfig *dockerHostConfig `json:"HostConfig,omitempty"`
 }
 
 var metaMu sync.Mutex

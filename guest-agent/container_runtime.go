@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	osuser "os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -335,6 +337,105 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 		cpus := float64(req.HostConfig.NanoCpus) / 1e9
 		opts = append(opts, oci.WithCPUs(strconv.FormatFloat(cpus, 'f', -1, 64)))
 	}
+	if hc := &req.HostConfig; hc != nil {
+		if hc.CpuShares > 0 {
+			opts = append(opts, oci.WithCPUShares(uint64(hc.CpuShares)))
+		}
+		if hc.CpuPeriod > 0 && hc.CpuQuota != 0 {
+			// CpuQuota -1 means "unlimited" and maps to the cgroup "max".
+			opts = append(opts, oci.WithCPUCFS(hc.CpuQuota, uint64(hc.CpuPeriod)))
+		}
+		if hc.CpusetCpus != "" || hc.CpusetMems != "" {
+			cpus, mems := hc.CpusetCpus, hc.CpusetMems
+			opts = append(opts, func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+				if s.Linux == nil || s.Linux.Resources == nil {
+					return errors.New("cpuset: missing linux resources in spec")
+				}
+				s.Linux.Resources.CPU.Cpus = cpus
+				s.Linux.Resources.CPU.Mems = mems
+				return nil
+			})
+		}
+		if hc.MemorySwap > 0 {
+			opts = append(opts, oci.WithMemorySwap(hc.MemorySwap))
+		}
+		if hc.MemoryReservation > 0 {
+			reservation := hc.MemoryReservation
+			opts = append(opts, func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+				if s.Linux == nil {
+					s.Linux = &specs.Linux{}
+				}
+				if s.Linux.Resources == nil {
+					s.Linux.Resources = &specs.LinuxResources{}
+				}
+				if s.Linux.Resources.Memory == nil {
+					s.Linux.Resources.Memory = &specs.LinuxMemory{}
+				}
+				s.Linux.Resources.Memory.Reservation = &reservation
+				return nil
+			})
+		}
+		if hc.PidsLimit != nil && *hc.PidsLimit > 0 {
+			// docker's -1 (unlimited) is the cgroup default here — skipped.
+			opts = append(opts, oci.WithPidsLimit(*hc.PidsLimit))
+		}
+		if hc.ShmSize > 0 {
+			opts = append(opts, oci.WithDevShmSize(hc.ShmSize/1024))
+		}
+		if hc.OomScoreAdj != 0 {
+			adj := hc.OomScoreAdj
+			opts = append(opts, func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+				if s.Process == nil {
+					return errors.New("oom_score_adj: missing process in spec")
+				}
+				s.Process.OOMScoreAdj = &adj
+				return nil
+			})
+		}
+		for _, opt := range hc.SecurityOpt {
+			if strings.HasPrefix(opt, "no-new-privileges") {
+				// covers both "no-new-privileges" and ":true" forms
+				opts = append(opts, oci.WithNoNewPrivileges)
+				break
+			}
+		}
+		for i := range hc.Ulimits {
+			u := hc.Ulimits[i]
+			opts = append(opts, oci.WithRlimit(&specs.POSIXRlimit{
+				Type: u.Name, Soft: uint64(u.Soft), Hard: uint64(u.Hard),
+			}))
+		}
+		if len(hc.GroupAdd) > 0 {
+			groups := hc.GroupAdd
+			opts = append(opts, func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+				if s.Process == nil {
+					return errors.New("group_add: missing process in spec")
+				}
+				for _, g := range groups {
+					var gid int
+					if n, err := strconv.Atoi(g); err == nil {
+						gid = n
+					} else if gr, err := osuser.LookupGroup(g); err == nil {
+						n, _ := strconv.Atoi(gr.Gid)
+						gid = n
+					} else {
+						return fmt.Errorf("group_add: unknown group %q", g)
+					}
+					s.Process.User.AdditionalGids = append(s.Process.User.AdditionalGids, uint32(gid))
+				}
+				return nil
+			})
+		}
+		if hc.IpcMode == "host" {
+			opts = append(opts, oci.WithHostNamespace(specs.IPCNamespace))
+		}
+		if hc.CgroupnsMode == "host" {
+			opts = append(opts, oci.WithHostNamespace(specs.CgroupNamespace))
+		}
+		if len(hc.Annotations) > 0 {
+			opts = append(opts, oci.WithAnnotations(hc.Annotations))
+		}
+	}
 	if len(req.HostConfig.Sysctls) > 0 {
 		sysctls := req.HostConfig.Sysctls
 		opts = append(opts, func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
@@ -468,6 +569,7 @@ func createNativeContainer(ctx context.Context, ns, name string, req dockerCreat
 		Mounts:           req.HostConfig.Mounts,
 		AnonymousVolumes: anonVols,
 		Healthcheck:      req.Healthcheck,
+		HostConfig:       &req.HostConfig,
 	}
 	if serr := saveContainerMeta(meta); serr != nil {
 		return "", serr

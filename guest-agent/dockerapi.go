@@ -723,7 +723,10 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(dockerCreateResponse{Id: id})
+			json.NewEncoder(w).Encode(dockerCreateResponse{
+				Id:       id,
+				Warnings: unsupportedHostConfigWarnings(req.HostConfig),
+			})
 		case isStart && r.Method == http.MethodPost:
 			if err := startDockerContainer(r.Context(), startID); err != nil {
 				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusInternalServerError)

@@ -68,6 +68,33 @@ type dockerHostConfig struct {
 	Sysctls         map[string]string           `json:"Sysctls"`
 	Devices         []dockerDevice              `json:"Devices"`
 	Links           []string                    `json:"Links"`
+
+	// Resource knobs beyond Memory/NanoCpus. Zero values mean "unset" and are
+	// skipped; docker semantics for sentinel values (-1) are honored.
+	CpuShares         int64             `json:"CpuShares"`
+	CpuPeriod         int64             `json:"CpuPeriod"`
+	CpuQuota          int64             `json:"CpuQuota"`
+	CpusetCpus        string            `json:"CpusetCpus"`
+	CpusetMems        string            `json:"CpusetMems"`
+	MemorySwap        int64             `json:"MemorySwap"`
+	MemoryReservation int64             `json:"MemoryReservation"`
+	PidsLimit         *int64            `json:"PidsLimit"`
+	ShmSize           int64             `json:"ShmSize"`
+	OomScoreAdj       int               `json:"OomScoreAdj"`
+	SecurityOpt       []string          `json:"SecurityOpt"`
+	Ulimits           []dockerUlimit    `json:"Ulimits"`
+	GroupAdd          []string          `json:"GroupAdd"`
+	IpcMode           string            `json:"IpcMode"`
+	CgroupnsMode      string            `json:"CgroupnsMode"`
+	UsernsMode        string            `json:"UsernsMode"`
+	Init              *bool             `json:"Init"`
+	Annotations       map[string]string `json:"Annotations"`
+}
+
+type dockerUlimit struct {
+	Name string `json:"Name"`
+	Soft int64  `json:"Soft"`
+	Hard int64  `json:"Hard"`
 }
 
 type dockerHostPort struct {
@@ -1319,14 +1346,14 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 					WorkingDir:  getContainerWorkingDir(did),
 					StopSignal:  getContainerStopSignal(did),
 				},
-				HostConfig: dockerHostConfig{
+				HostConfig: inspectHostConfig(meta, dockerHostConfig{
 					AutoRemove:   isAutoRemove(did),
 					NetworkMode:  networkName,
 					PortBindings: portBindings,
 					// The restart policy is owned by our monitor; report it
 					// from the registry.
 					RestartPolicy: restarts.policySpecFor(did),
-				},
+				}),
 				NetworkSettings: dockerNetworkSettings{
 					IPAddress: containerIP,
 					Ports:     portBindings,
@@ -1380,4 +1407,47 @@ func portBindingsFromMeta(meta *containerMeta) map[string][]dockerHostPort {
 		})
 	}
 	return bindings
+}
+
+// unsupportedHostConfigWarnings lists HostConfig features the native runtime
+// knowingly ignores, so `docker create` surfaces them in Warnings instead of
+// failing silently.
+func unsupportedHostConfigWarnings(hc dockerHostConfig) []string {
+	var w []string
+	if hc.Init != nil && *hc.Init {
+		w = append(w, "HostConfig.Init is not supported; no init process is injected")
+	}
+	if m := hc.UsernsMode; m != "" && m != "host" {
+		w = append(w, fmt.Sprintf("HostConfig.UsernsMode %q is not supported", m))
+	}
+	if m := hc.IpcMode; m != "" && m != "host" && m != "private" && m != "shareable" {
+		w = append(w, fmt.Sprintf("HostConfig.IpcMode %q is not supported", m))
+	}
+	for _, opt := range hc.SecurityOpt {
+		if strings.HasPrefix(opt, "no-new-privileges") {
+			continue
+		}
+		if strings.HasPrefix(opt, "apparmor=") || strings.HasPrefix(opt, "seccomp=") ||
+			strings.HasPrefix(opt, "label=") {
+			continue // no LSM/seccomp is applied by default; nothing to change
+		}
+		w = append(w, fmt.Sprintf("HostConfig.SecurityOpt %q is not supported", opt))
+	}
+	return w
+}
+
+// inspectHostConfig layers the dynamic, monitor-owned HostConfig fields over
+// the create-time snapshot persisted in the container metadata, so inspect
+// reports what was requested (memory, cpus, caps, ...) alongside live state.
+func inspectHostConfig(meta *containerMeta, live dockerHostConfig) dockerHostConfig {
+	if meta == nil || meta.HostConfig == nil {
+		return live
+	}
+	snap := *meta.HostConfig
+	// Fields owned elsewhere at runtime override the snapshot.
+	snap.AutoRemove = live.AutoRemove
+	snap.NetworkMode = live.NetworkMode
+	snap.PortBindings = live.PortBindings
+	snap.RestartPolicy = live.RestartPolicy
+	return snap
 }
