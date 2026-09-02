@@ -223,6 +223,22 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
 ## Current limitations
 
 - Apple Silicon only; no amd64 emulation yet (Rosetta support is planned).
+  `docker run --platform linux/amd64` is rejected with an explicit error
+  rather than silently substituting an arm64 image.
+- **Containers run with no seccomp filter.** Unlike Docker, whose default
+  profile blocks several dozen syscalls, anvil applies no seccomp/LSM
+  confinement — `--security-opt seccomp=unconfined` is effectively the
+  default for every container. This weakens the inner sandbox; the VM
+  boundary and the hypervisor are the primary isolation. `no-new-privileges`
+  is honored; custom seccomp profiles, AppArmor and SELinux labels are
+  rejected. A default seccomp profile is planned.
+- HostConfig surface: `--cpus/--cpuset-cpus/--pids-limit/--ulimit/--shm-size/
+  --memory-swap/--group-add (numeric)/--uts=host/--ipc=host/--cgroupns=host`
+  are honored. Refused with a 400 naming the flag: `--oom-kill-disable`,
+  `--blkio-weight`, `--storage-opt`, `--isolation`, `--runtime`,
+  `--log-driver` other than `json-file`/`none`, custom seccomp profiles,
+  AppArmor/SELinux. Not yet implemented: `--volumes-from`, `--init` (warned,
+  not rejected).
 - Docker API is emulated, not complete: it covers what `docker` CLI and
   `docker compose` actually use. Not implemented: Swarm and its whole CLI
   surface, `docker commit`, `docker update`, `docker diff`/`/changes`,
