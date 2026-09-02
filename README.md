@@ -223,16 +223,26 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
 ## Current limitations
 
 - Apple Silicon only; no amd64 emulation yet (Rosetta support is planned).
+- Docker API is emulated, not complete: it covers what `docker` CLI and
+  `docker compose` actually use. Not implemented: Swarm and its whole CLI
+  surface, `docker commit`, `docker update`, `docker diff`/`/changes`,
+  `docker export`, plugins and some prune endpoints.
 - With the remote buildx driver, plain `docker build` keeps the result in the
   build cache — add `--load` to import it into the image store (compose does
   this automatically). The buildx `docker-container` driver (which pulls a
   moby/buildkit image) does not work.
+- A container's final output line is lost if the process exits without a
+  trailing newline (`printf tail`, `cmd | head -c N`). The last write(2) of a
+  dying process is dropped by containerd's runc-v2 shim, which closes the
+  task's IO pipe before the logging reader drains it — a known upstream shim
+  behavior, not an anvil bug. Complete lines stream correctly, and any output
+  after the tail flushes everything.
 - `docker events --since` replays only what the in-memory event log kept
   (last 1024 events since first boot — the buffer survives snapshot pauses);
   live events, `--until` and filters are unaffected.
-- Docker API is emulated, not complete: it covers what `docker` CLI and
-  `docker compose` actually use. Swarm, plugins and some prune endpoints are
-  out of scope.
+- `FROM` in a Dockerfile resolves through the registry; if Docker Hub is
+  fully unreachable, a build with a brand-new base image fails (local
+  fallback only works for tags already pulled).
 - The control socket is unauthenticated (local-user trust model) — do not
   expose it.
 
