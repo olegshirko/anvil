@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	osuser "os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -255,6 +254,9 @@ func mergeEnv(lists ...[]string) []string {
 	return out
 }
 
+// cpuPeriod is the CFS period Docker and runc use by default (100 ms).
+const cpuPeriod = 100000
+
 // buildSpecOpts composes the OCI spec options for a create request.
 func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCreateRequest, mounts []specs.Mount, hostNet bool) ([]oci.SpecOpts, error) {
 	entrypoint := req.Entrypoint
@@ -309,7 +311,11 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 		},
 		oci.WithEnv(env),
 		oci.WithProcessCwd(cwd),
-		oci.WithHostname(hostname),
+	}
+	if req.HostConfig.UtsMode != "host" {
+		// A shared UTS namespace makes the hostname read-only (runc refuses
+		// to set one), and docker's --uts=host does not set it either.
+		opts = append(opts, oci.WithHostname(hostname))
 	}
 	if user != "" {
 		opts = append(opts, oci.WithUser(user))
@@ -334,8 +340,11 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 		opts = append(opts, oci.WithMemoryLimit(uint64(req.HostConfig.Memory)))
 	}
 	if req.HostConfig.NanoCpus > 0 {
-		cpus := float64(req.HostConfig.NanoCpus) / 1e9
-		opts = append(opts, oci.WithCPUs(strconv.FormatFloat(cpus, 'f', -1, 64)))
+		// NanoCpus is billionths of a CPU: 1.5 CPUs == 1_500_000_000. The
+		// CFS quota is that fraction of one period. (oci.WithCPUs is the
+		// cpuset — a CPU *list* — and must not be used here.)
+		quota := req.HostConfig.NanoCpus * cpuPeriod / 1e9
+		opts = append(opts, oci.WithCPUCFS(quota, cpuPeriod))
 	}
 	if hc := &req.HostConfig; hc != nil {
 		if hc.CpuShares > 0 {
@@ -345,19 +354,18 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 			// CpuQuota -1 means "unlimited" and maps to the cgroup "max".
 			opts = append(opts, oci.WithCPUCFS(hc.CpuQuota, uint64(hc.CpuPeriod)))
 		}
-		if hc.CpusetCpus != "" || hc.CpusetMems != "" {
-			cpus, mems := hc.CpusetCpus, hc.CpusetMems
-			opts = append(opts, func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
-				if s.Linux == nil || s.Linux.Resources == nil {
-					return errors.New("cpuset: missing linux resources in spec")
-				}
-				s.Linux.Resources.CPU.Cpus = cpus
-				s.Linux.Resources.CPU.Mems = mems
-				return nil
-			})
+		if hc.CpusetCpus != "" {
+			opts = append(opts, oci.WithCPUs(hc.CpusetCpus))
 		}
-		if hc.MemorySwap > 0 {
-			opts = append(opts, oci.WithMemorySwap(hc.MemorySwap))
+		if hc.CpusetMems != "" {
+			opts = append(opts, oci.WithCPUsMems(hc.CpusetMems))
+		}
+		// Docker's MemorySwap is memory+swap combined; runc applies the
+		// v1→v2 conversion itself (see memorySwapSpec).
+		if swap, serr := memorySwapSpec(hc.Memory, hc.MemorySwap); serr != nil {
+			return nil, serr
+		} else if swap != nil {
+			opts = append(opts, oci.WithMemorySwap(*swap))
 		}
 		if hc.MemoryReservation > 0 {
 			reservation := hc.MemoryReservation
@@ -393,16 +401,32 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 			})
 		}
 		for _, opt := range hc.SecurityOpt {
-			if strings.HasPrefix(opt, "no-new-privileges") {
-				// covers both "no-new-privileges" and ":true" forms
+			switch {
+			case opt == "no-new-privileges" || opt == "no-new-privileges:true":
 				opts = append(opts, oci.WithNoNewPrivileges)
-				break
+			case opt == "seccomp=unconfined":
+				// already the effective default: no seccomp filter is applied
+			case opt == "seccomp=false": // docker's legacy alias for unconfined
+			default:
+				if strings.HasPrefix(opt, "seccomp=") {
+					return nil, fmt.Errorf("security-opt %q: custom seccomp profiles are not supported (no default profile exists yet)", opt)
+				}
+				if strings.HasPrefix(opt, "apparmor=") {
+					return nil, fmt.Errorf("security-opt %q: no AppArmor in the anvil guest", opt)
+				}
+				if strings.HasPrefix(opt, "label=") {
+					return nil, fmt.Errorf("security-opt %q: no SELinux in the anvil guest", opt)
+				}
+				return nil, fmt.Errorf("security-opt %q is not supported by anvil", opt)
 			}
 		}
-		for i := range hc.Ulimits {
-			u := hc.Ulimits[i]
+		for _, u := range hc.Ulimits {
+			name := "RLIMIT_" + strings.ToUpper(u.Name)
+			if !knownRlimits[name] {
+				return nil, fmt.Errorf("invalid ulimit %q", u.Name)
+			}
 			opts = append(opts, oci.WithRlimit(&specs.POSIXRlimit{
-				Type: u.Name, Soft: uint64(u.Soft), Hard: uint64(u.Hard),
+				Type: name, Soft: uint64(u.Soft), Hard: uint64(u.Hard),
 			}))
 		}
 		if len(hc.GroupAdd) > 0 {
@@ -412,19 +436,19 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 					return errors.New("group_add: missing process in spec")
 				}
 				for _, g := range groups {
-					var gid int
-					if n, err := strconv.Atoi(g); err == nil {
-						gid = n
-					} else if gr, err := osuser.LookupGroup(g); err == nil {
-						n, _ := strconv.Atoi(gr.Gid)
-						gid = n
-					} else {
-						return fmt.Errorf("group_add: unknown group %q", g)
+					// Numeric-only by design: names would need /etc/group
+					// from the image rootfs (same punt as execUserFor).
+					gid, err := strconv.Atoi(g)
+					if err != nil || gid < 0 {
+						return fmt.Errorf("group-add %q: only numeric gids are supported", g)
 					}
 					s.Process.User.AdditionalGids = append(s.Process.User.AdditionalGids, uint32(gid))
 				}
 				return nil
 			})
+		}
+		if hc.UtsMode == "host" {
+			opts = append(opts, oci.WithHostNamespace(specs.UTSNamespace))
 		}
 		if hc.IpcMode == "host" {
 			opts = append(opts, oci.WithHostNamespace(specs.IPCNamespace))
