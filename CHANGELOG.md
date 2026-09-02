@@ -9,6 +9,7 @@
 
 - f0e9819 fix(guest-agent): error responses were hand-concatenated JSON — quotes in validator messages broke the wire; writeJSONError marshals properly (101 sites)
 ### Internal
+- 7310e07 test(guest-agent): events replay (since window, container filter, until-in-past), network lifecycle over temp CNI dirs (create/list/inspect/delete-by-ID), and rename — behind the fake containerd events/containers.Update services; cniConfDir/anvilRunDir made overridable
 - bdf1fe9 test(guest-agent): fake containerd gRPC server (namespaces/containers/tasks/images) behind the read-path handlers — /containers/json, inspect by name/ID-prefix, /images/json, /system/df run with the real containerd client, no VM
 - 83d4eb8 test(guest-agent): HTTP-layer tests via httptest over the real route table — ping/version headers, create rejection paths, 400 wire format (valid JSON + application/json), wildcard guards, Connection: close
 - 7704b21 refactor(guest-agent): the 566-line routing switch replaced with a declarative route table (router.go) and per-domain handler files api_{system,containers,images,networks,volumes}.go; matcher unit tests; events recorder debug instrumentation
