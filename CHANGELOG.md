@@ -1,6 +1,7 @@
 ## Unreleased
 
 ### Added
+- 10d5663 feat(guest-agent): HostConfig coverage — cpu shares/quota/cpuset, swap, pids, shm, ulimits, no-new-privileges, group-add, ipc/cgroup ns, annotations; snapshot-backed inspect and create warnings
 - d34b505 feat(guest-agent): registry authentication (docker login, private pull/push/build) and TTY resize endpoints
 - 2768e25 feat: docker events --since replay, doctor --json, generated changelog, Swift unit tests
 
