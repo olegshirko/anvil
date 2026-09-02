@@ -1,16 +1,20 @@
 ## Unreleased
 
 ### Added
+- f2b162f feat(guest-agent): HostConfig spec fields — ulimits/shm/pids/cpuset/swap/group-add/uts/ipc/cgroupns/security-opt per HOSTCONFIG_SPEC; log-driver none discards; wave4 integration tests
+- 6da1d84 feat(guest-agent): HostConfig rejection layer — 400 naming the flag for oom-kill-disable/blkio-weight/storage-opt/isolation/runtime, log drivers, and non-arm64 platforms
 - 10d5663 feat(guest-agent): HostConfig coverage — cpu shares/quota/cpuset, swap, pids, shm, ulimits, no-new-privileges, group-add, ipc/cgroup ns, annotations; snapshot-backed inspect and create warnings
 - d34b505 feat(guest-agent): registry authentication (docker login, private pull/push/build) and TTY resize endpoints
 - 2768e25 feat: docker events --since replay, doctor --json, generated changelog, Swift unit tests
 
 ### Fixed
+- 12b0c91 fix(guest-agent): --cpus set a cpuset pin instead of a CFS quota; cpuset now via WithCPUs/WithCPUsMems; hostname skipped under shared UTS
 - 2d86af3 fix(guest-agent): logs -f follow diagnostics; runtime artifacts moved under .anvil-run/
 - 385c76f fix(host): auto-restart crashed VM with backoff, vsock liveness strikes, snapshot invalidation after 2 failed restarts
 - 4eafef5 fix(guest-agent): docker logs -f ended after 30s; ANVIL_CPUS passthrough
 
 ### Docs
+- 6da1d84 docs: disclose the missing seccomp profile (README limitations, SECURITY.md); HostConfig support matrix
 - 8fe51d7 docs: honest Current limitations section in README
 
 ### Internal
