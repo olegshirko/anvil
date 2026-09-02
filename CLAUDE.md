@@ -121,8 +121,10 @@ The Docker API and exec wait on that finalize (bounded); `status`/`health` does 
   snapshot's config hash stays valid. Use `boot-containerd-fresh` to rebuild.
 - With the remote buildx driver (`anvil-remote`), plain `docker build` leaves the result in
   the build cache — `--load` is needed to import it into the image store.
-- `docker events` has no historical replay (no event log); only live streaming, filters and
-  `--until` work.
+- `docker events --since` replays the in-memory event log (ring buffer, last 1024 events
+  recorded since first boot — the buffer survives snapshot pauses), then continues live;
+  filters apply to the replay too. Events older than the buffer or from before the current
+  boot are gone.
 - CI (`.github/workflows/go.yml`) runs on `macos-15` x86_64 runners: it can build and sign
   but **cannot run any VM-based test**. `make validate` needs a self-hosted Apple Silicon
   runner and is `workflow_dispatch` only.

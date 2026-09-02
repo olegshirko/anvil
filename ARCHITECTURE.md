@@ -203,8 +203,11 @@ An HTTP/1.1 server emulating the subset of the Docker API needed by
 - `/volumes/*` create/inspect/list/rm/prune;
 - `/build` (classic path: the agent extracts the context tar and solves
   through buildkitd's gRPC API) and `/build/prune`;
-- `/events` (live stream with filters and `until`; no historical replay —
-  there is no event log);
+- `/events` (live stream with filters and `until`; `--since` in the past
+  replays the in-memory event log first — a ring buffer of the last 1024
+  events recorded since first boot, which survives snapshot pauses — then
+  the stream continues live; events from before the current boot or evicted
+  from the ring are unrecoverable);
 - `/system/df`, `/system/prune`.
 
 Notable details:
