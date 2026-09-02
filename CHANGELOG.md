@@ -7,6 +7,7 @@
 - d34b505 feat(guest-agent): registry authentication (docker login, private pull/push/build) and TTY resize endpoints
 - 2768e25 feat: docker events --since replay, doctor --json, generated changelog, Swift unit tests
 
+- f0e9819 fix(guest-agent): error responses were hand-concatenated JSON — quotes in validator messages broke the wire; writeJSONError marshals properly (101 sites)
 ### Fixed
 - 12b0c91 fix(guest-agent): --cpus set a cpuset pin instead of a CFS quota; cpuset now via WithCPUs/WithCPUsMems; hostname skipped under shared UTS
 - 2d86af3 fix(guest-agent): logs -f follow diagnostics; runtime artifacts moved under .anvil-run/
