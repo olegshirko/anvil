@@ -19,6 +19,7 @@ Uses DOCKER_HOST so the user's docker context is never touched.
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -1310,6 +1311,99 @@ def test_run_flags_wave3() -> None:
     record("run flags wave3: dns/sysctl/device/link", "PASS", "all honored")
 
 
+def test_run_flags_wave4() -> None:
+    """Fourth flag wave (HostConfig coverage spec): cpu quota/cpuset, pids,
+    ulimits, shm-size, memory-swap, group-add, uts/ipc/cgroupns host,
+    no-new-privileges, and the rejection layer."""
+    # --cpus is a CFS quota, not a cpuset pin (regression for the P0 bug)
+    out = docker("run", "--rm", "--cpus", "1.5", "alpine",
+                 "cat", "/sys/fs/cgroup/cpu.max").stdout.strip()
+    if out != "150000 100000":
+        raise RuntimeError(f"cpus quota: {out!r}")
+    # ...and it must NOT pin the cpuset
+    out = docker("run", "--rm", "--cpus", "2", "alpine",
+                 "cat", "/sys/fs/cgroup/cpuset.cpus.effective").stdout.strip()
+    if out == "2":
+        raise RuntimeError(f"--cpus still pins cpuset: {out!r}")
+    out = docker("run", "--rm", "--cpuset-cpus", "0-1", "alpine",
+                 "cat", "/sys/fs/cgroup/cpuset.cpus.effective").stdout.strip()
+    if out != "0-1":
+        raise RuntimeError(f"cpuset-cpus: {out!r}")
+    out = docker("run", "--rm", "--pids-limit", "42", "alpine",
+                 "cat", "/sys/fs/cgroup/pids.max").stdout.strip()
+    if out != "42":
+        raise RuntimeError(f"pids-limit: {out!r}")
+    out = docker("run", "--rm", "--ulimit", "nofile=1234:5678", "alpine",
+                 "sh", "-c", "ulimit -n").stdout.strip()
+    if out != "1234":
+        raise RuntimeError(f"ulimit nofile: {out!r}")
+    out = docker("run", "--rm", "--shm-size", "128m", "alpine",
+                 "df", "-k", "/dev/shm").stdout.splitlines()[1].split()[1]
+    if out != "131072":
+        raise RuntimeError(f"shm-size: {out!r}")
+    # The guest kernel has no swap controller (SwapTotal=0, memory.swap.max
+    # absent), so the only assertable contract is: the value converts, create
+    # succeeds, and the paired memory limit applies. Where swap.max exists
+    # (future kernel), assert the converted v2 value (128m-64m=64m).
+    out = docker("run", "--rm", "--memory", "64m", "--memory-swap", "128m", "alpine",
+                 "sh", "-c", "cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/memory.swap.max 2>/dev/null").stdout.split()
+    if out[0] != "67108864":
+        raise RuntimeError(f"memory-swap pairing: memory.max={out[0]!r}")
+    if len(out) > 1 and out[1] != "67108864":
+        raise RuntimeError(f"memory-swap conversion: swap.max={out[1]!r}")
+    out = docker("run", "--rm", "--group-add", "4242", "alpine", "id", "-G").stdout
+    if "4242" not in out.split():
+        raise RuntimeError(f"group-add: {out!r}")
+    uts_host = docker("run", "--rm", "--uts", "host", "alpine",
+                      "hostname").stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{12}", uts_host):
+        raise RuntimeError(f"uts host kept the container hostname: {uts_host!r}")
+    guest_name = docker("info", "--format", "{{.Name}}").stdout.strip()
+    if guest_name and uts_host != guest_name:
+        raise RuntimeError(f"uts host: {uts_host!r} vs guest {guest_name!r}")
+    priv = docker("run", "--rm", "alpine", "head", "-1", "/proc/self/cgroup").stdout
+    hostcg = docker("run", "--rm", "--cgroupns", "host", "alpine",
+                    "head", "-1", "/proc/self/cgroup").stdout
+    if priv == hostcg:
+        raise RuntimeError(f"cgroupns host had no effect: {priv!r}")
+    out = docker("run", "--rm", "--security-opt", "no-new-privileges", "alpine",
+                 "grep", "NoNewPrivs", "/proc/self/status").stdout.strip()
+    if not re.match(r"NoNewPrivs:\s+1$", out):
+        raise RuntimeError(f"no-new-privileges: {out!r}")
+    # rejection layer: each flag must fail, naming itself
+    for flag, value, needle in [
+        ("--oom-kill-disable", "", "OomKillDisable"),
+        ("--blkio-weight", "500", "BlkioWeight"),
+        ("--storage-opt", "size=1g", "StorageOpt"),
+        ("--isolation", "hyperv", "Isolation"),
+        ("--runtime", "sysbox", "Runtime"),
+        ("--log-driver", "syslog", "log driver"),
+        ("--platform", "linux/amd64", "platform"),
+    ]:
+        args = ["run", "--rm", flag]
+        if value:
+            args.append(value)
+        args += ["alpine", "true"]
+        res = docker(*args, check=False)
+        if res.returncode == 0 or needle not in res.stderr:
+            raise RuntimeError(f"{flag} not rejected: rc={res.returncode} err={res.stderr[-200:]!r}")
+    # seccomp=unconfined is accepted (it is the effective default)
+    docker("run", "--rm", "--security-opt", "seccomp=unconfined", "alpine", "true")
+    # log driver none: container runs, logs return nothing
+    name = f"{PREFIX}-lognone"
+    try:
+        docker("run", "-d", "--name", name, "--log-driver", "none",
+               "alpine", "sh", "-c", "echo chatty; sleep 60")
+        time.sleep(1.0)
+        logs = docker("logs", name, check=False).stdout
+        if logs.strip():
+            raise RuntimeError(f"log-driver none leaked output: {logs!r}")
+    finally:
+        cleanup(name)
+    record("run flags wave4: cpu/pids/ulimit/shm/swap/group/uts/nnp + rejections", "PASS",
+           "all honored; unsupported flags rejected naming themselves")
+
+
 def test_restart_policy() -> None:
     """--restart=on-failure actually restarts (guest-agent monitor)."""
     name = f"{PREFIX}-rstpol"
@@ -1625,6 +1719,7 @@ TESTS = [
     ("run flags P0 (entrypoint/w/add-host/memory/cap)", test_run_flags_p0),
     ("run flags wave2 (read-only/stop-signal/tmpfs/pid/net-host)", test_run_flags_wave2),
     ("run flags wave3 (dns/sysctl/device/link)", test_run_flags_wave3),
+    ("run flags wave4 (cpu/pids/ulimit/shm/swap/group/uts/nnp/rejections)", test_run_flags_wave4),
     ("restart policy monitor", test_restart_policy),
     ("restart always/unless-stopped", test_restart_policy_always),
     ("docker wait", test_docker_wait),
@@ -1701,7 +1796,11 @@ def main() -> int:
         log(f"cannot pull test images (network?): {e}")
         return 2
 
+    import sys as _sys
+    only = _sys.argv[1:]
     for name, fn in TESTS:
+        if only and not any(o in name for o in only):
+            continue
         log(f"\n=== {name} ===")
         try:
             fn()

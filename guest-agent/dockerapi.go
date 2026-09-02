@@ -278,6 +278,17 @@ func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
 		}
 	}
 
+	// Log driver "none" discards: there is deliberately no log file, so
+	// logs must return an empty stream (and an empty follow) instead of
+	// waiting 30s for a file that never appears.
+	if meta, merr := loadContainerMeta(ns, containerdID); merr == nil && meta.HostConfig != nil &&
+		meta.HostConfig.LogConfig.Type == "none" {
+		if opts.follow {
+			<-r.Context().Done()
+		}
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
 	w.Header().Set("Connection", "close")
 	w.WriteHeader(http.StatusOK)
@@ -711,9 +722,22 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case path == "/containers/create" && r.Method == http.MethodPost:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"message":"read body: %s"}`, err), http.StatusBadRequest)
+				return
+			}
+			if verr := validateHostConfig(body); verr != nil {
+				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, verr.Error()), http.StatusBadRequest)
+				return
+			}
+			if perr := validateCreatePlatform(r); perr != nil {
+				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, perr.Error()), http.StatusBadRequest)
+				return
+			}
 			var req dockerCreateRequest
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err.Error()), http.StatusBadRequest)
+			if err := json.Unmarshal(body, &req); err != nil {
+				http.Error(w, fmt.Sprintf(`{"message":"%s"}`, err), http.StatusBadRequest)
 				return
 			}
 			name := r.URL.Query().Get("name")

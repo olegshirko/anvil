@@ -89,6 +89,13 @@ type dockerHostConfig struct {
 	UsernsMode        string            `json:"UsernsMode"`
 	Init              *bool             `json:"Init"`
 	Annotations       map[string]string `json:"Annotations"`
+	UtsMode           string            `json:"UTSMode"`
+	LogConfig         dockerLogConfig   `json:"LogConfig"`
+}
+
+type dockerLogConfig struct {
+	Type   string            `json:"Type"`
+	Config map[string]string `json:"Config"`
 }
 
 type dockerUlimit struct {
@@ -1411,7 +1418,8 @@ func portBindingsFromMeta(meta *containerMeta) map[string][]dockerHostPort {
 
 // unsupportedHostConfigWarnings lists HostConfig features the native runtime
 // knowingly ignores, so `docker create` surfaces them in Warnings instead of
-// failing silently.
+// failing silently. Fields that can never be honored are rejected with a 400
+// by validateHostConfig instead — this is only for accepted-but-degraded.
 func unsupportedHostConfigWarnings(hc dockerHostConfig) []string {
 	var w []string
 	if hc.Init != nil && *hc.Init {
@@ -1419,19 +1427,6 @@ func unsupportedHostConfigWarnings(hc dockerHostConfig) []string {
 	}
 	if m := hc.UsernsMode; m != "" && m != "host" {
 		w = append(w, fmt.Sprintf("HostConfig.UsernsMode %q is not supported", m))
-	}
-	if m := hc.IpcMode; m != "" && m != "host" && m != "private" && m != "shareable" {
-		w = append(w, fmt.Sprintf("HostConfig.IpcMode %q is not supported", m))
-	}
-	for _, opt := range hc.SecurityOpt {
-		if strings.HasPrefix(opt, "no-new-privileges") {
-			continue
-		}
-		if strings.HasPrefix(opt, "apparmor=") || strings.HasPrefix(opt, "seccomp=") ||
-			strings.HasPrefix(opt, "label=") {
-			continue // no LSM/seccomp is applied by default; nothing to change
-		}
-		w = append(w, fmt.Sprintf("HostConfig.SecurityOpt %q is not supported", opt))
 	}
 	return w
 }
