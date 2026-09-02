@@ -332,11 +332,11 @@ func parseLogTime(v string) time.Time {
 	return time.Time{}
 }
 
-// runDockerAPIServer starts the Docker-compatible HTTP server on vsock:1025.
-// It waits for boot finalize (containerd up + stale-container cleanup) before
-// listening; see runBootFinalize. Endpoint logic lives in the api_*.go
-// handler files and is wired up by the route table in router.go.
-func runDockerAPIServer(containerdReady <-chan struct{}) {
+// newDockerAPIHandler builds the HTTP handler for the Docker-compatible API:
+// request logging, connection teardown semantics and the route table in
+// router.go. Separate from runDockerAPIServer so tests can exercise the full
+// HTTP layer with httptest (no vsock, no containerd).
+func newDockerAPIHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := stripAPIVersion(r.URL.Path)
@@ -350,6 +350,15 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 
 		dispatchDockerAPI(w, r, path)
 	})
+	return mux
+}
+
+// runDockerAPIServer starts the Docker-compatible HTTP server on vsock:1025.
+// It waits for boot finalize (containerd up + stale-container cleanup) before
+// listening; see runBootFinalize. Endpoint logic lives in the api_*.go
+// handler files and is wired up by the route table in router.go.
+func runDockerAPIServer(containerdReady <-chan struct{}) {
+	mux := newDockerAPIHandler()
 
 	// Container operations must not race the boot-time stale-container
 	// cleanup (and need containerd reachable); the host-side docker proxy
