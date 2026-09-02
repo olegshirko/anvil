@@ -20,7 +20,8 @@ const anvilShareRoot = "/mnt/anvil"
 // on the share. In dev mode the share is the project root, so writing at the
 // share root litters the checkout — everything ephemeral lives under this
 // dot-directory instead.
-const anvilRunDir = anvilShareRoot + "/.anvil-run"
+// anvilRunDir is a var so tests can point it at a temp directory.
+var anvilRunDir = anvilShareRoot + "/.anvil-run"
 
 // dockerNetwork matches the JSON returned by GET /networks.
 type dockerNetwork struct {

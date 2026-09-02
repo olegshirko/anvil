@@ -12,8 +12,11 @@ import (
 // grows that file on the host disk without bound, so the agent takes the file
 // over: it points its own stdout/stderr at a managed descriptor and rotates
 // the log once it exceeds debugLogMaxBytes, keeping a single backup.
+// debugLogPath is a var (not a const) because it derives from the
+// overridable anvilRunDir.
+var debugLogPath = anvilRunDir + "/guest-agent.log"
+
 const (
-	debugLogPath       = anvilRunDir + "/guest-agent.log"
 	debugLogMaxBytes   = 50 << 20 // 50 MiB
 	debugLogCheckEvery = time.Minute
 )

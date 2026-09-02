@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	grpc "google.golang.org/grpc"
@@ -22,6 +23,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	containerspb "github.com/containerd/containerd/api/services/containers/v1"
+	eventspb "github.com/containerd/containerd/api/services/events/v1"
 	imagespb "github.com/containerd/containerd/api/services/images/v1"
 	namespacespb "github.com/containerd/containerd/api/services/namespaces/v1"
 	taskspb "github.com/containerd/containerd/api/services/tasks/v1"
@@ -109,6 +111,28 @@ func (s *fakeContainersService) Get(ctx context.Context, req *containerspb.GetCo
 		return nil, status.Errorf(codes.NotFound, "container %s not found", req.ID)
 	}
 	return &containerspb.GetContainerResponse{Container: c}, nil
+}
+
+// Update applies the field-mask label updates the client sends for rename
+// (SetLabels -> mask paths "labels.<key>").
+func (s *fakeContainersService) Update(ctx context.Context, req *containerspb.UpdateContainerRequest) (*containerspb.UpdateContainerResponse, error) {
+	ns, ok := s.f.ns[requestNamespace(ctx)]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "namespace not found")
+	}
+	c, ok := ns.containers[req.Container.ID]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "container %s not found", req.Container.ID)
+	}
+	for _, path := range req.UpdateMask.GetPaths() {
+		if key, found := strings.CutPrefix(path, "labels."); found {
+			if c.Labels == nil {
+				c.Labels = map[string]string{}
+			}
+			c.Labels[key] = req.Container.Labels[key]
+		}
+	}
+	return &containerspb.UpdateContainerResponse{Container: c}, nil
 }
 
 func (s *fakeTasksService) Get(ctx context.Context, req *taskspb.GetRequest) (*taskspb.GetResponse, error) {
@@ -223,6 +247,7 @@ func startFakeContainerd(t *testing.T, namespace string, opts ...fakeContainerdO
 	namespacespb.RegisterNamespacesServer(srv, &fakeNamespacesService{f: f})
 	containerspb.RegisterContainersServer(srv, &fakeContainersService{f: f})
 	taskspb.RegisterTasksServer(srv, &fakeTasksService{f: f})
+	eventspb.RegisterEventsServer(srv, &fakeEventsService{})
 	imagespb.RegisterImagesServer(srv, &fakeImagesService{f: f})
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { srv.Stop(); os.Remove(sock) })
@@ -233,6 +258,18 @@ func startFakeContainerd(t *testing.T, namespace string, opts ...fakeContainerdO
 		pc.close()
 		pc = old
 	})
+}
+
+// fakeEventsService implements the events service: subscriptions live but
+// never deliver (the handlers under test replay from the in-memory ring and
+// use the live stream only as a keep-open select case).
+type fakeEventsService struct {
+	eventspb.UnimplementedEventsServer
+}
+
+func (s *fakeEventsService) Subscribe(req *eventspb.SubscribeRequest, stream eventspb.Events_SubscribeServer) error {
+	<-stream.Context().Done()
+	return nil
 }
 
 // runningTask is the task record for a live container.

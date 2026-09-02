@@ -17,9 +17,12 @@ const (
 	dockerAPIPort     = 1025
 	hostPortCheckPort = 1027
 	containerdSocket  = "/run/containerd/containerd.sock"
-	cniConfDir        = "/etc/cni/net.d"
 	netnsDir          = "/var/run/netns"
 )
+
+// cniConfDir is a var so tests can point it at a temp directory (a conflist
+// in this dir IS a network).
+var cniConfDir = "/etc/cni/net.d"
 
 // newContainerID returns a 64-char hex id in the shape Docker clients expect
 // (containerd accepts any unique string; we keep it docker-like).
