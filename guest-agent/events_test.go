@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -121,5 +122,44 @@ func TestParseEventTimestamp(t *testing.T) {
 	past := time.Now().Add(-time.Hour)
 	if ts := parseEventTimestamp(past.Format(time.RFC3339Nano)); ts == nil || ts.After(time.Now()) {
 		t.Errorf("past timestamp misparsed: %v", ts)
+	}
+}
+
+func TestEventLogRing(t *testing.T) {
+	old := eventLog.ring
+	defer func() { eventLog.ring = old }()
+
+	eventLog.ring = nil
+	base := time.Now()
+	for i := 0; i < eventBufferSize+50; i++ {
+		eventLogRecord(dockerEvent{
+			Action:   "start",
+			Actor:    dockerEventActor{ID: fmt.Sprintf("id%d", i)},
+			TimeNano: base.Add(time.Duration(i) * time.Millisecond).UnixNano(),
+		})
+	}
+	if got := len(eventLogSnapshot(time.Time{})); got != eventBufferSize {
+		t.Errorf("ring should cap at %d, holds %d", eventBufferSize, got)
+	}
+	got := eventLogSnapshot(base.Add(60 * time.Millisecond))
+	if len(got) != eventBufferSize-11 {
+		t.Errorf("since-filtered snapshot: want %d events, got %d", eventBufferSize-11, len(got))
+	}
+	// Chronological order, newest 1024 kept.
+	for i := 1; i < len(got); i++ {
+		if got[i].TimeNano <= got[i-1].TimeNano {
+			t.Fatalf("snapshot not chronological at %d", i)
+		}
+	}
+	if got[0].Actor.ID != "id61" {
+		t.Errorf("oldest kept after since should be id61, got %s", got[0].Actor.ID)
+	}
+}
+
+func TestEventKeyDedup(t *testing.T) {
+	a := dockerEvent{Action: "die", Actor: dockerEventActor{ID: "abc"}, TimeNano: 42}
+	b := dockerEvent{Action: "die", Actor: dockerEventActor{ID: "abc"}, TimeNano: 43}
+	if eventKey(a) != eventKey(a) || eventKey(a) == eventKey(b) {
+		t.Error("eventKey must be equal for same event and differ on TimeNano")
 	}
 }

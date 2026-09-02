@@ -562,7 +562,7 @@ case "exec":
     }
     ControlClient.exec(command: cmdArgs)
 case "doctor":
-    cmdDoctor()
+    cmdDoctor(args: Array(arguments.dropFirst()))
 case "logs":
     cmdLogs(args: Array(arguments.dropFirst()))
 case "images":

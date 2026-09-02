@@ -1,12 +1,19 @@
 import Foundation
 
-// `anvil doctor` — diagnose the local installation: hypervisor, signing,
-// assets, daemon, docker context and API reachability. Exits non-zero when
-// any check fails so it can be used in scripts.
-func cmdDoctor() {
+// `anvil doctor [--json]` — diagnose the local installation: hypervisor,
+// signing, assets, daemon, docker context and API reachability. Exits
+// non-zero when any check fails so it can be used in scripts. `--json`
+// emits one object with a `checks` array (name/ok/detail) instead of the
+// human-readable lines, plus a top-level `ok` for a single glance gate.
+func cmdDoctor(args: [String]) {
+    let asJSON = args.contains("--json")
+    var results: [(name: String, ok: Bool, detail: String)] = []
     var failures = 0
     func check(_ name: String, _ ok: Bool, _ detail: String = "") {
-        print(String(format: "[%@] %@", ok ? "OK" : "FAIL", name) + (detail.isEmpty ? "" : " — \(detail)"))
+        if !asJSON {
+            print(String(format: "[%@] %@", ok ? "OK" : "FAIL", name) + (detail.isEmpty ? "" : " — \(detail)"))
+        }
+        results.append((name, ok, detail))
         if !ok { failures += 1 }
     }
 
@@ -91,11 +98,25 @@ func cmdDoctor() {
         }
     }
 
+    if asJSON {
+        let checks = results.map { r in
+            // Strings are plain data (paths, versions); JSON-escaping via
+            // JSONSerialization keeps quotes/newlines correct.
+            func esc(_ s: String) -> String {
+                let d = try! JSONSerialization.data(withJSONObject: [s])
+                return String(data: d.dropFirst().dropLast(), encoding: .utf8)!
+            }
+            return "{\"name\":\(esc(r.name)),\"ok\":\(r.ok),\"detail\":\(esc(r.detail))}"
+        }
+        print("{\"ok\":\(failures == 0),\"failed\":\(failures),\"checks\":[")
+        print(checks.joined(separator: ",\n"))
+        print("]}")
+    }
     if failures > 0 {
-        print("\n\(failures) check(s) failed")
+        if !asJSON { print("\n\(failures) check(s) failed") }
         exit(1)
     }
-    print("\nall checks passed")
+    if !asJSON { print("\nall checks passed") }
 }
 
 // `anvil logs [daemon|console|guest]` — tail the relevant log files.

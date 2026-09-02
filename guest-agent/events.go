@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	eventsapi "github.com/containerd/containerd/api/events"
@@ -34,12 +35,12 @@ type dockerEventActor struct {
 	Attributes map[string]string `json:"Attributes,omitempty"`
 }
 
-// handleEvents streams live containerd task events as Docker JSON events.
-// Supported: the `filters` query param (type/event/container/image/label)
-// and `until` (timestamp — the stream closes when reached; the CLI relies
-// on this for `docker events --until +Ns` to terminate). Historical replay
-// (`since` in the past) is not possible: there is no event log, so only
-// live events are delivered.
+// handleEvents streams containerd task events as Docker JSON events.
+// Supported: the `filters` query param (type/event/container/image/label),
+// `until` (timestamp — the stream closes when reached; the CLI relies on
+// this for `docker events --until +Ns` to terminate) and `since` in the
+// past: the in-memory ring buffer recorded since boot is replayed first,
+// then the stream continues live.
 func handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -73,13 +74,45 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	// Subscribe before snapshotting the buffer so no event is missed between
+	// the replay and the live stream; duplicates at the seam are suppressed
+	// by the dedupe key set below.
 	eventCh, errCh := cl.Subscribe(ctx)
+	snapshotNano := time.Now().UnixNano()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
 	enc := json.NewEncoder(w)
+	send := func(ev dockerEvent) bool {
+		if !filter.match(ev) {
+			debugLog("events: filtered out %s id=%s", ev.Action, ev.Actor.ID[:12])
+			return true
+		}
+		debugLog("events: send %s id=%s attrs=%v", ev.Action, ev.Actor.ID[:12], ev.Actor.Attributes)
+		return enc.Encode(ev) == nil
+	}
+
+	// Historical replay (`since` in the past): everything the recorder has
+	// buffered up to the subscription moment, then continue live.
+	var replayed map[string]bool
+	if since := parseEventTimestamp(r.URL.Query().Get("since")); since != nil {
+		for _, ev := range eventLogSnapshot(*since) {
+			if ev.TimeNano > snapshotNano {
+				continue
+			}
+			if !send(ev) {
+				return
+			}
+			if replayed == nil {
+				replayed = make(map[string]bool)
+			}
+			replayed[eventKey(ev)] = true
+		}
+		flusher.Flush()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -100,15 +133,98 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 				debugLog("events: skip topic=%s ns=%s", env.Topic, env.Namespace)
 				continue
 			}
-			if !filter.match(ev) {
-				debugLog("events: filtered out %s id=%s", ev.Action, ev.Actor.ID[:12])
-				continue
+			// The same event may have been captured by the recorder between
+			// our Subscribe and the buffer snapshot — drop the live copy once.
+			if len(replayed) > 0 {
+				if replayed[eventKey(ev)] {
+					delete(replayed, eventKey(ev))
+					continue
+				}
+				if ev.TimeNano <= snapshotNano {
+					continue
+				}
+				replayed = nil
 			}
-			debugLog("events: send %s id=%s attrs=%v", ev.Action, ev.Actor.ID[:12], ev.Actor.Attributes)
-			if err := enc.Encode(ev); err != nil {
+			if !send(ev) {
 				return
 			}
 			flusher.Flush()
+		}
+	}
+}
+
+// eventKey identifies a translated event for replay/live deduplication.
+// TimeNano comes from the containerd envelope, so the same underlying event
+// has the same key in the buffer and on the live subscription.
+func eventKey(ev dockerEvent) string {
+	return fmt.Sprintf("%s/%s/%d", ev.Action, ev.Actor.ID, ev.TimeNano)
+}
+
+// eventBufferSize is how many recent events the in-memory log keeps. Events
+// survive VM pauses inside the memory snapshot, so the replay covers the
+// whole uptime (not just since the last resume) at no persistence cost.
+const eventBufferSize = 1024
+
+var eventLog struct {
+	sync.Mutex
+	ring []dockerEvent
+}
+
+// eventLogSnapshot returns buffered events with TimeNano after `since`, in
+// chronological order.
+func eventLogSnapshot(since time.Time) []dockerEvent {
+	eventLog.Lock()
+	defer eventLog.Unlock()
+	nano := since.UnixNano()
+	var out []dockerEvent
+	for _, ev := range eventLog.ring {
+		if ev.TimeNano > nano {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+func eventLogRecord(ev dockerEvent) {
+	eventLog.Lock()
+	defer eventLog.Unlock()
+	if len(eventLog.ring) >= eventBufferSize {
+		copy(eventLog.ring, eventLog.ring[1:])
+		eventLog.ring[len(eventLog.ring)-1] = ev
+	} else {
+		eventLog.ring = append(eventLog.ring, ev)
+	}
+}
+
+// startEventRecorder translates containerd events once, centrally, into the
+// ring buffer that backs `docker events --since`. It must not be started
+// before pc is initialized.
+func startEventRecorder() {
+	for {
+		ctx := context.Background()
+		cl, err := pc.get(ctx)
+		if err != nil {
+			time.Sleep(time.Second)
+			continue
+		}
+		eventCh, errCh := cl.Subscribe(ctx)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case err := <-errCh:
+				if err != nil {
+					log.Printf("[events] recorder stream error: %v", err)
+					time.Sleep(time.Second)
+				}
+			case env := <-eventCh:
+				if env == nil {
+					continue
+				}
+				if ev, ok := translateDockerEvent(ctx, cl, env); ok {
+					eventLogRecord(ev)
+				}
+			}
 		}
 	}
 }

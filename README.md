@@ -40,7 +40,9 @@ daemons and no userspace network stack in between.
 ## Requirements
 
 - macOS 14+ on Apple Silicon
-- Docker CLI (any recent `docker` / `docker compose` client)
+- Docker CLI (any recent `docker` / `docker compose` client — e.g.
+  `brew install docker docker-compose`; the CLI is enough, anvil supplies
+  the daemon)
 - For building from source: Xcode/Swift toolchain, Go, and either a Lima VM
   named `anvil` or a local Docker for the initramfs build
 
@@ -78,6 +80,20 @@ make service-start    # background daemon + docker context
 
 `make service-install` registers a LaunchAgent so anvil starts at login.
 
+### Uninstall
+
+```sh
+anvil stop
+brew uninstall olegshirko/tap/anvil      # or: make service-uninstall for source installs
+docker context rm anvil
+rm -rf ~/.anvil-vz                        # snapshot + sparse containerd disk — frees all VM data
+```
+
+If you registered the LaunchAgent (`make service-install` / Homebrew
+`brew services`), uninstall it first: `make service-uninstall` (from a source
+checkout) or `launchctl bootout gui/$(id -u)
+~/Library/LaunchAgents/com.olegshirko.anvil.plist`.
+
 ## Usage
 
 Anvil is a Docker **context** — after `anvil start` your normal Docker CLI
@@ -107,9 +123,10 @@ anvil start      Launch the daemon, wait for ready, switch docker context
 anvil stop       Stop the daemon, restore the previous docker context
 anvil restart    Stop + start
 anvil status     Daemon + guest readiness (usable as a health gate)
-anvil doctor     Diagnose install: hypervisor, signing, assets, API, shares
+anvil doctor     Diagnose install: hypervisor, signing, assets, API, shares (--json for scripts)
 anvil logs       Tail daemon/console/guest logs
 anvil exec ...   Run a command inside the VM (debugging)
+anvil images     Manage the image-mirror fallback (list / check / request)
 ```
 
 Housekeeping lives in the Makefile: `make prune` (remove containers/volumes/
@@ -125,6 +142,30 @@ intact).
 | `ANVIL_DISK_GB` | `64` | containerd disk size (sparse; existing disks only grow, guest fs is resized online) |
 | `ANVIL_SHARE_USERS` | `1` | Set to `0` to disable sharing the host `/Users` tree into the VM |
 | `DEBUG` | — | `1` enables guest-agent debug log (`guest-agent.log` on the share) |
+
+### Troubleshooting
+
+Start with `anvil doctor` — it checks hypervisor entitlements, code signing,
+assets, the Docker API endpoint and shares, and points at the failing part.
+Add `--json` for machine-readable output (exit code is non-zero on any
+failure either way, so plain `anvil doctor` works as a health gate in
+scripts).
+
+Common situations:
+
+- **"Operation not permitted" / VM fails to start** — the binary lost its
+  codesign with the `com.apple.security.hypervisor` entitlement (typical after
+  a manual rebuild): run `make sign`. The Homebrew bottle is signed in CI.
+- **A config change forced a cold boot** — the snapshot is keyed by a hash of
+  kernel/initrd/CPU/RAM/disk/shares, so changing `ANVIL_MEMORY` or
+  `ANVIL_DISK_GB` (or updating anvil) intentionally discards the old snapshot.
+  This is not an error; the next start is simply a ~0.6 s cold boot.
+- **Port conflicts** — published ports are bound on `localhost`; if another
+  service holds the port, the container starts but the forward fails — check
+  `anvil logs`.
+- **Fresh clues** — `anvil logs` tails daemon, VM console and guest-agent
+  logs; `anvil exec <cmd>` runs a command inside the VM for deeper
+  debugging.
 
 ## Architecture
 
@@ -185,8 +226,9 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   build cache — add `--load` to import it into the image store (compose does
   this automatically). The buildx `docker-container` driver (which pulls a
   moby/buildkit image) does not work.
-- `docker events --since` in the past replays nothing: there is no event
-  log, only live events are streamed (`--until` and filters work).
+- `docker events --since` replays only what the in-memory event log kept
+  (last 1024 events since first boot — the buffer survives snapshot pauses);
+  live events, `--until` and filters are unaffected.
 - Docker API is emulated, not complete: it covers what `docker` CLI and
   `docker compose` actually use. Swarm, plugins and some prune endpoints are
   out of scope.
@@ -207,8 +249,10 @@ Layout: `Sources/vz-runner/` (Swift host daemon, one file ≈ one component),
 build + service wrapper), `bench-harness/` (benchmarks),
 `ARCHITECTURE.md` (design decisions).
 
-Releases: `make release VERSION=x.y.z` — tag, GitHub Actions build + codesign,
-Homebrew tap update.
+Releases: `make release VERSION=x.y.z` — update [CHANGELOG.md](CHANGELOG.md),
+tag, GitHub Actions build + codesign, Homebrew tap update. The release notes
+are generated from the conventional-commit history
+(`make release-notes` previews them).
 
 ## License
 

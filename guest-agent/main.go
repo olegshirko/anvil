@@ -140,6 +140,7 @@ func main() {
 	// channel stays untouched.
 	go func() {
 		pc = newPersistentClient(containerdSocket)
+		go startEventRecorder()
 		runDockerAPIServer(bootFinalized)
 	}()
 

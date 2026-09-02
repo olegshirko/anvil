@@ -434,6 +434,45 @@ def test_events_filters_and_until() -> None:
         cleanup(name)
 
 
+def test_events_since_replay() -> None:
+    """--since in the past must replay the in-memory event log: the create/
+    start/die of a container that died before the events call started must
+    come back, with filters still applying."""
+    name = f"{PREFIX}-evs"
+    try:
+        before = int(time.time()) - 1
+        docker("run", "--rm", "--name", name, "alpine", "true", timeout=60.0)
+        time.sleep(1.0)
+        # --since without --until keeps streaming (like the real daemon),
+        # so bound the dump with a near-future --until.
+        until = int(time.time()) + 3
+        out = subprocess.run(
+            ["docker", "events", "--format", "{{json .}}",
+             "--filter", f"container={name}", "--since", str(before),
+             "--until", str(until)],
+            capture_output=True, text=True, timeout=30.0, env=DOCKER_ENV)
+        if out.returncode != 0:
+            raise RuntimeError(f"docker events --since exited {out.returncode}: {out.stderr[-300:]!r}")
+        actions = []
+        for line in out.stdout.splitlines():
+            try:
+                actions.append(json.loads(line).get("Action", ""))
+            except json.JSONDecodeError:
+                continue
+        needed = ["create", "start", "die"]
+        if actions[:3] != needed:
+            raise RuntimeError(f"replayed events should start with {needed}, got {actions}")
+        # Only this container's events: the filter must survive the replay.
+        # destroy is legit: --rm removes the container once the events call
+        # is past the replay window but still streaming live.
+        if any(a not in needed + ["destroy"] for a in actions):
+            raise RuntimeError(f"replay leaked other containers' events: {actions}")
+        record("docker events --since replay", "PASS",
+               f"historical {actions} replayed from the in-memory log")
+    finally:
+        cleanup(name)
+
+
 def _compose_file(web_port: int) -> str:
     return f"""services:
   web:
@@ -1617,6 +1656,7 @@ TESTS = [
     ("healthcheck unhealthy", test_healthcheck_unhealthy),
     ("events", test_events),
     ("events filters + --until", test_events_filters_and_until),
+    ("events --since replay", test_events_since_replay),
     ("UDP port publishing", test_udp_publishing),
     ("compose up", test_compose_up),
     ("compose lifecycle verbs", test_compose_lifecycle_verbs),

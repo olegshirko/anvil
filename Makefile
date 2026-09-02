@@ -9,7 +9,7 @@
     guest-agent initramfs-agent initramfs-ubuntu initramfs-containerd \
     container-tools time-boot time-service validate \
     bench bench-prepull harness harness-all prune clean-containers disk-compact \
-    release replace-release update-brew
+    release replace-release update-brew release-notes
 
 BINARY := .build/release/vz-runner
 ENTITLEMENTS := entitlements.plist
@@ -413,12 +413,32 @@ bench-all harness-all: sign
 # -----------------------------------------------------------------------------
 VERSION ?=
 
+# Preview the notes the next release would carry (commits since the last tag).
+release-notes:
+	@scripts/gen_release_notes.sh
+
+# Prepend the release section to CHANGELOG.md and return it to a clean state
+# for the caller (used by release/replace-release before tagging).
+define update_changelog
+	prev_tag=$$(git describe --tags --abbrev=0 2>/dev/null || true); \
+	notes=$$(scripts/gen_release_notes.sh); \
+	printf '## v$(VERSION) (%s)\n\n%s\n' "$$(date +%Y-%m-%d)" "$$notes" > CHANGELOG.md.tmp; \
+	cat CHANGELOG.md >> CHANGELOG.md.tmp 2>/dev/null || true; \
+	mv CHANGELOG.md.tmp CHANGELOG.md; \
+	git add CHANGELOG.md; \
+	git diff --cached --quiet || git commit -m "docs(changelog): v$(VERSION)"
+endef
+
 release: sign
 	@test -n "$(VERSION)" || { echo "Usage: make release VERSION=x.y.z"; exit 1; }
 	@git rev-parse "v$(VERSION)" >/dev/null 2>&1 && \
 		{ echo "Error: tag v$(VERSION) already exists. Use 'make replace-release VERSION=$(VERSION)'."; exit 1; } || true
+	@echo "[release] updating CHANGELOG.md..."
+	$(update_changelog)
 	@echo "[release] tagging v$(VERSION) and pushing..."
-	git tag -a "v$(VERSION)" -m "v$(VERSION)"
+	@scripts/gen_release_notes.sh > .release-notes.md
+	git tag -a "v$(VERSION)" -F .release-notes.md
+	rm -f .release-notes.md
 	git push origin "v$(VERSION)"
 	@echo "[release] waiting for CI to publish release..."
 	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
@@ -440,8 +460,12 @@ replace-release: sign
 	git tag -d "v$(VERSION)" 2>/dev/null || true
 	gh release delete "v$(VERSION)" --repo olegshirko/anvil --yes 2>/dev/null || \
 		echo "[replace-release] note: gh not authed or release not found (run: gh auth login)"
+	@echo "[replace-release] updating CHANGELOG.md..."
+	$(update_changelog)
 	@echo "[replace-release] tagging v$(VERSION) and pushing..."
-	git tag -a "v$(VERSION)" -m "v$(VERSION)"
+	@scripts/gen_release_notes.sh > .release-notes.md
+	git tag -a "v$(VERSION)" -F .release-notes.md
+	rm -f .release-notes.md
 	git push origin "v$(VERSION)"
 	@echo "[replace-release] waiting for CI to publish release..."
 	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
