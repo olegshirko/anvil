@@ -1200,13 +1200,28 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 				imageName = img.Name()
 			}
 
+			// docker ps COMMAND: the OCI process args (image entrypoint/cmd
+			// merged at create time), quoted like the docker CLI does.
+			command := ""
+			if spec, serr := c.Spec(nsCtx); serr == nil && spec != nil && spec.Process != nil {
+				args := make([]string, len(spec.Process.Args))
+				for i, a := range spec.Process.Args {
+					if strings.ContainsAny(a, " \t") {
+						args[i] = `"` + a + `"`
+					} else {
+						args[i] = a
+					}
+				}
+				command = strings.Join(args, " ")
+			}
+
 			did := dockerID(ns, c.ID())
 			summary := dockerContainerSummary{
 				Id:      did,
 				Names:   []string{"/" + name},
 				Image:   imageName,
 				ImageID: info.Image,
-				Command: "", // not trivial to extract from OCI spec; left empty
+				Command: command,
 				Created: info.CreatedAt.Unix(),
 				Ports:   ports,
 				Labels:  labels,
