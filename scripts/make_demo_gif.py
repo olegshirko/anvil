@@ -20,6 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 W, H = 1000, 560
 FPS = 12
+TYPE_INTERVAL = 0.012  # seconds per character of the typing animation
 FONT_SIZE = 15
 LINE_H = 22
 PAD = 24
@@ -76,8 +77,7 @@ def run_session(commands):
     t0 = time.time()
     for human, cmd in commands:
         transcript.append(("prompt", PROMPT, time.time() - t0))
-        for i in range(len(cmd)):
-            transcript.append(("cmd", cmd[: i + 1], time.time() - t0 + i * 0.012))
+        transcript.append(("cmd", cmd, time.time() - t0))
         typed_until = time.time() - t0 + len(cmd)*0.012 + 0.05
         os.write(fd, (cmd + "\n").encode())
         out = read_until_marker(90.0)
@@ -131,7 +131,13 @@ def render(transcript, out_path):
     end_hold = int(2.5 * FPS)
     frame_t = 0.0
     while True:
-        visible = [(k, s) for (k, s, et) in entries if et <= frame_t]
+        visible = []
+        for (k, s, et) in entries:
+            if k == "cmd" and frame_t >= et:
+                typed = int((frame_t - et) / TYPE_INTERVAL) + 1
+                visible.append((k, s[:typed]))
+            elif et <= frame_t:
+                visible.append((k, s))
         scroll = max(0, len(visible) - max_lines)
         visible = visible[scroll:]
 
