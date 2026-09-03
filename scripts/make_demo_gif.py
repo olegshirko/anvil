@@ -28,9 +28,41 @@ GRAY = (139, 148, 158)  # output text
 BLUE = (88, 166, 255)   # timings
 
 PROMPT = "❯"
-FONT = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 15)
 LINE_H = 22
 PAD = 24
+
+
+def load_font(size=15):
+    """First available monospace face; falls back to PIL's bitmap font."""
+    candidates = [
+        "/System/Library/Fonts/Menlo.ttc",          # macOS
+        "/System/Library/Fonts/SFMono.ttf",
+        "/Library/Fonts/SF-Mono-Regular.otf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",   # Linux
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    print("warning: no monospace TTF found; using PIL default "
+          "(glyphs like ❯/✔ may render as boxes)")
+    return ImageFont.load_default()
+
+
+FONT = load_font()
+
+
+def expand_tabs(s):
+    """PIL does not expand tabs; align columns like a terminal would."""
+    out = []
+    for line in s.split("\n"):
+        while "\t" in line:
+            i = line.index("\t")
+            line = line[:i] + " " * (8 - i % 8) + line[i + 1:]
+        out.append(line)
+    return "\n".join(out)
 
 # (command, [output lines]) — output lines are (text, color) tuples.
 SESSION = [
@@ -92,7 +124,7 @@ def render():
         for kind, text, color, at in lines:
             if at > t:
                 break
-            view.append((kind, text, color))
+            view.append((kind, expand_tabs(text), color))
         # Collapse typing prefixes: keep only the newest cmd of a run.
         collapsed = [
             (k, s, c)
@@ -102,15 +134,16 @@ def render():
         max_lines = (H - 2 * PAD) // LINE_H
         collapsed = collapsed[-max_lines:]
 
+        prompt_w = d.textlength(PROMPT, font=FONT) + 10
         y = PAD
         for kind, text, color in collapsed:
-            d.text((PAD if kind == "prompt" else PAD + 30, y),
+            d.text((PAD if kind == "prompt" else PAD + prompt_w, y),
                    text, fill=color, font=FONT)
             y += LINE_H
         # Block cursor after the last visible line while "typing".
         if collapsed:
             kind, text, _ = collapsed[-1]
-            x = PAD + 30 if kind != "prompt" else PAD
+            x = PAD + (prompt_w if kind != "prompt" else 0)
             w = d.textlength(text, font=FONT)
             d.rectangle([x + w + 2, y - LINE_H + 3, x + w + 11, y - 3], fill=GRAY)
 
