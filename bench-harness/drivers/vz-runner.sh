@@ -117,12 +117,22 @@ data = sys.stdin.read().strip()
 if not data:
     print(999)
     sys.exit(0)
+# docker compose >= 2.39 emits one JSON object per line (JSONL); older
+# versions emit a single JSON array. Accept both.
 try:
     parsed = json.loads(data)
+    items = parsed if isinstance(parsed, list) else [parsed]
 except json.JSONDecodeError:
-    print(999)
-    sys.exit(0)
-items = parsed if isinstance(parsed, list) else [parsed]
+    items = []
+    for line in data.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            items.append(json.loads(line))
+        except json.JSONDecodeError:
+            print(999)
+            sys.exit(0)
 for obj in items:
     if not isinstance(obj, dict):
         continue

@@ -21,11 +21,11 @@ work is ~0.1 s); a warm `docker compose up -d` with two services takes
 
 | Metric | **anvil** | colima | lima | orbstack | docker-desktop | apple-containers |
 |---|---|---|---|---|---|---|
-| Cold start (daemon ready) | 613 ms | 12107 ms | 8682 ms | 1972 ms | 5643 ms | **520 ms** |
-| Cold start: compose up (all healthy) | **792 ms** | 1456 ms | 1435 ms | 3436 ms | 1550 ms | 2598 ms |
-| Resume (daemon ready) | 742 ms | 9228 ms | 5768 ms | 1586 ms | 5616 ms | **269 ms** |
-| Resume: compose up (all healthy) | **734 ms** | 1439 ms | 1394 ms | 1495 ms | 1476 ms | 2377 ms |
-| Idle RSS | **1139 MB** | 2185 MB | 2057 MB | 2201 MB | 1220 MB | 2057 MB |
+| Cold start (daemon ready) | 732 ms | 12107 ms | 8682 ms | 1972 ms | 5643 ms | **520 ms** |
+| Cold start: compose up (all healthy) | 1573 ms | 1456 ms | **1435 ms** | 3436 ms | 1550 ms | 2598 ms |
+| Resume (daemon ready) | 486 ms | 9228 ms | 5768 ms | 1586 ms | 5616 ms | **269 ms** |
+| Resume: compose up (all healthy) | 1555 ms | 1439 ms | **1394 ms** | 1495 ms | 1476 ms | 2377 ms |
+| Idle RSS | 1225 MB | 2185 MB | 2057 MB | 2201 MB | **1220 MB** | 2057 MB |
 
 Full methodology and workloads: [bench-harness/](bench-harness/README.md).
 Apple Containers has no compose API: the same stack is started there as four
