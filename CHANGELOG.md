@@ -1,3 +1,42 @@
+## v1.1.0 (2026-09-03)
+
+### Added
+- f2b162f feat(guest-agent): HostConfig spec fields — ulimits/shm/pids/cpuset/swap/group-add/uts/ipc/cgroupns/security-opt per HOSTCONFIG_SPEC; log-driver none discards; wave4 integration tests
+- 3431a09 feat(guest-agent): HostConfig rejection layer — 400 naming the flag for oom-kill-disable/blkio-weight/storage-opt/isolation/runtime, log drivers, and non-arm64 platforms
+- 10d5663 feat(guest-agent): HostConfig coverage — cpu shares/quota/cpuset, swap, pids, shm, ulimits, no-new-privileges, group-add, ipc/cgroup ns, annotations; snapshot-backed inspect and create warnings
+- d34b505 feat(guest-agent): registry authentication (docker login, private pull/push/build) and TTY resize endpoints
+- 2768e25 feat: docker events --since replay, doctor --json, generated changelog, Swift unit tests
+
+### Fixed
+- f0e9819 fix(guest-agent): error responses were hand-concatenated JSON — quotes in validator messages broke the wire; writeJSONError marshals properly (101 sites)
+- 12b0c91 fix(guest-agent): --cpus set a cpuset pin instead of a CFS quota; cpuset now via WithCPUs/WithCPUsMems; hostname skipped under shared UTS
+- 2d86af3 fix(guest-agent): logs -f follow diagnostics; runtime artifacts moved under .anvil-run/
+- 385c76f fix(host): auto-restart crashed VM with backoff, vsock liveness strikes, snapshot invalidation after 2 failed restarts
+- 4eafef5 fix(guest-agent): docker logs -f ended after 30s; ANVIL_CPUS passthrough
+
+### Changed
+- 7704b21 refactor(guest-agent): replace the 566-line routing switch with a declarative route table
+
+### Docs
+- dcbac72 docs(changelog): drop Unreleased section — covered by the upcoming v1.1.0 release notes
+- 21ceeb1 docs: events replay exists — CLAUDE.md and ARCHITECTURE.md still claimed no event log
+- d940a7e docs: changelog — events/networks/rename tests
+- 9d390f2 docs: changelog — fake containerd tests
+- 3694913 docs: changelog — HTTP-layer tests
+- b376cf2 docs: changelog — routing refactor
+- 733d717 docs(changelog): writeJSONError entry
+- a9052d2 docs(changelog): HostConfig spec implementation entries
+- 6da1d84 docs: disclose the missing seccomp profile (README limitations, SECURITY.md); HostConfig support matrix
+- 05a88f6 docs(changelog): HostConfig coverage entry
+- 257f866 docs(changelog): unreleased section
+- 8fe51d7 docs: honest Current limitations section in README
+
+### Internal
+- 3c5b437 chore: remove CLAUDE.md (AGENTS.md is the single source of agent instructions)
+- 7310e07 test(guest-agent): events replay, network lifecycle and rename behind the fake containerd
+- bdf1fe9 test(guest-agent): fake containerd gRPC server behind the read-path handlers
+- 83d4eb8 test(guest-agent): HTTP-layer tests via httptest over the real route table
+- 698f249 chore: LaunchAgent plist as sed template; gofmt gate in unit-tests
 ## v1.0.55 (2026-08-16)
 
 ### Added
