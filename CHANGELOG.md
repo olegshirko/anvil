@@ -1,34 +1,3 @@
-## Unreleased
-
-### Added
-- f2b162f feat(guest-agent): HostConfig spec fields — ulimits/shm/pids/cpuset/swap/group-add/uts/ipc/cgroupns/security-opt per HOSTCONFIG_SPEC; log-driver none discards; wave4 integration tests
-- 6da1d84 feat(guest-agent): HostConfig rejection layer — 400 naming the flag for oom-kill-disable/blkio-weight/storage-opt/isolation/runtime, log drivers, and non-arm64 platforms
-- 10d5663 feat(guest-agent): HostConfig coverage — cpu shares/quota/cpuset, swap, pids, shm, ulimits, no-new-privileges, group-add, ipc/cgroup ns, annotations; snapshot-backed inspect and create warnings
-- d34b505 feat(guest-agent): registry authentication (docker login, private pull/push/build) and TTY resize endpoints
-- 2768e25 feat: docker events --since replay, doctor --json, generated changelog, Swift unit tests
-
-- f0e9819 fix(guest-agent): error responses were hand-concatenated JSON — quotes in validator messages broke the wire; writeJSONError marshals properly (101 sites)
-### Internal
-- 7310e07 test(guest-agent): events replay (since window, container filter, until-in-past), network lifecycle over temp CNI dirs (create/list/inspect/delete-by-ID), and rename — behind the fake containerd events/containers.Update services; cniConfDir/anvilRunDir made overridable
-- bdf1fe9 test(guest-agent): fake containerd gRPC server (namespaces/containers/tasks/images) behind the read-path handlers — /containers/json, inspect by name/ID-prefix, /images/json, /system/df run with the real containerd client, no VM
-- 83d4eb8 test(guest-agent): HTTP-layer tests via httptest over the real route table — ping/version headers, create rejection paths, 400 wire format (valid JSON + application/json), wildcard guards, Connection: close
-- 7704b21 refactor(guest-agent): the 566-line routing switch replaced with a declarative route table (router.go) and per-domain handler files api_{system,containers,images,networks,volumes}.go; matcher unit tests; events recorder debug instrumentation
-
-### Fixed
-- 12b0c91 fix(guest-agent): --cpus set a cpuset pin instead of a CFS quota; cpuset now via WithCPUs/WithCPUsMems; hostname skipped under shared UTS
-- 2d86af3 fix(guest-agent): logs -f follow diagnostics; runtime artifacts moved under .anvil-run/
-- 385c76f fix(host): auto-restart crashed VM with backoff, vsock liveness strikes, snapshot invalidation after 2 failed restarts
-- 4eafef5 fix(guest-agent): docker logs -f ended after 30s; ANVIL_CPUS passthrough
-
-### Docs
-- 6da1d84 docs: disclose the missing seccomp profile (README limitations, SECURITY.md); HostConfig support matrix
-- 8fe51d7 docs: honest Current limitations section in README
-
-### Internal
-- 698f249 chore: LaunchAgent plist as sed template; gofmt gate in unit-tests
-
-# Changelog
-
 ## v1.0.55 (2026-08-16)
 
 ### Added
