@@ -9,7 +9,7 @@ A minimal, fast alternative to Lima / Docker Desktop / OrbStack for running
 Docker containers on macOS (Apple Silicon only). One host process, one tiny
 Linux VM, no SSH, no systemd, no background fleet of helpers.
 
-![boot demo](boot-demo.gif?v=3)
+![boot demo](boot-demo.gif?v=4)
 
 Real session, timings from `/usr/bin/time -p`: `anvil start` restores the
 VM from a memory snapshot in 0.8 s; `docker run --rm alpine` answers in
