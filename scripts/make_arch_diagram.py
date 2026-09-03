@@ -57,7 +57,7 @@ def main():
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
 
-    d.text((30, 26), "anvil — two processes, one unix socket",
+    d.text((30, 26), "anvil — two processes, one VM",
            fill=FG, font=F(26))
 
     # --- CLI layer ---
