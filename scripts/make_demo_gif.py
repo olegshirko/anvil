@@ -1,229 +1,131 @@
 #!/usr/bin/env python3
-"""Record a real terminal session and render it as boot-demo.gif.
+"""Generate boot-demo.gif — a terminal-style animation from real timings.
 
-The session runs in a pty (so the outputs and timings are genuine), the
-transcript is captured with timestamps, then rendered into terminal-style
-frames with Pillow. Re-run after notable CLI/UX changes:
+This mirrors the original local-only boot-demo.py: the session is SYNTHETIC
+(typed and paced here, not recorded), but every number comes from a real
+measurement — re-measure and paste them into SESSION below:
 
-    python3 scripts/make_demo_gif.py
+    anvil stop && sleep 1 && /usr/bin/time -p anvil start
+    /usr/bin/time -p docker run --rm alpine echo hello from anvil
+    (warm) /usr/bin/time -p docker compose -p demo up -d   # demo compose file
+
+Run: python3 scripts/make_demo_gif.py   (writes boot-demo.gif)
 """
-import os
-import pty
-import re
-import select
-import subprocess
-import sys
-import termios
-import time
-
 from PIL import Image, ImageDraw, ImageFont
 
 W, H = 1000, 560
-FPS = 12
-TYPE_INTERVAL = 0.012  # seconds per character of the typing animation
-FONT_SIZE = 15
-LINE_H = 22
-PAD = 24
-COLS = 108
-BG = (30, 30, 40)
-FG = (220, 220, 230)
-GREEN = (140, 220, 160)
-CYAN = (120, 200, 230)
-GRAY = (130, 130, 145)
-TITLE_BG = (55, 55, 70)
+FRAME_MS = 60
+TYPE_MS = 16          # per character
+CMD_PAUSE_MS = 410    # after <enter>, before output
+OUT_LINE_MS = 90      # between output lines
+OUT_PAUSE_MS = 650    # after a command's output, before next prompt
+TAIL_HOLD_MS = 2500
+
+BG = (13, 17, 23)       # GitHub dark
+GREEN = (63, 185, 80)   # prompt, checkmarks
+WHITE = (230, 237, 243) # command text
+GRAY = (139, 148, 158)  # output text
+BLUE = (88, 166, 255)   # timings
 
 PROMPT = "❯"
+FONT = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 15)
+LINE_H = 22
+PAD = 24
 
-ansi_re = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]")
-
-
-def run_session(commands):
-    """Run each command in a zsh pty; return (lines, timings).
-
-    lines: list of (kind, text); kind in {"prompt","cmd","out"}.
-    timings: appearance offset in seconds for each line.
-    """
-    pid, fd = pty.fork()
-    if pid == 0:
-        os.environ["PS1"] = "PROMPT_MARKER "
-        os.environ["CLICOLOR"] = "0"
-        os.environ["NO_COLOR"] = "1"
-        os.execvp("zsh", ["zsh", "--no-rcs", "--no-globalrcs", "-i"])
-
-    def read_until_marker(deadline=60.0):
-        buf = b""
-        end = time.time() + deadline
-        while time.time() < end:
-            r, _, _ = select.select([fd], [], [], 0.2)
-            if not r:
-                continue
-            try:
-                chunk = os.read(fd, 65536)
-            except OSError:
-                break
-            if not chunk:
-                break
-            buf += chunk
-            if b"PROMPT_MARKER" in buf.split(b"\n")[-1] or buf.endswith(b"# "):
-                break
-        return buf
-
-    # We render the typing ourselves, so turn the terminal echo off.
-    attrs = termios.tcgetattr(fd)
-    attrs[3] &= ~(termios.ECHO | termios.ECHOCTL)
-    termios.tcsetattr(fd, termios.TCSANOW, attrs)
-    read_until_marker(5.0)  # initial prompt
-    transcript = []  # (kind, text, t_offset)
-    t0 = time.time()
-    for human, cmd in commands:
-        transcript.append(("prompt", PROMPT, time.time() - t0))
-        transcript.append(("cmd", cmd, time.time() - t0))
-        typed_until = time.time() - t0 + len(cmd)*0.012 + 0.05
-        os.write(fd, (cmd + "\n").encode())
-        out = read_until_marker(90.0)
-        clean = ansi_re.sub("", out.decode(errors="replace"))
-        out_t = max(time.time() - t0, typed_until)
-        for line in clean.splitlines():
-            line = line.rstrip()
-            # zsh prints a lone % when output lacks a trailing newline.
-            if not line or line == "%" or line.startswith("PROMPT_MARKER"):
-                continue
-            if line == cmd:  # zle redraws the input line even with ECHO off
-                continue
-            transcript.append(("out", line, out_t))
-        time.sleep(0.25)
-    os.write(fd, b"exit\n")
-    time.sleep(0.3)
-    try:
-        os.close(fd)
-    except OSError:
-        pass
-    os.waitpid(pid, 0)
-    return transcript
+# (command, [output lines]) — output lines are (text, color) tuples.
+SESSION = [
+    (
+        "/usr/bin/time -p anvil start",
+        [
+            ("", GRAY),
+            ("real\t0.80", BLUE),
+            ("user\t0.03", GRAY),
+            ("sys\t0.02", GRAY),
+        ],
+    ),
+    (
+        "/usr/bin/time -p docker run --rm alpine echo hello from anvil",
+        [
+            ("hello from anvil", GRAY),
+            ("", GRAY),
+            ("real\t0.95", BLUE),
+            ("user\t0.00", GRAY),
+            ("sys\t0.00", GRAY),
+        ],
+    ),
+    (
+        "docker compose -p demo up -d",
+        [
+            ("[+] Running: 3/3", GRAY),
+            (" ✔ Container demo-db-1   Started  0.1s", GREEN),
+            (" ✔ Container demo-app-1  Started  0.1s", GREEN),
+        ],
+    ),
+]
 
 
-def wrap(text, width):
-    out = []
-    while len(text) > width:
-        out.append(text[:width])
-        text = text[1 + width :]
-    out.append(text)
-    return out
+def build_timeline():
+    """Return display lines with their reveal times (ms)."""
+    lines = []  # (kind, text, color, reveal_ms)
+    t = 400
+    for cmd, out in SESSION:
+        lines.append(("prompt", PROMPT, GREEN, t))
+        for i in range(len(cmd)):
+            lines.append(("cmd", cmd[: i + 1], WHITE, t + i * TYPE_MS))
+        t += len(cmd) * TYPE_MS + CMD_PAUSE_MS
+        for text, color in out:
+            lines.append(("out", text, color, t))
+            t += OUT_LINE_MS
+        t += OUT_PAUSE_MS
+    return lines, t
 
 
-def render(transcript, out_path):
-    # Expand each transcript entry into wrapped display lines.
-    entries = []  # (kind, text, t)
-    for kind, text, t in transcript:
-        for i, ln in enumerate(wrap(text, COLS)):
-            entries.append((kind, ln, t if i == 0 else t + 0.01 * i))
-
-    total = entries[-1][2] if entries else 1
-    max_lines = (H - PAD * 2 - 28) // LINE_H
-    # Keep the tail visible: scroll offset in lines once we overflow.
+def render():
+    lines, total_ms = build_timeline()
     frames = []
-    step = 1.0 / FPS
-    t = 0.0
-    font = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", FONT_SIZE)
-    title_font = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 12)
-
-    prev_img = None
-    end_hold = int(2.5 * FPS)
-    frame_t = 0.0
-    while True:
-        visible = []
-        for (k, s, et) in entries:
-            if k == "cmd" and frame_t >= et:
-                typed = int((frame_t - et) / TYPE_INTERVAL) + 1
-                visible.append((k, s[:typed]))
-            elif et <= frame_t:
-                visible.append((k, s))
-        scroll = max(0, len(visible) - max_lines)
-        visible = visible[scroll:]
-
+    t = 0
+    end_frame_ms = total_ms + TAIL_HOLD_MS
+    while t < end_frame_ms:
         img = Image.new("RGB", (W, H), BG)
         d = ImageDraw.Draw(img)
-        # Title bar
-        d.rectangle([0, 0, W, 28], fill=TITLE_BG)
-        d.ellipse([14, 10, 26, 22], fill=(255, 95, 86))
-        d.ellipse([34, 10, 46, 22], fill=(255, 189, 46))
-        d.ellipse([54, 10, 66, 22], fill=(39, 201, 63))
-        d.text((W // 2 - 60, 7), "anvil — zsh", fill=GRAY, font=title_font)
+        view = []  # (kind, text, color) revealed so far
+        for kind, text, color, at in lines:
+            if at > t:
+                break
+            view.append((kind, text, color))
+        # Collapse typing prefixes: keep only the newest cmd of a run.
+        collapsed = [
+            (k, s, c)
+            for i, (k, s, c) in enumerate(view)
+            if not (k == "cmd" and i + 1 < len(view) and view[i + 1][0] == "cmd")
+        ]
+        max_lines = (H - 2 * PAD) // LINE_H
+        collapsed = collapsed[-max_lines:]
 
-        y = 28 + 14
-        for kind, s in visible:
-            if kind == "prompt":
-                d.text((PAD, y), s, fill=GREEN, font=font)
-            elif kind == "cmd":
-                d.text((PAD + 26, y), s, fill=FG, font=font)
-            else:
-                d.text((PAD + 26, y), s, fill=(200, 200, 210), font=font)
+        y = PAD
+        for kind, text, color in collapsed:
+            d.text((PAD if kind == "prompt" else PAD + 30, y),
+                   text, fill=color, font=FONT)
             y += LINE_H
+        # Block cursor after the last visible line while "typing".
+        if collapsed:
+            kind, text, _ = collapsed[-1]
+            x = PAD + 30 if kind != "prompt" else PAD
+            w = d.textlength(text, font=FONT)
+            d.rectangle([x + w + 2, y - LINE_H + 3, x + w + 11, y - 3], fill=GRAY)
 
-        # Cursor on the last line.
-        if visible:
-            d.rectangle([PAD + 26 + d.textlength(visible[-1][1], font=font) + 3,
-                         y - LINE_H + 4, PAD + 26 + d.textlength(visible[-1][1], font=font) + 12,
-                         y - 4], fill=CYAN)
-
-        if prev_img is not None and img.tobytes() == prev_img.tobytes():
-            same += 1
-        else:
-            same = 0
         frames.append(img)
-        prev_img = img
-
-        if frame_t >= total and same >= end_hold:
-            break
-        frame_t += step
+        t += FRAME_MS
 
     frames[0].save(
-        out_path,
+        "boot-demo.gif",
         save_all=True,
         append_images=frames[1:],
-        duration=int(1000 / FPS),
+        duration=FRAME_MS,
         loop=0,
-        optimize=True,
     )
-    print(f"wrote {out_path}: {len(frames)} frames")
-
-
-def main():
-    if "--dry" in sys.argv:
-        transcript = [
-            ("prompt", PROMPT, 0.0),
-            ("cmd", "/usr/bin/time -p anvil start", 0.05),
-            ("out", "anvil: daemon ready (context: anvil)", 0.5),
-            ("out", "real\t\t0.51", 0.55),
-        ]
-        render(transcript, "/tmp/demo-dry.gif")
-        return
-
-    subprocess.run(["anvil", "stop"], check=False, capture_output=True)
-    time.sleep(1.0)
-    # Clean state so the demo session is reproducible (name conflicts, stray
-    # containers); the demo container is removed again after recording.
-    subprocess.run(["anvil", "start"], check=False, capture_output=True)
-    for _ in range(30):
-        if subprocess.run(["docker", "version"], capture_output=True).returncode == 0:
-            break
-        time.sleep(0.5)
-    subprocess.run(["docker", "rm", "-f", "web"], check=False, capture_output=True)
-    subprocess.run(["anvil", "stop"], check=False, capture_output=True)
-    time.sleep(1.0)
-    commands = [
-        ("/usr/bin/time -p anvil start", "/usr/bin/time -p anvil start"),
-        ("docker run --rm alpine echo hello from anvil", "docker run --rm alpine echo hello from anvil"),
-        ("docker run -d --name web -p 8080:80 nginx:alpine", "docker run -d --name web -p 8080:80 nginx:alpine"),
-        ("docker ps", "docker ps"),
-    ]
-    transcript = run_session(commands)
-    subprocess.run(["docker", "rm", "-f", "web"], check=False, capture_output=True)
-    for kind, text, t in transcript:
-        if kind != "cmd" or text.endswith(("start", "anvil", "ps")) or " " not in text:
-            print(f"{t:6.2f}s {kind:6} {text}")
-    render(transcript, "boot-demo.gif")
+    print(f"boot-demo.gif: {len(frames)} frames, {total_ms/1000:.1f}s session")
 
 
 if __name__ == "__main__":
-    main()
+    render()
