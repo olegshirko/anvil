@@ -45,6 +45,25 @@ final class SnapshotManagerTests: XCTestCase {
             containerdDiskPath: disk.path, usersSharePath: "/Users"))
     }
 
+    /// A snapshot save from a restored session does not re-stamp the config
+    /// hash; the pre-save cleanup must therefore keep the hash file, or the
+    /// next start sees hasSnapshot == false, cold-boots and wipes containers.
+    func testStatePreservingCleanupKeepsConfigHash() throws {
+        let m = makeManager()
+        writeHash(m)
+        try Data("state".utf8).write(to: dir.appendingPathComponent("test.vzstate"))
+        XCTAssertTrue(m.hasSnapshot)
+
+        m.removeSnapshotStatePreservingSidecars()
+
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("test.vzstate").path))
+        XCTAssertTrue(m.configHashMatches(
+            kernel: kernel.path, initrd: initrd.path, cpus: 4, memory: 2,
+            containerdDiskPath: disk.path, usersSharePath: "/Users"),
+                      "config hash must survive snapshot-state cleanup")
+    }
+
     func testMemoryChangeInvalidates() {
         let m = makeManager()
         writeHash(m)

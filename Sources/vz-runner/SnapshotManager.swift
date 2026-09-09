@@ -108,12 +108,14 @@ struct SnapshotManager {
         try? FileManager.default.removeItem(at: networkConfigURL)
     }
 
-    /// Remove the snapshot and config hash files but keep the sidecars
-    /// (machine identifier, network config) so a newly saved snapshot remains
-    /// restorable with the same virtual hardware.
+    /// Remove the snapshot state but keep the sidecars (machine identifier,
+    /// network config, config hash) so a newly saved snapshot remains
+    /// restorable with the same virtual hardware. The config hash MUST
+    /// survive: a restored session does not re-stamp it ("keeps the hash it
+    /// booted with"), and deleting it here made hasSnapshot false on the
+    /// next start — forcing a cold boot that wipes all containers.
     func removeSnapshotStatePreservingSidecars() {
         try? FileManager.default.removeItem(at: snapshotURL)
-        try? FileManager.default.removeItem(at: configHashURL)
     }
 
     func loadMachineIdentifier() -> Data? {
