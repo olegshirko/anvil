@@ -1,3 +1,20 @@
+## v1.1.1 (2026-09-09)
+
+### Fixed
+- 37052ec fix(host): port forwarder kept dialing a dead container IP after restart
+- a2aab42 fix(demo): expand tabs into aligned columns; portable font discovery
+- a690a65 fix(demo): typing animation rendered every prefix as its own line
+
+### Docs
+- fec9a26 docs: diagram title said 'one unix socket' — vz-runner serves three
+- 0f2f5b3 docs: architecture diagram v3 — registry auth, buildkit bridge, route table
+- 1ae11e4 docs: refresh anvil benchmark numbers; fix harness JSONL parsing
+- 293aeb5 docs: bump demo gif cache-bust to ?v=4
+- e7fe7aa docs: new boot-demo.gif — old-style synthetic renderer with current timings
+- 1a03d8d docs: re-record boot-demo.gif; docker ps COMMAND filled from the OCI spec
+
+### Other
+- 1bbfc10 revert: restore the original boot-demo.gif and README caption
 ## v1.1.0 (2026-09-03)
 
 ### Added
