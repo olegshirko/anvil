@@ -114,6 +114,41 @@ def test_port_forward() -> None:
         cleanup(name)
 
 
+def test_port_restart_new_ip() -> None:
+    """A restarted container gets a new CNI IP; the host listener must follow.
+
+    Regression: the forwarder diffed state by listener key only, so a restart
+    (same container ID) left the listener dialing the dead pre-restart IP.
+    """
+    filler = f"{PREFIX}-ipfill"
+    name = f"{PREFIX}-web-restart"
+    port = PORT_BASE + 5
+    ip = lambda c: docker("inspect", "--format", "{{.NetworkSettings.IPAddress}}", c).stdout.strip()
+    try:
+        # Filler holds the lowest CNI address so the web container starts on a
+        # higher one; freeing the filler before the restart forces a new IP.
+        docker("run", "-d", "--name", filler, "nginx")
+        docker("run", "-d", "--name", name, "-p", f"{port}:80", "nginx")
+        code = curl_status(port)
+        if code != "200":
+            raise RuntimeError(f"nginx on :{port} -> {code}, want 200")
+        ip_before = ip(name)
+
+        docker("rm", "-f", filler)
+        docker("restart", name)
+        ip_after = ip(name)
+        if ip_before == ip_after:
+            raise RuntimeError(f"test is vacuous: container IP did not change ({ip_before})")
+        code = curl_status(port)
+        if code != "200":
+            raise RuntimeError(
+                f"after restart (ip {ip_before} -> {ip_after}) port :{port} -> {code}, want 200")
+        record("published port survives restart with new container IP", "PASS",
+               f"listener followed {ip_before} -> {ip_after}, still 200")
+    finally:
+        cleanup(filler, name)
+
+
 def test_foreign_port_conflict() -> None:
     """A host port held by a foreign process must fail the start loudly."""
     name = f"{PREFIX}-conflict"
@@ -1725,6 +1760,7 @@ TESTS = [
     ("docker wait", test_docker_wait),
     ("logs --since", test_logs_since),
     ("published port forwarded", test_port_forward),
+    ("published port survives restart with new IP", test_port_restart_new_ip),
     ("foreign host-port conflict", test_foreign_port_conflict),
     ("container lifecycle", test_create_ps_inspect_stop),
     ("pause/unpause", test_pause_unpause),

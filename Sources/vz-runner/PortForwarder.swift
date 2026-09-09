@@ -131,19 +131,35 @@ final class PortForwarder {
     // MARK: - Listener management
 
     private func apply(state: PortMapState) {
+        // Diff on the full mapping, not just the listener key: a container
+        // restart keeps its ID (same key) but usually gets a new CNI address,
+        // and the listener dials the IP captured at creation.
+        var desiredByKey: [String: PortMapping] = [:]
+        for mapping in state.mappings where desiredByKey[mapping.listenerKey] == nil {
+            desiredByKey[mapping.listenerKey] = mapping
+        }
+
         listenersLock.lock()
-        let currentKeys = Set(listeners.keys)
-        let desiredKeys = Set(state.mappings.map { $0.listenerKey })
+        let current: [String: PortMapping] = listeners.mapValues { $0.mapping }
         listenersLock.unlock()
 
+        let desiredKeys = Set(desiredByKey.keys)
+        let currentKeys = Set(current.keys)
         let toRemove = currentKeys.subtracting(desiredKeys)
-        let toAdd = state.mappings.filter { !currentKeys.contains($0.listenerKey) }
+        // Same key but changed target (new container IP after a restart) —
+        // the listener must be rebuilt, not left dialing the old address.
+        let toRestart = currentKeys.intersection(desiredKeys).filter { current[$0] != desiredByKey[$0] }
+        let toAdd = desiredKeys.subtracting(currentKeys).union(toRestart)
 
-        for key in toRemove {
+        // Removal runs before (re)addition so a same-port replacement never
+        // hits the "port already forwarded" guard in startListener.
+        for key in toRemove.union(toRestart) {
             stopListener(key: key)
         }
-        for mapping in toAdd {
-            startListener(mapping: mapping)
+        for key in toAdd {
+            if let mapping = desiredByKey[key] {
+                startListener(mapping: mapping)
+            }
         }
 
         if !toRemove.isEmpty || !toAdd.isEmpty {
@@ -542,12 +558,7 @@ private final class Listener {
                 close(fd)
                 return -1
             }
-            let connected = withUnsafePointer(to: &addr) { ptr -> Bool in
-                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
-                }
-            }
-            guard connected else {
+            guard connectWithTimeout(fd, addr, timeout: 5.0) else {
                 close(fd)
                 return -1
             }
@@ -564,12 +575,7 @@ private final class Listener {
             return -1
         }
 
-        let connected = withUnsafePointer(to: &addr) { ptr -> Bool in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
-            }
-        }
-        guard connected else {
+        guard connectWithTimeout(fd, addr, timeout: 5.0) else {
             close(fd)
             return -1
         }
@@ -640,6 +646,36 @@ private final class Listener {
 }
 
 // MARK: - FD write helper
+
+/// connect(2) with a timeout, via non-blocking mode + poll. A blocking
+/// connect to an unreachable guest address stalls for the full TCP SYN
+/// timeout (~75 s), and since it runs inline in the listener's accept loop
+/// it takes the whole published port down with it.
+private func connectWithTimeout(_ fd: Int32, _ addr: sockaddr_in, timeout: TimeInterval) -> Bool {
+    let flags = fcntl(fd, F_GETFL, 0)
+    guard flags >= 0 else { return false }
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+
+    let rc = withUnsafePointer(to: addr) { ptr -> Int32 in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    if rc == 0 {
+        fcntl(fd, F_SETFL, flags)
+        return true
+    }
+    guard errno == EINPROGRESS else { return false }
+
+    var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+    guard poll(&pfd, 1, Int32(timeout * 1000)) == 1 else { return false }
+    var soError: Int32 = 0
+    var len = socklen_t(MemoryLayout<Int32>.size)
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &len)
+    // Restore blocking mode: the relay pumps rely on blocking recv/send.
+    fcntl(fd, F_SETFL, flags)
+    return soError == 0
+}
 
 private func writeAllFD(_ fd: Int32, data: Data) -> Bool {
     var total = 0

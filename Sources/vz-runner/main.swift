@@ -534,6 +534,11 @@ func printUsage() {
 
 // MARK: - Main
 
+// Line-buffer stdout: the daemon redirects it to a log file, and block
+// buffering there hides the ordering of port-forwarder lifecycle messages
+// exactly when they are needed to diagnose a stale listener.
+setvbuf(stdout, nil, _IOLBF, 0)
+
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard let subcommand = arguments.first else {
     printUsage()
