@@ -1,3 +1,7 @@
+## v1.1.2 (2026-09-09)
+
+### Fixed
+- cb7d672 fix(host): every second daemon stop/start cycle cold-booted and wiped containers
 ## v1.1.1 (2026-09-09)
 
 ### Fixed
