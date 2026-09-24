@@ -12,9 +12,6 @@ func TestProjectSubnetOctetDeterministic(t *testing.T) {
 	if got := projectSubnetOctet("web"); got != 76 { // pinned FNV-1a reference value
 		t.Errorf("projectSubnetOctet(web) = %d, want 76", got)
 	}
-	if projectSubnetOctet("web") != projectSubnetOctet("web") {
-		t.Error("projectSubnetOctet not deterministic")
-	}
 }
 
 func TestProjectSubnetOctetRange(t *testing.T) {
@@ -40,9 +37,6 @@ func TestProjectSubnetOctetRange(t *testing.T) {
 func TestNetworkIDDeterministic(t *testing.T) {
 	if got := networkID("web"); got != "48d347bac606187dcfd0e4f13de7663e" { // pinned FNV-1a 128 reference value
 		t.Errorf("networkID(web) = %s", got)
-	}
-	if networkID("web") != networkID("web") {
-		t.Error("networkID not deterministic")
 	}
 	if len(networkID("x")) != 32 {
 		t.Errorf("networkID length = %d, want 32 hex chars", len(networkID("x")))

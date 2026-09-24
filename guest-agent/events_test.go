@@ -158,8 +158,9 @@ func TestEventLogRing(t *testing.T) {
 
 func TestEventKeyDedup(t *testing.T) {
 	a := dockerEvent{Action: "die", Actor: dockerEventActor{ID: "abc"}, TimeNano: 42}
+	same := dockerEvent{Action: "die", Actor: dockerEventActor{ID: "abc"}, TimeNano: 42}
 	b := dockerEvent{Action: "die", Actor: dockerEventActor{ID: "abc"}, TimeNano: 43}
-	if eventKey(a) != eventKey(a) || eventKey(a) == eventKey(b) {
+	if eventKey(a) != eventKey(same) || eventKey(a) == eventKey(b) {
 		t.Error("eventKey must be equal for same event and differ on TimeNano")
 	}
 }
