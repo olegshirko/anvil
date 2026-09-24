@@ -174,6 +174,13 @@ Saves/restores `default.vzstate`. Before saving, `GuestCacheDropper` runs
 `sync; echo 3 > /proc/sys/vm/drop_caches` in the guest so the snapshot does
 not drag along the page cache of images.
 
+A snapshot is single-use: the state file is deleted right before the VM runs
+again (after a restore or an idle pause), because from then on the guest
+writes to `/dev/vda` and the saved memory no longer matches the disk.
+Restoring it after a crash would replay a stale ext4 view over newer
+metadata, so a crash of a running VM cold-boots instead. The config hash,
+machine identifier and network config stay for the next save.
+
 ## 4. Guest side: guest-agent
 
 ### 4.1 Startup and the PID 1 role
@@ -410,15 +417,17 @@ On shutdown:
 
 1. `vz-runner` finds a valid snapshot.
 2. `restoreMachineStateFromURL` — usually < 1 s.
-3. The VM continues execution from where it was paused.
+3. The state file is deleted (§3.5) and the VM continues execution from
+   where it was paused.
 4. The guest-agent reconnects to vsock and pushes the full port state.
 5. `PortForwarder` reopens the needed listeners.
 
 ### 6.4 SIGTERM / idle timeout
 
 1. `vz-runner` receives SIGTERM or the idle timer fires.
-2. `ContainerdCacheManager.sync()` runs on a background queue (it used to
-   block the main queue).
+2. `ContainerdCacheManager.sync()` runs on a background queue — on the
+   idle path too: run on the main queue, its `anvil exec` cannot get the
+   main-queue vsock connect and times out.
 3. `GuestCacheDropper` drops the page cache in the guest.
 4. VM pause + `saveMachineStateToURL`.
 5. The process exits.

@@ -397,7 +397,7 @@ enum DaemonCommand {
         // A crashed VM must not take the daemon (and the docker context) with
         // it: restart the VM with exponential backoff instead of exiting. A
         // stopped VM object is unusable, but VMLifecycleManager.start() builds
-        // a fresh one and restores from the last snapshot.
+        // a fresh one (restoring a snapshot only if one is still valid).
         private func handleVMCrash() {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
@@ -428,10 +428,11 @@ enum DaemonCommand {
                 self.clientTracker = nil
 
                 let delay = daemonRestartDelay(attempt: self.restartAttempts)
-                // Two crashes in a row restoring the same snapshot smells like
-                // a poisoned snapshot (guest panics right after restore);
-                // the third attempt discards it and cold-boots instead of
-                // looping forever.
+                // A snapshot only survives until the VM runs again
+                // (SnapshotManager.invalidateBeforeResume), so a crash of a
+                // running VM cold-boots. A crash while the VM was still
+                // restoring can meet the same snapshot again: the third
+                // attempt discards it instead of looping forever.
                 let forceFresh = self.restartAttempts >= 2
                 self.restartAttempts += 1
                 print("[anvil] VM crashed; restarting in \(String(format: "%.0f", delay))s (attempt \(self.restartAttempts))\(forceFresh ? ", discarding snapshot" : "")")

@@ -118,6 +118,16 @@ struct SnapshotManager {
         try? FileManager.default.removeItem(at: snapshotURL)
     }
 
+    /// Drop the saved state right before a snapshotted VM runs again. From
+    /// that moment the guest writes to the containerd disk, so the saved
+    /// memory no longer matches it: restoring it later (after kill -9, a
+    /// guest panic, a host crash) would replay a stale ext4 view over newer
+    /// on-disk metadata. A missing snapshot means a cold boot instead; the
+    /// next pause or stop saves a fresh one. Sidecars stay, as for any save.
+    func invalidateBeforeResume() {
+        removeSnapshotStatePreservingSidecars()
+    }
+
     func loadMachineIdentifier() -> Data? {
         guard let data = try? Data(contentsOf: machineIDURL) else {
             return nil

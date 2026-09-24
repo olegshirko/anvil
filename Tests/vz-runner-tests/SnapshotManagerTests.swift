@@ -64,6 +64,24 @@ final class SnapshotManagerTests: XCTestCase {
                       "config hash must survive snapshot-state cleanup")
     }
 
+    // Once a snapshotted VM runs again its memory no longer matches the
+    // disk: the saved state must be gone (a crash then cold-boots instead of
+    // restoring a stale ext4 view), while the sidecars stay for the next save.
+    func testInvalidateBeforeResumeDropsStateKeepsSidecars() throws {
+        let m = makeManager()
+        writeHash(m)
+        try Data("state".utf8).write(to: dir.appendingPathComponent("test.vzstate"))
+        XCTAssertTrue(m.saveMachineIdentifier(Data("id".utf8)))
+
+        m.invalidateBeforeResume()
+
+        XCTAssertFalse(m.hasSnapshot, "a resumed VM must not leave a restorable snapshot")
+        XCTAssertNotNil(m.loadMachineIdentifier())
+        XCTAssertTrue(m.configHashMatches(
+            kernel: kernel.path, initrd: initrd.path, cpus: 4, memory: 2,
+            containerdDiskPath: disk.path, usersSharePath: "/Users"))
+    }
+
     func testMemoryChangeInvalidates() {
         let m = makeManager()
         writeHash(m)

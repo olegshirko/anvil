@@ -162,6 +162,8 @@ final class VMLifecycleManager: NSObject {
                 completion(.success(()))
                 return
             }
+            // The guest writes to /dev/vda as soon as it runs again.
+            self.snapshot.invalidateBeforeResume()
             vm.resume { result in
                 DispatchQueue.main.async {
                     switch result {
@@ -364,6 +366,7 @@ final class VMLifecycleManager: NSObject {
                 } else {
                     print("[anvil] VM restored in \(String(format: "%.3f", restoreDuration))s, resuming...")
                     self.phaseTimer.mark("vm_restore")
+                    self.snapshot.invalidateBeforeResume()
                     let resumeStart = Date()
                     vm.resume { result in
                         DispatchQueue.main.async { [weak self] in
