@@ -457,11 +457,37 @@ enum DaemonCommand {
         }
 
         private func idleTimeoutFired() {
-            guard !isShuttingDown, (server?.clientsCount ?? 0) == 0 else { return }
+            guard isIdleNow() else { return }
             clientTracker?.suppressIdleSchedule = true
             print("[anvil] idle timeout reached, syncing containerd cache...")
-            cacheManager?.sync()
-            GuestCacheDropper.dropCaches()
+            // Off the main queue: both calls run `anvil exec`, whose control
+            // connection needs the main queue for device.connect. Run on main
+            // they each block until their 20 s timeout and do nothing.
+            DispatchQueue.global().async { [weak self] in
+                self?.cacheManager?.sync()
+                GuestCacheDropper.dropCaches()
+                DispatchQueue.main.async { [weak self] in
+                    self?.pauseForIdle()
+                }
+            }
+        }
+
+        /// No control, Docker API or buildkit client is connected.
+        private func isIdleNow() -> Bool {
+            !isShuttingDown
+                && (server?.clientsCount ?? 0) == 0
+                && (clientTracker?.isIdle ?? true)
+        }
+
+        private func pauseForIdle() {
+            // A Docker or buildkit client may have connected while the caches
+            // were dropped; its disconnect re-arms the idle timer. Control
+            // connections are not rechecked: the exec children above may not
+            // have been reaped from clientsCount yet.
+            guard !isShuttingDown, clientTracker?.isIdle ?? true else {
+                clientTracker?.suppressIdleSchedule = false
+                return
+            }
             print("[anvil] pausing VM...")
             manager.pause { [weak self] result in
                 guard let self = self else { return }
