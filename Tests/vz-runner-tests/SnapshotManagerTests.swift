@@ -82,6 +82,31 @@ final class SnapshotManagerTests: XCTestCase {
             containerdDiskPath: disk.path, usersSharePath: "/Users"))
     }
 
+    // A save lands under the pending name and becomes the snapshot only on
+    // commit; a failed save leaves no partial file behind.
+    func testPendingSnapshotCommitAndDiscard() throws {
+        let m = makeManager()
+        writeHash(m)
+        XCTAssertFalse(m.hasSnapshot)
+
+        try Data("partial".utf8).write(to: m.pendingSnapshotURL)
+        XCTAssertFalse(m.hasSnapshot, "an uncommitted save is not a snapshot")
+        XCTAssertTrue(m.commitPendingSnapshot())
+        XCTAssertTrue(m.hasSnapshot)
+        XCTAssertEqual(try Data(contentsOf: m.snapshotURL), Data("partial".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: m.pendingSnapshotURL.path))
+
+        // Commit over an existing snapshot replaces it.
+        try Data("next".utf8).write(to: m.pendingSnapshotURL)
+        XCTAssertTrue(m.commitPendingSnapshot())
+        XCTAssertEqual(try Data(contentsOf: m.snapshotURL), Data("next".utf8))
+
+        try Data("broken".utf8).write(to: m.pendingSnapshotURL)
+        m.discardPendingSnapshot()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: m.pendingSnapshotURL.path))
+        XCTAssertEqual(try Data(contentsOf: m.snapshotURL), Data("next".utf8))
+    }
+
     func testMemoryChangeInvalidates() {
         let m = makeManager()
         writeHash(m)

@@ -230,7 +230,7 @@ final class VMLifecycleManager: NSObject {
         print("[anvil] saving VM snapshot...")
         snapshot.removeSnapshotStatePreservingSidecars()
         let start = Date()
-        vm.saveMachineStateTo(url: snapshot.snapshotURL) { [weak self] error in
+        vm.saveMachineStateTo(url: snapshot.pendingSnapshotURL) { [weak self] error in
             guard let self = self else {
                 completion?(error)
                 return
@@ -238,6 +238,7 @@ final class VMLifecycleManager: NSObject {
             let duration = Date().timeIntervalSince(start)
             if let error = error {
                 print("[anvil] snapshot save failed after \(String(format: "%.3f", duration))s: \(error)")
+                self.snapshot.discardPendingSnapshot()
                 completion?(error)
                 return
             }
@@ -255,6 +256,13 @@ final class VMLifecycleManager: NSObject {
                 )
             } else {
                 print("[anvil] keeping stored config hash (VM was restored, not booted with current assets)")
+            }
+            // The rename is the commit point: before it there is no snapshot
+            // (cold boot), after it a complete one.
+            guard self.snapshot.commitPendingSnapshot() else {
+                completion?(NSError(domain: "anvil", code: 104,
+                                    userInfo: [NSLocalizedDescriptionKey: "snapshot commit failed"]))
+                return
             }
             print("[anvil] snapshot saved in \(String(format: "%.3f", duration))s")
             completion?(nil)
@@ -382,7 +390,11 @@ final class VMLifecycleManager: NSObject {
                 if let error = error {
                     print("[anvil] restore failed after \(String(format: "%.3f", restoreDuration))s: \(error)")
                     print("[anvil] falling back to cold boot")
-                    self.snapshot.removeSnapshot()
+                    // Keep the machine identifier and network config: this
+                    // VM was configured with them and its next save must stay
+                    // restorable. removeSnapshot() deleted them, so the next
+                    // start cold-booted again and wiped the containers.
+                    self.snapshot.removeSnapshotStatePreservingSidecars()
                     self.coldBoot(vm: vm)
                 } else {
                     print("[anvil] VM restored in \(String(format: "%.3f", restoreDuration))s, resuming...")

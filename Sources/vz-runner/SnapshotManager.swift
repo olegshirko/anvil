@@ -116,6 +116,34 @@ struct SnapshotManager {
     /// next start — forcing a cold boot that wipes all containers.
     func removeSnapshotStatePreservingSidecars() {
         try? FileManager.default.removeItem(at: snapshotURL)
+        discardPendingSnapshot()
+    }
+
+    /// Where a save writes before it is committed: a crash or a failed save
+    /// mid-write must never leave a partial file under `snapshotURL`, next to
+    /// a valid config hash.
+    var pendingSnapshotURL: URL {
+        // default.partial.vzstate: keeps the extension VZ writes.
+        snapshotURL.deletingPathExtension()
+            .appendingPathExtension("partial")
+            .appendingPathExtension("vzstate")
+    }
+
+    /// Publish a completed save as the snapshot.
+    @discardableResult
+    func commitPendingSnapshot() -> Bool {
+        do {
+            _ = try FileManager.default.replaceItemAt(snapshotURL, withItemAt: pendingSnapshotURL)
+            return true
+        } catch {
+            print("[anvil] failed to commit snapshot: \(error)")
+            discardPendingSnapshot()
+            return false
+        }
+    }
+
+    func discardPendingSnapshot() {
+        try? FileManager.default.removeItem(at: pendingSnapshotURL)
     }
 
     /// Drop the saved state right before a snapshotted VM runs again. From
