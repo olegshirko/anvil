@@ -15,3 +15,16 @@ final class AcceptLoopTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(start), 0.09, "EMFILE must back off")
     }
 }
+
+final class SignalTests: XCTestCase {
+    // The handler runs on the main queue, outside signal context.
+    func testOnSignalRunsHandlerOnMainQueue() {
+        let fired = expectation(description: "handler")
+        onSignal(SIGUSR2) {
+            XCTAssertTrue(Thread.isMainThread)
+            fired.fulfill()
+        }
+        kill(getpid(), SIGUSR2)
+        wait(for: [fired], timeout: 2)
+    }
+}

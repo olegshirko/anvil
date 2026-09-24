@@ -22,16 +22,12 @@ enum DaemonCommand {
         let daemon = Daemon(manager: manager, idleSeconds: cliArgs.idleSeconds, phaseTimer: phaseTimer)
         globalDaemon = daemon
 
-        signal(SIGINT) { _ in
-            DispatchQueue.main.async {
-                print("\n[anvil] daemon received SIGINT, shutting down...")
-                globalDaemon?.shutdown()
-            }
-        }
-
-        signal(SIGTERM) { _ in
-            DispatchQueue.main.async {
-                print("\n[anvil] daemon received SIGTERM, shutting down...")
+        // Signal sources instead of signal(2) handlers: a handler may only
+        // call async-signal-safe functions, and DispatchQueue.main.async,
+        // print and the Swift runtime are not.
+        for (sig, name) in [(SIGINT, "SIGINT"), (SIGTERM, "SIGTERM")] {
+            onSignal(sig) {
+                print("\n[anvil] daemon received \(name), shutting down...")
                 globalDaemon?.shutdown()
             }
         }

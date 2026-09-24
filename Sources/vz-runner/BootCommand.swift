@@ -13,7 +13,7 @@ enum BootCommand {
         let delegate = BootDelegate(args: cliArgs, manager: manager)
         manager.delegate = delegate
 
-        signal(SIGINT) { _ in
+        onSignal(SIGINT) {
             print("\n[anvil] received SIGINT, exiting...")
             exit(0)
         }
