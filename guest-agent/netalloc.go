@@ -1,8 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"net"
+	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -21,11 +25,17 @@ import (
 var netAllocMu sync.Mutex
 
 type netAlloc struct {
-	octet  int
+	subnet string // CIDR
+	octet  int    // 10.10.<octet>.0/24 for hashed subnets, 0 for a user pool
 	bridge string
 }
 
-// allocFromConflist extracts the subnet octet and bridge a conflist uses.
+// hashedSubnet is the subnet of a hashed slot.
+func hashedSubnet(octet int) string {
+	return fmt.Sprintf("10.10.%d.0/24", octet)
+}
+
+// allocFromConflist extracts the subnet and bridge a conflist uses.
 func allocFromConflist(cl cniConflist) (netAlloc, bool) {
 	for _, p := range cl.Plugins {
 		if p.Type != "bridge" {
@@ -33,34 +43,64 @@ func allocFromConflist(cl cniConflist) (netAlloc, bool) {
 		}
 		for _, ranges := range p.IPAM.Ranges {
 			for _, r := range ranges {
-				var a, b, c, d, bits int
-				if n, _ := fmt.Sscanf(r.Subnet, "%d.%d.%d.%d/%d", &a, &b, &c, &d, &bits); n == 5 && a == 10 && b == 10 {
-					return netAlloc{octet: c, bridge: p.Bridge}, true
+				if _, _, err := net.ParseCIDR(r.Subnet); err != nil {
+					continue
 				}
+				a := netAlloc{subnet: r.Subnet, bridge: p.Bridge}
+				var o int
+				if n, _ := fmt.Sscanf(r.Subnet, "10.10.%d.0/24", &o); n == 1 && hashedSubnet(o) == r.Subnet {
+					a.octet = o
+				}
+				return a, true
 			}
 		}
 	}
 	return netAlloc{}, false
 }
 
-// pickNetAlloc returns the allocation for netName given every existing
-// conflist (keyed by network name). preferred is the hashed octet.
-func pickNetAlloc(netName string, preferred int, existing map[string]cniConflist) netAlloc {
-	if cl, ok := existing[netName]; ok {
-		if a, ok := allocFromConflist(cl); ok {
-			return a
-		}
+// cidrsOverlap reports whether two CIDRs share any address.
+func cidrsOverlap(a, b string) bool {
+	_, na, errA := net.ParseCIDR(a)
+	_, nb, errB := net.ParseCIDR(b)
+	if errA != nil || errB != nil {
+		return false
 	}
+	return na.Contains(nb.IP) || nb.Contains(na.IP)
+}
+
+// pickNetAlloc returns the allocation for netName given every existing
+// conflist (keyed by network name). preferred is the hashed octet; pool is
+// the user-requested address pool, if any.
+func pickNetAlloc(netName string, preferred int, existing map[string]cniConflist, pool *ipamPool) netAlloc {
+	cur, have := allocFromConflist(existing[netName])
 	usedOctets := map[int]bool{}
 	usedBridges := map[string]bool{}
 	for name, cl := range existing {
 		if name == netName {
 			continue
 		}
-		if a, ok := allocFromConflist(cl); ok {
-			usedOctets[a.octet] = true
-			usedBridges[a.bridge] = true
+		a, ok := allocFromConflist(cl)
+		if !ok {
+			continue
 		}
+		usedBridges[a.bridge] = true
+		// A user pool inside 10.10.0.0/16 takes every slot it overlaps.
+		for o := 1; o <= 250; o++ {
+			if cidrsOverlap(a.subnet, hashedSubnet(o)) {
+				usedOctets[o] = true
+			}
+		}
+	}
+
+	bridge := cur.bridge
+	if !have {
+		bridge = pickBridgeName(netName, usedBridges)
+	}
+	if pool != nil {
+		return netAlloc{subnet: pool.Subnet, bridge: bridge}
+	}
+	if have && cur.octet != 0 {
+		return cur
 	}
 
 	octet := preferred
@@ -71,7 +111,7 @@ func pickNetAlloc(netName string, preferred int, existing map[string]cniConflist
 			break
 		}
 	}
-	return netAlloc{octet: octet, bridge: pickBridgeName(netName, usedBridges)}
+	return netAlloc{subnet: hashedSubnet(octet), octet: octet, bridge: bridge}
 }
 
 // pickBridgeName keeps the readable "br-<name>" when it fits IFNAMSIZ and is
@@ -102,8 +142,132 @@ func pickBridgeName(netName string, used map[string]bool) string {
 func networkSubnet(netName string) string {
 	if confs, err := loadCNIConflists(); err == nil {
 		if a, ok := allocFromConflist(confs[netName]); ok {
-			return fmt.Sprintf("10.10.%d.0/24", a.octet)
+			return a.subnet
 		}
 	}
-	return fmt.Sprintf("10.10.%d.0/24", projectSubnetOctet(netName))
+	return hashedSubnet(projectSubnetOctet(netName))
+}
+
+// --- user-requested address pools (compose ipam.config) --------------------
+
+// ipamPool is a validated IPv4 pool from POST /networks/create.
+type ipamPool struct {
+	Subnet     string `json:"Subnet"`
+	Gateway    string `json:"Gateway"`
+	RangeStart string `json:"RangeStart,omitempty"`
+	RangeEnd   string `json:"RangeEnd,omitempty"`
+}
+
+// poolFromIPAM validates the request's IPAM config. It returns nil when no
+// IPv4 subnet was requested (the hashed slot is used). IPv6 pools are
+// ignored: anvil networks are IPv4-only.
+func poolFromIPAM(cfgs []dockerIPAMConfig) (*ipamPool, error) {
+	for _, c := range cfgs {
+		if c.Subnet == "" {
+			continue
+		}
+		ip, subnet, err := net.ParseCIDR(c.Subnet)
+		if err != nil {
+			return nil, fmt.Errorf("invalid subnet %q: %v", c.Subnet, err)
+		}
+		if ip.To4() == nil {
+			continue
+		}
+		if ones, _ := subnet.Mask.Size(); ones > 30 {
+			return nil, fmt.Errorf("subnet %s is too small", c.Subnet)
+		}
+		pool := &ipamPool{Subnet: subnet.String()}
+		if c.Gateway != "" {
+			gw := net.ParseIP(c.Gateway).To4()
+			if gw == nil || !subnet.Contains(gw) {
+				return nil, fmt.Errorf("gateway %s is not in subnet %s", c.Gateway, pool.Subnet)
+			}
+			pool.Gateway = gw.String()
+		} else {
+			pool.Gateway = offsetIP(subnet.IP, 1).String()
+		}
+		if c.IPRange != "" {
+			_, rng, err := net.ParseCIDR(c.IPRange)
+			if err != nil || rng.IP.To4() == nil || !subnet.Contains(rng.IP) || !subnet.Contains(lastIP(rng)) {
+				return nil, fmt.Errorf("ip range %s is not in subnet %s", c.IPRange, pool.Subnet)
+			}
+			start, end := rng.IP.To4(), lastIP(rng)
+			if start.Equal(subnet.IP.To4()) {
+				start = offsetIP(start, 1)
+			}
+			if end.Equal(lastIP(subnet)) {
+				end = offsetIP(end, -1)
+			}
+			pool.RangeStart, pool.RangeEnd = start.String(), end.String()
+		}
+		return pool, nil
+	}
+	return nil, nil
+}
+
+func offsetIP(ip net.IP, delta int) net.IP {
+	v4 := ip.To4()
+	n := uint32(v4[0])<<24 | uint32(v4[1])<<16 | uint32(v4[2])<<8 | uint32(v4[3])
+	n = uint32(int64(n) + int64(delta))
+	return net.IPv4(byte(n>>24), byte(n>>16), byte(n>>8), byte(n)).To4()
+}
+
+// lastIP is the broadcast address of an IPv4 network.
+func lastIP(n *net.IPNet) net.IP {
+	ip := n.IP.To4()
+	out := make(net.IP, 4)
+	for i := range out {
+		out[i] = ip[i] | ^n.Mask[len(n.Mask)-4+i]
+	}
+	return out
+}
+
+// poolOverlap returns the name of another network whose subnet overlaps the
+// pool, if any — Docker refuses such a create the same way.
+func poolOverlap(netName string, pool *ipamPool, existing map[string]cniConflist) string {
+	for name, cl := range existing {
+		if name == netName {
+			continue
+		}
+		if a, ok := allocFromConflist(cl); ok && cidrsOverlap(a.subnet, pool.Subnet) {
+			return name
+		}
+	}
+	return ""
+}
+
+// The pool is persisted next to the network's labels: conflists are
+// rewritten on every container create and restored after a cold boot, and
+// both must keep the requested subnet. ".ipam", not ".json": the restore
+// loop treats every .json there as a network's labels.
+func networkPoolPath(name string) string {
+	return filepath.Join(anvilRunDir, "networks", sanitizeCNIName(name)+".ipam")
+}
+
+func saveNetworkPool(name string, pool *ipamPool) error {
+	path := networkPoolPath(name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(pool)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func loadNetworkPool(name string) *ipamPool {
+	data, err := os.ReadFile(networkPoolPath(name))
+	if err != nil {
+		return nil
+	}
+	var pool ipamPool
+	if json.Unmarshal(data, &pool) != nil || pool.Subnet == "" {
+		return nil
+	}
+	return &pool
+}
+
+func deleteNetworkPool(name string) {
+	_ = os.Remove(networkPoolPath(name))
 }

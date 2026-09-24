@@ -334,6 +334,14 @@ func generateCNIConfig(ns string) error {
 }
 
 func generateCNIConfigWithLabels(ns string, extraLabels map[string]string) error {
+	netAllocMu.Lock()
+	defer netAllocMu.Unlock()
+	return generateCNIConfigLocked(ns, extraLabels)
+}
+
+// generateCNIConfigLocked writes a network's conflist; the caller holds
+// netAllocMu.
+func generateCNIConfigLocked(ns string, extraLabels map[string]string) error {
 	// Docker clients expect the default network to be called "bridge".
 	// Per-project networks keep their own name (e.g. project-a, compose-test_default).
 	if ns == "" {
@@ -346,14 +354,23 @@ func generateCNIConfigWithLabels(ns string, extraLabels map[string]string) error
 	base := sanitizeCNIName(netName)
 	path := filepath.Join(cniConfDir, "anvil-"+base+".conflist")
 
-	netAllocMu.Lock()
-	defer netAllocMu.Unlock()
 	existing, _ := loadCNIConflists()
-	alloc := pickNetAlloc(netName, projectSubnetOctet(ns), existing)
+	pool := loadNetworkPool(netName)
+	alloc := pickNetAlloc(netName, projectSubnetOctet(ns), existing, pool)
 	bridge := alloc.bridge
-	octet := alloc.octet
-	subnet := fmt.Sprintf("10.10.%d.0/24", octet)
-	gateway := fmt.Sprintf("10.10.%d.1", octet)
+	subnet := alloc.subnet
+	ipRange := map[string]interface{}{"subnet": subnet}
+	if pool != nil {
+		ipRange["gateway"] = pool.Gateway
+		if pool.RangeStart != "" {
+			ipRange["rangeStart"] = pool.RangeStart
+			ipRange["rangeEnd"] = pool.RangeEnd
+		}
+	} else {
+		ipRange["gateway"] = fmt.Sprintf("10.10.%d.1", alloc.octet)
+		ipRange["rangeStart"] = fmt.Sprintf("10.10.%d.2", alloc.octet)
+		ipRange["rangeEnd"] = fmt.Sprintf("10.10.%d.254", alloc.octet)
+	}
 
 	labels := map[string]string{}
 	if ns == "default" {
@@ -392,14 +409,7 @@ func generateCNIConfigWithLabels(ns string, extraLabels map[string]string) error
 				"ipam": map[string]interface{}{
 					"type": "host-local",
 					"ranges": []interface{}{
-						[]interface{}{
-							map[string]interface{}{
-								"subnet":     subnet,
-								"rangeStart": fmt.Sprintf("10.10.%d.2", octet),
-								"rangeEnd":   fmt.Sprintf("10.10.%d.254", octet),
-								"gateway":    gateway,
-							},
-						},
+						[]interface{}{ipRange},
 					},
 					"routes": []interface{}{
 						map[string]interface{}{"dst": "0.0.0.0/0"},

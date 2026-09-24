@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,7 +49,9 @@ type dockerIPAM struct {
 
 // dockerIPAMConfig is a single IPAM pool config.
 type dockerIPAMConfig struct {
-	Subnet string `json:"Subnet,omitempty"`
+	Subnet  string `json:"Subnet,omitempty"`
+	Gateway string `json:"Gateway,omitempty"`
+	IPRange string `json:"IPRange,omitempty"`
 }
 
 // dockerNetworkCreateRequest mirrors Docker's POST /networks/create body.
@@ -121,7 +125,7 @@ func conflistToDockerNetwork(cl cniConflist) dockerNetwork {
 	for _, p := range cl.Plugins {
 		for _, ranges := range p.IPAM.Ranges {
 			for _, r := range ranges {
-				ipam.Config = append(ipam.Config, dockerIPAMConfig{Subnet: r.Subnet})
+				ipam.Config = append(ipam.Config, dockerIPAMConfig{Subnet: r.Subnet, Gateway: r.Gateway})
 			}
 		}
 	}
@@ -328,22 +332,42 @@ func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*
 		return existing, nil
 	}
 
+	// A requested pool (compose ipam.config) must reach the conflist; it
+	// used to be echoed in the response while containers got the hashed
+	// subnet.
+	pool, perr := poolFromIPAM(req.IPAM.Config)
+	if perr != nil {
+		return nil, &apiError{status: http.StatusBadRequest, msg: perr.Error()}
+	}
+
 	// Pre-create the CNI config so the new network uses our deterministic subnet
 	// and bridge name instead of an auto-generated one. Include any labels sent
 	// by Compose so the network is recognised as Compose-managed. A conflist
 	// in /etc/cni/net.d IS the network, so no further registration is needed.
-	if err := generateCNIConfigWithLabels(req.Name, req.Labels); err != nil {
+	if err := func() error {
+		netAllocMu.Lock()
+		defer netAllocMu.Unlock()
+		if pool != nil {
+			existing, _ := loadCNIConflists()
+			if other := poolOverlap(req.Name, pool, existing); other != "" {
+				return &apiError{status: http.StatusForbidden,
+					msg: fmt.Sprintf("invalid pool request: Pool overlaps with other one on this address space (network %s)", other)}
+			}
+			if err := saveNetworkPool(req.Name, pool); err != nil {
+				return fmt.Errorf("save ipam pool for %s: %w", req.Name, err)
+			}
+		}
+		return generateCNIConfigLocked(req.Name, req.Labels)
+	}(); err != nil {
+		if _, ok := err.(*apiError); ok {
+			return nil, err
+		}
 		log.Printf("[docker-api] ensure cni config for network %s: %v", req.Name, err)
 	}
 
 	// Build the response manually: Compose relies on the labels being
 	// present in the create response.
-	subnet := ""
-	if len(req.IPAM.Config) > 0 && req.IPAM.Config[0].Subnet != "" {
-		subnet = req.IPAM.Config[0].Subnet
-	} else {
-		subnet = networkSubnet(req.Name)
-	}
+	subnet := networkSubnet(req.Name)
 	labels := req.Labels
 	if labels == nil {
 		labels = map[string]string{}
@@ -357,7 +381,7 @@ func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*
 		Driver:  defaultString(req.Driver, "bridge"),
 		Scope:   "local",
 		Created: time.Now().UTC().Format(time.RFC3339),
-		IPAM:    dockerIPAM{Driver: defaultString(req.IPAM.Driver, "default"), Config: []dockerIPAMConfig{{Subnet: subnet}}},
+		IPAM:    dockerIPAM{Driver: defaultString(req.IPAM.Driver, "default"), Config: []dockerIPAMConfig{responsePool(subnet, pool)}},
 		Labels:  labels,
 		Options: req.Options,
 	}, nil
@@ -410,8 +434,35 @@ func removeDockerNetwork(ctx context.Context, name string) error {
 	cnim.invalidate()
 	if netName != "" {
 		deleteNetworkLabels(netName)
+		deleteNetworkPool(netName)
 	}
 	return nil
+}
+
+// responsePool is the IPAM config reported for a created network.
+func responsePool(subnet string, pool *ipamPool) dockerIPAMConfig {
+	if pool == nil {
+		return dockerIPAMConfig{Subnet: subnet}
+	}
+	c := dockerIPAMConfig{Subnet: pool.Subnet, Gateway: pool.Gateway}
+	return c
+}
+
+// apiError carries the HTTP status a handler should answer with.
+type apiError struct {
+	status int
+	msg    string
+}
+
+func (e *apiError) Error() string { return e.msg }
+
+// errorStatus maps an error to its HTTP status, fallback when untyped.
+func errorStatus(err error, fallback int) int {
+	var ae *apiError
+	if errors.As(err, &ae) {
+		return ae.status
+	}
+	return fallback
 }
 
 // removeStaleBridge deletes the Linux bridge of a removed network when no

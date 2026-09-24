@@ -283,7 +283,11 @@ Every Docker Compose project gets its own namespace and bridge network:
 - the subnet is `10.10.<hash(project) % 250 + 1>.0/24` — deterministic
   unless that slot is taken by another network, in which case the next
   free slot is used; an existing network keeps its allocation
-  (`netalloc.go`);
+  (`netalloc.go`). A subnet requested by compose (`ipam.config`: subnet,
+  gateway, ip_range; IPv4 only) replaces the hashed one; it is persisted as
+  `/mnt/anvil/.anvil-run/networks/<name>.ipam`, so config rewrites and the
+  cold-boot restore keep it, and a pool overlapping another network is
+  refused like in Docker;
 - the bridge is `br-<sanitized-project>` when that fits the 15-character
   interface-name limit and is free, otherwise `br-<5 chars>-<hash>` — plain
   truncation made every `compose-test-*` project share one bridge;

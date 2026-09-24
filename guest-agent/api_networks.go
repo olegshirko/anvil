@@ -37,7 +37,7 @@ func handleNetworkCreate(w http.ResponseWriter, r *http.Request, _ routeParams) 
 	}
 	nw, err := createDockerNetwork(r.Context(), req)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, errorStatus(err, http.StatusInternalServerError), err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
