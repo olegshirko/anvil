@@ -177,6 +177,27 @@ final class VMLifecycleManager: NSObject {
         }
     }
 
+    /// Hard-stop the current VM if it can still run. A restart after a
+    /// liveness failure (the guest stopped answering, the VM did not stop)
+    /// must never start a second VM on the same containerd disk while the
+    /// wedged one keeps writing to it.
+    func forceStop(completion: @escaping () -> Void) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let vm = self.vm, vm.canStop else {
+                completion()
+                return
+            }
+            // The stop is intentional; it must not come back as a crash.
+            vm.delegate = nil
+            vm.stop { error in
+                if let error = error {
+                    print("[anvil] force stop failed: \(error)")
+                }
+                DispatchQueue.main.async { completion() }
+            }
+        }
+    }
+
     /// Pause, save snapshot, and call completion. Keeps the daemon alive.
     func stopAndSave(completion: @escaping () -> Void) {
         guard vm != nil else {

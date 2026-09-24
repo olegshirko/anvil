@@ -436,10 +436,14 @@ enum DaemonCommand {
                 let forceFresh = self.restartAttempts >= 2
                 self.restartAttempts += 1
                 print("[anvil] VM crashed; restarting in \(String(format: "%.0f", delay))s (attempt \(self.restartAttempts))\(forceFresh ? ", discarding snapshot" : "")")
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    guard let self = self, !self.isShuttingDown else { return }
-                    self.isRestartingVM = false
-                    self.manager.start(fresh: forceFresh)
+                // The liveness path gets here with the VM still running
+                // (wedged guest): stop it before a new one opens the disk.
+                self.manager.forceStop {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                        guard let self = self, !self.isShuttingDown else { return }
+                        self.isRestartingVM = false
+                        self.manager.start(fresh: forceFresh)
+                    }
                 }
             }
         }
