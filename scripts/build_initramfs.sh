@@ -1,3 +1,5 @@
+#!/bin/bash
+# Legacy initramfs-agent build (make initramfs-agent).
 cat > myinit <<'EOF'
 #!/bin/sh
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
