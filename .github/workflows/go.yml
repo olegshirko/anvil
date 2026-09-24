@@ -34,6 +34,39 @@ jobs:
           echo 'let buildVersion = "dev"' > Sources/vz-runner/version.swift
           swift build -c release
 
+      # Unit tests need no VM: the Swift tests cover the protocol, snapshot
+      # and forwarder logic; the guest-agent tests run its handlers against
+      # a fake containerd. VM-based suites stay on the self-hosted runner.
+      - name: Swift tests
+        run: swift test
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: guest-agent/go.mod
+          cache-dependency-path: guest-agent/go.sum
+
+      - name: gofmt
+        working-directory: guest-agent
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "gofmt needed:"; echo "$unformatted"; exit 1; fi
+
+      - name: go vet (linux/arm64, the real target)
+        working-directory: guest-agent
+        run: GOOS=linux GOARCH=arm64 go vet ./...
+
+      - name: go test -race
+        working-directory: guest-agent
+        run: go test -race ./...
+
+      - name: staticcheck (linux/arm64)
+        working-directory: guest-agent
+        # Installed for the host, then pointed at the linux/arm64 build.
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@2026.2.1
+          GOOS=linux GOARCH=arm64 "$(go env GOPATH)/bin/staticcheck" ./...
+
   build:
     needs: checks
     runs-on: macos-15
