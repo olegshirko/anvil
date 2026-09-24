@@ -23,6 +23,7 @@ const (
 	defaultNetworkName = "bridge"
 	debounceDelay      = 150 * time.Millisecond
 	pollInterval       = 500 * time.Millisecond
+	scanTimeout        = 10 * time.Second
 )
 
 // cniPortMapping is the shape of the anvil/ports label.
@@ -106,8 +107,12 @@ func (s *portScanner) run() {
 
 	for range ticker.C {
 		// Reconnect if containerd went away.
-		if _, err := cl.NamespaceService().List(context.Background()); err != nil {
+		pctx, pcancel := context.WithTimeout(context.Background(), scanTimeout)
+		_, err := cl.NamespaceService().List(pctx)
+		pcancel()
+		if err != nil {
 			log.Printf("[scanner] containerd connection lost, reconnecting")
+			cl.Close() //nolint:errcheck
 			cl = connect()
 		}
 
@@ -186,7 +191,10 @@ func (s *portScanner) unsubscribe(ch chan PortMapState) {
 }
 
 func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
-	ctx := context.Background()
+	// Bounded: a hung containerd must not freeze port forwarding forever;
+	// the next tick simply retries.
+	ctx, cancel := context.WithTimeout(context.Background(), scanTimeout)
+	defer cancel()
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
 		return PortMapState{}, fmt.Errorf("list namespaces: %w", err)
@@ -199,6 +207,7 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 	}
 
 	var mappings []PortMapping
+	seen := make(map[string]bool)
 
 	for _, ns := range nss {
 		nsCtx := namespaces.WithNamespace(ctx, ns)
@@ -209,8 +218,16 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 		}
 
 		for _, c := range containers {
-			labels, err := c.Labels(nsCtx)
+			// The list call already fetched the record; do not re-fetch it
+			// per container every tick. Containers without published ports
+			// are skipped before any task round-trip.
+			info, err := c.Info(nsCtx, client.WithoutRefreshedMetadata)
 			if err != nil {
+				continue
+			}
+			labels := info.Labels
+			portsJSON := labels[labelPorts]
+			if portsJSON == "" {
 				continue
 			}
 
@@ -221,11 +238,6 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 			}
 			status, err := task.Status(nsCtx)
 			if err != nil || status.Status != "running" {
-				continue
-			}
-
-			portsJSON := portsLabel(c, nsCtx)
-			if portsJSON == "" {
 				continue
 			}
 
@@ -240,6 +252,7 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 			// guest NAT IP. Address lookups cost ~ms, so cache per
 			// (namespace, id) keyed by task pid — a restart gets a new pid.
 			containerIP := s.containerIPFor(ns, c.ID(), task.Pid(), labels[labelName])
+			seen[ns+"/"+c.ID()] = true
 
 			for _, p := range ports {
 				proto := p.Protocol
@@ -258,6 +271,13 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 					HostIP:        pushedHostIP(p.HostIP),
 				})
 			}
+		}
+	}
+
+	// Removed and stopped containers leave the address cache.
+	for key := range s.containerIPs {
+		if !seen[key] {
+			delete(s.containerIPs, key)
 		}
 	}
 
