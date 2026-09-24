@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -64,6 +65,36 @@ func usesHostNetworkName(netName string) bool {
 }
 
 // --- start ------------------------------------------------------------------
+
+// taskRuns numbers the runs of each container. startNativeTask begins a new
+// run and hands its number to the exit watcher; the watcher only applies its
+// teardown while its run is still the current one. Without this, the watcher
+// of the previous run (docker restart, the restart policy) can fire after the
+// next start and cache a stale exit code, stop the new health monitor or
+// detach the new network.
+var taskRuns = struct {
+	sync.Mutex
+	gen map[string]uint64
+}{gen: make(map[string]uint64)}
+
+func beginTaskRun(did string) uint64 {
+	taskRuns.Lock()
+	defer taskRuns.Unlock()
+	taskRuns.gen[did]++
+	return taskRuns.gen[did]
+}
+
+func isCurrentTaskRun(did string, run uint64) bool {
+	taskRuns.Lock()
+	defer taskRuns.Unlock()
+	return taskRuns.gen[did] == run
+}
+
+func forgetTaskRuns(did string) {
+	taskRuns.Lock()
+	delete(taskRuns.gen, did)
+	taskRuns.Unlock()
+}
 
 // startNativeTask attaches CNI networking, creates the task with json-file
 // logging and starts it. A leftover stopped task from a previous run is
@@ -128,6 +159,12 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 		}()
 	}
 
+	// A new run: the previous run's exit code must not answer /wait for
+	// this one.
+	did := dockerID(ns, id)
+	run := beginTaskRun(did)
+	takeContainerExitCode(did)
+
 	uri, lerr := taskLogURI(containerLogPath(ns, id))
 	if lerr != nil {
 		err = lerr
@@ -150,14 +187,19 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 		return err
 	}
 
-	go watchTaskExit(context.Background(), ns, id, netName, ports)
+	go watchTaskExit(context.Background(), ns, id, netName, ports, run)
+	// Re-attach the health monitor on every start: docker start, docker
+	// restart and the restart policy all come through here.
+	if hc := getHealthcheckConfig(did); hc != nil {
+		startHealthCheck(did, ns, id, hc, getHealthcheckUser(did))
+	}
 	return nil
 }
 
 // watchTaskExit waits for the task to die and performs teardown Docker
 // semantics expect: exit-code cache, health monitor stop and CNI detach (the
 // IP is released on stop, exactly like docker stop).
-func watchTaskExit(ctx context.Context, ns, id, netName string, ports []cniPortMapping) {
+func watchTaskExit(ctx context.Context, ns, id, netName string, ports []cniPortMapping, run uint64) {
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return
@@ -185,7 +227,17 @@ func watchTaskExit(ctx context.Context, ns, id, netName string, ports []cniPortM
 	}
 
 	did := dockerID(ns, id)
-	cacheContainerExitCode(did, code)
+	if !isCurrentTaskRun(did, run) {
+		// The container was started again before this watcher woke up; the
+		// new run owns the exit code, the health monitor and the network.
+		debugLog("[runtime] task %s/%s exited code=%d (superseded run)", ns, truncateID(id), code)
+		return
+	}
+	// docker kill caches the mapped 137 before the task dies; containerd
+	// often reports 0 for signal deaths, so do not overwrite it.
+	if cached, ok := peekContainerExitCode(did); !ok || code != 0 || cached == 0 {
+		cacheContainerExitCode(did, code)
+	}
 	stopHealthCheck(did)
 
 	if !usesHostNetworkName(netName) {

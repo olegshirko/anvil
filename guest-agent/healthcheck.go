@@ -207,7 +207,9 @@ func getHealthcheckUser(dockerID string) string {
 	return healthcheckUsers.byID[dockerID]
 }
 
-// stopHealthCheck stops and removes the health monitor for a container.
+// stopHealthCheck stops the running health monitor for a container. The
+// stored configuration is kept so the next start (docker start, docker
+// restart, the restart policy) re-attaches the monitor.
 func stopHealthCheck(dockerID string) {
 	healthChecks.mu.Lock()
 	if h, ok := healthChecks.byID[dockerID]; ok {
@@ -215,6 +217,12 @@ func stopHealthCheck(dockerID string) {
 		delete(healthChecks.byID, dockerID)
 	}
 	healthChecks.mu.Unlock()
+}
+
+// forgetHealthCheck stops the monitor and drops the stored configuration.
+// Only container removal may call it.
+func forgetHealthCheck(dockerID string) {
+	stopHealthCheck(dockerID)
 
 	healthcheckConfigs.mu.Lock()
 	delete(healthcheckConfigs.byID, dockerID)

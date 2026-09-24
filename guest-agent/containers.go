@@ -845,11 +845,7 @@ func startDockerContainer(ctx context.Context, id string) error {
 	if links := pendingLinkEntries(dockerID(ns, containerdID)); len(links) > 0 {
 		go applyLinkAliases(context.Background(), ns, containerdID, links)
 	}
-	// Re-attach the health monitor after a stop/start cycle.
 	did := dockerID(ns, containerdID)
-	if hc := getHealthcheckConfig(did); hc != nil {
-		startHealthCheck(did, ns, containerdID, hc, getHealthcheckUser(did))
-	}
 
 	// For AutoRemove containers we wait for the exit code ourselves and then
 	// delete the container. Deleting earlier would break /wait.
@@ -926,24 +922,29 @@ func stopDockerContainer(ctx context.Context, id string, timeout int) error {
 // container actually exits. The client sees an in-flight response and opens a
 // separate connection for /start.
 func handleContainerWait(w http.ResponseWriter, r *http.Request, id string) {
-	// AutoRemove containers may already be deleted; their exit code was cached.
-	if code, ok := takeContainerExitCode(id); ok {
+	writeCode := func(code int) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `{"StatusCode":%d}`, code)
-		return
 	}
 
+	// Exit codes are cached by Docker ID, so resolve names first.
 	ns, containerdID, _, err := resolveDockerID(r.Context(), id)
 	if err != nil {
-		// The container may have been auto-removed before we could cache the code.
+		// An AutoRemove container may already be deleted; its exit code
+		// was cached before the removal.
 		if code, ok := takeContainerExitCode(id); ok {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, `{"StatusCode":%d}`, code)
+			writeCode(code)
 			return
 		}
 		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	did := dockerID(ns, containerdID)
+	// A cached code belongs to the current run: every start clears it, so
+	// the container has exited since its last start.
+	if code, ok := takeContainerExitCode(did); ok {
+		writeCode(code)
 		return
 	}
 
@@ -959,7 +960,7 @@ func handleContainerWait(w http.ResponseWriter, r *http.Request, id string) {
 	if err != nil {
 		log.Printf("[docker-api] wait %s task error: %v", id, err)
 	}
-	cacheContainerExitCode(id, exitCode)
+	cacheContainerExitCode(did, exitCode)
 	log.Printf("[docker-api] wait %s returning StatusCode=%d", id, exitCode)
 	fmt.Fprintf(w, `{"StatusCode":%d}`, exitCode)
 }
@@ -975,7 +976,8 @@ func deleteDockerContainer(ctx context.Context, id string, force bool) error {
 	if err := deleteNativeContainer(ctx, ns, containerdID, force); err != nil {
 		return err
 	}
-	stopHealthCheck(did)
+	forgetHealthCheck(did)
+	forgetTaskRuns(did)
 	restarts.clear(did)
 	unmarkAutoRemove(did)
 	takeContainerExitCode(did)
