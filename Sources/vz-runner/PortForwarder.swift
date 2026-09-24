@@ -443,10 +443,9 @@ private final class Listener {
 
     // One datagram socket per host port; for every distinct client endpoint
     // a connected socket toward the guest target is created, and datagrams
-    // are pumped in both directions. VZ NAT passes host->guest UDP, and the
-    // target is the container's CNI address (containerIP:containerPort) —
-    // reachable from the host for UDP via the NAT gateway, unlike TCP, which
-    // needs the in-guest port proxy. Client sockets idle out after 60 s.
+    // are pumped in both directions. The target is guestIP:hostPort, which
+    // vzNAT delivers; CNI portmap in the guest DNATs it to the container
+    // (see startUDP). Client sockets idle out after 60 s.
     private struct UDPClient {
         let fd: Int32
         var lastUsed: Date
@@ -485,10 +484,6 @@ private final class Listener {
         }
         var reuse: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
-        // Wake the recvfrom loop regularly so replies can be pumped even
-        // when no new client datagrams arrive.
-        var tv = timeval(tv_sec: 0, tv_usec: 250_000)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
         let bindResult = bindAddress.bind(fd: fd, port: mapping.hostPort)
         guard bindResult == 0 else {
@@ -510,24 +505,43 @@ private final class Listener {
     private func udpRelayLoop(_ fd: Int32, targetIP: String, targetPort: Int) {
         var buffer = [UInt8](repeating: 0, count: 65536)
         while owns(fd) {
-            var src = sockaddr_in6()
-            var srcLen = socklen_t(MemoryLayout<sockaddr_in6>.size)
-            let n = withUnsafeMutablePointer(to: &src) { ptr -> Int in
-                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    recvfrom(fd, &buffer, buffer.count, 0, $0, &srcLen)
-                }
+            // Wait on the listener and every per-client guest socket at once.
+            // Replies used to be pumped only after recvfrom on the listener
+            // returned — up to its 250 ms timeout — adding that much latency
+            // to every DNS/statsd/QUIC-style request/response exchange.
+            var fds = [pollfd(fd: fd, events: Int16(POLLIN), revents: 0)]
+            udpClientsLock.lock()
+            for c in udpClients.values {
+                fds.append(pollfd(fd: c.fd, events: Int16(POLLIN), revents: 0))
             }
-            if n > 0 {
-                let clientFd = udpClientFd(for: src, targetIP: targetIP, targetPort: targetPort)
-                if clientFd >= 0 {
-                    _ = buffer.withUnsafeBufferPointer { ptr in
-                        send(clientFd, ptr.baseAddress, n, 0)
-                    }
-                }
-            } else if n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
+            udpClientsLock.unlock()
+            let ready = poll(&fds, nfds_t(fds.count), 250)
+            if ready < 0 && errno != EINTR {
                 break
             }
-            pumpUDPReplies(fd: fd)
+
+            if ready > 0 && fds[0].revents & Int16(POLLIN) != 0 {
+                var src = sockaddr_in6()
+                var srcLen = socklen_t(MemoryLayout<sockaddr_in6>.size)
+                let n = withUnsafeMutablePointer(to: &src) { ptr -> Int in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        recvfrom(fd, &buffer, buffer.count, MSG_DONTWAIT, $0, &srcLen)
+                    }
+                }
+                if n > 0 {
+                    let clientFd = udpClientFd(for: src, targetIP: targetIP, targetPort: targetPort)
+                    if clientFd >= 0 {
+                        _ = buffer.withUnsafeBufferPointer { ptr in
+                            send(clientFd, ptr.baseAddress, n, 0)
+                        }
+                    }
+                } else if n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR {
+                    break
+                }
+            }
+            if ready > 0 {
+                pumpUDPReplies(fd: fd)
+            }
             reapIdleUDPClients()
         }
     }
