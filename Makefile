@@ -7,19 +7,22 @@
     download-alpine extract-alpine-kernel \
     download-ubuntu ubuntu-modules \
     guest-agent initramfs-agent initramfs-ubuntu initramfs-containerd \
-    container-tools time-boot time-service validate \
-    bench bench-prepull harness harness-all prune clean-containers disk-compact \
-    release replace-release update-brew release-notes
+    boot-containerd-fresh alpine-virt-modules alpine-iptables download-upx \
+    container-tools time-boot time-service validate unit-tests integration \
+    harness harness-prepull harness-tests harness-all bench-all \
+    prune clean-containers disk-compact \
+    release replace-release update-brew release-notes bottle
 
 BINARY := .build/release/vz-runner
 ENTITLEMENTS := entitlements.plist
-VERSION ?= dev
+# Release targets require an explicit VERSION=x.y.z; plain builds are "dev".
+BUILD_VERSION := $(or $(VERSION),dev)
 HOMEBREW_TAP_DIR ?= $(CURDIR)/../homebrew-tap
 
 all: sign
 
 build:
-	echo 'let buildVersion = "$(VERSION)"' > Sources/vz-runner/version.swift
+	echo 'let buildVersion = "$(BUILD_VERSION)"' > Sources/vz-runner/version.swift
 	swift build -c release
 
 sign: build
@@ -140,8 +143,9 @@ disk-compact:
 	@$(MAKE) service-stop
 	@if [ -f "$(CONTAINERD_DISK)" ]; then \
 	    echo "[anvil] compacting $(CONTAINERD_DISK) ($$(du -h "$(CONTAINERD_DISK)" | cut -f1) allocated)..."; \
-	    /bin/dd if="$(CONTAINERD_DISK)" of="$(CONTAINERD_DISK).new" conv=sparse bs=16m 2>/dev/null; \
-	    mv "$(CONTAINERD_DISK).new" "$(CONTAINERD_DISK)"; \
+	    /bin/dd if="$(CONTAINERD_DISK)" of="$(CONTAINERD_DISK).new" conv=sparse bs=16m 2>/dev/null \
+	        && mv "$(CONTAINERD_DISK).new" "$(CONTAINERD_DISK)" \
+	        || { rm -f "$(CONTAINERD_DISK).new"; echo "[anvil] compaction failed; disk left untouched"; $(MAKE) service-start; exit 1; }; \
 	    chmod 600 "$(CONTAINERD_DISK)"; \
 	    echo "[anvil] compacted: $$(du -h "$(CONTAINERD_DISK)" | cut -f1) allocated"; \
 	else \
@@ -389,7 +393,7 @@ boot-containerd-fresh: sign initramfs-containerd
 # -----------------------------------------------------------------------------
 
 # Backends to benchmark. Override, e.g.:
-#   make bench BENCH_BACKENDS="vz-runner lima colima"
+#   make harness BENCH_BACKENDS="vz-runner lima colima"
 BENCH_BACKENDS ?= vz-runner
 
 # Prepull harness workload images into the vz-runner VM. Starts the service if
@@ -416,7 +420,24 @@ bench-all harness-all: sign
 # -----------------------------------------------------------------------------
 # Release management
 # -----------------------------------------------------------------------------
-VERSION ?=
+# A release target without VERSION used to tag and push "vdev".
+define require_version
+	@echo "$(VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$$' || \
+		{ echo "Usage: make $@ VERSION=x.y.z (got '$(VERSION)')"; exit 1; }
+endef
+
+# Poll the GitHub API until CI has published the release for the new tag.
+define wait_for_release
+	@echo "[$@] waiting for CI to publish release..."
+	@i=0; while [ $$i -lt 80 ]; do \
+		sleep 15; \
+		curl -sf $${GITHUB_TOKEN:+-H "Authorization: token $$GITHUB_TOKEN"} \
+			"https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && exit 0; \
+		i=$$((i + 1)); printf "."; \
+	done; \
+	echo ""; echo "[$@] timeout. Check https://github.com/olegshirko/anvil/actions"; exit 1
+	@echo "[$@] release published."
+endef
 
 # Preview the notes the next release would carry (commits since the last tag).
 release-notes:
@@ -425,7 +446,6 @@ release-notes:
 # Prepend the release section to CHANGELOG.md and return it to a clean state
 # for the caller (used by release/replace-release before tagging).
 define update_changelog
-	prev_tag=$$(git describe --tags --abbrev=0 2>/dev/null || true); \
 	notes=$$(scripts/gen_release_notes.sh); \
 	printf '## v$(VERSION) (%s)\n\n%s\n' "$$(date +%Y-%m-%d)" "$$notes" > CHANGELOG.md.tmp; \
 	cat CHANGELOG.md >> CHANGELOG.md.tmp 2>/dev/null || true; \
@@ -435,7 +455,7 @@ define update_changelog
 endef
 
 release: sign
-	@test -n "$(VERSION)" || { echo "Usage: make release VERSION=x.y.z"; exit 1; }
+	$(require_version)
 	@git rev-parse "v$(VERSION)" >/dev/null 2>&1 && \
 		{ echo "Error: tag v$(VERSION) already exists. Use 'make replace-release VERSION=$(VERSION)'."; exit 1; } || true
 	@echo "[release] updating CHANGELOG.md..."
@@ -445,21 +465,11 @@ release: sign
 	git tag -a "v$(VERSION)" -F .release-notes.md
 	rm -f .release-notes.md
 	git push origin "v$(VERSION)"
-	@echo "[release] waiting for CI to publish release..."
-	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
-	i=0; while [ $$i -lt 80 ]; do \
-		sleep 15; \
-		curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
-		i=$$((i + 1)); printf "."; \
-	done; echo ""
-	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
-	curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 || \
-		{ echo "[release] timeout. Check https://github.com/olegshirko/anvil/actions"; exit 1; }
-	@echo "[release] release published."
+	$(wait_for_release)
 	$(MAKE) update-brew VERSION=$(VERSION)
 
 replace-release: sign
-	@test -n "$(VERSION)" || { echo "Usage: make replace-release VERSION=x.y.z"; exit 1; }
+	$(require_version)
 	@echo "[replace-release] deleting remote tag and GitHub release..."
 	git push origin ":refs/tags/v$(VERSION)" 2>/dev/null || true
 	git tag -d "v$(VERSION)" 2>/dev/null || true
@@ -472,26 +482,19 @@ replace-release: sign
 	git tag -a "v$(VERSION)" -F .release-notes.md
 	rm -f .release-notes.md
 	git push origin "v$(VERSION)"
-	@echo "[replace-release] waiting for CI to publish release..."
-	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
-	i=0; while [ $$i -lt 80 ]; do \
-		sleep 15; \
-		curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && break; \
-		i=$$((i + 1)); printf "."; \
-	done; echo ""
-	@AUTH=$$(test -n "$$GITHUB_TOKEN" && echo "-H 'Authorization: token $$GITHUB_TOKEN'" || echo ""); \
-	curl -sf $$AUTH "https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 || \
-		{ echo "[replace-release] timeout. Check https://github.com/olegshirko/anvil/actions"; exit 1; }
-	@echo "[replace-release] release published."
+	$(wait_for_release)
 	$(MAKE) update-brew VERSION=$(VERSION)
 
 update-brew:
-	@test -n "$(VERSION)" || { echo "Usage: make update-brew VERSION=x.y.z"; exit 1; }
-	@echo "[update-brew] downloading tar.gz and computing sha256..."
+	$(require_version)
 	@echo "[update-brew] using tap dir: $(HOMEBREW_TAP_DIR)"
 	@test -f "$(HOMEBREW_TAP_DIR)/anvil.rb" || { echo "[update-brew] error: $(HOMEBREW_TAP_DIR)/anvil.rb not found"; exit 1; }
 	@echo "[update-brew] downloading tar.gz and computing sha256..."
-	@SHA_TAR=$$(curl -sL "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz" | shasum -a 256 | cut -d' ' -f1); \
+	@tmp=$$(mktemp); \
+		curl -fsSL -o "$$tmp" "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz" || \
+			{ rm -f "$$tmp"; echo "[update-brew] error: release asset v$(VERSION) not downloadable"; exit 1; }; \
+		SHA_TAR=$$(shasum -a 256 "$$tmp" | cut -d' ' -f1); rm -f "$$tmp"; \
+		echo "$$SHA_TAR" | grep -Eq '^[0-9a-f]{64}$$' || { echo "[update-brew] error: bad sha256 '$$SHA_TAR'"; exit 1; }; \
 		echo "[update-brew] sha256=$$SHA_TAR"; \
 		perl -0pi -e 's/\n  bottle do\n.*?  end\n/\n/s' "$(HOMEBREW_TAP_DIR)/anvil.rb"; \
 		sed -i '' 's|version ".*"|version "$(VERSION)"|' "$(HOMEBREW_TAP_DIR)/anvil.rb"; \
@@ -501,5 +504,5 @@ update-brew:
 		echo "[update-brew] done. Run 'make bottle VERSION=$(VERSION)' to build and publish a bottle."
 
 bottle:
-	@test -n "$(VERSION)" || { echo "Usage: make bottle VERSION=x.y.z"; exit 1; }
+	$(require_version)
 	scripts/make_bottle.sh "$(VERSION)" "$(HOMEBREW_TAP_DIR)"
