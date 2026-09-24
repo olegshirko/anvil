@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -27,18 +26,6 @@ const dockerMinAPIVersion = "1.24"
 
 // writeDockerStream writes a Docker multiplexed stream frame.
 // streamType: 0=stdin, 1=stdout, 2=stderr.
-// unixToRFC3339 converts a unix-seconds timestamp (the form the docker CLI
-// sends for logs since/until) to RFC3339. Returns "" when the input is not
-// a plain number (RFC3339 or a relative duration pass through as is).
-func unixToRFC3339(raw string) string {
-	f, err := strconv.ParseFloat(raw, 64)
-	if err != nil {
-		return ""
-	}
-	sec, frac := math.Modf(f)
-	return time.Unix(int64(sec), int64(frac*1e9)).UTC().Format(time.RFC3339Nano)
-}
-
 func writeDockerStream(w io.Writer, streamType byte, data []byte) error {
 	header := make([]byte, 8)
 	header[0] = streamType
@@ -129,13 +116,6 @@ func matchesLabelFilters(labels map[string]string, filters map[string]map[string
 		return true
 	}
 	return true
-}
-
-// streamTaskLogTo replays the container's json-file log (and optionally
-// follows it), writing output as Docker multiplexed stream frames until the
-// container exits or the writer fails.
-func streamTaskLogTo(out io.Writer, ns, id string, follow bool) {
-	streamTaskLogToTTY(out, ns, id, follow, false)
 }
 
 // streamTaskLogToTTY streams the task log; with tty=true the bytes go out raw

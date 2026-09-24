@@ -33,7 +33,6 @@ const restartBackoffMax = 30 * time.Second
 type restartMonitor struct {
 	mu       sync.Mutex
 	policies map[string]restartPolicy // dockerID -> policy
-	retries  map[string]int           // dockerID -> consecutive failed restarts
 	backoff  map[string]time.Duration // dockerID -> current backoff
 	nextAt   map[string]time.Time     // dockerID -> earliest next restart
 	// specs keeps the originally requested policy (including "no"-adjacent
@@ -49,7 +48,6 @@ type restartMonitor struct {
 
 var restarts = &restartMonitor{
 	policies: make(map[string]restartPolicy),
-	retries:  make(map[string]int),
 	backoff:  make(map[string]time.Duration),
 	nextAt:   make(map[string]time.Time),
 	specs:    make(map[string]restartPolicy),
@@ -131,7 +129,6 @@ func (m *restartMonitor) forget(dockerID string) {
 }
 
 func (m *restartMonitor) resetLocked(dockerID string) {
-	delete(m.retries, dockerID)
 	delete(m.backoff, dockerID)
 	delete(m.nextAt, dockerID)
 }
@@ -267,13 +264,6 @@ func (m *restartMonitor) paceNextLocked(dockerID string) {
 	}
 	m.backoff[dockerID] = b
 	m.nextAt[dockerID] = time.Now().Add(b)
-}
-
-func (m *restartMonitor) bumpRetries(dockerID string) int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.retries[dockerID]++
-	return m.retries[dockerID]
 }
 
 // taskExitState reads the authoritative run state from the containerd task:

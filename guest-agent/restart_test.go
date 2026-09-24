@@ -69,7 +69,6 @@ func TestRestartPolicyMergeWithRetryCount(t *testing.T) {
 func TestRestartMonitorRegistry(t *testing.T) {
 	m := &restartMonitor{
 		policies: make(map[string]restartPolicy),
-		retries:  make(map[string]int),
 		backoff:  make(map[string]time.Duration),
 		nextAt:   make(map[string]time.Time),
 		specs:    make(map[string]restartPolicy),

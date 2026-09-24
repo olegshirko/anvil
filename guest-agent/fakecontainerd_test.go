@@ -31,13 +31,6 @@ import (
 	tasktype "github.com/containerd/containerd/api/types/task"
 )
 
-// fakeNS is the per-namespace state served by the fake.
-type fakeNS struct {
-	containers map[string]*containerspb.Container
-	tasks      map[string]*tasktype.Process // container ID -> task
-	images     map[string]*imagespb.Image   // image name -> image
-}
-
 // One wrapper per service (embedding all Unimplemented servers in one
 // struct makes shared method names like Create ambiguous selectors).
 type fakeContainerd struct {

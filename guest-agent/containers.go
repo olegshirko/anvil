@@ -143,10 +143,6 @@ type dockerCreateResponse struct {
 	Warnings []string `json:"Warnings"`
 }
 
-type dockerWaitResponse struct {
-	StatusCode int `json:"StatusCode"`
-}
-
 // autoRemoveContainers tracks Docker IDs that were created with AutoRemove.
 // Removal happens in-agent after the exit code is captured so /wait can
 // still read it.
@@ -563,61 +559,6 @@ func containerTaskState(ctx context.Context, ns, id string) (running bool, statu
 		return false, "", false
 	}
 	return st.Status == "running", dockerStatus(string(st.Status)), true
-}
-
-// containerStatus returns the container's status string ("created",
-// "running", "exited", ...) or "" when it cannot be determined. It reads
-// containerd task state directly.
-func containerStatus(ns, name string) string {
-	id := resolveContainerdIDByName(context.Background(), ns, name)
-	if id == "" {
-		return ""
-	}
-	_, status, ok := containerTaskState(context.Background(), ns, id)
-	if !ok {
-		return ""
-	}
-	return status
-}
-
-func isContainerRunning(ns, name string) bool {
-	running, _, ok := func() (bool, string, bool) {
-		ctx := context.Background()
-		id := resolveContainerdIDByName(ctx, ns, name)
-		if id == "" {
-			return false, "", false
-		}
-		return containerTaskState(ctx, ns, id)
-	}()
-	return ok && running
-}
-
-// resolveContainerdIDByName finds the containerd ID for a container name
-// (label lookup) within one namespace.
-func resolveContainerdIDByName(ctx context.Context, ns, name string) string {
-	cl, err := pc.get(ctx)
-	if err != nil {
-		return ""
-	}
-	nsCtx := namespaces.WithNamespace(ctx, ns)
-	containers, err := cl.Containers(nsCtx)
-	if err != nil {
-		return ""
-	}
-	for _, c := range containers {
-		labels, err := c.Labels(nsCtx)
-		if err != nil {
-			continue
-		}
-		cn := labels[labelName]
-		if cn == "" {
-			cn = c.ID()
-		}
-		if cn == name || c.ID() == name {
-			return c.ID()
-		}
-	}
-	return ""
 }
 
 // findContainerByName returns the Docker ID of a container with the given name

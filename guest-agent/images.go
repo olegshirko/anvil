@@ -19,7 +19,6 @@ import (
 	"github.com/containerd/containerd/v2/core/images/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
-	"github.com/containerd/platforms"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -508,25 +507,6 @@ func deleteImageTree(cl *client.Client, nsCtx context.Context, name string, targ
 // saveScratchNs stages images for docker save so every blob sits in a
 // single namespace before the archive export.
 const saveScratchNs = "anvil-save-tmp"
-
-// pullImageAllPlatforms pulls every platform of a (possibly multi-arch)
-// image so the full index can be exported by docker save.
-func pullImageAllPlatforms(ctx context.Context, canonicalRef, ns string) error {
-	cl, err := pc.get(ctx)
-	if err != nil {
-		return fmt.Errorf("containerd client: %w", err)
-	}
-	nsCtx := namespaces.WithNamespace(ctx, ns)
-	leaseCtx, release, lerr := cl.WithLease(nsCtx)
-	if lerr == nil {
-		if leaseID, ok := leases.FromContext(leaseCtx); ok {
-			nsCtx = leases.WithLease(nsCtx, leaseID)
-		}
-		defer release(context.Background())
-	}
-	_, err = cl.Pull(nsCtx, canonicalRef, client.WithPlatformMatcher(platforms.All))
-	return err
-}
 
 // putImage creates or updates an image record.
 func putImage(cl *client.Client, nsCtx context.Context, img images.Image) error {

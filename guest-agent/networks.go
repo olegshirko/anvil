@@ -284,25 +284,6 @@ func restoreNetworkConfigs() {
 	}
 }
 
-// cniLabelsForNetwork reads the labels from the CNI conflist generated for the
-// given network name, if it exists.
-func cniLabelsForNetwork(name string) map[string]string {
-	data, err := os.ReadFile(cniConflistPath(name))
-	if err != nil {
-		return map[string]string{}
-	}
-	var conf struct {
-		Labels map[string]string `json:"anvilLabels"`
-	}
-	if err := json.Unmarshal(data, &conf); err != nil {
-		return map[string]string{}
-	}
-	if conf.Labels == nil {
-		return map[string]string{}
-	}
-	return conf.Labels
-}
-
 // createDockerNetwork creates a network in the requested namespace.
 // It first writes a deterministic CNI conflist for the requested name, because
 // The runtime consumes the conflist directly — there is no separate
