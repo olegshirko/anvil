@@ -342,8 +342,7 @@ func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*
 	if len(req.IPAM.Config) > 0 && req.IPAM.Config[0].Subnet != "" {
 		subnet = req.IPAM.Config[0].Subnet
 	} else {
-		octet := projectSubnetOctet(req.Name)
-		subnet = fmt.Sprintf("10.10.%d.0/24", octet)
+		subnet = networkSubnet(req.Name)
 	}
 	labels := req.Labels
 	if labels == nil {

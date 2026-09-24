@@ -346,12 +346,12 @@ func generateCNIConfigWithLabels(ns string, extraLabels map[string]string) error
 	base := sanitizeCNIName(netName)
 	path := filepath.Join(cniConfDir, "anvil-"+base+".conflist")
 
-	bridge := "br-" + base
-	if len(bridge) > 15 {
-		bridge = bridge[:15]
-	}
-
-	octet := projectSubnetOctet(ns)
+	netAllocMu.Lock()
+	defer netAllocMu.Unlock()
+	existing, _ := loadCNIConflists()
+	alloc := pickNetAlloc(netName, projectSubnetOctet(ns), existing)
+	bridge := alloc.bridge
+	octet := alloc.octet
 	subnet := fmt.Sprintf("10.10.%d.0/24", octet)
 	gateway := fmt.Sprintf("10.10.%d.1", octet)
 
