@@ -486,7 +486,7 @@ After that:
 - `docker ps` — ~0.06 s;
 - `docker images` — ~0.04 s;
 - `docker run --rm alpine echo hi` — ~2.0 s;
-- `make run_tests_locally` in `pprb_uzp_efficiency` — ~50 s.
+- a real-world project's container-based test suite — ~50 s.
 
 The risk: on a kill -9 of the daemon or a host panic the last metadata
 transaction can be lost. Acceptable for a dev VM; this mode does not fit
@@ -524,7 +524,7 @@ The result compared to `.none` without tuning:
 - `docker ps` — ~0.01 s (was ~0.06 s);
 - `docker images` — ~0.03 s (was ~0.04 s);
 - `docker run --rm alpine echo hi` — ~1.2 s (was ~2.0 s);
-- `make run_tests_locally` — ~40 s (was ~50 s).
+- the same project test suite — ~40 s (was ~50 s).
 
 > **Multiqueue virtio-blk** — in the current Virtualization.framework SDK
 > (`VZVirtioBlockDeviceConfiguration.h`, macOS 14/15) there is no public
