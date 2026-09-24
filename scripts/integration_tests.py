@@ -1834,14 +1834,21 @@ def main() -> int:
 
     import sys as _sys
     only = _sys.argv[1:]
+    selected = 0
     for name, fn in TESTS:
         if only and not any(o in name for o in only):
             continue
+        selected += 1
         log(f"\n=== {name} ===")
         try:
             fn()
         except Exception as e:
             record(name, "FAIL", str(e))
+
+    if only and selected == 0:
+        # A typo in the filter must not look like a green run.
+        log(f"no test name matches {only}")
+        return 2
 
     log("\n=== Summary ===")
     passed = sum(1 for _, s, _ in results if s == "PASS")
