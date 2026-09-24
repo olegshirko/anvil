@@ -1002,12 +1002,34 @@ func deleteDockerContainer(ctx context.Context, id string, force bool) error {
 	if err := deleteNativeContainer(ctx, ns, containerdID, force); err != nil {
 		return err
 	}
+	forgetContainerState(did)
+	return nil
+}
+
+// forgetContainerState drops every in-memory record kept per container.
+// Without it each removed container (CI loops, `docker run --rm`) left
+// entries behind in a dozen maps until the next cold boot.
+func forgetContainerState(did string) {
 	forgetHealthCheck(did)
 	forgetTaskRuns(did)
-	restarts.clear(did)
+	restarts.forget(did)
 	unmarkAutoRemove(did)
 	takeContainerExitCode(did)
-	return nil
+	setContainerLinks(did, nil)
+
+	containerTTYFlags.mu.Lock()
+	delete(containerTTYFlags.m, did)
+	containerTTYFlags.mu.Unlock()
+
+	containerEntryPoints.mu.Lock()
+	delete(containerEntryPoints.dirs, did)
+	delete(containerEntryPoints.eps, did)
+	delete(containerEntryPoints.stops, did)
+	containerEntryPoints.mu.Unlock()
+
+	attachTracker.mu.Lock()
+	delete(attachTracker.counts, did)
+	attachTracker.mu.Unlock()
 }
 
 // renameDockerContainer implements POST /containers/{id}/rename. Compose

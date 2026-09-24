@@ -99,6 +99,18 @@ func (m *restartMonitor) clear(dockerID string) {
 	m.resetLocked(dockerID)
 }
 
+// forget drops everything kept for a removed container, the inspect spec
+// and restart count included.
+func (m *restartMonitor) forget(dockerID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.policies, dockerID)
+	delete(m.stopped, dockerID)
+	delete(m.specs, dockerID)
+	delete(m.counts, dockerID)
+	m.resetLocked(dockerID)
+}
+
 func (m *restartMonitor) resetLocked(dockerID string) {
 	delete(m.retries, dockerID)
 	delete(m.backoff, dockerID)
