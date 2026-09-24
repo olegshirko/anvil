@@ -4,8 +4,10 @@ package main
 // from one run of a container into the next.
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -74,5 +76,42 @@ func TestHandleContainerWaitByName(t *testing.T) {
 	}
 	if _, ok := takeContainerExitCode(did); ok {
 		t.Fatal("/wait must consume the cached code")
+	}
+}
+
+// Docker resolves a reference as full ID, then exact name, then unique ID
+// prefix. A container named "db" must win over another whose ID starts with
+// "db", and an empty reference must match nothing.
+func TestPickContainerRefOrder(t *testing.T) {
+	var hexy containerRef
+	for i := 0; ; i++ {
+		c := containerRef{ns: "p", id: fmt.Sprintf("c%d", i), name: "other"}
+		if strings.HasPrefix(dockerID(c.ns, c.id), "db") {
+			hexy = c
+			break
+		}
+	}
+	named := containerRef{ns: "p", id: "named", name: "db"}
+	cands := []containerRef{hexy, named}
+
+	if got, err := pickContainerRef("db", cands); err != nil || got != named {
+		t.Fatalf("name must win over ID prefix: got %+v, %v", got, err)
+	}
+	if got, err := pickContainerRef("/db", cands); err != nil || got != named {
+		t.Fatalf("leading slash: got %+v, %v", got, err)
+	}
+	full := dockerID(hexy.ns, hexy.id)
+	if got, err := pickContainerRef(full, cands); err != nil || got != hexy {
+		t.Fatalf("full ID: got %+v, %v", got, err)
+	}
+	if got, err := pickContainerRef(full[:5], cands); err != nil || got != hexy {
+		t.Fatalf("unique prefix: got %+v, %v", got, err)
+	}
+	if _, err := pickContainerRef("", cands); err == nil {
+		t.Fatal("empty reference must not match")
+	}
+	twins := []containerRef{{ns: "a", id: "1", name: "web"}, {ns: "b", id: "2", name: "web"}}
+	if _, err := pickContainerRef("web", twins); err == nil {
+		t.Fatal("a name in two namespaces is ambiguous")
 	}
 }

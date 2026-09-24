@@ -464,10 +464,7 @@ func resolveDockerID(ctx context.Context, prefix string) (ns, containerdID, name
 		return "", "", "", fmt.Errorf("list namespaces: %w", err)
 	}
 
-	type match struct {
-		ns, id, name string
-	}
-	var matches []match
+	var cands []containerRef
 	for _, ns := range nss {
 		nsCtx := namespaces.WithNamespace(ctx, ns)
 		containers, err := cl.Containers(nsCtx)
@@ -488,27 +485,56 @@ func resolveDockerID(ctx context.Context, prefix string) (ns, containerdID, name
 				cname = c.ID()
 			}
 
-			if strings.HasPrefix(dockerID(ns, c.ID()), prefix) {
-				matches = append(matches, match{ns, c.ID(), cname})
-				continue
-			}
-			searchName := prefix
-			if strings.HasPrefix(searchName, "/") {
-				searchName = searchName[1:]
-			}
-			if cname == searchName {
-				matches = append(matches, match{ns, c.ID(), cname})
-			}
+			cands = append(cands, containerRef{ns: ns, id: c.ID(), name: cname})
 		}
 	}
 
-	if len(matches) == 0 {
-		return "", "", "", fmt.Errorf("No such container: %s", prefix)
+	m, err := pickContainerRef(prefix, cands)
+	if err != nil {
+		return "", "", "", err
 	}
-	if len(matches) > 1 {
-		return "", "", "", fmt.Errorf("multiple containers match %s", prefix)
+	return m.ns, m.id, m.name, nil
+}
+
+// containerRef is one container as seen by name/ID resolution.
+type containerRef struct {
+	ns, id, name string
+}
+
+// pickContainerRef resolves a user reference in Docker's order: full ID,
+// then exact name, then a unique ID prefix. Mixing the three in one pass let
+// a name made of hex characters ("db", "cafe") collide with an unrelated
+// container whose ID starts that way.
+func pickContainerRef(ref string, cands []containerRef) (containerRef, error) {
+	name := strings.TrimPrefix(ref, "/")
+	if ref == "" || name == "" {
+		return containerRef{}, fmt.Errorf("No such container: %s", ref)
 	}
-	return matches[0].ns, matches[0].id, matches[0].name, nil
+	pick := func(match func(containerRef) bool) ([]containerRef, bool) {
+		var out []containerRef
+		for _, c := range cands {
+			if match(c) {
+				out = append(out, c)
+			}
+		}
+		return out, len(out) > 0
+	}
+	if m, ok := pick(func(c containerRef) bool { return dockerID(c.ns, c.id) == ref }); ok {
+		return m[0], nil
+	}
+	if m, ok := pick(func(c containerRef) bool { return c.name == name }); ok {
+		if len(m) > 1 {
+			return containerRef{}, fmt.Errorf("multiple containers match %s", ref)
+		}
+		return m[0], nil
+	}
+	if m, ok := pick(func(c containerRef) bool { return strings.HasPrefix(dockerID(c.ns, c.id), ref) }); ok {
+		if len(m) > 1 {
+			return containerRef{}, fmt.Errorf("multiple containers match %s", ref)
+		}
+		return m[0], nil
+	}
+	return containerRef{}, fmt.Errorf("No such container: %s", ref)
 }
 
 // containerTaskState reads the task state for a container directly from
@@ -1251,18 +1277,23 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 		return nil, fmt.Errorf("containerd client: %w", err)
 	}
 
-	nss, err := cl.NamespaceService().List(ctx)
+	// Same resolution order as every other endpoint; the loop below then
+	// only builds the result for that one container.
+	rns, rid, _, err := resolveDockerID(ctx, prefix)
 	if err != nil {
-		return nil, fmt.Errorf("list namespaces: %w", err)
+		return nil, err
 	}
 
-	for _, ns := range nss {
+	for _, ns := range []string{rns} {
 		nsCtx := namespaces.WithNamespace(ctx, ns)
 		containers, err := cl.Containers(nsCtx)
 		if err != nil {
 			continue
 		}
 		for _, c := range containers {
+			if c.ID() != rid {
+				continue
+			}
 			info, err := c.Info(nsCtx)
 			if err != nil {
 				continue
@@ -1275,21 +1306,6 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 			name := labels[labelName]
 			if name == "" {
 				name = c.ID()
-			}
-
-			// Match by Docker ID prefix or by name (with or without leading slash).
-			matched := strings.HasPrefix(dockerID(ns, c.ID()), prefix)
-			if !matched {
-				searchName := prefix
-				if strings.HasPrefix(searchName, "/") {
-					searchName = searchName[1:]
-				}
-				if name == searchName {
-					matched = true
-				}
-			}
-			if !matched {
-				continue
 			}
 
 			status := "created"
