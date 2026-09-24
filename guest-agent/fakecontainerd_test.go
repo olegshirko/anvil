@@ -147,6 +147,18 @@ func (s *fakeTasksService) Get(ctx context.Context, req *taskspb.GetRequest) (*t
 	return &taskspb.GetResponse{Process: p}, nil
 }
 
+func (s *fakeTasksService) List(ctx context.Context, _ *taskspb.ListTasksRequest) (*taskspb.ListTasksResponse, error) {
+	ns, ok := s.f.ns[requestNamespace(ctx)]
+	if !ok {
+		return &taskspb.ListTasksResponse{}, nil
+	}
+	out := &taskspb.ListTasksResponse{}
+	for _, p := range ns.tasks {
+		out.Tasks = append(out.Tasks, p)
+	}
+	return out, nil
+}
+
 func (s *fakeImagesService) List(ctx context.Context, _ *imagespb.ListImagesRequest) (*imagespb.ListImagesResponse, error) {
 	ns, ok := s.f.ns[requestNamespace(ctx)]
 	if !ok {

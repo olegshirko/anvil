@@ -77,6 +77,13 @@ func TestContainersListAgainstFakeContainerd(t *testing.T) {
 	if len(web.Ports) != 1 || web.Ports[0].PublicPort != 8080 || web.Ports[0].PrivatePort != 80 {
 		t.Errorf("web.Ports = %+v", web.Ports)
 	}
+	// COMMAND comes from the OCI spec in the listed record, quoted like the CLI.
+	if web.Command != `nginx -g "daemon off;"` {
+		t.Errorf("web.Command = %q", web.Command)
+	}
+	if web.Image != "docker.io/library/nginx:latest" {
+		t.Errorf("web.Image = %q", web.Image)
+	}
 
 	// all=1 includes the created container.
 	resp2, err := http.Get(srv.URL + "/containers/json?all=1")

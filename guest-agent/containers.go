@@ -13,7 +13,10 @@ import (
 	"syscall"
 	"time"
 
+	tasks "github.com/containerd/containerd/api/services/tasks/v1"
+	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // dockerCreateRequest mirrors the minimal parts of Docker's container creation body.
@@ -1195,9 +1198,13 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 			log.Printf("[docker-api] list containers in %s: %v", ns, err)
 			continue
 		}
+		// One task list per namespace instead of Task+Status per container.
+		taskStates := namespaceTaskStates(nsCtx, cl)
 
 		for _, c := range containers {
-			info, err := c.Info(nsCtx)
+			// The list call already returned the record: no per-container
+			// re-fetch for info, labels, image or spec.
+			info, err := c.Info(nsCtx, client.WithoutRefreshedMetadata)
 			if err != nil {
 				continue
 			}
@@ -1213,17 +1220,13 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 
 			state := "created"
 			status := "created"
-			task, err := c.Task(nsCtx, nil)
-			if err == nil {
-				st, err := task.Status(nsCtx)
-				if err == nil {
-					state = dockerState(string(st.Status))
-					status = dockerStatus(string(st.Status))
-				}
+			if st, ok := taskStates[c.ID()]; ok {
+				state = dockerState(st)
+				status = dockerStatus(st)
 			}
 
 			var ports []dockerPort
-			if portsJSON := portsLabel(c, nsCtx); portsJSON != "" {
+			if portsJSON := labels[labelPorts]; portsJSON != "" {
 				var pm []cniPortMapping
 				if err := json.Unmarshal([]byte(portsJSON), &pm); err == nil {
 					for _, p := range pm {
@@ -1245,15 +1248,14 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 				}
 			}
 
+			// c.Image() only looked the image up by this same name.
 			imageName := info.Image
-			if img, err := c.Image(nsCtx); err == nil && img != nil {
-				imageName = img.Name()
-			}
 
 			// docker ps COMMAND: the OCI process args (image entrypoint/cmd
 			// merged at create time), quoted like the docker CLI does.
 			command := ""
-			if spec, serr := c.Spec(nsCtx); serr == nil && spec != nil && spec.Process != nil {
+			var spec specs.Spec
+			if info.Spec != nil && json.Unmarshal(info.Spec.GetValue(), &spec) == nil && spec.Process != nil {
 				args := make([]string, len(spec.Process.Args))
 				for i, a := range spec.Process.Args {
 					if strings.ContainsAny(a, " \t") {
@@ -1288,6 +1290,20 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 		return result[i].Id < result[j].Id
 	})
 	return result, nil
+}
+
+// namespaceTaskStates maps containerd container ID -> task status
+// ("running", "stopped", "created", "paused") for one namespace.
+func namespaceTaskStates(nsCtx context.Context, cl *client.Client) map[string]string {
+	out := map[string]string{}
+	resp, err := cl.TaskService().List(nsCtx, &tasks.ListTasksRequest{})
+	if err != nil {
+		return out
+	}
+	for _, p := range resp.Tasks {
+		out[p.ID] = strings.ToLower(p.Status.String())
+	}
+	return out
 }
 
 // inspectDockerContainer returns a minimal inspect payload for a container.
