@@ -513,7 +513,7 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 
 // createNativeContainer registers the container with containerd and prepares
 // all start-time state. It returns the containerd ID.
-func createNativeContainer(ctx context.Context, ns, name string, req dockerCreateRequest) (string, error) {
+func createNativeContainer(ctx context.Context, ns, name string, req dockerCreateRequest) (_ string, err error) {
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return "", fmt.Errorf("containerd client: %w", err)
@@ -537,12 +537,23 @@ func createNativeContainer(ctx context.Context, ns, name string, req dockerCreat
 		if _, nerr := createNamedNetNS(id); nerr != nil {
 			return "", fmt.Errorf("create netns: %w", nerr)
 		}
-		defer func() {
-			if err != nil {
-				releaseNamedNetNS(id)
-			}
-		}()
 	}
+	// Undo everything below on any failure. err is the named result, so
+	// every `return "", …` counts — the per-step perr/merr/serr variables
+	// used to bypass the old cleanup and leak the bind-mounted netns.
+	var anonVols []string
+	defer func() {
+		if err == nil {
+			return
+		}
+		for _, v := range anonVols {
+			os.RemoveAll(volumeDataDir(ns, v))
+		}
+		deleteContainerMeta(ns, id) // also the prepared root (hosts, resolv.conf)
+		if !hostNet {
+			releaseNamedNetNS(id)
+		}
+	}()
 
 	hostname := req.Hostname
 	if hostname == "" {
@@ -555,10 +566,11 @@ func createNativeContainer(ctx context.Context, ns, name string, req dockerCreat
 		return "", perr
 	}
 
-	mounts, anonVols, merr := computeContainerMounts(ns, id, req)
+	mounts, vols, merr := computeContainerMounts(ns, id, req)
 	if merr != nil {
 		return "", merr
 	}
+	anonVols = vols
 
 	var imgCfg *ocispecImageConfig
 	if spec, serr := img.Spec(nsCtx); serr == nil {
@@ -598,11 +610,6 @@ func createNativeContainer(ctx context.Context, ns, name string, req dockerCreat
 	if serr := saveContainerMeta(meta); serr != nil {
 		return "", serr
 	}
-	defer func() {
-		if err != nil {
-			deleteContainerMeta(ns, id)
-		}
-	}()
 
 	labels := map[string]string{}
 	for k, v := range req.Labels {
@@ -626,7 +633,6 @@ func createNativeContainer(ctx context.Context, ns, name string, req dockerCreat
 		client.WithContainerLabels(labels),
 		client.WithNewSpec(specOpts...),
 	); cerr != nil {
-		err = cerr
 		return "", fmt.Errorf("new container: %w", cerr)
 	}
 	return id, nil
