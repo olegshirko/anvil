@@ -8,7 +8,7 @@
     download-ubuntu ubuntu-modules \
     guest-agent initramfs-agent initramfs-ubuntu initramfs-containerd \
     boot-containerd-fresh alpine-virt-modules alpine-iptables download-upx \
-    container-tools time-boot time-service validate unit-tests integration \
+    container-tools time-boot time-service validate doctor unit-tests integration \
     harness harness-prepull harness-tests harness-all bench-all \
     prune clean-containers disk-compact \
     release replace-release update-brew release-notes bottle
@@ -179,6 +179,10 @@ time-service: sign
 
 validate: sign
 	python3 scripts/validate_robustness.py
+
+# Diagnose the install: hypervisor, signing, assets, API, shares.
+doctor: sign
+	@$(BINARY) doctor
 
 # -----------------------------------------------------------------------------
 # Alpine (M0 bare boot)
