@@ -76,16 +76,26 @@ final class DockerProxyServer {
             return
         }
 
+        let listenFD = fd
         DispatchQueue.global().async { [weak self] in
-            while let self = self, self.fd >= 0 {
-                let client = accept(self.fd, nil, nil)
-                guard client >= 0 else { continue }
+            while let self = self, self.isListening(on: listenFD) {
+                let client = accept(listenFD, nil, nil)
+                guard client >= 0 else {
+                    if acceptShouldStop(errno) { break }
+                    continue
+                }
                 setSocketNoSigPipe(client)
                 DispatchQueue.global().async { [weak self] in
                     self?.handleClient(fd: client)
                 }
             }
         }
+    }
+
+    private func isListening(on listenFD: Int32) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return fd == listenFD
     }
 
     /// Close the listening socket and remove the path.

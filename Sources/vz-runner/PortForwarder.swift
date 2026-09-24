@@ -365,7 +365,7 @@ private final class Listener {
             self.fd = fd
             self.lock.unlock()
 
-            while self.isRunning {
+            while self.owns(fd) {
                 var clientAddr = sockaddr_in6()
                 var len = socklen_t(MemoryLayout<sockaddr_in6>.size)
                 let client = withUnsafeMutablePointer(to: &clientAddr) { ptr -> Int32 in
@@ -374,13 +374,51 @@ private final class Listener {
                     }
                 }
                 guard client >= 0 else {
-                    if errno == EINTR { continue }
+                    let err = errno
+                    if err == EINTR || err == ECONNABORTED { continue }
+                    if err == EMFILE || err == ENFILE || err == ENOBUFS {
+                        // Transient exhaustion: back off instead of giving up
+                        // the port (or spinning).
+                        Thread.sleep(forTimeInterval: 0.1)
+                        continue
+                    }
+                    break
+                }
+                // stop() may have closed our fd and a new listener reused the
+                // number; never serve a connection that is not ours.
+                guard self.owns(fd) else {
+                    close(client)
                     break
                 }
                 self.handleClient(client)
             }
 
+            self.release(fd, onFailure: onFailure)
+        }
+    }
+
+    /// Whether `fd` is still this listener's socket (stop() resets it).
+    private func owns(_ fd: Int32) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return self.fd == fd
+    }
+
+    /// Close `fd` when the serving loop ends on its own (an accept or recv
+    /// error) and report the dead listener so the forwarder drops it. After
+    /// stop() the fd is no longer ours: stop() already closed it, and closing
+    /// the number again could close a replacement listener's socket.
+    private func release(_ fd: Int32, onFailure: () -> Void) {
+        lock.lock()
+        let ours = self.fd == fd
+        if ours {
             close(fd)
+            self.fd = -1
+        }
+        lock.unlock()
+        if ours {
+            print("[listener :\(mapping.hostPort)] serving loop failed; dropping the listener")
+            onFailure()
         }
     }
 
@@ -466,11 +504,12 @@ private final class Listener {
         let targetPort = mapping.hostPort
         print("[port-forwarder] forwarding localhost:\(mapping.hostPort)/udp -> \(targetIP):\(targetPort) (guest relay)")
         udpRelayLoop(fd, targetIP: targetIP, targetPort: targetPort)
+        release(fd, onFailure: onFailure)
     }
 
     private func udpRelayLoop(_ fd: Int32, targetIP: String, targetPort: Int) {
         var buffer = [UInt8](repeating: 0, count: 65536)
-        while isRunning {
+        while owns(fd) {
             var src = sockaddr_in6()
             var srcLen = socklen_t(MemoryLayout<sockaddr_in6>.size)
             let n = withUnsafeMutablePointer(to: &src) { ptr -> Int in
@@ -580,13 +619,6 @@ private final class Listener {
             udpClients.removeValue(forKey: k)
         }
         udpClientsLock.unlock()
-    }
-
-    private var isRunning: Bool {
-        lock.lock()
-        let running = fd >= 0
-        lock.unlock()
-        return running
     }
 
     private func handleClient(_ clientFd: Int32) {

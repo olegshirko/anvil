@@ -6,6 +6,21 @@ func setSocketNoSigPipe(_ fd: Int32) {
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
 }
 
+/// Classify a failed accept(2) on a listening socket: true when the socket is
+/// gone (closed by stop()), false to retry. Descriptor exhaustion backs off
+/// briefly — retrying it immediately spun a core at 100%.
+func acceptShouldStop(_ err: Int32) -> Bool {
+    switch err {
+    case EBADF, EINVAL, ENOTSOCK:
+        return true
+    case EINTR, ECONNABORTED:
+        return false
+    default:
+        Thread.sleep(forTimeInterval: 0.1)
+        return false
+    }
+}
+
 /// Unix-domain socket control server. Accepts length-prefixed JSON requests from
 /// local clients and forwards the raw bytes to the guest agent over vsock.
 final class ControlServer {
@@ -69,16 +84,26 @@ final class ControlServer {
             return
         }
 
+        let listenFD = fd
         DispatchQueue.global().async { [weak self] in
-            while let self = self, self.fd >= 0 {
-                let client = accept(self.fd, nil, nil)
-                guard client >= 0 else { continue }
+            while let self = self, self.isListening(on: listenFD) {
+                let client = accept(listenFD, nil, nil)
+                guard client >= 0 else {
+                    if acceptShouldStop(errno) { break }
+                    continue
+                }
                 setSocketNoSigPipe(client)
                 DispatchQueue.global().async { [weak self] in
                     self?.handleClient(fd: client)
                 }
             }
         }
+    }
+
+    private func isListening(on listenFD: Int32) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return fd == listenFD
     }
 
     /// Close the listening socket and remove the path.
