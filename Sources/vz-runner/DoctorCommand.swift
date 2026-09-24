@@ -44,13 +44,19 @@ func cmdDoctor(args: [String]) {
     check("kernel", kernel != nil, kernel ?? "not found in ~/.anvil-vz, brew assets or .download")
     check("initramfs", initrd != nil, initrd ?? "not found")
 
-    // Persistent containerd disk + free space on the host volume.
+    let daemonRunning = isDaemonRunning()
+
+    // Persistent containerd disk + free space on the host volume. A fresh
+    // install has none until the first start creates it: only a running
+    // daemon without a disk is a failure.
     let diskPath = stateDir.appendingPathComponent("containerd-disk.img").path
     if let attrs = try? FileManager.default.attributesOfItem(atPath: diskPath),
        let size = attrs[.size] as? NSNumber {
         check("containerd disk", true, "\(size.int64Value / (1024*1024*1024)) GiB sparse at \(diskPath)")
+    } else if daemonRunning {
+        check("containerd disk", false, "missing at \(diskPath) while the daemon runs")
     } else {
-        check("containerd disk", false, "missing at \(diskPath) (created on first start)")
+        check("containerd disk", true, "not created yet (created on first start)")
     }
     if let sysAttrs = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory()),
        let free = sysAttrs[.systemFreeSize] as? NSNumber {
@@ -58,17 +64,33 @@ func cmdDoctor(args: [String]) {
         check("host free space", freeGiB >= 10, "\(freeGiB) GiB free")
     }
 
-    // Snapshot state.
+    // Snapshot state. The snapshots directory always exists; the state file
+    // is what a resume needs, and it only exists while the VM is stopped or
+    // paused (it is dropped as soon as the VM runs again).
     let snapshotPresent = FileManager.default.fileExists(
-        atPath: stateDir.appendingPathComponent("snapshots").path)
-    check("snapshot", true, snapshotPresent ? "present (fast resume)" : "absent (next start is a cold boot)")
+        atPath: SnapshotManager().snapshotURL.path)
+    let snapshotDetail: String
+    if snapshotPresent {
+        snapshotDetail = "present (next start resumes)"
+    } else if daemonRunning {
+        snapshotDetail = "none while the VM runs (saved on stop and idle pause)"
+    } else {
+        snapshotDetail = "absent (next start is a cold boot)"
+    }
+    check("snapshot", true, snapshotDetail)
 
     // Daemon + control channel.
-    check("daemon", isDaemonRunning(), isDaemonRunning() ? "running" : "not running (anvil start)")
+    check("daemon", daemonRunning, daemonRunning ? "running" : "not running (anvil start)")
 
-    // Docker CLI integration.
+    // Docker CLI integration: the anvil context, or DOCKER_HOST pointing at
+    // the anvil socket, both reach anvil.
     let ctx = shell("docker", "context", "show").trimmingCharacters(in: .whitespacesAndNewlines)
-    check("docker context", ctx == "anvil", "current: \(ctx)")
+    let dockerHost = ProcessInfo.processInfo.environment["DOCKER_HOST"] ?? ""
+    if dockerHost == "unix://\(dockerSocketPath)" {
+        check("docker context", true, "DOCKER_HOST=\(dockerHost)")
+    } else {
+        check("docker context", ctx == "anvil", "current: \(ctx)" + (dockerHost.isEmpty ? "" : ", DOCKER_HOST=\(dockerHost)"))
+    }
     check("docker.sock", FileManager.default.fileExists(atPath: dockerSocketPath), dockerSocketPath)
     var ping = ""
     if FileManager.default.fileExists(atPath: dockerSocketPath) {
@@ -77,15 +99,22 @@ func cmdDoctor(args: [String]) {
         check("docker api", ping == "OK", ping.isEmpty ? "no answer on /_ping" : ping)
     }
 
-    // Host /Users share for bind mounts.
-    check("/Users share", usersSharePath() != nil,
-          usersSharePath() != nil ? "/Users available in the guest" : "disabled (ANVIL_SHARE_USERS=0)")
+    // Host /Users share for bind mounts. Turning it off is a choice, not a
+    // failure.
+    if usersSharePath() != nil {
+        check("/Users share", true, "/Users available in the guest")
+    } else if ProcessInfo.processInfo.environment["ANVIL_SHARE_USERS"] == "0" {
+        check("/Users share", true, "disabled by ANVIL_SHARE_USERS=0 (bind mounts from /Users will not work)")
+    } else {
+        check("/Users share", false, "unavailable")
+    }
 
     // Inside-container sanity: a fresh container must have its loopback UP
     // (the CNI loopback plugin's job). Skipped when no local image exists —
     // doctor must stay usable offline. --pull=never keeps the check fast.
     if ping == "OK" {
-        let lo = shell("docker", "run", "--rm", "--pull=never", "alpine",
+        // -H: test anvil itself, not whatever engine the current context is.
+        let lo = shell("docker", "-H", "unix://\(dockerSocketPath)", "run", "--rm", "--pull=never", "alpine",
                        "ip", "link", "show", "lo")
         let loUp = lo.contains("<LOOPBACK,UP,LOWER_UP>")
         if lo.isEmpty {
