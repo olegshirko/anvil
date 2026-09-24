@@ -21,14 +21,18 @@ section() { # $1 header, $2 grep pattern
     echo
 }
 
-section "Added"    '^[0-9a-f]+ feat'
-section "Fixed"    '^[0-9a-f]+ fix'
-section "Changed"  '^[0-9a-f]+ (refactor|perf|feat!)'
-section "Docs"     '^[0-9a-f]+ docs'
-section "Internal" '^[0-9a-f]+ (chore|ci|test|style|build)'
+# "type(scope)!:" marks a breaking change of any type; it is listed once,
+# under Breaking, not also under its type.
+scope='(\([^)]*\))?'
+section "Breaking" "^[0-9a-f]+ [a-z]+${scope}!:"
+section "Added"    "^[0-9a-f]+ feat${scope}:"
+section "Fixed"    "^[0-9a-f]+ fix${scope}:"
+section "Changed"  "^[0-9a-f]+ (refactor|perf)${scope}:"
+section "Docs"     "^[0-9a-f]+ docs${scope}:"
+section "Internal" "^[0-9a-f]+ (chore|ci|test|style|build)${scope}:"
 
 # Anything not matched above still deserves a line.
-rest=$(git log "$RANGE" --oneline --no-merges 2>/dev/null | grep -Evi '^[0-9a-f]+ (feat|fix|refactor|perf|docs|chore|ci|test|style|build)' || true)
+rest=$(git log "$RANGE" --oneline --no-merges 2>/dev/null | grep -Evi "^[0-9a-f]+ ([a-z]+${scope}!|(feat|fix|refactor|perf|docs|chore|ci|test|style|build)${scope}):" || true)
 if [ -n "$rest" ]; then
     echo "### Other"
     echo "$rest" | sed 's/^/- /'
