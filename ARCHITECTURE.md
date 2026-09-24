@@ -138,7 +138,9 @@ first connection to port 1026, the first `/build` request or the first
 The guest-agent scans running containers and pushes the full list of port
 mappings to `vz-runner`. `PortForwarder`:
 
-- opens `listen 0.0.0.0:<hostPort>`;
+- opens `listen <hostIP>:<hostPort>` — every interface by default, only the
+  given address for `-p 127.0.0.1:8080:80` (the guest pushes `host_ip`; an
+  IPv4 address binds its IPv4-mapped form on the dual-stack socket);
 - forwards TCP to the container through the guest-side port proxy
   (guest-agent listens on a single well-known TCP port; the forwarder
   sends `containerIP:containerPort` as a length-prefixed JSON header and

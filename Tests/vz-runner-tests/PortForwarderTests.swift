@@ -40,5 +40,62 @@ final class PortForwarderTests: XCTestCase {
         XCTAssertEqual(state.mappings.count, 1)
         XCTAssertEqual(state.mappings[0].name, "api")
         XCTAssertEqual(state.mappings[0].containerIP, "10.89.1.7")
+        XCTAssertNil(state.mappings[0].hostIP, "older guests send no host_ip")
+    }
+
+    func testPortMapStateDecodesHostIP() throws {
+        let payload = """
+        {"mappings":[{"namespace":"default","container_id":"c1","host_port":5432,
+        "container_port":5432,"protocol":"tcp","guest_ip":"192.168.64.2","host_ip":"127.0.0.1"}]}
+        """
+        let state = try JSONDecoder().decode(PortMapState.self, from: payload.data(using: .utf8)!)
+        XCTAssertEqual(state.mappings[0].hostIP, "127.0.0.1")
+    }
+
+    private func bytes(_ addr: in6_addr) -> [UInt8] {
+        withUnsafeBytes(of: addr) { Array($0) }
+    }
+
+    func testBindAddressAnyInterface() throws {
+        for ip in [nil, "", "0.0.0.0", "::", "[::]"] {
+            let bind = try XCTUnwrap(ListenerBindAddress(hostIP: ip), "\(ip ?? "nil")")
+            XCTAssertEqual(bytes(bind.address), bytes(in6addr_any))
+            XCTAssertFalse(bind.v6Only)
+        }
+    }
+
+    // -p 127.0.0.1:5432:5432 must bind loopback only, not every interface.
+    func testBindAddressIPv4IsMapped() throws {
+        let bind = try XCTUnwrap(ListenerBindAddress(hostIP: "127.0.0.1"))
+        XCTAssertEqual(bytes(bind.address), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1])
+        XCTAssertFalse(bind.v6Only, "IPv4-mapped binds need a dual-stack socket")
+    }
+
+    func testBindAddressIPv6() throws {
+        let bind = try XCTUnwrap(ListenerBindAddress(hostIP: "::1"))
+        XCTAssertEqual(bytes(bind.address), bytes(in6addr_loopback))
+        XCTAssertTrue(bind.v6Only)
+        XCTAssertNotNil(ListenerBindAddress(hostIP: "[::1]"))
+    }
+
+    func testBindAddressRejectsGarbage() {
+        XCTAssertNil(ListenerBindAddress(hostIP: "localhost"))
+        XCTAssertNil(ListenerBindAddress(hostIP: "999.1.1.1"))
+    }
+
+    // A loopback listener must not be reachable on another interface.
+    func testLoopbackBindAcceptsOnlyLoopback() throws {
+        let bindAddr = try XCTUnwrap(ListenerBindAddress(hostIP: "127.0.0.1"))
+        let fd = socket(AF_INET6, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { close(fd) }
+        XCTAssertEqual(bindAddr.bind(fd: fd, port: 0), 0, String(cString: strerror(errno)))
+        XCTAssertEqual(listen(fd, 1), 0)
+        var bound = sockaddr_in6()
+        var len = socklen_t(MemoryLayout<sockaddr_in6>.size)
+        _ = withUnsafeMutablePointer(to: &bound) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
+        }
+        XCTAssertEqual(bytes(bound.sin6_addr), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1])
     }
 }

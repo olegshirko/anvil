@@ -67,3 +67,21 @@ func TestSanitizeCNIName(t *testing.T) {
 		t.Errorf("sanitizeCNIName length = %d, want capped at 64", len(got))
 	}
 }
+
+// -p 127.0.0.1:5432:5432 must reach the host forwarder as a bind address;
+// the wildcard forms mean every interface and are left empty on the wire.
+func TestPushedHostIP(t *testing.T) {
+	cases := map[string]string{
+		"":          "",
+		"0.0.0.0":   "",
+		"::":        "",
+		"[::]":      "",
+		"127.0.0.1": "127.0.0.1",
+		"::1":       "::1",
+	}
+	for in, want := range cases {
+		if got := pushedHostIP(in); got != want {
+			t.Errorf("pushedHostIP(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

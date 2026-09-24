@@ -16,6 +16,9 @@ struct PortMapping: Codable, Hashable {
     let `protocol`: String?
     let guestIP: String
     let containerIP: String?
+    /// Host address from `-p <hostIP>:<host>:<container>`; nil, empty,
+    /// 0.0.0.0 or :: mean every interface.
+    var hostIP: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case namespace
@@ -26,12 +29,65 @@ struct PortMapping: Codable, Hashable {
         case `protocol`
         case guestIP = "guest_ip"
         case containerIP = "container_ip"
+        case hostIP = "host_ip"
     }
 
     /// Listener identity key. A single host-side listener is bound per exposed host port.
     var listenerKey: String {
         let proto = `protocol` ?? "tcp"
         return "\(namespace)/\(containerID)/\(hostPort)/\(proto)"
+    }
+}
+
+/// Where a host listener binds. Listeners use one AF_INET6 socket type for
+/// every address: an IPv4 host IP binds its IPv4-mapped form on a dual-stack
+/// socket, which accepts IPv4 traffic to that address only — so
+/// `-p 127.0.0.1:5432:5432` stays on loopback instead of the whole LAN.
+struct ListenerBindAddress {
+    let address: in6_addr
+    let v6Only: Bool
+
+    init?(hostIP: String?) {
+        let ip = (hostIP ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "[] "))
+        if ip.isEmpty || ip == "0.0.0.0" || ip == "::" {
+            address = in6addr_any
+            v6Only = false
+            return
+        }
+        var v4 = in_addr()
+        if inet_pton(AF_INET, ip, &v4) == 1 {
+            var mapped = in6_addr()
+            withUnsafeMutableBytes(of: &mapped) { raw in
+                raw[10] = 0xff
+                raw[11] = 0xff
+                withUnsafeBytes(of: v4) { raw[12..<16].copyBytes(from: $0) }
+            }
+            address = mapped
+            v6Only = false
+            return
+        }
+        var v6 = in6_addr()
+        if inet_pton(AF_INET6, ip, &v6) == 1 {
+            address = v6
+            v6Only = true
+            return
+        }
+        return nil
+    }
+
+    /// Apply IPV6_V6ONLY and bind `fd` to this address and `port`.
+    func bind(fd: Int32, port: Int) -> Int32 {
+        var only: Int32 = v6Only ? 1 : 0
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &only, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in6()
+        addr.sin6_family = sa_family_t(AF_INET6)
+        addr.sin6_port = in_port_t(port).bigEndian
+        addr.sin6_addr = address
+        return withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+        }
     }
 }
 
@@ -183,7 +239,7 @@ final class PortForwarder {
             self?.stopListener(key: mapping.listenerKey)
         }
         if let target = mapping.containerIP, !target.isEmpty {
-            print("[port-forwarder] forwarding localhost:\(mapping.hostPort) -> proxy -> \(target):\(mapping.containerPort)")
+            print("[port-forwarder] forwarding \(mapping.hostIP ?? "*"):\(mapping.hostPort) -> proxy -> \(target):\(mapping.containerPort)")
         } else {
             print("[port-forwarder] forwarding localhost:\(mapping.hostPort) -> \(mapping.guestIP):\(mapping.hostPort)")
         }
@@ -244,6 +300,11 @@ private final class Listener {
                 self.startUDP(onFailure: onFailure)
                 return
             }
+            guard let bindAddress = ListenerBindAddress(hostIP: self.mapping.hostIP) else {
+                print("[listener :\(self.mapping.hostPort)] invalid host IP \(self.mapping.hostIP ?? ""); refusing to start")
+                onFailure()
+                return
+            }
             let fd = socket(AF_INET6, SOCK_STREAM, 0)
             guard fd >= 0 else {
                 print("[listener :\(self.mapping.hostPort)] socket failed")
@@ -258,20 +319,7 @@ private final class Listener {
             var nodelay: Int32 = 1
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, socklen_t(MemoryLayout<Int32>.size))
 
-            // Allow binding to both IPv4 and IPv6 localhost.
-            var off: Int32 = 0
-            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, socklen_t(MemoryLayout<Int32>.size))
-
-            var addr = sockaddr_in6()
-            addr.sin6_family = sa_family_t(AF_INET6)
-            addr.sin6_port = in_port_t(self.mapping.hostPort).bigEndian
-            addr.sin6_addr = in6addr_any
-
-            let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
-                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
-                }
-            }
+            let bindResult = bindAddress.bind(fd: fd, port: self.mapping.hostPort)
             guard bindResult == 0, listen(fd, 128) == 0 else {
                 print("[listener :\(self.mapping.hostPort)] bind/listen failed: \(String(cString: strerror(errno)))")
                 close(fd)
@@ -353,13 +401,16 @@ private final class Listener {
             onFailure()
             return
         }
+        guard let bindAddress = ListenerBindAddress(hostIP: mapping.hostIP) else {
+            print("[listener :\(mapping.hostPort)/udp] invalid host IP \(mapping.hostIP ?? ""); refusing to start")
+            onFailure()
+            return
+        }
         let fd = socket(AF_INET6, SOCK_DGRAM, 0)
         guard fd >= 0 else {
             onFailure()
             return
         }
-        var off: Int32 = 0
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, socklen_t(MemoryLayout<Int32>.size))
         var reuse: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
         // Wake the recvfrom loop regularly so replies can be pumped even
@@ -367,15 +418,7 @@ private final class Listener {
         var tv = timeval(tv_sec: 0, tv_usec: 250_000)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
-        var addr = sockaddr_in6()
-        addr.sin6_family = sa_family_t(AF_INET6)
-        addr.sin6_port = in_port_t(mapping.hostPort).bigEndian
-        addr.sin6_addr = in6addr_any
-        let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
-            }
-        }
+        let bindResult = bindAddress.bind(fd: fd, port: mapping.hostPort)
         guard bindResult == 0 else {
             print("[listener :\(mapping.hostPort)/udp] bind failed: \(String(cString: strerror(errno)))")
             close(fd)

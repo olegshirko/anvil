@@ -49,6 +49,9 @@ type PortMapping struct {
 	Protocol      string `json:"protocol,omitempty"`
 	GuestIP       string `json:"guest_ip"`
 	ContainerIP   string `json:"container_ip,omitempty"`
+	// HostIP is the host address to bind (`-p 127.0.0.1:8080:80`); empty
+	// means every interface.
+	HostIP string `json:"host_ip,omitempty"`
 }
 
 // PortMapState is the full snapshot pushed to vz-runner.

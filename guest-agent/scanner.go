@@ -255,6 +255,7 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 					Protocol:      proto,
 					GuestIP:       guestIP,
 					ContainerIP:   containerIP,
+					HostIP:        pushedHostIP(p.HostIP),
 				})
 			}
 		}
@@ -446,4 +447,15 @@ func sanitizeCNIName(ns string) string {
 		base = base[:64]
 	}
 	return base
+}
+
+// pushedHostIP maps a published host address to the host forwarder's form:
+// the wildcard addresses become empty (bind every interface), anything else
+// is passed through so the host binds only that address.
+func pushedHostIP(ip string) string {
+	switch ip {
+	case "", "0.0.0.0", "::", "[::]":
+		return ""
+	}
+	return ip
 }
