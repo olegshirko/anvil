@@ -25,8 +25,9 @@ if [[ -z "${IN_CONTAINER:-}" ]]; then
         export ANVIL_DEB_WORK="$ANVIL_WORK_BASE/deb-extract"
     else
         # Force the default Docker context so a user-selected anvil context does
-        # not break the build container step.
-        docker --context default run --rm --platform linux/arm64 \
+        # not break the build container step. ANVIL_BUILD_CONTEXT=anvil builds
+        # on a running anvil itself (the project lives under the shared /Users).
+        docker --context "${ANVIL_BUILD_CONTEXT:-default}" run --rm --platform linux/arm64 \
             -v "$ROOT/.download:/build/download" \
             -v "$SCRIPT_DIR:/scripts:ro" \
             -e IN_CONTAINER=1 \
