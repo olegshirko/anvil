@@ -377,26 +377,6 @@ func removeDockerNetwork(ctx context.Context, name string) error {
 		netName = nw.Name
 	}
 
-	cl, err := pc.get(ctx)
-	if err != nil {
-		return fmt.Errorf("containerd client: %w", err)
-	}
-
-	nss, err := cl.NamespaceService().List(ctx)
-	if err != nil {
-		return fmt.Errorf("list namespaces: %w", err)
-	}
-	hasDefault := false
-	for _, ns := range nss {
-		if ns == "default" {
-			hasDefault = true
-			break
-		}
-	}
-	if !hasDefault {
-		nss = append([]string{"default"}, nss...)
-	}
-
 	// The conflist file is keyed by network NAME; when the client sent a
 	// network ID, inspectDockerNetwork already resolved it above.
 	fileName := name

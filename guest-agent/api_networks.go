@@ -70,11 +70,8 @@ func handleNetworkConnect(w http.ResponseWriter, r *http.Request, p routeParams)
 		writeJSONError(w, http.StatusBadRequest, "missing Container")
 		return
 	}
-	if err := connectContainerNetwork(p["id"], req.Container); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	// Not supported by the runtime: an honest 501, not a server error.
+	writeJSONError(w, http.StatusNotImplemented, connectContainerNetwork(p["id"], req.Container).Error())
 }
 
 func handleNetworkDisconnect(w http.ResponseWriter, r *http.Request, p routeParams) {
@@ -85,11 +82,8 @@ func handleNetworkDisconnect(w http.ResponseWriter, r *http.Request, p routePara
 		writeJSONError(w, http.StatusBadRequest, "missing Container")
 		return
 	}
-	if err := disconnectContainerNetwork(p["id"], req.Container); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	// Not supported by the runtime: an honest 501, not a server error.
+	writeJSONError(w, http.StatusNotImplemented, disconnectContainerNetwork(p["id"], req.Container).Error())
 }
 
 func handleNetworksPrune(w http.ResponseWriter, r *http.Request, _ routeParams) {

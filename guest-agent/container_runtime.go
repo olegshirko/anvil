@@ -346,7 +346,8 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 		quota := req.HostConfig.NanoCpus * cpuPeriod / 1e9
 		opts = append(opts, oci.WithCPUCFS(quota, cpuPeriod))
 	}
-	if hc := &req.HostConfig; hc != nil {
+	{
+		hc := &req.HostConfig
 		if hc.CpuShares > 0 {
 			opts = append(opts, oci.WithCPUShares(uint64(hc.CpuShares)))
 		}

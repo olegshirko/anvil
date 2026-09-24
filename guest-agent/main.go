@@ -273,7 +273,7 @@ func periodicClockSync() {
 		}
 		hostTime := time.Unix(epoch, 0)
 		// How far the host time (per the file) is AHEAD of the guest clock.
-		ahead := hostTime.Sub(time.Now())
+		ahead := time.Until(hostTime)
 		if ahead <= minDrift {
 			continue
 		}
