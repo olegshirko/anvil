@@ -694,7 +694,7 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name st
 		if p.max < 0 && req.HostConfig.RestartPolicy.MaximumRetryCount > 0 {
 			p.max = req.HostConfig.RestartPolicy.MaximumRetryCount
 		}
-		restarts.register(dockerID, p.name, p.max)
+		restarts.registerAt(ns, containerdID, p.name, p.max)
 	}
 	// Remember TTY for attach (raw stream) and inspect responses.
 	setContainerTTY(dockerID, req.Tty)

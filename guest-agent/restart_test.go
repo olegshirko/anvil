@@ -75,6 +75,20 @@ func TestRestartMonitorRegistry(t *testing.T) {
 		specs:    make(map[string]restartPolicy),
 		counts:   make(map[string]int),
 		stopped:  make(map[string]bool),
+		where:    make(map[string]containerRef),
+	}
+
+	// registerAt remembers the location so the poll skips resolution;
+	// forget (container removal) drops it with the spec and count.
+	m.registerAt("ns", "cid", "always", -1)
+	did := dockerID("ns", "cid")
+	if m.where[did] != (containerRef{ns: "ns", id: "cid"}) {
+		t.Fatalf("location not recorded: %+v", m.where[did])
+	}
+	m.counts[did] = 2
+	m.forget(did)
+	if len(m.where)+len(m.specs)+len(m.counts)+len(m.policies) != 0 {
+		t.Fatal("forget must drop location, spec, count and policy")
 	}
 
 	// register arms the policy and keeps the spec for inspect.

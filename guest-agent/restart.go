@@ -41,6 +41,10 @@ type restartMonitor struct {
 	specs   map[string]restartPolicy // dockerID -> requested spec
 	counts  map[string]int           // dockerID -> restarts performed
 	stopped map[string]bool          // dockerID -> user-stopped (policy disabled)
+	// where remembers namespace and containerd ID, known at create, so the
+	// per-second poll does not resolve every container across every
+	// namespace for every tracked policy.
+	where map[string]containerRef
 }
 
 var restarts = &restartMonitor{
@@ -51,6 +55,7 @@ var restarts = &restartMonitor{
 	specs:    make(map[string]restartPolicy),
 	counts:   make(map[string]int),
 	stopped:  make(map[string]bool),
+	where:    make(map[string]containerRef),
 }
 
 // register records the requested policy at create time: active policies go
@@ -58,6 +63,19 @@ var restarts = &restartMonitor{
 func (m *restartMonitor) register(dockerID, name string, max int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.registerLocked(dockerID, name, max)
+}
+
+// registerAt is register for a container whose location is known.
+func (m *restartMonitor) registerAt(ns, containerdID, name string, max int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	did := dockerID(ns, containerdID)
+	m.where[did] = containerRef{ns: ns, id: containerdID}
+	m.registerLocked(did, name, max)
+}
+
+func (m *restartMonitor) registerLocked(dockerID, name string, max int) {
 	p := restartPolicy{name: name, max: max}
 	m.specs[dockerID] = p
 	if name == "" || name == "no" {
@@ -108,6 +126,7 @@ func (m *restartMonitor) forget(dockerID string) {
 	delete(m.stopped, dockerID)
 	delete(m.specs, dockerID)
 	delete(m.counts, dockerID)
+	delete(m.where, dockerID)
 	m.resetLocked(dockerID)
 }
 
@@ -143,14 +162,18 @@ func runRestartMonitor() {
 }
 
 func maybeRestartContainers() {
-	snapshot := func() map[string]restartPolicy {
+	snapshot, where := func() (map[string]restartPolicy, map[string]containerRef) {
 		restarts.mu.Lock()
 		defer restarts.mu.Unlock()
 		out := make(map[string]restartPolicy, len(restarts.policies))
+		loc := make(map[string]containerRef, len(restarts.policies))
 		for k, v := range restarts.policies {
 			out[k] = v
+			if r, ok := restarts.where[k]; ok {
+				loc[k] = r
+			}
 		}
-		return out
+		return out, loc
 	}()
 	if len(snapshot) == 0 {
 		return
@@ -160,12 +183,17 @@ func maybeRestartContainers() {
 		return
 	}
 	for did := range snapshot {
-		ns, containerdID, _, err := resolveDockerID(context.Background(), did)
-		if err != nil {
-			// Container gone (auto-removed); drop the policy.
-			restarts.clear(did)
-			continue
+		ref, known := where[did]
+		if !known {
+			ns, containerdID, _, err := resolveDockerID(context.Background(), did)
+			if err != nil {
+				// Container gone (auto-removed); drop the policy.
+				restarts.clear(did)
+				continue
+			}
+			ref = containerRef{ns: ns, id: containerdID}
 		}
+		ns, containerdID := ref.ns, ref.id
 		running, exit, ok := taskExitState(cl, ns, containerdID)
 		if !ok {
 			continue
