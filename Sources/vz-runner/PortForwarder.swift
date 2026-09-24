@@ -208,18 +208,7 @@ final class PortForwarder {
             return nil
         }
 
-        var connection: VZVirtioSocketConnection?
-        let sem = DispatchSemaphore(value: 0)
-        DispatchQueue.main.async {
-            device.connect(toPort: controlPort) { result in
-                if case .success(let conn) = result {
-                    connection = conn
-                }
-                sem.signal()
-            }
-        }
-        _ = sem.wait(timeout: .now() + .seconds(5))
-        return connection
+        return connectVsockOnce(device: device, port: controlPort, timeout: 5)
     }
 
     // MARK: - Listener management

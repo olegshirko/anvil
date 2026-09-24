@@ -135,23 +135,7 @@ final class DockerProxyServer {
             return
         }
 
-        let deadline = Date().addingTimeInterval(20)
-        var vsockConn: VZVirtioSocketConnection?
-        while vsockConn == nil, Date() < deadline {
-            let sem = DispatchSemaphore(value: 0)
-            DispatchQueue.main.async {
-                device.connect(toPort: self.port) { result in
-                    if case .success(let conn) = result {
-                        vsockConn = conn
-                    }
-                    sem.signal()
-                }
-            }
-            _ = sem.wait(timeout: .now() + .seconds(2))
-            if vsockConn == nil {
-                Thread.sleep(forTimeInterval: 0.2)
-            }
-        }
+        let vsockConn = connectVsock(device: device, port: self.port, until: Date().addingTimeInterval(20))
         guard let conn = vsockConn else {
             print("[docker-proxy] vsock connect failed, closing client")
             DispatchQueue.main.async { [weak self] in
