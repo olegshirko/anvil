@@ -239,8 +239,9 @@ ubuntu-modules: $(UBUNTU_DIR)
 	echo "[ubuntu-modules] $$DEB_PATH"; \
 	curl -L -o $(UBUNTU_DEB) "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/$$DEB_PATH"
 
+# No `go mod tidy` here: a build must not rewrite go.mod/go.sum (CI checks
+# tidiness with `go mod tidy -diff`).
 guest-agent:
-	cd guest-agent && go mod tidy
 	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o ../$(AGENT_BIN) .
 
 initramfs-agent: extract-alpine-kernel guest-agent
@@ -370,7 +371,7 @@ download-upx:
 	    rm -f /tmp/anvil-upx.tar.xz; \
 	fi
 
-initramfs-containerd: extract-alpine-kernel alpine-virt-modules guest-agent container-tools alpine-iptables download-upx
+initramfs-containerd: download-alpine extract-alpine-kernel alpine-virt-modules guest-agent container-tools alpine-iptables download-upx
 	@if command -v limactl >/dev/null 2>&1 && limactl list anvil --format '{{.Status}}' 2>/dev/null | grep -q Running; then \
 	    echo "Building initramfs inside Lima VM 'anvil'..."; \
 	    limactl shell anvil -- bash $(CURDIR)/scripts/build_initramfs_containerd.sh; \

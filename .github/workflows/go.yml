@@ -46,6 +46,10 @@ jobs:
           go-version-file: guest-agent/go.mod
           cache-dependency-path: guest-agent/go.sum
 
+      - name: go.mod is tidy
+        working-directory: guest-agent
+        run: go mod tidy -diff
+
       - name: gofmt
         working-directory: guest-agent
         run: |
@@ -111,8 +115,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: "1.26"
-          cache: false
+          go-version-file: guest-agent/go.mod
+          cache-dependency-path: guest-agent/go.sum
 
       # The build container must run linux/arm64 so that binaries pulled from
       # Alpine packages match the VM's ARM64 architecture.
@@ -122,54 +126,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Download Alpine initramfs (base userspace)
-        run: |
-          mkdir -p .download/alpine
-          curl -L -o .download/alpine/initramfs-virt https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/netboot/initramfs-virt
-
-      - name: Download Alpine linux-virt package (kernel + modules)
-        run: |
-          mkdir -p .download/alpine/linux-virt-pkg
-          curl -L -o .download/alpine/linux-virt.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/linux-virt-6.6.142-r0.apk
-          tar -xzf .download/alpine/linux-virt.apk -C .download/alpine/linux-virt-pkg boot lib/modules
-
-      - name: Extract raw kernel
-        run: |
-          python3 scripts/extract_alpine_kernel.py .download/alpine/linux-virt-pkg/boot/vmlinuz-virt .download/alpine/vmlinuz-raw.gz
-          gunzip -c .download/alpine/vmlinuz-raw.gz > .download/alpine/vmlinuz-raw || test -s .download/alpine/vmlinuz-raw
-          file .download/alpine/vmlinuz-raw
-
-      - name: Build guest-agent
-        run: |
-          cd guest-agent
-          go mod tidy
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o ../.download/alpine/guest-agent .
-
-      - name: Download container tools
-        run: |
-          mkdir -p .download/container-tools
-          curl -L -o .download/container-tools/containerd.tgz https://github.com/containerd/containerd/releases/download/v2.3.3/containerd-static-2.3.3-linux-arm64.tar.gz
-          curl -L -o .download/container-tools/runc https://github.com/opencontainers/runc/releases/download/v1.5.1/runc.arm64
-          chmod +x .download/container-tools/runc
-          curl -L -o .download/container-tools/cni-plugins.tgz https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-arm64-v1.9.1.tgz
-          curl -L -o .download/container-tools/buildkit.tgz https://github.com/moby/buildkit/releases/download/v0.32.2/buildkit-v0.32.2.linux-arm64.tar.gz
-
-      - name: Download Alpine iptables
-        run: |
-          mkdir -p .download/alpine-iptables
-          curl -L -o .download/alpine-iptables/iptables.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/iptables-1.8.10-r3.apk
-          curl -L -o .download/alpine-iptables/libmnl.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libmnl-1.0.5-r2.apk
-          curl -L -o .download/alpine-iptables/libnftnl.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libnftnl-1.2.6-r0.apk
-          curl -L -o .download/alpine-iptables/libxtables.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libxtables-1.8.10-r3.apk
-          curl -L -o .download/alpine-iptables/tar.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/tar-1.35-r2.apk
-          curl -L -o .download/alpine-iptables/libacl.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libacl-2.3.2-r0.apk
-          curl -L -o .download/alpine-iptables/libattr.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libattr-2.5.2-r0.apk
-          curl -L -o .download/alpine-iptables/e2fsprogs.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/e2fsprogs-1.47.0-r5.apk
-          curl -L -o .download/alpine-iptables/e2fsprogs-extra.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/e2fsprogs-extra-1.47.0-r5.apk
-          curl -L -o .download/alpine-iptables/e2fsprogs-libs.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/e2fsprogs-libs-1.47.0-r5.apk
-          curl -L -o .download/alpine-iptables/libcom_err.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libcom_err-1.47.0-r5.apk
-          curl -L -o .download/alpine-iptables/libblkid.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libblkid-2.40.1-r1.apk
-          curl -L -o .download/alpine-iptables/libuuid.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/libuuid-2.40.1-r1.apk
+      # The Makefile owns every download URL and version (kernel apk,
+      # containerd, runc, CNI, buildkit, Alpine packages); CI used to carry a
+      # copy that a version bump could silently skip. upx comes from apk in
+      # the build container below, so download-upx is not needed here.
+      - name: Download assets and build guest-agent
+        run: make download-alpine extract-alpine-kernel guest-agent container-tools alpine-iptables
 
       - name: Build initramfs-containerd
         run: |
