@@ -105,26 +105,47 @@ final class PortForwarder {
     private var listeners: [String: Listener] = [:]
     private let listenersLock = NSLock()
 
-    private var isRunning = false
+    /// Guards `running` and `subscription`. `stop()` is called from other
+    /// threads while `runLoop()` occupies `queue` for good, so it cannot be
+    /// serialized through `queue`.
+    private let stateLock = NSLock()
+    private var running = false
+    private var subscription: VZVirtioSocketConnection?
+    /// Serializes `apply` between the subscription loop and `stop()`.
+    private let applyLock = NSLock()
+
+    private var isRunning: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return running
+    }
 
     init(deviceProvider: @escaping () -> VZVirtioSocketDevice?) {
         self.deviceProvider = deviceProvider
     }
 
     func start() {
+        stateLock.lock()
+        running = true
+        stateLock.unlock()
         queue.async { [weak self] in
-            guard let self = self else { return }
-            self.isRunning = true
-            self.runLoop()
+            self?.runLoop()
         }
     }
 
+    /// Stop forwarding synchronously: when this returns, every host port is
+    /// released and `holdsTCP` is false, so a forwarder for a restarted VM
+    /// can bind the same ports. The subscription loop exits on its own once
+    /// its blocking read fails.
     func stop() {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            self.isRunning = false
-            self.apply(state: PortMapState(mappings: []))
+        stateLock.lock()
+        running = false
+        if let subscription = subscription {
+            // Unblocks the read in runLoop; runLoop owns the close.
+            shutdown(subscription.fileDescriptor, SHUT_RDWR)
         }
+        stateLock.unlock()
+        apply(state: PortMapState(mappings: []))
     }
 
     // MARK: - Subscription loop
@@ -135,13 +156,21 @@ final class PortForwarder {
                 Thread.sleep(forTimeInterval: 1.0)
                 continue
             }
+            stateLock.lock()
+            guard running else {
+                stateLock.unlock()
+                connection.close()
+                break
+            }
+            subscription = connection
+            stateLock.unlock()
             let fd = connection.fileDescriptor
 
             // Send subscribe_ports request.
             let request = ControlRequest(cmd: "subscribe_ports", args: nil)
             guard let requestData = try? encodeLengthPrefixed(request),
                   writeAllFD(fd, data: requestData) else {
-                connection.close()
+                closeSubscription(connection)
                 Thread.sleep(forTimeInterval: 1.0)
                 continue
             }
@@ -157,11 +186,20 @@ final class PortForwarder {
                 }
             }
 
-            connection.close()
+            closeSubscription(connection)
             // Clear stale listeners while disconnected; guest-agent will send a full state on reconnect.
             self.apply(state: PortMapState(mappings: []))
-            Thread.sleep(forTimeInterval: 1.0)
+            if isRunning {
+                Thread.sleep(forTimeInterval: 1.0)
+            }
         }
+    }
+
+    private func closeSubscription(_ connection: VZVirtioSocketConnection) {
+        stateLock.lock()
+        subscription = nil
+        stateLock.unlock()
+        connection.close()
     }
 
     private func connectToGuestAgent() -> VZVirtioSocketConnection? {
@@ -187,6 +225,13 @@ final class PortForwarder {
     // MARK: - Listener management
 
     private func apply(state: PortMapState) {
+        applyLock.lock()
+        defer { applyLock.unlock() }
+        // A push that was already in flight when stop() ran must not bind
+        // ports again.
+        if !state.mappings.isEmpty && !isRunning {
+            return
+        }
         // Diff on the full mapping, not just the listener key: a container
         // restart keeps its ID (same key) but usually gets a new CNI address,
         // and the listener dials the IP captured at creation.
