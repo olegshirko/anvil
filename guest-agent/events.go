@@ -119,12 +119,17 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-untilTimer:
 			return
-		case err := <-errCh:
-			if err != nil {
+		case err, ok := <-errCh:
+			// Any error or close ends the stream: a closed channel would
+			// otherwise be selected forever and spin the loop.
+			if ok && err != nil {
 				log.Printf("[docker-api] events stream error: %v", err)
+			}
+			return
+		case env, ok := <-eventCh:
+			if !ok {
 				return
 			}
-		case env := <-eventCh:
 			if env == nil {
 				continue
 			}
@@ -207,25 +212,41 @@ func startEventRecorder() {
 			time.Sleep(time.Second)
 			continue
 		}
-		eventCh, errCh := cl.Subscribe(ctx)
-		for {
-			select {
-			case <-ctx.Done():
+		recordEventStream(ctx, cl)
+		// The stream ended (containerd restarted, connection dropped):
+		// back off, then subscribe again.
+		time.Sleep(time.Second)
+	}
+}
+
+// recordEventStream records one containerd subscription until it fails.
+// containerd sends at most one error and then closes both channels; a closed
+// channel yields zero values forever, so any error or close ends the stream
+// instead of spinning on it.
+func recordEventStream(ctx context.Context, cl *client.Client) {
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	eventCh, errCh := cl.Subscribe(sctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err, ok := <-errCh:
+			if ok && err != nil {
+				log.Printf("[events] recorder stream error: %v", err)
+			}
+			return
+		case env, ok := <-eventCh:
+			if !ok {
 				return
-			case err := <-errCh:
-				if err != nil {
-					log.Printf("[events] recorder stream error: %v", err)
-					time.Sleep(time.Second)
-				}
-			case env := <-eventCh:
-				if env == nil {
-					continue
-				}
-				ev, ok := translateDockerEvent(ctx, cl, env)
-				debugLog("[events] recorder: topic=%s ns=%s ok=%v action=%s", env.Topic, env.Namespace, ok, ev.Action)
-				if ok {
-					eventLogRecord(ev)
-				}
+			}
+			if env == nil {
+				continue
+			}
+			ev, recorded := translateDockerEvent(ctx, cl, env)
+			debugLog("[events] recorder: topic=%s ns=%s ok=%v action=%s", env.Topic, env.Namespace, recorded, ev.Action)
+			if recorded {
+				eventLogRecord(ev)
 			}
 		}
 	}
