@@ -1,3 +1,14 @@
+## v1.4.0 (2026-09-25)
+
+### Added
+- 5c0f7f8 feat: volume copy-up, image VOLUME, inspect Mounts, real docker stats, network events, Rosetta AOT; host relay hardening
+
+### Docs
+- 0d6a06e docs: Rosetta AOT cache effect
+
+### Internal
+- c046ccd test(validate): restart via a failing workload (docker kill disables the policy); recycle the UDP echo server
+- 1ed8d5f test(validate): --network goes after the docker subcommand
 ## v1.3.3 (2026-09-25)
 
 ### Fixed
