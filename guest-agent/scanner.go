@@ -200,11 +200,16 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 		return PortMapState{}, fmt.Errorf("list namespaces: %w", err)
 	}
 
-	guestIP := s.guestIP
+	// Re-read every scan: the address can change after the first scan (the
+	// DHCP lease lands after boot, or a new machine identifier gets a new
+	// lease). A value cached once kept the host forwarder dialing a dead
+	// address. A changed IP changes every mapping, so the host rebuilds its
+	// listeners on the next push.
+	guestIP := detectGuestIP()
 	if guestIP == "" {
-		guestIP = detectGuestIP()
-		s.guestIP = guestIP
+		guestIP = s.guestIP
 	}
+	s.guestIP = guestIP
 
 	var mappings []PortMapping
 	seen := make(map[string]bool)
