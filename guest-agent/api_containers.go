@@ -256,8 +256,10 @@ func handleContainerExecInspect(w http.ResponseWriter, _ *http.Request, p routeP
 }
 
 func handleContainerDelete(w http.ResponseWriter, r *http.Request, p routeParams) {
-	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
-	if err := deleteDockerContainer(r.Context(), p["id"], force); err != nil {
+	q := r.URL.Query()
+	force := q.Get("force") == "1" || q.Get("force") == "true"
+	removeVolumes := q.Get("v") == "1" || q.Get("v") == "true"
+	if err := deleteDockerContainer(r.Context(), p["id"], force, removeVolumes); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

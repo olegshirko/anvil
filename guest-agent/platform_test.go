@@ -25,7 +25,8 @@ func TestResolveRequestedPlatform(t *testing.T) {
 		{"", false, "", ""},
 		{"linux", false, "", ""},
 		{"linux/arm64", false, "", ""},
-		{"linux/arm64/v8", true, "", ""},
+		{"linux/arm64/v8", true, "linux/arm64/v8", ""}, // explicit arm64 must not fall back to amd64
+		{"linux/arm64", true, "linux/arm64/v8", ""},
 		{"linux/amd64", false, "", "ANVIL_ROSETTA=1"},
 		{"linux/amd64", true, "linux/amd64", ""},
 		{"linux/x86_64", true, "linux/amd64", ""},

@@ -2249,6 +2249,110 @@ def test_save_under_gc() -> None:
     record("docker save under GC pressure", "PASS", "5 complete archives with concurrent rmi")
 
 
+
+def test_cp_symlink_race_stays_in_container() -> None:
+    """A running container swapping a directory for a symlink to the VM's
+    share (/mnt/anvil, the Mac) must not get docker cp to write there."""
+    name = f"{PREFIX}-cprace"
+    marker = f"anvil-cp-escape-{os.getpid()}.txt"
+    share_roots = [HOME / ".anvil-vz"]
+    ps = subprocess.run(["pgrep", "-fl", "vz-runner daemon"], capture_output=True, text=True).stdout
+    m = re.search(r"--share (\S+)", ps)
+    if m:
+        share_roots.append(Path(m.group(1)))
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sh", "-c",
+               "mkdir -p /mnt/anvil; while true; do rm -rf /d; mkdir /d; rm -rf /d; ln -s /mnt/anvil /d; done")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / marker
+            src.write_text("must stay inside the container\n")
+            for _ in range(40):
+                docker("cp", str(src), f"{name}:/d/", check=False, timeout=30.0)
+        for root in share_roots:
+            if (root / marker).exists():
+                (root / marker).unlink()
+                raise RuntimeError(f"docker cp escaped the container into {root}")
+        record("docker cp symlink race", "PASS", "40 copies under a swapping symlink, nothing reached the share")
+    finally:
+        cleanup(name)
+
+
+def test_volumes_from_source_rm_keeps_data() -> None:
+    src, user = f"{PREFIX}-vfkeep", f"{PREFIX}-vfuser"
+    try:
+        docker("run", "--name", src, "-v", "/shared", "alpine", "sh", "-c", "echo kept > /shared/f")
+        docker("run", "-d", "--name", user, "--volumes-from", src, "alpine", "sleep", "300")
+        docker("rm", "-v", src)  # -v: but the volume is still mounted by user
+        out = docker("exec", user, "cat", "/shared/f").stdout
+        if out != "kept\n":
+            raise RuntimeError(f"data lost after rm -v of the source: {out!r}")
+        record("volumes-from survives source rm", "PASS", "rm -v keeps a volume another container mounts")
+    finally:
+        cleanup(src, user)
+
+
+def test_update_pids_unlimited() -> None:
+    name = f"{PREFIX}-pidsmax"
+    try:
+        docker("run", "-d", "--name", name, "--pids-limit", "64", "alpine", "sleep", "300")
+        docker("update", "--pids-limit", "-1", name)
+        out = docker("exec", name, "cat", "/sys/fs/cgroup/pids.max").stdout.strip()
+        if out != "max":
+            raise RuntimeError(f"pids.max after --pids-limit -1 = {out!r}, want max")
+        record("update --pids-limit -1", "PASS", "pids.max = max")
+    finally:
+        cleanup(name)
+
+
+def test_commit_keeps_healthcheck_labels_user() -> None:
+    name, image = f"{PREFIX}-commitkeep", f"{PREFIX}-commitkeep:1"
+    try:
+        docker("run", "--name", name, "--user", "nobody", "--label", "team=anvil",
+               "--health-cmd", "true", "--health-interval", "5s", "alpine", "true")
+        docker("commit", name, image)
+        cfg = json.loads(docker("image", "inspect", "-f", "{{json .Config}}", image).stdout)
+        hc = (cfg.get("Healthcheck") or {}).get("Test") or []
+        if cfg.get("User") != "nobody" or (cfg.get("Labels") or {}).get("team") != "anvil" or "true" not in hc:
+            raise RuntimeError(f"committed config: User={cfg.get('User')!r} Labels={cfg.get('Labels')} Healthcheck={hc}")
+        record("commit keeps healthcheck/labels/user", "PASS", "all three in the image config")
+    finally:
+        cleanup(name)
+        docker("rmi", "-f", image, check=False)
+
+
+def test_connect_alias_scoped_to_network() -> None:
+    net = f"{PREFIX}-aliasnet"
+    name, peer_new, peer_old = f"{PREFIX}-alias", f"{PREFIX}-aliasp1", f"{PREFIX}-aliasp2"
+    try:
+        docker("network", "create", net)
+        docker("run", "-d", "--name", name, "alpine", "sleep", "300")
+        docker("run", "-d", "--name", peer_old, "alpine", "sleep", "300")
+        docker("run", "-d", "--name", peer_new, "--network", net, "alpine", "sleep", "300")
+        docker("network", "connect", "--alias", "only-on-new", net, name)
+        if docker("exec", peer_new, "ping", "-c", "1", "-W", "3", "only-on-new", check=False).returncode != 0:
+            raise RuntimeError("alias not resolvable on its own network")
+        hosts = docker("exec", peer_old, "cat", "/etc/hosts").stdout
+        if "only-on-new" in hosts:
+            raise RuntimeError(f"alias leaked onto the default network: {hosts!r}")
+        record("connect alias per network", "PASS", "resolves on its network only")
+    finally:
+        cleanup(name, peer_new, peer_old)
+        docker("network", "rm", net, check=False)
+
+
+def test_rosetta_explicit_arm64() -> None:
+    probe = docker("run", "--rm", "--platform", "linux/amd64", "alpine", "true", check=False, timeout=300.0)
+    if probe.returncode != 0 and "ANVIL_ROSETTA=1" in probe.stderr:
+        record("rosetta explicit arm64", "SKIP", "Rosetta off")
+        return
+    res = docker("run", "--rm", "--platform", "linux/arm64", "amd64/alpine", "uname", "-m",
+                 check=False, timeout=300.0)
+    if res.returncode == 0:
+        raise RuntimeError(f"--platform linux/arm64 ran an amd64-only image: {res.stdout.strip()!r}")
+    docker("rmi", "-f", "amd64/alpine", check=False)
+    record("rosetta explicit arm64", "PASS", "no silent amd64 fallback for an explicit arm64")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -2327,6 +2431,12 @@ TESTS = [
     ("network none", test_network_none),
     ("network rm in use", test_network_rm_in_use_and_inspect),
     ("save under gc", test_save_under_gc),
+    ("cp symlink race", test_cp_symlink_race_stays_in_container),
+    ("volumes-from source rm", test_volumes_from_source_rm_keeps_data),
+    ("update pids unlimited", test_update_pids_unlimited),
+    ("commit keeps config", test_commit_keeps_healthcheck_labels_user),
+    ("connect alias scoped", test_connect_alias_scoped_to_network),
+    ("rosetta explicit arm64", test_rosetta_explicit_arm64),
 ]
 
 

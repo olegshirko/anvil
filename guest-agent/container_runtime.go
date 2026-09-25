@@ -716,6 +716,12 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		return "", nil, fmt.Errorf("image %s not found in namespace %s: %w", imgRef, ns, err)
 	}
 	img = imageWithPlatform(nsCtx, cl, img, platform)
+	// The platform actually resolved (an amd64-only image under Rosetta
+	// with none requested included), for commit to pick the same subtree.
+	actualPlatform := imagePlatform(nsCtx, img)
+	if actualPlatform == "" {
+		actualPlatform = platform
+	}
 	if platform == "" {
 		if w := emulatedPlatformWarning(nsCtx, img); w != "" {
 			warnings = append(warnings, w)
@@ -797,16 +803,18 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		Ports:            portMappings,
 		Networks:         append([]string{effectiveNetworkName(req.HostConfig.NetworkMode)}, secondaryNetworksFromCreate(req)...),
 		Aliases:          requestedNetworkAliases(req),
+		NetworkAliases:   requestedNetworkAliasesByNetwork(req),
 		TTY:              req.Tty,
 		AutoRemove:       req.HostConfig.AutoRemove,
 		StopSignal:       req.StopSignal,
+		User:             req.User,
 		WorkingDir:       req.WorkingDir,
 		Entrypoint:       req.Entrypoint,
 		Mounts:           req.HostConfig.Mounts,
 		AnonymousVolumes: anonVols,
 		Healthcheck:      req.Healthcheck,
 		HostConfig:       &req.HostConfig,
-		Platform:         platform,
+		Platform:         actualPlatform,
 	}
 	if serr := saveContainerMeta(meta); serr != nil {
 		return "", nil, serr

@@ -179,9 +179,11 @@ func applyResourceUpdate(res *specs.LinuxResources, u dockerUpdateRequest) error
 		}
 	}
 	if u.PidsLimit != nil && *u.PidsLimit != 0 {
+		// -1 is "unlimited" (pids.max = max), passed through as Docker
+		// does; runc's update applied a 0 as pids.max = 1.
 		limit := *u.PidsLimit
 		if limit < 0 {
-			limit = 0 // runc: 0 = no limit (pids.max "max")
+			limit = -1
 		}
 		res.Pids = &specs.LinuxPids{Limit: &limit}
 	}

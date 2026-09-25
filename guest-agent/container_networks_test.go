@@ -118,3 +118,27 @@ func TestValidateNetworkModeNone(t *testing.T) {
 		t.Errorf("plain --network none refused: %v", err)
 	}
 }
+
+// An alias given for one network (docker network connect --alias) must not
+// resolve on the container's other networks.
+func TestAliasesArePerNetwork(t *testing.T) {
+	api := &containerMeta{Namespace: "p", ID: "api", Name: "api", Networks: []string{"front", "back"},
+		NetworkAliases: map[string][]string{"back": {"db-proxy"}}}
+	infos := map[string]containerNetInfo{
+		"api": {Network: "front", IP: "10.1.0.2", Extra: []netEndpoint{{Network: "back", IfName: "eth1", IP: "10.2.0.2"}}},
+	}
+	entries := networkHostsEntries([]*containerMeta{api}, func(_, id string) (containerNetInfo, bool) {
+		ni, ok := infos[id]
+		return ni, ok
+	})
+	if got := strings.Join(entries["front"], "\n"); strings.Contains(got, "db-proxy") {
+		t.Errorf("back-only alias leaked onto front: %q", got)
+	}
+	if got := strings.Join(entries["back"], "\n"); !strings.Contains(got, "10.2.0.2\tapi db-proxy") {
+		t.Errorf("back entries = %q", got)
+	}
+	legacy := &containerMeta{Aliases: []string{"web"}}
+	if a := legacy.aliasesOn("any"); len(a) != 1 || a[0] != "web" {
+		t.Errorf("legacy aliases = %v", a)
+	}
+}

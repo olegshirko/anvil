@@ -217,8 +217,25 @@ func handleEgressProxyClient(conn net.Conn, dial dialContextFunc) {
 		target = net.JoinHostPort(target, "443")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	upstream, err := dial(ctx, "tcp", target)
-	cancel()
+	defer cancel()
+	// The proxy is reachable from host-network containers and build steps,
+	// not only buildkitd: only public destinations, dialed by the address
+	// that was checked (no second lookup to rebind).
+	checked, hostOnly, err := checkEgressProxyTarget(ctx, target)
+	if err != nil {
+		log.Printf("[egress] CONNECT %s refused: %v", target, err)
+		fmt.Fprint(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+		return
+	}
+	var upstream net.Conn
+	if hostOnly {
+		// No DNS in the VM (the full-tunnel VPN case this proxy exists
+		// for): only the Mac can resolve it, and vz-runner refuses
+		// loopback targets itself.
+		upstream, err = dialViaHost(ctx, target)
+	} else {
+		upstream, err = dial(ctx, "tcp", checked)
+	}
 	if err != nil {
 		log.Printf("[egress] CONNECT %s: %v", target, err)
 		fmt.Fprint(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
@@ -241,6 +258,51 @@ func handleEgressProxyClient(conn net.Conn, dial dialContextFunc) {
 	go func() { defer wg.Done(); _, _ = io.Copy(upstream, conn); closeWrite(upstream) }()
 	go func() { defer wg.Done(); _, _ = io.Copy(conn, upstream); closeWrite(conn) }()
 	wg.Wait()
+}
+
+// egressProxyLookup resolves CONNECT targets. Seam for tests.
+var egressProxyLookup = net.DefaultResolver.LookupIPAddr
+
+// checkEgressProxyTarget resolves host:port and returns ip:port when every
+// address is a public one. buildkitd's NO_PROXY already keeps loopback and
+// private destinations off the proxy; anything else asking for them is not
+// registry traffic. Loopback, private (RFC 1918, fc00::/7 — the VM's NAT
+// subnet and the guest's own services included), link-local, multicast and
+// unspecified addresses are refused.
+//
+// When the VM cannot resolve the name at all, hostOnly is set: the target
+// then goes to vz-runner by name, never dialed directly.
+func checkEgressProxyTarget(ctx context.Context, target string) (addr string, hostOnly bool, err error) {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		return "", false, err
+	}
+	var ips []net.IP
+	if ip := net.ParseIP(host); ip != nil {
+		ips = []net.IP{ip}
+	} else {
+		addrs, err := egressProxyLookup(ctx, host)
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) && !dnsErr.IsNotFound {
+			return target, true, nil
+		}
+		if err != nil {
+			return "", false, err
+		}
+		for _, a := range addrs {
+			ips = append(ips, a.IP)
+		}
+	}
+	if len(ips) == 0 {
+		return "", false, fmt.Errorf("no address for %s", host)
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() || ip.IsMulticast() ||
+			ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() {
+			return "", false, fmt.Errorf("%s resolves to non-public address %s", host, ip)
+		}
+	}
+	return net.JoinHostPort(ips[0].String(), port), false, nil
 }
 
 func closeWrite(c net.Conn) {

@@ -114,29 +114,16 @@ func loadFromMirror(ctx context.Context, ref, ns string) error {
 // (containerd's content store is namespaced, so a bare metadata copy would
 // leave a dangling pointer pointing at blobs the target namespace cannot see).
 // Otherwise it is pulled into the target namespace.
-func ensureImageInNamespace(ctx context.Context, ref, targetNs, platform string, auth *registryAuth) error {
+// findImageLocally makes ref available in targetNs from what the VM already
+// holds — the target namespace itself, a raw-name alias, or another
+// namespace (streamed across). It never pulls.
+func findImageLocally(ctx context.Context, ref, targetNs string) (bool, error) {
 	cl, err := pc.get(ctx)
 	if err != nil {
-		return fmt.Errorf("containerd client: %w", err)
+		return false, fmt.Errorf("containerd client: %w", err)
 	}
 
 	canonicalRef := canonicalizeImageRef(ref)
-
-	// An explicit non-native platform (--platform linux/amd64): the record
-	// may exist with only the arm64 subtree, so check that platform's
-	// content and pull it when missing.
-	if platform != "" {
-		targetCtx := namespaces.WithNamespace(ctx, targetNs)
-		if img, err := cl.GetImage(targetCtx, canonicalRef); err == nil &&
-			platformContentPresent(targetCtx, cl.ContentStore(), img.Target(), platform) {
-			return nil
-		}
-		log.Printf("[images] pulling %q for %s into namespace %s", canonicalRef, platform, targetNs)
-		if err := pullImageIntoNamespace(ctx, canonicalRef, targetNs, platform, auth); err != nil {
-			return fmt.Errorf("pull failed: %w", explainEgressFailure(err))
-		}
-		return nil
-	}
 
 	// Fast path: image already exists in target namespace AND its content
 	// is actually there (records left by interrupted copies or partial GCs
@@ -147,7 +134,7 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs, platform string,
 	if img, err := cl.GetImage(targetCtx, canonicalRef); err == nil {
 		if missing := imageTreeMissing(cl, targetCtx, img.Target()); len(missing) == 0 {
 			log.Printf("[images] %s already in namespace %s", canonicalRef, targetNs)
-			return nil
+			return true, nil
 		}
 		debugLog("image %s in namespace %s is dangling, refreshing", canonicalRef, targetNs)
 		deleteImageTree(cl, targetCtx, canonicalRef, img.Target())
@@ -161,17 +148,17 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs, platform string,
 	if ref != canonicalRef {
 		if img, err := cl.GetImage(targetCtx, ref); err == nil {
 			if err := putImage(cl, targetCtx, images.Image{Name: canonicalRef, Target: img.Target(), Labels: img.Labels()}); err != nil {
-				return fmt.Errorf("alias image %s to %s: %w", ref, canonicalRef, err)
+				return false, fmt.Errorf("alias image %s to %s: %w", ref, canonicalRef, err)
 			}
 			log.Printf("[images] aliased %s to %s in namespace %s", ref, canonicalRef, targetNs)
-			return nil
+			return true, nil
 		}
 	}
 
 	// Find the image in another namespace and stream it into the target one.
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
-		return fmt.Errorf("list namespaces: %w", err)
+		return false, fmt.Errorf("list namespaces: %w", err)
 	}
 	candidates := []string{canonicalRef}
 	if ref != canonicalRef {
@@ -216,7 +203,37 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs, platform string,
 				continue
 			}
 			log.Printf("[images] streamed %s from %s to %s", name, ns, targetNs)
-			return nil
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ensureImageInNamespace makes sure an image reference exists in the target
+// namespace, locally if possible (findImageLocally), pulling otherwise. With
+// an explicit platform the local record must also hold that platform's
+// content — a multi-arch record may carry only another platform's subtree.
+func ensureImageInNamespace(ctx context.Context, ref, targetNs, platform string, auth *registryAuth) error {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return fmt.Errorf("containerd client: %w", err)
+	}
+	canonicalRef := canonicalizeImageRef(ref)
+	targetCtx := namespaces.WithNamespace(ctx, targetNs)
+
+	found, err := findImageLocally(ctx, ref, targetNs)
+	if err != nil {
+		return err
+	}
+	if found && platform == "" {
+		return nil
+	}
+	if found {
+		for _, name := range []string{canonicalRef, ref} {
+			if img, gerr := cl.GetImage(targetCtx, name); gerr == nil &&
+				platformContentPresent(targetCtx, cl.ContentStore(), img.Target(), platform) {
+				return nil
+			}
 		}
 	}
 
@@ -230,7 +247,7 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs, platform string,
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 		}
-		perr = pullImageIntoNamespace(ctx, canonicalRef, targetNs, "", auth)
+		perr = pullImageIntoNamespace(ctx, canonicalRef, targetNs, platform, auth)
 		if perr == nil {
 			break
 		}
@@ -241,6 +258,9 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs, platform string,
 		// Fallback: docker-mirror GitHub release (used when the registry is
 		// unreachable or rate-limited but a mirror exists). Only silent on a
 		// clean 404 ("not mirrored yet"); other download errors are logged.
+		if platform != "" {
+			return pullErr // the mirror only carries the native platform
+		}
 		if mErr := loadFromMirror(ctx, ref, targetNs); mErr == nil {
 			if _, err := cl.GetImage(targetCtx, canonicalRef); err == nil {
 				return nil

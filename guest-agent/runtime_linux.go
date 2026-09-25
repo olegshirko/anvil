@@ -287,8 +287,12 @@ func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName stri
 	if err != nil {
 		return "", "", fmt.Errorf("cni config %s: %w", netName, err)
 	}
-	raw, err := extraCNI.AddNetworkList(ctx, list, &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: ifName})
+	rt := &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: ifName}
+	raw, err := extraCNI.AddNetworkList(ctx, list, rt)
 	if err != nil {
+		// A failed ADD may leave a veth or an IPAM lease behind; the CNI
+		// spec has the runtime issue DEL for it.
+		extraCNI.DelNetworkList(context.WithoutCancel(ctx), list, rt) //nolint:errcheck
 		return "", "", fmt.Errorf("cni setup %s (%s): %w", netName, ifName, err)
 	}
 	res, err := types100.NewResultFromResult(raw)

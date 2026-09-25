@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -122,6 +123,17 @@ func TestEgressProxyConnect(t *testing.T) {
 		go func() { defer echo.Close(); _, _ = io.Copy(echo, echo) }()
 		return up, nil
 	}
+	origLookup := egressProxyLookup
+	t.Cleanup(func() { egressProxyLookup = origLookup })
+	egressProxyLookup = func(_ context.Context, host string) ([]net.IPAddr, error) {
+		switch host {
+		case "registry-1.docker.io":
+			return []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}}, nil
+		case "evil.example":
+			return []net.IPAddr{{IP: net.ParseIP("203.0.113.11")}, {IP: net.ParseIP("127.0.0.1")}}, nil
+		}
+		return nil, fmt.Errorf("no such host %s", host)
+	}
 	go handleEgressProxyClient(server, dial)
 
 	if _, err := io.WriteString(client, "CONNECT registry-1.docker.io:443 HTTP/1.1\r\nHost: registry-1.docker.io:443\r\n\r\nhello"); err != nil {
@@ -136,10 +148,25 @@ func TestEgressProxyConnect(t *testing.T) {
 	if _, err := io.ReadFull(br, buf); err != nil || string(buf) != "hello" {
 		t.Fatalf("bytes after CONNECT: %q, %v", buf, err)
 	}
-	if dialed != "registry-1.docker.io:443" {
-		t.Fatalf("dialed %q", dialed)
+	if dialed != "203.0.113.10:443" {
+		t.Fatalf("dialed %q, want the checked address", dialed)
 	}
 	client.Close()
+
+	for _, target := range []string{"127.0.0.1:2375", "localhost:22", "10.10.1.2:80", "192.168.64.1:22",
+		"169.254.169.254:80", "[::1]:443", "evil.example:443"} {
+		c, s := net.Pipe()
+		go handleEgressProxyClient(s, dial)
+		dialed = ""
+		if _, err := io.WriteString(c, "CONNECT "+target+" HTTP/1.1\r\nHost: "+target+"\r\n\r\n"); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err != nil || resp.StatusCode != http.StatusForbidden || dialed != "" {
+			t.Errorf("CONNECT %s: resp=%v err=%v dialed=%q, want 403 and no dial", target, resp, err, dialed)
+		}
+		c.Close()
+	}
 
 	c2, s2 := net.Pipe()
 	defer c2.Close()

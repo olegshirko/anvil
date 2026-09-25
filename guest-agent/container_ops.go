@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -386,7 +387,7 @@ func (l *logOnlyIO) Close() error { return nil }
 // deleteNativeContainer removes the task (if any), the container record, its
 // rootfs snapshot, CNI attachment, named netns and anvil metadata. Anonymous
 // volumes are removed with the container (--rm semantics).
-func deleteNativeContainer(ctx context.Context, ns, id string, force bool) error {
+func deleteNativeContainer(ctx context.Context, ns, id string, force, removeVolumes bool) error {
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd client: %w", err)
@@ -446,12 +447,51 @@ func deleteNativeContainer(ctx context.Context, ns, id string, force bool) error
 			refreshNetworkHosts(net)
 		}
 	}
-	if meta != nil {
+	// Anonymous volumes go only with docker rm -v / --rm, as in Docker,
+	// and never while another container still mounts one (--volumes-from):
+	// that would delete data out from under it.
+	if meta != nil && removeVolumes {
 		for _, v := range meta.AnonymousVolumes {
-			os.RemoveAll(volumeDataDir(ns, v))
+			dir := volumeDataDir(ns, v)
+			if volumeDirInUse(ctx, dir) {
+				log.Printf("[docker-api] keeping volume %s: still mounted by another container", truncateID(v))
+				continue
+			}
+			os.RemoveAll(dir)
 		}
 	}
 	return nil
+}
+
+// volumeDirInUse reports whether any remaining container mounts dir.
+func volumeDirInUse(ctx context.Context, dir string) bool {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return true // unsure: keep the data
+	}
+	nss, err := cl.NamespaceService().List(ctx)
+	if err != nil {
+		return true
+	}
+	for _, ns := range nss {
+		nsCtx := namespaces.WithNamespace(ctx, ns)
+		cs, err := cl.Containers(nsCtx)
+		if err != nil {
+			return true
+		}
+		for _, c := range cs {
+			spec, err := c.Spec(nsCtx)
+			if err != nil {
+				continue
+			}
+			for _, m := range spec.Mounts {
+				if m.Type == "bind" && filepath.Clean(m.Source) == filepath.Clean(dir) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // --- exec primitive -----------------------------------------------------------

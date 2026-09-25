@@ -43,10 +43,11 @@ final class EgressServer: NSObject {
     }
 
     private func handle(connection: VZVirtioSocketConnection) {
-        DispatchQueue.global(qos: .utility).async {
+        runGuestConnection(connection, name: "egress") {
             let vfd = connection.fileDescriptor
-            defer { connection.close() }
-            guard let request = try? decodeLengthPrefixedFD(Request.self, fd: vfd) else { return }
+            guard let request = try? withReceiveTimeout(vfd, seconds: guestHandshakeTimeout, {
+                try decodeLengthPrefixedFD(Request.self, fd: vfd)
+            }) else { return }
             let upstream: Int32
             switch dialEgressTarget(request.target, timeoutSeconds: 10) {
             case .failure(let error):
@@ -183,31 +184,4 @@ func connectWithTimeout(_ addr: UnsafePointer<sockaddr>, _ len: socklen_t, timeo
     let message = String(cString: strerror(errno))
     close(fd)
     return .failure(EgressError(message: message))
-}
-
-/// Copy bytes in both directions until both sides are done, half-closing
-/// the peer when one direction ends.
-func relayBothWays(_ a: Int32, _ b: Int32) {
-    let group = DispatchGroup()
-    for (from, to) in [(a, b), (b, a)] {
-        group.enter()
-        DispatchQueue.global(qos: .utility).async {
-            var buf = [UInt8](repeating: 0, count: 65536)
-            outer: while true {
-                let n = read(from, &buf, buf.count)
-                if n < 0 && errno == EINTR { continue }
-                if n <= 0 { break }
-                var off = 0
-                while off < n {
-                    let w = buf.withUnsafeBytes { write(to, $0.baseAddress!.advanced(by: off), n - off) }
-                    if w < 0 && errno == EINTR { continue }
-                    if w <= 0 { break outer }
-                    off += w
-                }
-            }
-            _ = shutdown(to, Int32(SHUT_WR))
-            group.leave()
-        }
-    }
-    group.wait()
 }

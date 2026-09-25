@@ -30,6 +30,24 @@ const (
 	netHostsEnd   = "# END ANVIL NETWORK ENTRIES"
 )
 
+// requestedNetworkAliasesByNetwork keys the create request's aliases by
+// network, so an alias only resolves on the network it was given for.
+func requestedNetworkAliasesByNetwork(req dockerCreateRequest) map[string][]string {
+	if req.NetworkingConfig == nil {
+		return nil
+	}
+	out := map[string][]string{}
+	for name, ep := range req.NetworkingConfig.EndpointsConfig {
+		n := effectiveNetworkName(name)
+		for _, a := range ep.Aliases {
+			if a = strings.TrimSpace(a); a != "" {
+				out[n] = append(out[n], a)
+			}
+		}
+	}
+	return out
+}
+
 // requestedNetworkAliases extracts service aliases from the create request.
 // Compose sends them per endpoint network; any non-empty list is used.
 func requestedNetworkAliases(req dockerCreateRequest) []string {
@@ -92,9 +110,9 @@ func networkHostsEntries(metas []*containerMeta, netInfo func(ns, id string) (co
 		if !ok {
 			continue
 		}
-		names := strings.Join(dedupeStrings(append([]string{m.Name}, m.Aliases...)), " ")
 		for _, n := range m.Networks {
 			if ip := ni.ipOn(n); ip != "" {
+				names := strings.Join(dedupeStrings(append([]string{m.Name}, m.aliasesOn(n)...)), " ")
 				out[n] = append(out[n], ip+"\t"+names)
 			}
 		}

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
@@ -81,5 +83,53 @@ func TestCommitImageName(t *testing.T) {
 		if got := commitImageName(tc.repo, tc.tag, d); got != tc.want {
 			t.Errorf("commitImageName(%q, %q) = %q, want %q", tc.repo, tc.tag, got, tc.want)
 		}
+	}
+}
+
+// Docker's config extensions (Healthcheck, OnBuild, Shell) survive a
+// commit; keys the commit dropped are removed, not kept from the base.
+func TestMergeImageConfigJSONKeepsExtensions(t *testing.T) {
+	base := []byte(`{"architecture":"arm64","os":"linux","config":{"Cmd":["old"],"Entrypoint":["/e"],` +
+		`"Healthcheck":{"Test":["CMD","true"]},"OnBuild":["RUN x"],"Shell":["/bin/bash","-c"]},` +
+		`"rootfs":{"type":"layers","diff_ids":[]},"custom":"kept"}`)
+	var img ocispec.Image
+	if err := json.Unmarshal(base, &img); err != nil {
+		t.Fatal(err)
+	}
+	img.Config.Cmd = []string{"new"}
+	img.Config.Entrypoint = nil // the commit dropped it
+	img.Config.User = "app"
+
+	out, err := mergeImageConfigJSON(base, img, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Custom string `json:"custom"`
+		Config struct {
+			Cmd         []string        `json:"Cmd"`
+			Entrypoint  []string        `json:"Entrypoint"`
+			User        string          `json:"User"`
+			Healthcheck json.RawMessage `json:"Healthcheck"`
+			OnBuild     []string        `json:"OnBuild"`
+			Shell       []string        `json:"Shell"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	c := got.Config
+	if got.Custom != "kept" || len(c.Cmd) != 1 || c.Cmd[0] != "new" || c.Entrypoint != nil || c.User != "app" ||
+		len(c.Healthcheck) == 0 || len(c.OnBuild) != 1 || len(c.Shell) != 2 {
+		t.Errorf("merged config: %s", out)
+	}
+
+	hc := &dockerHealthcheck{Test: []string{"CMD-SHELL", "curl -f localhost"}, Retries: 3}
+	out, err = mergeImageConfigJSON(base, img, hc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "curl -f localhost") {
+		t.Errorf("container healthcheck not committed: %s", out)
 	}
 }

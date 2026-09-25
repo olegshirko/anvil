@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"slices"
 	"strconv"
@@ -123,9 +124,11 @@ func commitContainer(ctx context.Context, o commitOptions) (string, error) {
 		return "", fmt.Errorf("base manifest: %w", err)
 	}
 	var baseConfig ocispec.Image
-	if blob, err := content.ReadBlob(nsCtx, cs, baseManifest.Config); err != nil {
+	blob, err := content.ReadBlob(nsCtx, cs, baseManifest.Config)
+	if err != nil {
 		return "", fmt.Errorf("base config: %w", err)
-	} else if err := json.Unmarshal(blob, &baseConfig); err != nil {
+	}
+	if err := json.Unmarshal(blob, &baseConfig); err != nil {
 		return "", fmt.Errorf("base config: %w", err)
 	}
 
@@ -161,7 +164,7 @@ func commitContainer(ctx context.Context, o commitOptions) (string, error) {
 	}
 
 	cfg := baseConfig
-	cfg.Config = committedProcessConfig(nsCtx, c, cid, ns, baseConfig.Config)
+	cfg.Config = committedProcessConfig(nsCtx, c, cid, ns, baseConfig.Config, info.Labels)
 	if o.config != nil {
 		mergeCommitConfig(&cfg.Config, o.config)
 	}
@@ -180,7 +183,15 @@ func commitContainer(ctx context.Context, o commitOptions) (string, error) {
 		Created: &now, Author: o.author, Comment: o.comment,
 	})
 
-	configDesc, err := writeJSONBlob(nsCtx, cs, configType, cfg, nil)
+	var healthcheck *dockerHealthcheck
+	if meta, merr := loadContainerMeta(ns, cid); merr == nil {
+		healthcheck = meta.Healthcheck
+	}
+	cfgJSON, err := mergeImageConfigJSON(blob, cfg, healthcheck)
+	if err != nil {
+		return "", fmt.Errorf("image config: %w", err)
+	}
+	configDesc, err := writeJSONBlob(nsCtx, cs, configType, json.RawMessage(cfgJSON), nil)
 	if err != nil {
 		return "", fmt.Errorf("write config: %w", err)
 	}
@@ -226,14 +237,34 @@ func commitImageName(repo, tag string, dgst digest.Digest) string {
 // committedProcessConfig starts from the base image config and replaces
 // what the container actually ran with: args split back into entrypoint and
 // cmd, the merged env and the working directory.
-func committedProcessConfig(ctx context.Context, c client.Container, cid, ns string, base ocispec.ImageConfig) ocispec.ImageConfig {
+func committedProcessConfig(ctx context.Context, c client.Container, cid, ns string, base ocispec.ImageConfig, containerLabels map[string]string) ocispec.ImageConfig {
 	out := base
+	// The container's own labels, user and stop signal, as Docker commits
+	// the container config (anvil's bookkeeping labels excluded).
+	labels := maps.Clone(base.Labels) // never write into the base's map
+	for k, v := range containerLabels {
+		if strings.HasPrefix(k, "anvil/") {
+			continue
+		}
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		labels[k] = v
+	}
+	out.Labels = labels
+	meta, _ := loadContainerMeta(ns, cid)
+	if meta != nil && meta.User != "" {
+		out.User = meta.User
+	}
+	if meta != nil && meta.StopSignal != "" {
+		out.StopSignal = meta.StopSignal
+	}
 	spec, err := c.Spec(ctx)
 	if err != nil || spec.Process == nil {
 		return out
 	}
 	entrypoint := base.Entrypoint
-	if meta, merr := loadContainerMeta(ns, cid); merr == nil && len(meta.Entrypoint) > 0 {
+	if meta != nil && len(meta.Entrypoint) > 0 {
 		entrypoint = meta.Entrypoint
 	}
 	out.Entrypoint, out.Cmd = splitEntrypoint(userProcessArgs(spec.Process.Args), entrypoint)
@@ -242,6 +273,65 @@ func committedProcessConfig(ctx context.Context, c client.Container, cid, ns str
 		out.WorkingDir = spec.Process.Cwd
 	}
 	return out
+}
+
+// mergeImageConfigJSON renders cfg over the base config JSON. ocispec has
+// no Docker extensions (Healthcheck, OnBuild, Shell, ...): taking the base
+// JSON and replacing only the keys ocispec manages keeps them. A container
+// healthcheck replaces the image's, as in Docker.
+func mergeImageConfigJSON(base []byte, cfg ocispec.Image, healthcheck *dockerHealthcheck) ([]byte, error) {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(base, &top); err != nil {
+		return nil, err
+	}
+	var inner map[string]json.RawMessage
+	if raw, ok := top["config"]; ok && len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &inner); err != nil {
+			return nil, err
+		}
+	}
+	if inner == nil {
+		inner = map[string]json.RawMessage{}
+	}
+	overlay := func(dst map[string]json.RawMessage, v any, managed []string) error {
+		data, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		var fresh map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fresh); err != nil {
+			return err
+		}
+		for _, k := range managed {
+			delete(dst, k) // dropped by the commit (omitempty) or replaced below
+		}
+		for k, v := range fresh {
+			dst[k] = v
+		}
+		return nil
+	}
+	if err := overlay(inner, cfg.Config, []string{"User", "ExposedPorts", "Env", "Entrypoint", "Cmd",
+		"Volumes", "WorkingDir", "Labels", "StopSignal", "ArgsEscaped"}); err != nil {
+		return nil, err
+	}
+	if healthcheck != nil {
+		hc, err := json.Marshal(healthcheck)
+		if err != nil {
+			return nil, err
+		}
+		inner["Healthcheck"] = hc
+	}
+	cfg.Config = ocispec.ImageConfig{}
+	if err := overlay(top, cfg, []string{"created", "author", "architecture", "os", "os.version",
+		"os.features", "variant", "config", "rootfs", "history"}); err != nil {
+		return nil, err
+	}
+	innerJSON, err := json.Marshal(inner)
+	if err != nil {
+		return nil, err
+	}
+	top["config"] = innerJSON
+	return json.Marshal(top)
 }
 
 // splitEntrypoint splits argv into (entrypoint, cmd) when argv starts with

@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
 	"log"
 	"sort"
 	"strings"
@@ -508,6 +511,9 @@ func inspectDockerImage(ctx context.Context, name string) (map[string]interface{
 	if spec.Config.StopSignal != "" {
 		config["StopSignal"] = spec.Config.StopSignal
 	}
+	for k, v := range dockerConfigExtensions(nsCtx, img) {
+		config[k] = v
+	}
 
 	created := ""
 	if spec.Created != nil && !spec.Created.IsZero() {
@@ -537,4 +543,31 @@ func inspectDockerImage(ctx context.Context, name string) (map[string]interface{
 		"VirtualSize": size,
 		"GraphDriver": map[string]interface{}{"Data": map[string]interface{}{}, "Name": "overlayfs"},
 	}, nil
+}
+
+// dockerConfigExtensions returns the Docker-only image config fields
+// (Healthcheck, OnBuild, Shell) that ocispec.ImageConfig does not carry,
+// read from the raw config blob.
+func dockerConfigExtensions(ctx context.Context, img client.Image) map[string]json.RawMessage {
+	desc, err := img.Config(ctx)
+	if err != nil {
+		return nil
+	}
+	blob, err := content.ReadBlob(ctx, img.ContentStore(), desc)
+	if err != nil {
+		return nil
+	}
+	var raw struct {
+		Config map[string]json.RawMessage `json:"config"`
+	}
+	if json.Unmarshal(blob, &raw) != nil {
+		return nil
+	}
+	out := map[string]json.RawMessage{}
+	for _, k := range []string{"Healthcheck", "OnBuild", "Shell"} {
+		if v, ok := raw.Config[k]; ok && string(v) != "null" {
+			out[k] = v
+		}
+	}
+	return out
 }

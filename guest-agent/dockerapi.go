@@ -451,7 +451,7 @@ func pruneDockerContainers(ctx context.Context) ([]string, int64, error) {
 		if c.State == "running" {
 			continue
 		}
-		if err := deleteDockerContainer(ctx, c.Id, true); err != nil {
+		if err := deleteDockerContainer(ctx, c.Id, true, false); err != nil {
 			log.Printf("[docker-api] prune container %s: %v", c.Id, err)
 			continue
 		}

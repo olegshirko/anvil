@@ -314,7 +314,8 @@ func startDockerContainer(ctx context.Context, id string) error {
 			// Let any attach connection finish replaying the output before
 			// the container (and its logs) disappear.
 			waitForAttachDrain(did, 30*time.Second)
-			if err := deleteDockerContainer(context.Background(), did, true); err != nil {
+			// --rm removes the anonymous volumes too, as in Docker.
+			if err := deleteDockerContainer(context.Background(), did, true, true); err != nil {
 				log.Printf("[docker-api] auto-remove %s: %v", did, err)
 			}
 			unmarkAutoRemove(did)
@@ -428,14 +429,14 @@ func handleContainerWait(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 // deleteDockerContainer removes a container by Docker ID or name.
-func deleteDockerContainer(ctx context.Context, id string, force bool) error {
+func deleteDockerContainer(ctx context.Context, id string, force, removeVolumes bool) error {
 	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
 	}
 	did := dockerID(ns, containerdID)
 	// Native delete: task + snapshot + CNI + netns + metadata cleanup.
-	if err := deleteNativeContainer(ctx, ns, containerdID, force); err != nil {
+	if err := deleteNativeContainer(ctx, ns, containerdID, force, removeVolumes); err != nil {
 		return err
 	}
 	forgetContainerState(did)

@@ -49,8 +49,7 @@ final class HostServicesServer: NSObject {
     }
 
     private func handleSSHAgent(_ connection: VZVirtioSocketConnection) {
-        DispatchQueue.global(qos: .utility).async {
-            defer { connection.close() }
+        runGuestConnection(connection, name: "ssh-agent") {
             guard let path = sshAuthSocketPath() else {
                 print("[host-services] ssh-agent: SSH_AUTH_SOCK is not set for the daemon")
                 return
@@ -65,10 +64,11 @@ final class HostServicesServer: NSObject {
     }
 
     private func handleLoopback(_ connection: VZVirtioSocketConnection) {
-        DispatchQueue.global(qos: .utility).async {
+        runGuestConnection(connection, name: "host-loopback") {
             let vfd = connection.fileDescriptor
-            defer { connection.close() }
-            guard let request = try? decodeLengthPrefixedFD(LoopbackRequest.self, fd: vfd) else { return }
+            guard let request = try? withReceiveTimeout(vfd, seconds: guestHandshakeTimeout, {
+                try decodeLengthPrefixedFD(LoopbackRequest.self, fd: vfd)
+            }) else { return }
             let upstream: Int32
             switch dialHostLoopback(port: request.port, timeoutSeconds: 5) {
             case .failure(let error):

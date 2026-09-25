@@ -41,7 +41,7 @@ func TestApplyResourceUpdate(t *testing.T) {
 	}
 
 	unlimited := int64(-1)
-	if err := applyResourceUpdate(res, dockerUpdateRequest{PidsLimit: &unlimited}); err != nil || *res.Pids.Limit != 0 {
+	if err := applyResourceUpdate(res, dockerUpdateRequest{PidsLimit: &unlimited}); err != nil || *res.Pids.Limit != -1 {
 		t.Errorf("pids -1: %v %d", err, *res.Pids.Limit)
 	}
 }

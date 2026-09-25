@@ -219,7 +219,15 @@ func connectContainerNetwork(ctx context.Context, networkRef, container string, 
 		}
 	}
 	meta.Networks = append(meta.Networks, network)
-	meta.Aliases = dedupeStrings(append(meta.Aliases, aliases...))
+	if meta.NetworkAliases == nil {
+		// Freeze the legacy flat list onto the networks it applied to, so
+		// the new network's aliases stay on the new network only.
+		meta.NetworkAliases = map[string][]string{}
+		for _, n := range meta.Networks[:len(meta.Networks)-1] {
+			meta.NetworkAliases[n] = meta.Aliases
+		}
+	}
+	meta.NetworkAliases[network] = dedupeStrings(aliases)
 	if err := saveContainerMeta(meta); err != nil {
 		return err
 	}
@@ -275,6 +283,7 @@ func disconnectContainerNetwork(ctx context.Context, networkRef, container strin
 		}
 	}
 	meta.Networks = slices.Delete(meta.Networks, idx, idx+1)
+	delete(meta.NetworkAliases, network)
 	if err := saveContainerMeta(meta); err != nil {
 		return err
 	}

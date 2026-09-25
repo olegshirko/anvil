@@ -1,14 +1,14 @@
 package main
 
 import (
-	"bytes"
+	"archive/tar"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
@@ -61,20 +61,23 @@ func handleContainerExport(w http.ResponseWriter, r *http.Request, p routeParams
 		return
 	}
 	out := &writeTracker{w: w}
+	// Go tar inside a chroot of the rootfs: a running container's symlinks
+	// can never lead the walk out into the VM (see inChroot).
 	err = withContainerRootfs(r.Context(), ns, cid, func(root string) error {
-		var stderr bytes.Buffer
-		// Numeric owners: the guest's /etc/passwd would map the container's
-		// uids to the wrong names.
-		cmd := exec.CommandContext(r.Context(), "/bin/tar", "--numeric-owner", "-C", root, "-cf", "-", ".")
-		cmd.Stdout = out
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("tar: %v: %s", err, strings.TrimSpace(stderr.String()))
-		}
-		return nil
+		return inChroot(root, func() error {
+			tw := tar.NewWriter(out)
+			if err := writeTarTree(tw, "/", ""); err != nil {
+				return err
+			}
+			return tw.Close()
+		})
 	})
-	if err != nil && !out.started {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+	if err != nil {
+		if !out.started {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		log.Printf("[docker-api] export %s: %v", truncateID(cid), err)
 	}
 }
 

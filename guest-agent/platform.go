@@ -52,6 +52,11 @@ func resolveRequestedPlatform(p string) (string, error) {
 		return "", fmt.Errorf("invalid platform %q: %v", p, err)
 	}
 	if spec.OS == "linux" && spec.Architecture == "arm64" {
+		// With Rosetta the default matcher falls back to amd64; an
+		// explicit arm64 request must not (Docker: "no matching manifest").
+		if rosettaActive() {
+			return platforms.Format(hostPlatform), nil
+		}
 		return "", nil
 	}
 	if spec.OS == "linux" && spec.Architecture == "amd64" && (spec.Variant == "" || spec.Variant == "v1") {
@@ -139,4 +144,23 @@ func emulatedPlatformWarning(ctx context.Context, img client.Image) string {
 	p := platforms.Format(ocispec.Platform{OS: cfg.OS, Architecture: cfg.Architecture, Variant: cfg.Variant})
 	return fmt.Sprintf("The requested image's platform (%s) does not match the detected host platform (%s) and no specific platform was requested",
 		p, platforms.Format(hostPlatform))
+}
+
+// imagePlatform is the platform of the image's config ("linux/amd64"), or
+// "" when it cannot be read.
+func imagePlatform(ctx context.Context, img client.Image) string {
+	var cfg struct {
+		OS           string `json:"os"`
+		Architecture string `json:"architecture"`
+		Variant      string `json:"variant"`
+	}
+	desc, err := img.Config(ctx)
+	if err != nil {
+		return ""
+	}
+	blob, err := content.ReadBlob(ctx, img.ContentStore(), desc)
+	if err != nil || json.Unmarshal(blob, &cfg) != nil || cfg.Architecture == "" {
+		return ""
+	}
+	return platforms.Format(platforms.Normalize(ocispec.Platform{OS: cfg.OS, Architecture: cfg.Architecture, Variant: cfg.Variant}))
 }

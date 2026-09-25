@@ -64,29 +64,45 @@ func volumeDataDir(ns, name string) string {
 // attach counts, restart policies) stays in memory exactly as before. The
 // containerd id is encoded in the directory name and mirrored into ID.
 type containerMeta struct {
-	ID               string             `json:"ID"`
-	Name             string             `json:"Name"`
-	Namespace        string             `json:"Namespace"`
-	ImageRef         string             `json:"ImageRef,omitempty"`
-	Ports            []cniPortMapping   `json:"Ports,omitempty"`
-	Networks         []string           `json:"Networks,omitempty"`
-	Aliases          []string           `json:"Aliases,omitempty"`
-	Links            []string           `json:"Links,omitempty"`
-	TTY              bool               `json:"TTY,omitempty"`
-	AutoRemove       bool               `json:"AutoRemove,omitempty"`
-	StopSignal       string             `json:"StopSignal,omitempty"`
-	WorkingDir       string             `json:"WorkingDir,omitempty"`
-	Entrypoint       []string           `json:"Entrypoint,omitempty"`
-	Mounts           []dockerMount      `json:"Mounts,omitempty"`
-	AnonymousVolumes []string           `json:"AnonymousVolumes,omitempty"`
-	Healthcheck      *dockerHealthcheck `json:"Healthcheck,omitempty"`
+	ID        string           `json:"ID"`
+	Name      string           `json:"Name"`
+	Namespace string           `json:"Namespace"`
+	ImageRef  string           `json:"ImageRef,omitempty"`
+	Ports     []cniPortMapping `json:"Ports,omitempty"`
+	Networks  []string         `json:"Networks,omitempty"`
+	Aliases   []string         `json:"Aliases,omitempty"`
+	// NetworkAliases are the aliases per network (docker network connect
+	// --alias, compose per-network aliases). Aliases above is the legacy
+	// flat list, used for a network with no entry here.
+	NetworkAliases   map[string][]string `json:"NetworkAliases,omitempty"`
+	Links            []string            `json:"Links,omitempty"`
+	TTY              bool                `json:"TTY,omitempty"`
+	AutoRemove       bool                `json:"AutoRemove,omitempty"`
+	StopSignal       string              `json:"StopSignal,omitempty"`
+	User             string              `json:"User,omitempty"` // create-time --user, for commit
+	WorkingDir       string              `json:"WorkingDir,omitempty"`
+	Entrypoint       []string            `json:"Entrypoint,omitempty"`
+	Mounts           []dockerMount       `json:"Mounts,omitempty"`
+	AnonymousVolumes []string            `json:"AnonymousVolumes,omitempty"`
+	Healthcheck      *dockerHealthcheck  `json:"Healthcheck,omitempty"`
 	// HostConfig snapshot of the create request, echoed back by inspect for
 	// fields owned by the spec (memory, cpus, caps, ...) that have no other
 	// persisted representation.
 	HostConfig *dockerHostConfig `json:"HostConfig,omitempty"`
-	// Platform is an explicitly requested non-native platform
-	// ("linux/amd64"); empty for the default resolution.
+	// Platform is the image platform the container was created from
+	// ("linux/amd64", "linux/arm64/v8").
 	Platform string `json:"Platform,omitempty"`
+}
+
+// aliasesOn returns the container's aliases on network.
+func (m *containerMeta) aliasesOn(network string) []string {
+	if a, ok := m.NetworkAliases[network]; ok {
+		return a
+	}
+	if m.NetworkAliases != nil {
+		return nil // per-network aliases recorded, none for this one
+	}
+	return m.Aliases
 }
 
 var metaMu sync.Mutex
