@@ -1,3 +1,60 @@
+## v1.2.0 (2026-09-25)
+
+### Added
+- 1c53a66 feat(guest-agent): Docker Desktop parity — host.docker.internal, seccomp, --init, volumes-from, history, search, export, diff
+- 7f89775 feat: registry traffic falls back to the Mac when the VM has no internet
+- 338e771 feat: diagnose a VM without internet access (full-tunnel VPN on the Mac)
+
+### Fixed
+- af9659b fix(host): published ports broke when the Mac routed the vmnet subnet elsewhere
+- f1a298e fix(guest-agent): port forwarding dialed a stale guest IP after a new DHCP lease
+- 1149875 fix(guest-agent): output without a trailing newline was lost
+- dffe271 fix(guest-agent): docker wait after docker run -d returned 0 immediately
+- 547d5c3 fix(host): anvil doctor failed on healthy setups and tested the wrong engine
+- fe4f111 fix(guest-agent): staticcheck findings — network connect answered 500, dead namespace listing
+- aafe8cb fix(guest-agent): compose ipam.config subnet was reported but never applied
+- 40f0b1b fix(guest-agent): networks could share a subnet or a bridge
+- ab3ac7b fix(host): SIGINT/SIGTERM handlers called non-async-signal-safe code
+- f59f3d9 fix(host): partial snapshot saves and a failed restore forced repeated cold boots
+- 1d920c9 fix(host): listener fds closed twice; accept loops spun at 100% on EMFILE
+- 97c354e fix(host): late vsock connect completions leaked connections and raced the waiter
+- fa3d349 fix(host): a liveness restart started a second VM on the disk the wedged one still used
+- 48e0138 fix(guest-agent): per-container state was never dropped on removal
+- 7500ed2 fix(guest-agent): a failed create leaked the container's netns and files
+- be2db0e fix(guest-agent): a container name made of hex characters collided with ID prefixes
+- 5921c3a fix(make): release without VERSION tagged vdev; disk-compact and update-brew could corrupt state
+- 2b3e4ef fix(guest-agent): event recorder spun at 100% CPU after the containerd stream dropped
+- 6aa9748 fix(guest-agent): healthcheck lost and stale /wait code after stop/start or restart
+- 589189d fix(host): idle pause stalled the daemon for ~40 s and never dropped guest caches
+- 238667c fix(host): a crash after resume restored stale VM memory over a newer disk
+- 1b4c33f fix(host): PortForwarder.stop() never ran, a stale forwarder kept the ports after a VM crash
+- eb7c19d fix: -p 127.0.0.1:port published the port on every host interface
+
+### Changed
+- ef4b7dd refactor(guest-agent): split images.go (1586 lines) by concern
+- ea03c0f refactor(guest-agent): split containers.go (1460 lines) by concern
+- d212988 refactor(guest-agent): remove unused functions and the never-incremented retries map
+- f4d9b3b perf(guest-agent): docker ps made about seven containerd calls per container
+- 277b05b perf(host): UDP replies waited up to 250 ms for the relay loop to wake
+- fabed84 perf(guest-agent): restart monitor resolved every container each second per policy
+- 5c44230 perf(guest-agent): port scanner re-fetched every container twice per 500 ms tick
+
+### Docs
+- 254b75b docs: drop an internal project name from ARCHITECTURE.md
+
+### Internal
+- dbdb38a test: --link probe lost its output to the missing-newline limitation
+- bd269c0 build: ANVIL_BUILD_PROXY passes an HTTPS proxy to the initramfs build container
+- 5460136 chore(host): silence the Swift 6.x build warnings
+- 1cd784c ci: build guest assets through the Makefile instead of a copy of its URLs
+- 9462c1d chore(guest-agent): go mod tidy after removing pullImageAllPlatforms
+- 41f4f45 build: build_initramfs.sh had no shebang
+- 86ee1d0 build: release notes listed feat! twice and missed feat(scope)!
+- 7226a31 test: an integration filter that matched no test reported a green run
+- 365e683 build: make doctor runs anvil doctor
+- bd21e7a ci: run the unit tests, go vet and staticcheck
+- 6bc0a32 test(guest-agent): three assertions compared a value with itself
+- bb7b263 build: ANVIL_BUILD_CONTEXT selects the docker context for the initramfs build
 ## v1.1.2 (2026-09-09)
 
 ### Fixed
