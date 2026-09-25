@@ -84,3 +84,37 @@ func TestHostsBlockUnionAcrossNetworks(t *testing.T) {
 		t.Errorf("web does not see api on front:\n%s", webBlock)
 	}
 }
+
+func TestEndpointsOn(t *testing.T) {
+	api := &containerMeta{Namespace: "p", ID: "api", Name: "/api", Networks: []string{"front", "back"}}
+	stopped := &containerMeta{Namespace: "p", ID: "old", Name: "old", Networks: []string{"back"}}
+	infos := map[string]containerNetInfo{
+		"api": {Network: "front", IP: "10.1.0.2", Extra: []netEndpoint{{Network: "back", IfName: "eth1", IP: "10.2.0.2", Mac: "aa"}}},
+	}
+	eps := endpointsOn("back", 24, []*containerMeta{api, stopped}, func(_, id string) (containerNetInfo, bool) {
+		ni, ok := infos[id]
+		return ni, ok
+	})
+	if len(eps) != 1 {
+		t.Fatalf("endpoints = %+v, want only the running api", eps)
+	}
+	ep := eps[dockerID("p", "api")]
+	if ep.Name != "api" || ep.IPv4Address != "10.2.0.2/24" || ep.MacAddress != "aa" || len(ep.EndpointID) != 64 {
+		t.Errorf("endpoint = %+v", ep)
+	}
+	if got := networkPrefixLen(dockerIPAM{Config: []dockerIPAMConfig{{Subnet: "10.10.5.0/24"}}}); got != 24 {
+		t.Errorf("prefix = %d", got)
+	}
+}
+
+func TestValidateNetworkModeNone(t *testing.T) {
+	req := dockerCreateRequest{HostConfig: dockerHostConfig{NetworkMode: "none",
+		PortBindings: map[string][]dockerHostPort{"80/tcp": {{HostPort: "8080"}}}}}
+	if err := validateNetworkMode(req); err == nil {
+		t.Error("-p with --network none accepted")
+	}
+	req.HostConfig.PortBindings = nil
+	if err := validateNetworkMode(req); err != nil {
+		t.Errorf("plain --network none refused: %v", err)
+	}
+}

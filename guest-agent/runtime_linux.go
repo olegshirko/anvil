@@ -165,6 +165,9 @@ func findConflistForNetwork(netName string) (string, error) {
 // attachNetwork attaches a container's netns to the given logical network
 // with port mappings and returns the assigned IPv4 address.
 func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports []cniPortMapping) (string, string, error) {
+	if netName == noneNetwork {
+		return "", "", attachLoopbackOnly(ctx, id, netnsPath)
+	}
 	conflist, err := findConflistForNetwork(netName)
 	if err != nil {
 		return "", "", err
@@ -201,6 +204,9 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 
 // detachNetwork tears down a container endpoint on a logical network.
 func detachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports []cniPortMapping) error {
+	if netName == noneNetwork {
+		return detachLoopbackOnly(ctx, id, netnsPath)
+	}
 	conflist, err := findConflistForNetwork(netName)
 	if err != nil {
 		return err
@@ -326,4 +332,29 @@ func extraResultAddresses(res *types100.Result, ifName string) (ip, mac string) 
 		}
 	}
 	return ip, mac
+}
+
+// --- --network none -----------------------------------------------------------
+
+// loopbackOnlyConf is the whole network of a --network none container: the
+// loopback plugin bringing lo up in its fresh netns, and nothing else.
+var loopbackOnlyConf = []byte(`{"cniVersion":"1.0.0","name":"none","plugins":[{"type":"loopback"}]}`)
+
+func attachLoopbackOnly(ctx context.Context, id, netnsPath string) error {
+	list, err := cnilibrary.ConfListFromBytes(loopbackOnlyConf)
+	if err != nil {
+		return err
+	}
+	if _, err := extraCNI.AddNetworkList(ctx, list, &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: "lo"}); err != nil {
+		return fmt.Errorf("cni loopback: %w", err)
+	}
+	return nil
+}
+
+func detachLoopbackOnly(ctx context.Context, id, netnsPath string) error {
+	list, err := cnilibrary.ConfListFromBytes(loopbackOnlyConf)
+	if err != nil {
+		return err
+	}
+	return extraCNI.DelNetworkList(ctx, list, &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: "lo"})
 }

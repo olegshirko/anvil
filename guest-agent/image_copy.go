@@ -375,11 +375,13 @@ func stageTreeForExport(bc *blobCopier, target ocispec.Descriptor) (ocispec.Desc
 				debugLog("save: skipping incomplete manifest %s: %v", child.Digest, cerr)
 				continue
 			}
-			// copyTree may claim "already in destination" from stale
-			// scratch-namespace leftovers; only keep the child if it is
-			// genuinely visible now, otherwise the export fails on it.
-			if _, ierr := bc.cs.Info(bc.dstCtx, child.Digest); ierr != nil {
-				debugLog("save: manifest %s copied but not visible, skipping", child.Digest)
+			// Keep a platform only if its whole subtree is in the
+			// destination: copyTree can report success for a manifest whose
+			// config or layers are gone (a partially pruned platform, e.g.
+			// after rmi of an image sharing the manifest), and the export
+			// then dies mid-stream on the missing blob.
+			if missing := manifestTreeMissing(bc.dstCtx, bc.cs, child); len(missing) > 0 {
+				debugLog("save: manifest %s incomplete in staging (%d missing), skipping", child.Digest, len(missing))
 				continue
 			}
 			kept = append(kept, child)
@@ -412,6 +414,26 @@ func stageTreeForExport(bc *blobCopier, target ocispec.Descriptor) (ocispec.Desc
 		}
 		return target, nil
 	}
+}
+
+// manifestTreeMissing lists the blobs of a single-platform manifest (the
+// manifest itself, its config and layers) not visible in ctx's namespace.
+func manifestTreeMissing(ctx context.Context, cs content.Store, d ocispec.Descriptor) []string {
+	data, err := readBlobAll(ctx, cs, d)
+	if err != nil {
+		return []string{d.Digest.String()}
+	}
+	var man ocispec.Manifest
+	if json.Unmarshal(data, &man) != nil {
+		return []string{d.Digest.String()}
+	}
+	var missing []string
+	for _, kid := range append([]ocispec.Descriptor{man.Config}, man.Layers...) {
+		if _, err := cs.Info(ctx, kid.Digest); err != nil {
+			missing = append(missing, kid.Digest.String())
+		}
+	}
+	return missing
 }
 
 // copyImageBetweenNamespaces copies an image from one containerd namespace

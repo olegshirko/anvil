@@ -85,6 +85,9 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name, p
 	// container, otherwise CNI attach fails with "no such network".
 	if !usesHostNetwork(req) {
 		for _, n := range append([]string{effectiveNetworkName(networkMode)}, secondaryNetworksFromCreate(req)...) {
+			if n == noneNetwork {
+				continue // no bridge: lo only (attachNetwork)
+			}
 			if err := generateCNIConfig(n); err != nil {
 				log.Printf("[docker-api] ensure cni config for %s: %v", n, err)
 			}

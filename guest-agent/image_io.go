@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/images/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
@@ -76,11 +77,43 @@ func streamImageSave(ctx context.Context, w http.ResponseWriter, names []string)
 				_ = cl.ImageService().Delete(sctx, im.Name())
 			}
 		}
+		// Content is namespaced and outlives its records: without an
+		// explicit delete the namespace is never empty (so never removed),
+		// and the next save finds those unreferenced blobs "already
+		// staged" — outside its lease, free for any concurrent GC pass to
+		// sweep before the new record pins them.
+		cs := cl.ContentStore()
+		_ = cs.Walk(sctx, func(info content.Info) error {
+			_ = cs.Delete(sctx, info.Digest)
+			return nil
+		})
+		// A save that died mid-way leaves its lease behind, which would
+		// keep the namespace (and its blobs) forever.
+		if ls, lerr := cl.LeasesService().List(sctx); lerr == nil {
+			for _, l := range ls {
+				_ = cl.LeasesService().Delete(sctx, l)
+			}
+		}
 		_ = cl.NamespaceService().Delete(ctx, scratchNs) //nolint:errcheck
 	}
 	dropScratch() // stale leftovers from a previous run
-	scratchCtx := namespaces.WithNamespace(ctx, scratchNs)
-	bc := newBlobCopier(ctx, cl, ns, scratchNs)
+	// A lease protects the staged blobs from garbage collection until the
+	// export is done: without it a GC pass started elsewhere (any rmi) can
+	// sweep freshly staged layers mid-export, and the client gets a
+	// truncated archive with a 200. The lease must go before the namespace
+	// can be deleted.
+	scratchCtx, releaseLease, err := cl.WithLease(namespaces.WithNamespace(ctx, scratchNs))
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("save: lease: %v", err))
+		return
+	}
+	dropScratch = func(drop func()) func() {
+		return func() {
+			releaseLease(context.WithoutCancel(ctx)) //nolint:errcheck
+			drop()
+		}
+	}(dropScratch)
+	bc := newBlobCopier(scratchCtx, cl, ns, scratchNs)
 	for _, name := range names {
 		canonical := canonicalizeImageRef(name)
 		srcCtx := namespaces.WithNamespace(ctx, ns)
@@ -115,6 +148,16 @@ func streamImageSave(ctx context.Context, w http.ResponseWriter, names []string)
 		return
 	}
 	defer dropScratch()
+
+	// Everything the export reads must be staged before the 200 goes out:
+	// afterwards a failure can only truncate the stream.
+	for _, im := range imgs {
+		if missing := imageTreeMissing(cl, scratchCtx, im.Target); len(missing) > 0 {
+			writeJSONError(w, http.StatusInternalServerError,
+				fmt.Sprintf("save %s: %d blobs missing after staging (%s)", im.Name, len(missing), missing[0]))
+			return
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.WriteHeader(http.StatusOK)

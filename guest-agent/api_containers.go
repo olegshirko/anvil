@@ -118,6 +118,10 @@ func handleContainerCreate(w http.ResponseWriter, r *http.Request, _ routeParams
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := validateNetworkMode(req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	name := r.URL.Query().Get("name")
 	id, platformWarnings, err := createDockerContainer(r.Context(), req, name, platform, parseRegistryAuth(r))
 	if err != nil {

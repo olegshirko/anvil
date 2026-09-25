@@ -2150,6 +2150,105 @@ def test_restart_policy_survives_stop_start() -> None:
         cleanup(name)
 
 
+
+def test_cp_shell_less_image() -> None:
+    """docker cp works on a running container whose image has no shell, tar
+    or stat (scratch/distroless), including files inside a volume and paths
+    through an absolute symlink."""
+    name, image = f"{PREFIX}-cpscratch", f"{PREFIX}-scratch:1"
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = Path(tmp)
+        (ctx / "Dockerfile").write_text(
+            "FROM busybox:musl AS b\n"
+            "RUN mkdir -p /out/real && echo from-image > /out/real/f && ln -s /real /out/link\n"
+            "FROM scratch\n"
+            "COPY --from=b /bin/busybox /busybox\n"
+            "COPY --from=b /out/ /\n"
+            'CMD ["/busybox", "sleep", "300"]\n')
+        try:
+            docker("build", "-t", image, str(ctx), timeout=300.0)
+            docker("run", "-d", "--name", name, "-v", "/data", image)
+            src = ctx / "in.txt"
+            src.write_text("copied-in\n")
+            docker("cp", str(src), f"{name}:/data/in.txt")
+            docker("cp", f"{name}:/data/in.txt", str(ctx / "back.txt"))
+            if (ctx / "back.txt").read_text() != "copied-in\n":
+                raise RuntimeError("volume file did not round-trip")
+            docker("cp", f"{name}:/link/f", str(ctx / "via-link.txt"))
+            if (ctx / "via-link.txt").read_text() != "from-image\n":
+                raise RuntimeError("path through /link did not resolve inside the container")
+            out = docker("exec", name, "/busybox", "cat", "/data/in.txt").stdout
+            if out != "copied-in\n":
+                raise RuntimeError(f"container does not see the copied file: {out!r}")
+            record("docker cp without shell/tar in the image", "PASS", "volume + symlinked path, in and out")
+        finally:
+            cleanup(name)
+            docker("rmi", "-f", image, check=False)
+
+
+def test_network_none() -> None:
+    out = docker("run", "--rm", "--network", "none", "alpine", "ip", "-o", "link").stdout
+    ifaces = [l.split(":")[1].strip().split("@")[0] for l in out.splitlines() if ":" in l]
+    if ifaces != ["lo"] or "UP" not in out:
+        raise RuntimeError(f"--network none interfaces: {out!r}")
+    res = docker("run", "--rm", "--network", "none", "alpine", "wget", "-q", "-T", "3",
+                 "-O", "/dev/null", "http://1.1.1.1/", check=False)
+    if res.returncode == 0:
+        raise RuntimeError("--network none reached the internet")
+    res = docker("run", "--rm", "--network", "none", "-p", "18480:80", "alpine", "true", check=False)
+    if res.returncode == 0 or "conflicting options" not in res.stderr:
+        raise RuntimeError(f"-p with --network none: rc={res.returncode} {res.stderr.strip()!r}")
+    record("--network none", "PASS", "lo only, no egress, -p refused")
+
+
+def test_network_rm_in_use_and_inspect() -> None:
+    net, name = f"{PREFIX}-inuse", f"{PREFIX}-inusec"
+    try:
+        docker("network", "create", net)
+        docker("run", "-d", "--name", name, "--network", net, "alpine", "sleep", "300")
+        info = json.loads(docker("network", "inspect", net).stdout)[0]
+        eps = list(info["Containers"].values())
+        if len(eps) != 1 or eps[0]["Name"] != name or "/" not in eps[0]["IPv4Address"]:
+            raise RuntimeError(f"inspect Containers: {info['Containers']}")
+        res = docker("network", "rm", net, check=False)
+        if res.returncode == 0 or "active endpoints" not in res.stderr:
+            raise RuntimeError(f"rm of an in-use network: rc={res.returncode} {res.stderr.strip()!r}")
+        docker("rm", "-f", name)
+        docker("network", "rm", net)
+        record("network rm in use + inspect Containers", "PASS", "refused while attached, listed endpoint")
+    finally:
+        cleanup(name)
+        docker("network", "rm", net, check=False)
+
+
+def test_save_under_gc() -> None:
+    """docker save stays complete while other image removals trigger GC."""
+    stop = threading.Event()
+
+    def churn() -> None:
+        i = 0
+        while not stop.is_set():
+            t = f"{PREFIX}-churn:{i % 3}"
+            docker("tag", "busybox", t, check=False, timeout=60.0)
+            docker("rmi", "-f", t, check=False, timeout=60.0)
+            i += 1
+
+    th = threading.Thread(target=churn, daemon=True)
+    th.start()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            for i in range(5):
+                tar = Path(tmp) / f"s{i}.tar"
+                docker("save", "-o", str(tar), "alpine", "busybox", timeout=180.0)
+                size = tar.stat().st_size
+                if size < 3_000_000:
+                    raise RuntimeError(f"save #{i} truncated: {size} bytes")
+    finally:
+        stop.set()
+        th.join(timeout=60)
+    record("docker save under GC pressure", "PASS", "5 complete archives with concurrent rmi")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -2224,6 +2323,10 @@ TESTS = [
     ("rosetta amd64", test_rosetta_amd64),
     ("compose multi-network", test_compose_multi_network),
     ("restart policy after stop/start", test_restart_policy_survives_stop_start),
+    ("cp shell-less image", test_cp_shell_less_image),
+    ("network none", test_network_none),
+    ("network rm in use", test_network_rm_in_use_and_inspect),
+    ("save under gc", test_save_under_gc),
 ]
 
 

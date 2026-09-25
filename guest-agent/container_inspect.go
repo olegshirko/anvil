@@ -289,7 +289,7 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 				}
 			}
 			containerIP := endpoint.IPAddress
-			if containerIP == "" {
+			if containerIP == "" && networkName != noneNetwork {
 				containerIP = detectGuestIP()
 			}
 			var portBindings map[string][]dockerHostPort

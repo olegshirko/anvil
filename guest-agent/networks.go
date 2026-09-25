@@ -38,6 +38,18 @@ type dockerNetwork struct {
 	IPAM       dockerIPAM        `json:"IPAM"`
 	Options    map[string]string `json:"Options"`
 	Labels     map[string]string `json:"Labels"`
+	// Containers lists the running containers attached to the network
+	// (filled by inspect; Docker's list endpoint leaves it empty too).
+	Containers map[string]dockerNetworkContainer `json:"Containers"`
+}
+
+// dockerNetworkContainer is one endpoint in network inspect.
+type dockerNetworkContainer struct {
+	Name        string `json:"Name"`
+	EndpointID  string `json:"EndpointID"`
+	MacAddress  string `json:"MacAddress"`
+	IPv4Address string `json:"IPv4Address"`
+	IPv6Address string `json:"IPv6Address"`
 }
 
 // dockerIPAM is the IPAM configuration inside dockerNetwork.
@@ -136,14 +148,15 @@ func conflistToDockerNetwork(cl cniConflist) dockerNetwork {
 		labels = mergeNetworkLabels(labels, loadNetworkLabels(cl.Name))
 	}
 	return dockerNetwork{
-		Id:      cl.AnvilID,
-		Name:    cl.Name,
-		Driver:  "bridge",
-		Scope:   "local",
-		Created: time.Now().UTC().Format(time.RFC3339),
-		IPAM:    ipam,
-		Options: map[string]string{},
-		Labels:  labels,
+		Id:         cl.AnvilID,
+		Name:       cl.Name,
+		Driver:     "bridge",
+		Scope:      "local",
+		Created:    time.Now().UTC().Format(time.RFC3339),
+		IPAM:       ipam,
+		Options:    map[string]string{},
+		Labels:     labels,
+		Containers: map[string]dockerNetworkContainer{},
 	}
 }
 
@@ -185,6 +198,7 @@ func inspectDockerNetwork(ctx context.Context, name string) (*dockerNetwork, err
 			continue
 		}
 		dn := conflistToDockerNetwork(cl)
+		dn.Containers = networkEndpoints(cl.Name, networkPrefixLen(dn.IPAM))
 		return &dn, nil
 	}
 	return nil, fmt.Errorf("No such network: %s", name)
@@ -382,6 +396,10 @@ func removeDockerNetwork(ctx context.Context, name string) error {
 	fileName := name
 	if netName != "" {
 		fileName = netName
+		if eps := networkEndpoints(netName, 0); len(eps) > 0 {
+			return &apiError{status: http.StatusForbidden,
+				msg: fmt.Sprintf("error while removing network: network %s has active endpoints (%s)", netName, endpointNames(eps))}
+		}
 	}
 	path := cniConflistPath(fileName)
 	if _, statErr := os.Stat(path); statErr != nil {

@@ -56,7 +56,7 @@ func handleNetworkInspect(w http.ResponseWriter, r *http.Request, p routeParams)
 
 func handleNetworkDelete(w http.ResponseWriter, r *http.Request, p routeParams) {
 	if err := removeDockerNetwork(r.Context(), p["id"]); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSONError(w, errorStatus(err, http.StatusInternalServerError), err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

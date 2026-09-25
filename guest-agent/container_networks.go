@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"slices"
 	"sort"
@@ -22,6 +23,20 @@ import (
 // net.json's Extra) attached at start, or live by docker network connect.
 // Compose sends all of a service's networks in the create request's
 // EndpointsConfig; before this, everything but the first was dropped.
+
+// noneNetwork is --network none: an isolated netns with only lo up.
+const noneNetwork = "none"
+
+// validateNetworkMode refuses what Docker refuses for --network none.
+func validateNetworkMode(req dockerCreateRequest) error {
+	if req.HostConfig.NetworkMode != noneNetwork {
+		return nil
+	}
+	if len(req.HostConfig.PortBindings) > 0 || req.HostConfig.PublishAllPorts {
+		return fmt.Errorf("conflicting options: port publishing and the container type network mode")
+	}
+	return nil
+}
 
 // netEndpoint is one secondary network attachment of a running container.
 type netEndpoint struct {
@@ -74,14 +89,14 @@ func nextIfName(extra []netEndpoint) string {
 // secondaryNetworksFromCreate lists the create request's networks beyond
 // the primary one, in a stable order.
 func secondaryNetworksFromCreate(req dockerCreateRequest) []string {
-	if req.NetworkingConfig == nil || usesHostNetwork(req) || req.HostConfig.NetworkMode == "none" {
+	if req.NetworkingConfig == nil || usesHostNetwork(req) || req.HostConfig.NetworkMode == noneNetwork {
 		return nil
 	}
 	primary := effectiveNetworkName(req.HostConfig.NetworkMode)
 	var out []string
 	for name := range req.NetworkingConfig.EndpointsConfig {
 		n := effectiveNetworkName(name)
-		if n == primary || usesHostNetworkName(n) || n == "none" || slices.Contains(out, n) {
+		if n == primary || usesHostNetworkName(n) || n == noneNetwork || slices.Contains(out, n) {
 			continue
 		}
 		out = append(out, n)
@@ -181,7 +196,7 @@ func connectContainerNetwork(ctx context.Context, networkRef, container string, 
 	if err != nil {
 		return fmt.Errorf("container metadata: %w", err)
 	}
-	if len(meta.Networks) > 0 && (usesHostNetworkName(meta.Networks[0]) || meta.Networks[0] == "none") {
+	if len(meta.Networks) > 0 && (usesHostNetworkName(meta.Networks[0]) || meta.Networks[0] == noneNetwork) {
 		return &apiError{status: http.StatusBadRequest,
 			msg: fmt.Sprintf("container sharing network namespace with another container or host cannot be connected to any other network (network mode %q)", meta.Networks[0])}
 	}
@@ -285,4 +300,65 @@ func updateNetworksLabel(ctx context.Context, ns, id string, networks []string) 
 	if _, err := c.SetLabels(nsCtx, map[string]string{labelNetworks: string(data)}); err != nil {
 		debugLog("[docker-api] networks label %s: %v", truncateID(id), err)
 	}
+}
+
+// --- network inspect endpoints ------------------------------------------------
+
+// networkEndpoints lists the running containers with an endpoint on network,
+// keyed by Docker container ID.
+func networkEndpoints(network string, prefixLen int) map[string]dockerNetworkContainer {
+	metas, err := containerMetas()
+	if err != nil {
+		return map[string]dockerNetworkContainer{}
+	}
+	return endpointsOn(network, prefixLen, metas, func(ns, id string) (containerNetInfo, bool) { return loadNetInfo(ns, id) })
+}
+
+func endpointsOn(network string, prefixLen int, metas []*containerMeta, netInfo func(ns, id string) (containerNetInfo, bool)) map[string]dockerNetworkContainer {
+	out := map[string]dockerNetworkContainer{}
+	for _, m := range metas {
+		if !slices.Contains(m.Networks, network) {
+			continue
+		}
+		ni, ok := netInfo(m.Namespace, m.ID)
+		if !ok {
+			continue
+		}
+		ep, ok := ni.endpointOn(network)
+		if !ok || ep.IPAddress == "" {
+			continue
+		}
+		did := dockerID(m.Namespace, m.ID)
+		addr := ep.IPAddress
+		if prefixLen > 0 {
+			addr += "/" + strconv.Itoa(prefixLen)
+		}
+		out[did] = dockerNetworkContainer{
+			Name:        strings.TrimPrefix(m.Name, "/"),
+			EndpointID:  dockerID(did, network),
+			MacAddress:  ep.MacAddress,
+			IPv4Address: addr,
+		}
+	}
+	return out
+}
+
+// networkPrefixLen is the prefix length of the network's first subnet.
+func networkPrefixLen(ipam dockerIPAM) int {
+	for _, c := range ipam.Config {
+		if _, n, err := net.ParseCIDR(c.Subnet); err == nil {
+			ones, _ := n.Mask.Size()
+			return ones
+		}
+	}
+	return 0
+}
+
+func endpointNames(eps map[string]dockerNetworkContainer) string {
+	var names []string
+	for _, e := range eps {
+		names = append(names, e.Name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }

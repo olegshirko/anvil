@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -222,24 +224,39 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	spec.exitCode = 0
 	spec.mu.Unlock()
 
+	// failExec reports a failure to start the process the way Docker does:
+	// the reason on the client's stderr ("OCI runtime exec failed: ...")
+	// and in the log, exit code 126.
+	failExec := func(stage string, err error) {
+		msg := fmt.Sprintf("OCI runtime exec failed: %s: %v\n", stage, err)
+		log.Printf("[exec] %s in %s: %s", truncateID(id), truncateID(spec.ContainerdID), strings.TrimSpace(msg))
+		if spec.Tty {
+			bufrw.WriteString(msg)
+		} else {
+			writeDockerStream(bufrw, 2, []byte(msg))
+		}
+		bufrw.Flush()
+		spec.setExit(126)
+	}
+
 	// Native exec: task.Exec inside the container's task, with the hijacked
 	// connection wired to the process stdio. Docker's hijacked attach
 	// protocol sends client stdin as a raw byte stream in both TTY and
 	// non-TTY modes (only the output direction is multiplexed).
 	cl, cerr := pc.get(context.Background())
 	if cerr != nil {
-		spec.setExit(126)
+		failExec("containerd", cerr)
 		return
 	}
 	nsCtx := namespaces.WithNamespace(context.Background(), spec.Namespace)
 	container, lerr := cl.LoadContainer(nsCtx, spec.ContainerdID)
 	if lerr != nil {
-		spec.setExit(126)
+		failExec("load container", lerr)
 		return
 	}
 	task, terr := container.Task(nsCtx, nil)
 	if terr != nil {
-		spec.setExit(126)
+		failExec("container is not running", terr)
 		return
 	}
 
@@ -283,7 +300,7 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		stdoutW.Close()
 		stderrR.Close()
 		stderrW.Close()
-		spec.setExit(126)
+		failExec("exec", xerr)
 		return
 	}
 	spec.setProcess(process)
@@ -315,10 +332,12 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	go stream(stderrR, 2)
 
 	if serr := process.Start(nsCtx); serr != nil {
+		stdoutW.Close()
+		stderrW.Close()
 		wg.Wait()
 		stdoutR.Close()
 		stderrR.Close()
-		spec.setExit(126)
+		failExec("start", serr)
 		return
 	}
 
