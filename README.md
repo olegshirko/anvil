@@ -230,7 +230,10 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   too). Without it, `--platform linux/amd64` is rejected with an explicit
   error rather than silently substituting an arm64 image. With it, arm64
   stays preferred and an amd64-only image runs with Docker's platform
-  warning.
+  warning. Rosetta's ahead-of-time cache (`rosettad`, kept on the VM disk)
+  roughly halves the emulation overhead of repeated runs: a Python start
+  importing json/ssl/sqlite3/asyncio took 3.21 s cold, 3.00 s with a warm
+  cache, 2.83 s natively on arm64 (`docker run` wall time, M-series Mac).
 - No AppArmor/SELinux in the guest. Seccomp matches Docker: unprivileged
   containers get the default profile, `--security-opt seccomp=unconfined` and
   `--privileged` lift it, and custom profiles (`seccomp=profile.json`, Docker
