@@ -2579,6 +2579,80 @@ def test_compose_cp_and_watch() -> None:
                            capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
 
 
+
+def test_log_rotation() -> None:
+    name = f"{PREFIX}-logrot"
+    try:
+        docker("run", "-d", "--name", name, "--log-opt", "max-size=20k", "--log-opt", "max-file=2",
+               "alpine", "sh", "-c", "i=0; while [ $i -lt 3000 ]; do echo line-$i-padding-padding-padding; i=$((i+1)); done; sleep 300")
+        time.sleep(4)
+        out = docker("logs", name, timeout=60.0).stdout.splitlines()
+        if not out or out[-1] != "line-2999-padding-padding-padding":
+            raise RuntimeError(f"last log line: {out[-1:]!r}")
+        # 3000 lines x ~35 bytes of payload are ~100 KB of JSON; with two
+        # 20 KB files at most ~40 KB survive.
+        if len(out) >= 3000 or len(out) < 100:
+            raise RuntimeError(f"{len(out)} lines kept: rotation did not bound the log")
+        nums = [int(l.split("-")[1]) for l in out]
+        if nums != sorted(nums) or nums != list(range(nums[0], nums[0] + len(nums))):
+            raise RuntimeError("rotated log replay is not contiguous and ordered")
+        res = docker("run", "--rm", "--log-opt", "max-size=lots", "alpine", "true", check=False)
+        if res.returncode == 0:
+            raise RuntimeError("invalid max-size accepted")
+        record("log rotation", "PASS", f"{len(out)} contiguous newest lines kept under max-size=20k x2")
+    finally:
+        cleanup(name)
+
+
+def test_health_status_events() -> None:
+    name = f"{PREFIX}-healthev"
+    try:
+        since = str(int(time.time()) - 1)
+        docker("run", "-d", "--name", name, "--health-cmd", "test -f /tmp/ok", "--health-interval", "1s",
+               "--health-retries", "2", "alpine", "sh", "-c", "touch /tmp/ok; sleep 4; rm /tmp/ok; sleep 300")
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if docker("inspect", "-f", "{{.State.Health.Status}}", name).stdout.strip() == "unhealthy":
+                break
+            time.sleep(1)
+        out = docker("events", "--since", since, "--until", str(int(time.time()) + 1),
+                     "--filter", f"container={name}", "--filter", "event=health_status",
+                     "--format", "{{.Action}}", timeout=30.0).stdout.splitlines()
+        if out != ["health_status: healthy", "health_status: unhealthy"]:
+            raise RuntimeError(f"health events {out}")
+        record("health_status events", "PASS", "healthy then unhealthy after retries")
+    finally:
+        cleanup(name)
+
+
+def test_volume_prune_semantics() -> None:
+    named, user = f"{PREFIX}-prunenamed", f"{PREFIX}-pruneuser"
+    try:
+        docker("volume", "create", named)
+        docker("run", "-d", "--name", user, "-v", "/busy", "alpine", "sleep", "300")
+        busy = [m["Name"] for m in json.loads(docker("inspect", "-f", "{{json .Mounts}}", user).stdout)]
+        docker("run", "--rm", "-v", "/scratch", "alpine", "true")  # --rm drops its own anon volume
+        docker("run", "--name", f"{user}-gone", "-v", "/leftover", "alpine", "true")
+        leftover = [m["Name"] for m in json.loads(docker("inspect", "-f", "{{json .Mounts}}", f"{user}-gone").stdout)]
+        docker("rm", f"{user}-gone")  # without -v: anon volume stays, unused
+        pruned = docker("volume", "prune", "-f").stdout
+        vols = docker("volume", "ls", "-q").stdout.split()
+        if leftover[0] in vols:
+            raise RuntimeError("unused anonymous volume survived prune")
+        if busy[0] not in vols:
+            raise RuntimeError("prune removed a volume a container still mounts")
+        if named not in vols:
+            raise RuntimeError("plain prune removed a named volume")
+        docker("volume", "prune", "-f", "--all")
+        vols = docker("volume", "ls", "-q").stdout.split()
+        if named in vols or busy[0] not in vols:
+            raise RuntimeError(f"prune --all: named gone={named not in vols}, busy kept={busy[0] in vols}")
+        record("volume prune", "PASS", "anonymous only by default, --all for named, mounted kept")
+    finally:
+        cleanup(user, f"{user}-gone")
+        docker("volume", "rm", "-f", named, check=False)
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -2671,6 +2745,9 @@ TESTS = [
     ("compose recreate anonymous volume", test_compose_recreate_keeps_anonymous_volume),
     ("stats real numbers", test_stats_real_numbers),
     ("compose cp and watch", test_compose_cp_and_watch),
+    ("log rotation", test_log_rotation),
+    ("health status events", test_health_status_events),
+    ("volume prune", test_volume_prune_semantics),
 ]
 
 

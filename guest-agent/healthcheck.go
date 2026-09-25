@@ -163,24 +163,14 @@ func startHealthCheck(dockerID, ns, containerdID string, hc *dockerHealthcheck, 
 				h.state.Log = h.state.Log[len(h.state.Log)-5:]
 			}
 
-			if exitCode == 0 {
-				consecutiveFailures = 0
-				h.state.FailingStreak = 0
-				h.state.Status = "healthy"
-			} else {
-				consecutiveFailures++
-				h.state.FailingStreak = consecutiveFailures
-				if h.state.Status == "starting" {
-					// Remain in starting until the failure streak exceeds retries;
-					// after that the container is unhealthy.
-					if consecutiveFailures >= retries {
-						h.state.Status = "unhealthy"
-					}
-				} else {
-					h.state.Status = "unhealthy"
-				}
-			}
+			prev := h.state.Status
+			h.state.Status, consecutiveFailures = nextHealthStatus(prev, exitCode == 0, consecutiveFailures, retries)
+			h.state.FailingStreak = consecutiveFailures
+			status := h.state.Status
 			h.mu.Unlock()
+			if status != prev {
+				publishHealthEvent(ns, containerdID, status)
+			}
 		}
 	}()
 }
@@ -264,4 +254,30 @@ func formatHealthStatus(dockerID, baseStatus string) string {
 		return baseStatus
 	}
 	return fmt.Sprintf("%s (%s)", baseStatus, state.Status)
+}
+
+// nextHealthStatus applies one probe result. As in Docker, a container turns
+// unhealthy only after `retries` consecutive failures — from starting and
+// from healthy alike — and one success makes it healthy.
+func nextHealthStatus(status string, ok bool, failures, retries int) (string, int) {
+	if ok {
+		return "healthy", 0
+	}
+	failures++
+	if failures >= retries {
+		return "unhealthy", failures
+	}
+	return status, failures
+}
+
+// publishHealthEvent emits Docker's "health_status: <status>" container
+// event (docker events, compose).
+func publishHealthEvent(ns, containerdID, status string) {
+	attrs := map[string]string{}
+	if meta, err := loadContainerMeta(ns, containerdID); err == nil {
+		attrs["name"] = strings.TrimPrefix(meta.Name, "/")
+		attrs["image"] = meta.ImageRef
+	}
+	publishAgentEvent(dockerEvent{Type: "container", Action: "health_status: " + status,
+		Actor: dockerEventActor{ID: dockerID(ns, containerdID), Attributes: attrs}})
 }

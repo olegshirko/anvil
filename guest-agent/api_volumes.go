@@ -61,7 +61,7 @@ func handleVolumeDelete(w http.ResponseWriter, r *http.Request, p routeParams) {
 }
 
 func handleVolumesPrune(w http.ResponseWriter, r *http.Request, _ routeParams) {
-	deleted, reclaimed, err := pruneDockerVolumes(r.Context())
+	deleted, reclaimed, err := pruneDockerVolumes(r.Context(), parseDockerFilters(r.URL.Query().Get("filters")))
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return

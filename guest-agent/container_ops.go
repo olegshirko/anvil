@@ -177,7 +177,13 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 	run := beginTaskRun(did)
 	takeContainerExitCode(did)
 
-	uri, lerr := taskLogURI(containerLogPath(ns, id))
+	rot := logRotation{maxSize: defaultLogMaxSize, maxFile: defaultLogMaxFile}
+	if meta, merr := loadContainerMeta(ns, id); merr == nil && meta.HostConfig != nil {
+		if r, rerr := logRotationFor(meta.HostConfig.LogConfig.Config); rerr == nil {
+			rot = r
+		}
+	}
+	uri, lerr := taskLogURI(containerLogPath(ns, id), rot)
 	if lerr != nil {
 		err = lerr
 		return err
@@ -468,19 +474,30 @@ func deleteNativeContainer(ctx context.Context, ns, id string, force, removeVolu
 
 // volumeDirInUse reports whether any remaining container mounts dir.
 func volumeDirInUse(ctx context.Context, dir string) bool {
-	cl, err := pc.get(ctx)
+	mounted, err := mountedBindSources(ctx)
 	if err != nil {
 		return true // unsure: keep the data
 	}
+	return mounted[filepath.Clean(dir)]
+}
+
+// mountedBindSources is the set of bind-mount sources of every container
+// (running or not) across namespaces — volume directories included.
+func mountedBindSources(ctx context.Context) (map[string]bool, error) {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return nil, err
+	}
 	nss, err := cl.NamespaceService().List(ctx)
 	if err != nil {
-		return true
+		return nil, err
 	}
+	out := map[string]bool{}
 	for _, ns := range nss {
 		nsCtx := namespaces.WithNamespace(ctx, ns)
 		cs, err := cl.Containers(nsCtx)
 		if err != nil {
-			return true
+			return nil, err
 		}
 		for _, c := range cs {
 			spec, err := c.Spec(nsCtx)
@@ -488,13 +505,13 @@ func volumeDirInUse(ctx context.Context, dir string) bool {
 				continue
 			}
 			for _, m := range spec.Mounts {
-				if m.Type == "bind" && filepath.Clean(m.Source) == filepath.Clean(dir) {
-					return true
+				if m.Type == "bind" {
+					out[filepath.Clean(m.Source)] = true
 				}
 			}
 		}
 	}
-	return false
+	return out, nil
 }
 
 // --- exec primitive -----------------------------------------------------------

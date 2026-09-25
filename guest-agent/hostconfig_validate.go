@@ -45,13 +45,17 @@ func validateLogConfig(raw json.RawMessage) error {
 		return nil
 	}
 	var lc struct {
-		Type string `json:"Type"`
+		Type   string            `json:"Type"`
+		Config map[string]string `json:"Config"`
 	}
 	if err := json.Unmarshal(raw, &lc); err != nil {
 		return nil // shape errors surface in the typed decode
 	}
 	switch lc.Type {
-	case "", "json-file", "none":
+	case "", "json-file":
+		_, err := logRotationFor(lc.Config)
+		return err
+	case "none":
 		return nil
 	}
 	return fmt.Errorf("log driver %q is not supported by anvil: only json-file and none exist", lc.Type)

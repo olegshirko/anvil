@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -512,60 +514,56 @@ func pruneDockerNetworks(ctx context.Context) ([]string, error) {
 }
 
 // pruneDockerVolumes removes volumes not referenced by any container.
-func pruneDockerVolumes(ctx context.Context) ([]string, int64, error) {
+func pruneDockerVolumes(ctx context.Context, filters map[string]map[string]bool) ([]string, int64, error) {
 	volumes, err := listDockerVolumes(ctx, nil)
 	if err != nil {
 		return nil, 0, err
 	}
-	containers, err := listDockerContainers(ctx, nil)
+	// In use = mounted by any container, running or not, read from the
+	// containers' specs. (The labels this used to rely on were never set,
+	// so every volume looked unused — mounted ones included.)
+	mounted, err := mountedBindSources(ctx)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("list container mounts: %w", err)
 	}
-	inUse := map[string]struct{}{}
-	for _, c := range containers {
-		labels := c.Labels
-		if labels == nil {
-			labels = map[string]string{}
-		}
-		// Anonymous volumes.
-		anonJSON := labels[labelAnonymousVolumes]
-		if anonJSON != "" {
-			var vols []string
-			if err := json.Unmarshal([]byte(anonJSON), &vols); err == nil {
-				for _, v := range vols {
-					inUse[v] = struct{}{}
-				}
-			}
-		}
-		// Named mounts.
-		mountsJSON := labels[labelMounts]
-		if mountsJSON != "" {
-			var mounts []struct {
-				Type string `json:"Type"`
-				Name string `json:"Name"`
-			}
-			if err := json.Unmarshal([]byte(mountsJSON), &mounts); err == nil {
-				for _, m := range mounts {
-					if m.Type == "volume" && m.Name != "" {
-						inUse[m.Name] = struct{}{}
-					}
-				}
-			}
-		}
-	}
-
-	var deleted []string
+	// Docker 23+: only anonymous volumes unless all=true (docker volume
+	// prune --all).
+	all := filters["all"]["true"] || filters["all"]["1"]
+	deleted := []string{}
+	var reclaimed int64
 	for _, v := range volumes {
-		if _, ok := inUse[v.Name]; ok {
+		if mounted[filepath.Clean(v.Mountpoint)] {
 			continue
 		}
+		if _, anon := v.Labels[labelAnonymousVolume]; !anon && !all {
+			continue
+		}
+		if !matchesLabelFilters(v.Labels, filters) {
+			continue
+		}
+		size := dirSize(v.Mountpoint)
 		if err := removeDockerVolume(ctx, v.Name); err != nil {
 			log.Printf("[docker-api] prune volume %s: %v", v.Name, err)
 			continue
 		}
 		deleted = append(deleted, v.Name)
+		reclaimed += size
 	}
-	return deleted, 0, nil
+	return deleted, reclaimed, nil
+}
+
+// dirSize sums the regular files under dir (best effort).
+func dirSize(dir string) int64 {
+	var total int64
+	filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error { //nolint:errcheck
+		if err == nil && d.Type().IsRegular() {
+			if fi, ierr := d.Info(); ierr == nil {
+				total += fi.Size()
+			}
+		}
+		return nil
+	})
+	return total
 }
 
 // writeJSONError writes a Docker-API style error body. Hand-concatenated

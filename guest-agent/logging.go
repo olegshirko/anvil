@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"strconv"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -38,8 +40,8 @@ type logLine struct {
 
 // runJSONLogger implements the `guest-agent --log-json <path>` logging
 // subcommand. It never returns until both input streams are closed.
-func runJSONLogger(path string) error {
-	out, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+func runJSONLogger(path string, rot logRotation) error {
+	out, err := openRotatingLog(path, rot)
 	if err != nil {
 		return err
 	}
@@ -217,7 +219,7 @@ func writeStream(out io.Writer, stream string, r io.Reader) {
 
 // taskLogURI builds the binary-v2 log URI pointing at this binary with the
 // hidden logging subcommand. Query args become argv for the spawned logger.
-func taskLogURI(logPath string) (*url.URL, error) {
+func taskLogURI(logPath string, rot logRotation) (*url.URL, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("resolve agent path: %w", err)
@@ -225,6 +227,8 @@ func taskLogURI(logPath string) (*url.URL, error) {
 	u := &url.URL{Scheme: "binary-v2", Path: self}
 	q := u.Query()
 	q.Set("--log-json", logPath)
+	q.Set("--max-size", strconv.FormatInt(rot.maxSize, 10))
+	q.Set("--max-file", strconv.Itoa(rot.maxFile))
 	u.RawQuery = q.Encode()
 	return u, nil
 }
@@ -267,13 +271,22 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 		emit(stream, line)
 	}
 
-	// Replay what exists, keeping only the last tail records when set.
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return err
+	// Replay what exists — rotated files oldest first, then the live one —
+	// keeping only the last tail records when set.
+	var data []byte
+	var liveSize int64
+	for _, p := range rotatedLogFiles(logPath) {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return err
+			}
+			continue
 		}
-		data = nil
+		data = append(data, b...)
+		if p == logPath {
+			liveSize = int64(len(b))
+		}
 	}
 	var lines [][]byte
 	if len(data) > 0 {
@@ -319,7 +332,8 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	// observable, so follow re-reads by PATH instead of holding one fd, and
 	// an empty/quiet log at stop time gets a grace period before giving up.
 	var pending []byte // partial line carried between polls
-	off := int64(len(data))
+	off := liveSize
+	ino := logInode(logPath)
 	var quietSince time.Time
 	var stopDeadline time.Time
 	// A running container is followed indefinitely (docker logs -f must not
@@ -335,6 +349,18 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 		noStopDeadline = time.Now().Add(wait)
 	}
 	for {
+		// Rotation: the live file got a new inode. The old one is now
+		// path.1; take what was appended to it since the last poll first.
+		if cur := logInode(logPath); cur != 0 && ino != 0 && cur != ino {
+			if logInode(rotatedLogName(logPath, 1)) == ino {
+				if chunk, _, cerr := readLogFrom(rotatedLogName(logPath, 1), off); cerr == nil {
+					pending = append(pending, chunk...)
+				}
+			}
+			ino, off = cur, 0
+		} else if ino == 0 {
+			ino = cur
+		}
 		if chunk, next, cerr := readLogFrom(logPath, off); cerr == nil {
 			fileSeen = true
 			if len(chunk) > 0 {
@@ -402,4 +428,16 @@ func readLogFrom(path string, off int64) ([]byte, int64, error) {
 		return nil, off, err
 	}
 	return buf[:n], off + int64(n), nil
+}
+
+// logInode identifies the file at path (0 when absent), to notice rotation.
+func logInode(path string) uint64 {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return uint64(st.Ino)
+	}
+	return 0
 }

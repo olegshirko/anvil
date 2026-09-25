@@ -211,3 +211,37 @@ func TestAgentNetworkEvents(t *testing.T) {
 		t.Error("network filter matched a container event")
 	}
 }
+
+func TestHealthStatusTransitions(t *testing.T) {
+	st, f := "starting", 0
+	st, f = nextHealthStatus(st, false, f, 3)
+	if st != "starting" || f != 1 {
+		t.Fatalf("1st failure: %s %d", st, f)
+	}
+	st, f = nextHealthStatus(st, true, f, 3)
+	if st != "healthy" || f != 0 {
+		t.Fatalf("success: %s %d", st, f)
+	}
+	// One failure after healthy is not unhealthy yet (Docker: retries in a row).
+	st, f = nextHealthStatus(st, false, f, 3)
+	st, f = nextHealthStatus(st, false, f, 3)
+	if st != "healthy" {
+		t.Fatalf("2 failures after healthy: %s", st)
+	}
+	st, _ = nextHealthStatus(st, false, f, 3)
+	if st != "unhealthy" {
+		t.Fatalf("3rd failure: %s", st)
+	}
+
+	ev := dockerEvent{Type: "container", Action: "health_status: healthy", Actor: dockerEventActor{ID: "abc"}}
+	for flt, want := range map[string]bool{
+		`{"event":["health_status"]}`:          true,
+		`{"event":["health_status: healthy"]}`: true,
+		`{"event":["die"]}`:                    false,
+	} {
+		fl, _ := parseEventFilters(flt)
+		if fl.match(ev) != want {
+			t.Errorf("%s: match != %v", flt, want)
+		}
+	}
+}

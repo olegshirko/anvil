@@ -78,7 +78,8 @@ func handleSystemPrune(w http.ResponseWriter, r *http.Request, _ routeParams) {
 	nets, _ := pruneDockerNetworks(r.Context())
 	var vols []string
 	if withVolumes {
-		vols, _, _ = pruneDockerVolumes(r.Context())
+		// system prune --volumes: anonymous unused volumes, as in Docker.
+		vols, _, _ = pruneDockerVolumes(r.Context(), nil)
 	}
 	_, reclaimed, _ := pruneDockerImages(r.Context(), false)
 	w.Header().Set("Content-Type", "application/json")

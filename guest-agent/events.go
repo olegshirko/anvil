@@ -329,7 +329,11 @@ func (f *eventFilters) match(ev dockerEvent) bool {
 		return false
 	}
 	if len(f.events) > 0 && !containsFold(f.events, ev.Action) {
-		return false
+		// "health_status: healthy" matches event=health_status, as in Docker.
+		base, _, _ := strings.Cut(ev.Action, ":")
+		if !containsFold(f.events, strings.TrimSpace(base)) {
+			return false
+		}
 	}
 	if len(f.containers) > 0 {
 		name := ev.Actor.Attributes["name"]

@@ -256,6 +256,11 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   memory/swap/reservation, CPU (cpus, shares, quota/period, cpuset), pids and
   the restart policy; blkio and device limits are not updatable. `docker search` queries Docker Hub only. `docker diff` does not
   report files hidden by an opaque directory (`rm -rf dir && mkdir dir`).
+- Container logs (`json-file`) rotate at 100 MB x 3 files by default — unlike
+  Docker, which keeps them unbounded — because the VM disk is a fixed image;
+  `--log-opt max-size=… --log-opt max-file=…` override it (`max-size=-1` for
+  unbounded). `docker volume prune` removes unused anonymous volumes only;
+  `--all` includes named ones (Docker 23+ semantics).
 - With the remote buildx driver, plain `docker build` keeps the result in the
   build cache — add `--load` to import it into the image store (compose does
   this automatically). The buildx `docker-container` driver (which pulls a
