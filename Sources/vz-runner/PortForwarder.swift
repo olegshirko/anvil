@@ -596,6 +596,7 @@ private final class Listener {
 
         let fd = socket(AF_INET, SOCK_DGRAM, 0)
         guard fd >= 0 else { return -1 }
+        bindToGuestInterface(fd, guestIP: targetIP)
         var target = sockaddr_in()
         target.sin_family = sa_family_t(AF_INET)
         target.sin_port = in_port_t(targetPort).bigEndian
@@ -661,6 +662,7 @@ private final class Listener {
     private func connectToGuest() -> Int32 {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return -1 }
+        bindToGuestInterface(fd, guestIP: mapping.guestIP)
 
         // Preferred path: the guest-side port proxy. The forwarder connects
         // to a single well-known port and names the real target
@@ -812,4 +814,39 @@ private func writeAllFD(_ fd: Int32, data: Data) -> Bool {
         return true
     }
     return ok
+}
+
+// MARK: - Guest interface scoping
+
+/// Index of the host interface whose IPv4 subnet contains `ip` (the vmnet
+/// bridge for the guest's address), or nil.
+func interfaceIndex(containing ip: String) -> UInt32? {
+    var target = in_addr()
+    guard inet_pton(AF_INET, ip, &target) == 1 else { return nil }
+    var list: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&list) == 0, let first = list else { return nil }
+    defer { freeifaddrs(list) }
+    var cursor: UnsafeMutablePointer<ifaddrs>? = first
+    while let ifa = cursor {
+        cursor = ifa.pointee.ifa_next
+        guard let addr = ifa.pointee.ifa_addr, let mask = ifa.pointee.ifa_netmask,
+              Int32(addr.pointee.sa_family) == AF_INET else { continue }
+        let a = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr }
+        let m = mask.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr }
+        if m != 0, a & m == target.s_addr & m {
+            let idx = if_nametoindex(ifa.pointee.ifa_name)
+            return idx == 0 ? nil : idx
+        }
+    }
+    return nil
+}
+
+/// Pin a socket to the interface that owns the guest's subnet. The host
+/// routing table can send the vmnet subnet elsewhere — a static route to
+/// the LAN router, a VPN's routes — and connections to the guest then
+/// leave through the wrong interface and time out. IP_BOUND_IF makes the
+/// kernel use the bridge's own routes.
+func bindToGuestInterface(_ fd: Int32, guestIP: String) {
+    guard var idx = interfaceIndex(containing: guestIP) else { return }
+    setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &idx, socklen_t(MemoryLayout<UInt32>.size))
 }

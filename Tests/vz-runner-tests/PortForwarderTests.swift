@@ -99,3 +99,13 @@ final class PortForwarderTests: XCTestCase {
         XCTAssertEqual(bytes(bound.sin6_addr), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1])
     }
 }
+
+final class GuestInterfaceTests: XCTestCase {
+    // The forwarder pins guest connections to the interface owning the
+    // guest's subnet; loopback is always present to check the lookup.
+    func testInterfaceIndexContaining() {
+        XCTAssertEqual(interfaceIndex(containing: "127.0.0.1"), if_nametoindex("lo0"))
+        XCTAssertNil(interfaceIndex(containing: "not-an-ip"))
+        XCTAssertNil(interfaceIndex(containing: "203.0.113.7"), "TEST-NET-3 is on no interface")
+    }
+}
