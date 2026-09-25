@@ -70,7 +70,7 @@ func waitContainerTask(ctx context.Context, ns, containerdID string) (int, error
 
 // createDockerContainer creates a container natively via containerd and
 // returns its Docker ID.
-func createDockerContainer(ctx context.Context, req dockerCreateRequest, name string, auth *registryAuth) (string, error) {
+func createDockerContainer(ctx context.Context, req dockerCreateRequest, name, platform string, auth *registryAuth) (string, []string, error) {
 	networkMode := req.HostConfig.NetworkMode
 	ns := namespaceFromNetwork(networkMode)
 	// Compose attaches containers to a network named <project>_<network>. The
@@ -93,20 +93,20 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name st
 	// store is shared, so when the image already exists elsewhere we copy its
 	// metadata instead of re-pulling, which avoids corrupting the shared content
 	// store when docker compose creates multiple containers in parallel.
-	if err := ensureImageInNamespace(ctx, req.Image, ns, auth); err != nil {
-		return "", err
+	if err := ensureImageInNamespace(ctx, req.Image, ns, platform, auth); err != nil {
+		return "", nil, err
 	}
 
 	// Docker refuses duplicate names; mimic that to avoid ambiguous lookups later.
 	if name != "" {
 		if existing, err := findContainerByName(ctx, ns, name); err == nil && existing != "" {
-			return "", fmt.Errorf("Conflict. The container name \"/%s\" is already in use by container \"%s\". You have to remove (or rename) that container to be able to reuse that name.", name, existing)
+			return "", nil, fmt.Errorf("Conflict. The container name \"/%s\" is already in use by container \"%s\". You have to remove (or rename) that container to be able to reuse that name.", name, existing)
 		}
 	}
 
-	containerdID, err := createNativeContainer(ctx, ns, name, req)
+	containerdID, warnings, err := createNativeContainer(ctx, ns, name, platform, req)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	dockerID := dockerID(ns, containerdID)
@@ -148,7 +148,7 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name st
 		}
 	}
 	setHealthcheckConfig(dockerID, req.Healthcheck, containerUser)
-	return dockerID, nil
+	return dockerID, warnings, nil
 }
 
 // expandPortRange parses "80" or "80-81" into a list of port numbers.

@@ -257,7 +257,7 @@ func tagDockerImage(ctx context.Context, source, target string) error {
 		// Every record is dangling (a GC pass raced earlier pulls). Re-pull
 		// the SOURCE into the default namespace — the retrying pull path
 		// re-ingests a fully labelled tree — and tag from there.
-		if perr := pullImageIntoNamespace(ctx, canonicalizeImageRef(source), "default", nil); perr != nil {
+		if perr := pullImageIntoNamespace(ctx, canonicalizeImageRef(source), "default", "", nil); perr != nil {
 			debugLog("tag %s: healing pull: %v", source, perr)
 		}
 		ns = findImageNamespace(ctx, source)
@@ -292,13 +292,13 @@ func tagDockerImage(ctx context.Context, source, target string) error {
 	// tag is not left dangling when a racing GC pass sweeps the source
 	// namespace right after the records are created.
 	if ns != "default" {
-		if err := ensureImageInNamespace(ctx, target, "default", nil); err != nil {
+		if err := ensureImageInNamespace(ctx, target, "default", "", nil); err != nil {
 			log.Printf("[images] mirror tag %s to default: %v", target, err)
 			// The source tree was swept mid-copy. Re-pull the SOURCE into
 			// default (works for registry-backed refs) and re-tag from the
 			// fresh copy; otherwise remove the tag records we just made so
 			// no dangling tag is left behind.
-			if perr := pullImageIntoNamespace(ctx, canonicalizeImageRef(source), "default", nil); perr != nil {
+			if perr := pullImageIntoNamespace(ctx, canonicalizeImageRef(source), "default", "", nil); perr != nil {
 				for _, name := range []string{canonicalTarget, target} {
 					_ = cl.ImageService().Delete(nsCtx, name)
 				}
@@ -519,13 +519,16 @@ func inspectDockerImage(ctx context.Context, name string) (map[string]interface{
 	}
 
 	return map[string]interface{}{
-		"Id":          target.Digest.String(),
-		"RepoTags":    repoTags,
-		"RepoDigests": repoDigests,
-		"Comment":     comment,
-		"Created":     created,
-		"Author":      spec.Author,
-		"Config":      config,
+		"Id":           target.Digest.String(),
+		"RepoTags":     repoTags,
+		"RepoDigests":  repoDigests,
+		"Comment":      comment,
+		"Created":      created,
+		"Author":       spec.Author,
+		"Os":           spec.OS,
+		"Architecture": spec.Architecture,
+		"Variant":      spec.Variant,
+		"Config":       config,
 		"RootFS": map[string]interface{}{
 			"Type":   "layers",
 			"Layers": layers,

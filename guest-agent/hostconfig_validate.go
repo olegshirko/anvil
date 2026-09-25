@@ -84,15 +84,12 @@ func isJSONSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
 }
 
-// validateCreatePlatform refuses platform requests the guest cannot honor.
-// Until Rosetta lands, anything but linux/arm64 is a lie — a user asking for
+// validateCreatePlatform refuses platform requests the guest cannot honor:
+// linux/arm64 always, linux/amd64 only through Rosetta. A user asking for
 // amd64 deserves an answer, not an arm64 container pretending to be one.
 func validateCreatePlatform(r *http.Request) error {
-	p := r.URL.Query().Get("platform")
-	if p == "" || p == "linux" || p == "linux/arm64" {
-		return nil
-	}
-	return fmt.Errorf("platform %q is not supported by anvil: the guest VM is arm64-only (no Rosetta emulation yet)", p)
+	_, err := resolveRequestedPlatform(r.URL.Query().Get("platform"))
+	return err
 }
 
 // memorySwapSpec converts Docker's MemorySwap into the OCI

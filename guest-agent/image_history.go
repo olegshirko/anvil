@@ -43,7 +43,7 @@ func lookupDockerImage(ctx context.Context, name string) (client.Image, context.
 	if gerr != nil {
 		return nil, nil, fmt.Errorf("No such image: %s", name)
 	}
-	return img, nsCtx, nil
+	return imageWithPlatform(nsCtx, cl, img, ""), nsCtx, nil
 }
 
 func imageHistory(ctx context.Context, name string) ([]dockerImageHistoryItem, error) {

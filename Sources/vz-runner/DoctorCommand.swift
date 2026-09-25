@@ -1,4 +1,5 @@
 import Foundation
+import Virtualization
 
 // `anvil doctor [--json]` — diagnose the local installation: hypervisor,
 // signing, assets, daemon, docker context and API reachability. Exits
@@ -137,6 +138,18 @@ func cmdDoctor(args: [String]) {
         check("/Users share", true, "disabled by ANVIL_SHARE_USERS=0 (bind mounts from /Users will not work)")
     } else {
         check("/Users share", false, "unavailable")
+    }
+
+    // Rosetta for linux/amd64 containers is opt-in; an off state is fine.
+    switch (rosettaRequested(), VZLinuxRosettaDirectoryShare.availability) {
+    case (false, _):
+        check("rosetta (amd64)", true, "off (ANVIL_ROSETTA=1 enables linux/amd64 containers)")
+    case (true, .installed):
+        check("rosetta (amd64)", true, "enabled")
+    case (true, .notInstalled):
+        check("rosetta (amd64)", false, "ANVIL_ROSETTA=1 but Rosetta is not installed: softwareupdate --install-rosetta")
+    default:
+        check("rosetta (amd64)", false, "ANVIL_ROSETTA=1 but Rosetta is not supported on this Mac")
     }
 
     // Inside-container sanity: a fresh container must have its loopback UP

@@ -84,6 +84,9 @@ type containerMeta struct {
 	// fields owned by the spec (memory, cpus, caps, ...) that have no other
 	// persisted representation.
 	HostConfig *dockerHostConfig `json:"HostConfig,omitempty"`
+	// Platform is an explicitly requested non-native platform
+	// ("linux/amd64"); empty for the default resolution.
+	Platform string `json:"Platform,omitempty"`
 }
 
 var metaMu sync.Mutex

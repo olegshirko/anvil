@@ -1415,7 +1415,8 @@ def test_run_flags_wave4() -> None:
         ("--isolation", "hyperv", "Isolation"),
         ("--runtime", "sysbox", "Runtime"),
         ("--log-driver", "syslog", "log driver"),
-        ("--platform", "linux/amd64", "platform"),
+        # linux/amd64 is accepted with Rosetta (ANVIL_ROSETTA=1); s390x never
+        ("--platform", "linux/s390x", "platform"),
     ]:
         args = ["run", "--rm", flag]
         if value:
@@ -2026,6 +2027,38 @@ def test_ssh_agent_forwarding() -> None:
         raise RuntimeError(f"agent answer {out.stdout.strip()!r} (want '12 {host_keys}'): {out.stderr.strip()}")
     record("ssh agent forwarding", "PASS", f"agent answered, {host_keys} key(s) like the Mac")
 
+
+def test_rosetta_amd64() -> None:
+    """linux/amd64 through Rosetta (daemon started with ANVIL_ROSETTA=1)."""
+    probe = docker("run", "--rm", "--platform", "linux/amd64", "alpine", "uname", "-m",
+                   check=False, timeout=300.0)
+    if probe.returncode != 0 and "ANVIL_ROSETTA=1" in probe.stderr:
+        record("rosetta amd64", "SKIP", "Rosetta off (start the daemon with ANVIL_ROSETTA=1)")
+        return
+    if probe.stdout.strip() != "x86_64":
+        raise RuntimeError(f"uname -m = {probe.stdout.strip()!r}: {probe.stderr.strip()}")
+    # arm64 stays the default for multi-arch images
+    native = docker("run", "--rm", "alpine", "uname", "-m").stdout.strip()
+    if native != "aarch64":
+        raise RuntimeError(f"default platform ran {native!r}, want aarch64")
+    arch = docker("image", "inspect", "-f", "{{.Architecture}}", "alpine").stdout.strip()
+    if arch != "arm64":
+        raise RuntimeError(f"alpine inspect Architecture = {arch!r}")
+    # an amd64-only image (the amd64/ per-arch repo) pulls and runs without
+    # --platform, with Docker's platform warning
+    image = "amd64/alpine:latest"
+    try:
+        docker("rmi", "-f", image, check=False)
+        out = docker("run", "--rm", image, "uname", "-m", timeout=300.0)
+        if out.stdout.strip() != "x86_64":
+            raise RuntimeError(f"amd64-only image ran as {out.stdout.strip()!r}")
+        if "does not match the detected host platform" not in out.stderr:
+            raise RuntimeError(f"no platform warning: {out.stderr.strip()!r}")
+    finally:
+        docker("rmi", "-f", image, check=False)
+    record("rosetta amd64", "PASS", "--platform linux/amd64 = x86_64, arm64 default kept, amd64-only image runs")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -2097,6 +2130,7 @@ TESTS = [
     ("container update", test_container_update),
     ("commit", test_commit),
     ("ssh agent forwarding", test_ssh_agent_forwarding),
+    ("rosetta amd64", test_rosetta_amd64),
 ]
 
 

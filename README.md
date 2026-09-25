@@ -143,6 +143,7 @@ intact).
 | `ANVIL_CPUS` | — | VM CPU count (unset = vz-runner default of 2) |
 | `ANVIL_DISK_GB` | `64` | containerd disk size (sparse; existing disks only grow, guest fs is resized online) |
 | `ANVIL_SHARE_USERS` | `1` | Set to `0` to disable sharing the host `/Users` tree into the VM |
+| `ANVIL_ROSETTA` | `0` | Set to `1` to run `linux/amd64` containers through Rosetta (needs `softwareupdate --install-rosetta`; changing it forces one cold boot) |
 | `DEBUG` | — | `1` enables guest-agent debug log (`guest-agent.log` on the share) |
 
 ### Troubleshooting
@@ -223,9 +224,13 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
 
 ## Current limitations
 
-- Apple Silicon only; no amd64 emulation yet (Rosetta support is planned).
-  `docker run --platform linux/amd64` is rejected with an explicit error
-  rather than silently substituting an arm64 image.
+- Apple Silicon only. `linux/amd64` containers run through Rosetta when the
+  daemon is started with `ANVIL_ROSETTA=1` (off by default: its binfmt
+  handler is VM-wide, so buildkit's amd64 builds move from qemu to Rosetta
+  too). Without it, `--platform linux/amd64` is rejected with an explicit
+  error rather than silently substituting an arm64 image. With it, arm64
+  stays preferred and an amd64-only image runs with Docker's platform
+  warning.
 - No AppArmor/SELinux in the guest. Seccomp matches Docker: unprivileged
   containers get the default profile, `--security-opt seccomp=unconfined` and
   `--privileged` lift it, and custom profiles (`seccomp=profile.json`, Docker

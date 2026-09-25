@@ -54,7 +54,11 @@ func handleImageCreate(w http.ResponseWriter, r *http.Request, _ routeParams) {
 		writeJSONError(w, http.StatusBadRequest, "missing fromImage")
 		return
 	}
-	status, err := pullDockerImage(r.Context(), image, parseRegistryAuth(r))
+	platform, perr := resolveRequestedPlatform(r.URL.Query().Get("platform"))
+	status, err := "", perr
+	if perr == nil {
+		status, err = pullDockerImage(r.Context(), image, platform, parseRegistryAuth(r))
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		// The progress stream must carry the failure in "error"

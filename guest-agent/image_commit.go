@@ -112,6 +112,11 @@ func commitContainer(ctx context.Context, o commitOptions) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("base image %s: %w", info.Image, err)
 	}
+	platform := ""
+	if meta, merr := loadContainerMeta(ns, cid); merr == nil {
+		platform = meta.Platform
+	}
+	baseImg = imageWithPlatform(nsCtx, cl, baseImg, platform)
 	cs := cl.ContentStore()
 	baseManifest, err := images.Manifest(nsCtx, cs, baseImg.Target(), baseImg.Platform())
 	if err != nil {

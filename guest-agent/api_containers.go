@@ -108,7 +108,8 @@ func handleContainerCreate(w http.ResponseWriter, r *http.Request, _ routeParams
 		writeJSONError(w, http.StatusBadRequest, verr.Error())
 		return
 	}
-	if perr := validateCreatePlatform(r); perr != nil {
+	platform, perr := resolveRequestedPlatform(r.URL.Query().Get("platform"))
+	if perr != nil {
 		writeJSONError(w, http.StatusBadRequest, perr.Error())
 		return
 	}
@@ -118,7 +119,7 @@ func handleContainerCreate(w http.ResponseWriter, r *http.Request, _ routeParams
 		return
 	}
 	name := r.URL.Query().Get("name")
-	id, err := createDockerContainer(r.Context(), req, name, parseRegistryAuth(r))
+	id, platformWarnings, err := createDockerContainer(r.Context(), req, name, platform, parseRegistryAuth(r))
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -126,7 +127,7 @@ func handleContainerCreate(w http.ResponseWriter, r *http.Request, _ routeParams
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(dockerCreateResponse{
 		Id:       id,
-		Warnings: unsupportedHostConfigWarnings(req.HostConfig),
+		Warnings: append(unsupportedHostConfigWarnings(req.HostConfig), platformWarnings...),
 	})
 }
 

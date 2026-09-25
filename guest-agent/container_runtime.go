@@ -701,11 +701,11 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 // --- create ----------------------------------------------------------------
 
 // createNativeContainer registers the container with containerd and prepares
-// all start-time state. It returns the containerd ID.
-func createNativeContainer(ctx context.Context, ns, name string, req dockerCreateRequest) (_ string, err error) {
+// all start-time state. It returns the containerd ID and create warnings.
+func createNativeContainer(ctx context.Context, ns, name, platform string, req dockerCreateRequest) (_ string, warnings []string, err error) {
 	cl, err := pc.get(ctx)
 	if err != nil {
-		return "", fmt.Errorf("containerd client: %w", err)
+		return "", nil, fmt.Errorf("containerd client: %w", err)
 	}
 	nsCtx := namespaces.WithNamespace(ctx, ns)
 
@@ -713,22 +713,28 @@ func createNativeContainer(ctx context.Context, ns, name string, req dockerCreat
 	imgRef := canonicalizeImageRef(req.Image)
 	img, err := cl.GetImage(nsCtx, imgRef)
 	if err != nil {
-		return "", fmt.Errorf("image %s not found in namespace %s: %w", imgRef, ns, err)
+		return "", nil, fmt.Errorf("image %s not found in namespace %s: %w", imgRef, ns, err)
+	}
+	img = imageWithPlatform(nsCtx, cl, img, platform)
+	if platform == "" {
+		if w := emulatedPlatformWarning(nsCtx, img); w != "" {
+			warnings = append(warnings, w)
+		}
 	}
 
 	// The rootfs snapshot requires unpacked layers.
 	if uerr := img.Unpack(nsCtx, ""); uerr != nil {
-		return "", fmt.Errorf("unpack %s: %w", imgRef, uerr)
+		return "", nil, fmt.Errorf("unpack %s: %w", imgRef, uerr)
 	}
 
 	hostNet := usesHostNetwork(req)
 	if !hostNet {
 		if _, nerr := createNamedNetNS(id); nerr != nil {
-			return "", fmt.Errorf("create netns: %w", nerr)
+			return "", nil, fmt.Errorf("create netns: %w", nerr)
 		}
 	}
 	// Undo everything below on any failure. err is the named result, so
-	// every `return "", …` counts — the per-step perr/merr/serr variables
+	// every `return "", nil, …` counts — the per-step perr/merr/serr variables
 	// used to bypass the old cleanup and leak the bind-mounted netns.
 	var anonVols []string
 	defer func() {
@@ -752,17 +758,17 @@ func createNativeContainer(ctx context.Context, ns, name string, req dockerCreat
 		hostname = id[:12]
 	}
 	if perr := prepareContainerRoot(ns, id, hostname, req.HostConfig.Dns, req.HostConfig.ExtraHosts); perr != nil {
-		return "", perr
+		return "", nil, perr
 	}
 
 	mounts, vols, merr := computeContainerMounts(ns, id, req)
 	if merr != nil {
-		return "", merr
+		return "", nil, merr
 	}
 	anonVols = vols
 	inherited, verr := volumesFromMounts(ctx, req.HostConfig.VolumesFrom)
 	if verr != nil {
-		return "", verr
+		return "", nil, verr
 	}
 	mounts = mergeInheritedMounts(mounts, inherited)
 
@@ -779,7 +785,7 @@ func createNativeContainer(ctx context.Context, ns, name string, req dockerCreat
 
 	specOpts, serr := buildSpecOpts(id, hostname, imgCfg, req, mounts, hostNet)
 	if serr != nil {
-		return "", serr
+		return "", nil, serr
 	}
 
 	portMappings := portMappingsFromCreate(req)
@@ -800,9 +806,10 @@ func createNativeContainer(ctx context.Context, ns, name string, req dockerCreat
 		AnonymousVolumes: anonVols,
 		Healthcheck:      req.Healthcheck,
 		HostConfig:       &req.HostConfig,
+		Platform:         platform,
 	}
 	if serr := saveContainerMeta(meta); serr != nil {
-		return "", serr
+		return "", nil, serr
 	}
 
 	labels := map[string]string{}
@@ -827,9 +834,9 @@ func createNativeContainer(ctx context.Context, ns, name string, req dockerCreat
 		client.WithContainerLabels(labels),
 		client.WithNewSpec(specOpts...),
 	); cerr != nil {
-		return "", fmt.Errorf("new container: %w", cerr)
+		return "", nil, fmt.Errorf("new container: %w", cerr)
 	}
-	return id, nil
+	return id, warnings, nil
 }
 
 // portMappingsFromCreate extracts published host ports from the create

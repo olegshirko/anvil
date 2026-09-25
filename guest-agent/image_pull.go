@@ -114,13 +114,29 @@ func loadFromMirror(ctx context.Context, ref, ns string) error {
 // (containerd's content store is namespaced, so a bare metadata copy would
 // leave a dangling pointer pointing at blobs the target namespace cannot see).
 // Otherwise it is pulled into the target namespace.
-func ensureImageInNamespace(ctx context.Context, ref, targetNs string, auth *registryAuth) error {
+func ensureImageInNamespace(ctx context.Context, ref, targetNs, platform string, auth *registryAuth) error {
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd client: %w", err)
 	}
 
 	canonicalRef := canonicalizeImageRef(ref)
+
+	// An explicit non-native platform (--platform linux/amd64): the record
+	// may exist with only the arm64 subtree, so check that platform's
+	// content and pull it when missing.
+	if platform != "" {
+		targetCtx := namespaces.WithNamespace(ctx, targetNs)
+		if img, err := cl.GetImage(targetCtx, canonicalRef); err == nil &&
+			platformContentPresent(targetCtx, cl.ContentStore(), img.Target(), platform) {
+			return nil
+		}
+		log.Printf("[images] pulling %q for %s into namespace %s", canonicalRef, platform, targetNs)
+		if err := pullImageIntoNamespace(ctx, canonicalRef, targetNs, platform, auth); err != nil {
+			return fmt.Errorf("pull failed: %w", explainEgressFailure(err))
+		}
+		return nil
+	}
 
 	// Fast path: image already exists in target namespace AND its content
 	// is actually there (records left by interrupted copies or partial GCs
@@ -214,7 +230,7 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs string, auth *reg
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 		}
-		perr = pullImageIntoNamespace(ctx, canonicalRef, targetNs, auth)
+		perr = pullImageIntoNamespace(ctx, canonicalRef, targetNs, "", auth)
 		if perr == nil {
 			break
 		}
@@ -240,7 +256,7 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs string, auth *reg
 
 // pullImageIntoNamespace pulls an image into the given namespace's image and
 // content stores, unpacking its rootfs so containers can start immediately.
-func pullImageIntoNamespace(ctx context.Context, canonicalRef, ns string, auth *registryAuth) error {
+func pullImageIntoNamespace(ctx context.Context, canonicalRef, ns, platform string, auth *registryAuth) error {
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd client: %w", err)
@@ -265,9 +281,12 @@ func pullImageIntoNamespace(ctx context.Context, canonicalRef, ns string, auth *
 	// the next attempt that pass has finished. NOTE: no outer lease here —
 	// wrapping Pull in our own lease makes the committed image record
 	// lease-scoped, and releasing it deletes the record outright.
-	authOpts := authResolverOpts(auth)
+	opts := append([]client.RemoteOpt{client.WithPullUnpack}, authResolverOpts(auth)...)
+	if platform != "" {
+		opts = append(opts, client.WithPlatformMatcher(platformMatcher(platform)))
+	}
 	for attempt := 1; ; attempt++ {
-		img, perr := cl.Pull(nsCtx, canonicalRef, append([]client.RemoteOpt{client.WithPullUnpack}, authOpts...)...)
+		img, perr := cl.Pull(nsCtx, canonicalRef, opts...)
 		if perr != nil {
 			return perr
 		}
@@ -324,9 +343,9 @@ func pushDockerImage(ctx context.Context, name string, auth *registryAuth, w io.
 // pullDockerImage pulls an image natively into the default namespace. When
 // the registry pull fails it falls back to the docker-mirror GitHub release
 // and returns a status line describing which path produced the image.
-func pullDockerImage(ctx context.Context, image string, auth *registryAuth) (string, error) {
+func pullDockerImage(ctx context.Context, image, platform string, auth *registryAuth) (string, error) {
 	ns := "default"
-	if err := pullImageIntoNamespace(ctx, canonicalizeImageRef(image), ns, auth); err == nil {
+	if err := pullImageIntoNamespace(ctx, canonicalizeImageRef(image), ns, platform, auth); err == nil {
 		return fmt.Sprintf("Downloaded newer image for %s", image), nil
 	} else {
 		pullErr := err

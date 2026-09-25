@@ -63,7 +63,7 @@ func (pc *persistentClient) get(ctx context.Context) (*client.Client, error) {
 	// cancellation so handlers do not pile up on the write lock forever
 	// when containerd is down.
 	for {
-		c, err := client.New(pc.address)
+		c, err := client.New(pc.address, client.WithDefaultPlatform(defaultPlatformMatcher()))
 		if err == nil {
 			log.Printf("[persistent-client] connected to containerd")
 			pc.conn = c

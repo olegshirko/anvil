@@ -19,6 +19,22 @@ func usersSharePath() -> String? {
     return "/Users"
 }
 
+/// Virtiofs tag for the Rosetta runtime share (amd64 containers).
+let rosettaShareTag = "rosetta"
+
+/// Rosetta for linux/amd64 containers: opt-in with ANVIL_ROSETTA=1 and only
+/// when Rosetta is installed on the Mac (softwareupdate --install-rosetta).
+/// Off by default: once registered, binfmt_misc hands every x86-64 binary in
+/// the VM to Rosetta, buildkit's amd64 builds included.
+func rosettaRequested(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+    environment["ANVIL_ROSETTA"] == "1"
+}
+
+func rosettaEnabled() -> Bool {
+    guard rosettaRequested() else { return false }
+    return VZLinuxRosettaDirectoryShare.availability == .installed
+}
+
 struct BootArgs {
     var kernelPath: String
     var initrdPath: String
@@ -173,6 +189,18 @@ func makeConfiguration(
         let fsConfig = VZVirtioFileSystemDeviceConfiguration(tag: usersShareTag)
         fsConfig.share = VZSingleDirectoryShare(directory: sharedDirectory)
         sharingDevices.append(fsConfig)
+    }
+    if rosettaRequested() {
+        switch VZLinuxRosettaDirectoryShare.availability {
+        case .installed:
+            let fsConfig = VZVirtioFileSystemDeviceConfiguration(tag: rosettaShareTag)
+            fsConfig.share = try VZLinuxRosettaDirectoryShare()
+            sharingDevices.append(fsConfig)
+        case .notInstalled:
+            print("[anvil] ANVIL_ROSETTA=1 but Rosetta is not installed: run 'softwareupdate --install-rosetta'")
+        default:
+            print("[anvil] ANVIL_ROSETTA=1 but Rosetta is not supported on this Mac")
+        }
     }
     config.directorySharingDevices = sharingDevices
 

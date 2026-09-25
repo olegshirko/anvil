@@ -142,7 +142,8 @@ func TestCreateRejectsUnsupportedLogDriver(t *testing.T) {
 	}
 }
 
-func TestCreateRejectsNonArm64Platform(t *testing.T) {
+func TestCreateRejectsAmd64WithoutRosetta(t *testing.T) {
+	withRosetta(t, false)
 	srv := newTestAPIServer(t)
 	resp := postCreate(t, srv, "linux/amd64", `{"Image":"alpine"}`)
 	defer resp.Body.Close()
@@ -150,7 +151,7 @@ func TestCreateRejectsNonArm64Platform(t *testing.T) {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 	msg := decodeAPIError(t, resp)
-	if !strings.Contains(msg, "arm64") {
+	if !strings.Contains(msg, "linux/amd64") || !strings.Contains(msg, "ANVIL_ROSETTA=1") {
 		t.Errorf("message = %q", msg)
 	}
 }

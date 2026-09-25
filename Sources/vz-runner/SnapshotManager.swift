@@ -63,7 +63,9 @@ struct SnapshotManager {
         let diskToken = diskToken(for: containerdDiskPath)
         // The share set is part of the device configuration: restoring a snapshot
         // with a different virtiofs device list fails, so invalidate on change.
-        let sharesToken = usersSharePath ?? "nousers"
+        // The Rosetta share is appended only when on, so the hash (and the
+        // snapshot) of a default configuration is unchanged.
+        let sharesToken = (usersSharePath ?? "nousers") + (rosettaEnabled() ? ":rosetta" : "")
         let input = "\(kernelSHA):\(initrdSHA):\(cpus):\(memory):\(diskToken):\(sharesToken)"
         let hash = SHA256.hash(data: Data(input.utf8)).compactMap { String(format: "%02x", $0) }.joined()
         return HashComponents(kernelSHA: kernelSHA, initrdSHA: initrdSHA, cpus: cpus, memory: memory, diskToken: diskToken, hash: hash)

@@ -421,6 +421,8 @@ done
 for nf_mod in iptable_nat iptable_filter ip_tables nf_conntrack_netlink; do
     putmod "$nf_mod"
 done
+# binfmt_misc: Rosetta for linux/amd64 containers (ANVIL_ROSETTA=1).
+putmod binfmt_misc
 
 # Init script.
 cat > myinit <<'EOF'
@@ -609,6 +611,22 @@ mountpoint -q /mnt/anvil || mount -t virtiofs anvil /mnt/anvil 2>/dev/null || tr
 # host disabled it (ANVIL_SHARE_USERS=0).
 mkdir -p /Users
 mountpoint -q /Users || mount -t virtiofs macusers /Users 2>/dev/null || true
+
+# Rosetta for linux/amd64 containers: the share exists only when the host
+# runs with ANVIL_ROSETTA=1. binfmt_misc hands x86-64 ELF binaries to it;
+# F (fix binary) opens the interpreter now, so it works inside container
+# mount namespaces; C keeps setuid credentials; O passes an open fd.
+mkdir -p /mnt/rosetta
+if mountpoint -q /mnt/rosetta || mount -t virtiofs -o ro rosetta /mnt/rosetta 2>/dev/null; then
+    modprobe binfmt_misc 2>/dev/null || true
+    mountpoint -q /proc/sys/fs/binfmt_misc || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc
+    if [ ! -e /proc/sys/fs/binfmt_misc/rosetta ]; then
+        printf '%s\n' ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/mnt/rosetta/rosetta:OCF' \
+            > /proc/sys/fs/binfmt_misc/register || echo "[stage2] rosetta binfmt registration failed"
+    fi
+else
+    rmdir /mnt/rosetta 2>/dev/null || true
+fi
 
 # Persistent state: mount the virtio-blk disk (or virtiofs share) over /var/lib
 # so both containerd root (/var/lib/containerd) and anvil state (/var/lib/anvil)
