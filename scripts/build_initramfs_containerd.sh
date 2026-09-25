@@ -27,7 +27,15 @@ if [[ -z "${IN_CONTAINER:-}" ]]; then
         # Force the default Docker context so a user-selected anvil context does
         # not break the build container step. ANVIL_BUILD_CONTEXT=anvil builds
         # on a running anvil itself (the project lives under the shared /Users).
+        # ANVIL_BUILD_PROXY=http://host:port hands an HTTPS proxy to the
+        # container's `apk add` — for building on anvil itself when the VM
+        # has no direct internet (full-tunnel VPN on the Mac).
+        proxy_env=()
+        if [[ -n "${ANVIL_BUILD_PROXY:-}" ]]; then
+            proxy_env=(-e "https_proxy=$ANVIL_BUILD_PROXY" -e "http_proxy=$ANVIL_BUILD_PROXY")
+        fi
         docker --context "${ANVIL_BUILD_CONTEXT:-default}" run --rm --platform linux/arm64 \
+            ${proxy_env[@]+"${proxy_env[@]}"} \
             -v "$ROOT/.download:/build/download" \
             -v "$SCRIPT_DIR:/scripts:ro" \
             -e IN_CONTAINER=1 \
