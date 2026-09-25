@@ -97,3 +97,37 @@ func TestRestartMonitorUpdate(t *testing.T) {
 		t.Error("--restart=no left the policy armed")
 	}
 }
+
+func TestRestartMonitorRearm(t *testing.T) {
+	m := &restartMonitor{
+		policies: make(map[string]restartPolicy),
+		backoff:  make(map[string]time.Duration),
+		nextAt:   make(map[string]time.Time),
+		specs:    make(map[string]restartPolicy),
+		counts:   make(map[string]int),
+		stopped:  make(map[string]bool),
+		where:    make(map[string]containerRef),
+	}
+	did := dockerID("default", "c1")
+	m.registerAt("default", "c1", "on-failure", 3)
+	m.counts[did] = 2
+	m.clear(did) // docker stop
+	if _, armed := m.policies[did]; armed {
+		t.Fatal("stop did not disarm")
+	}
+	m.rearm(did) // docker start
+	if p, armed := m.policies[did]; !armed || p.name != "on-failure" || p.max != 3 {
+		t.Errorf("start did not re-arm: %+v %v", p, armed)
+	}
+	if m.countFor(did) != 0 {
+		t.Error("restart count not reset by a user start")
+	}
+
+	none := dockerID("default", "c2")
+	m.registerAt("default", "c2", "no", -1)
+	m.rearm(none)
+	if _, armed := m.policies[none]; armed {
+		t.Error("--restart=no armed by start")
+	}
+	m.rearm(dockerID("default", "unknown")) // no spec: no-op
+}

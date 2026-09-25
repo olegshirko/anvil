@@ -40,3 +40,11 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 func detachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports []cniPortMapping) error {
 	return fmt.Errorf("CNI not supported on this platform")
 }
+
+func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName string) (string, string, error) {
+	return "", "", fmt.Errorf("CNI not supported on this platform")
+}
+
+func detachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName string) error {
+	return fmt.Errorf("CNI not supported on this platform")
+}

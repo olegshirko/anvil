@@ -62,30 +62,6 @@ func handleNetworkDelete(w http.ResponseWriter, r *http.Request, p routeParams) 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func handleNetworkConnect(w http.ResponseWriter, r *http.Request, p routeParams) {
-	var req struct {
-		Container string `json:"Container"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Container == "" {
-		writeJSONError(w, http.StatusBadRequest, "missing Container")
-		return
-	}
-	// Not supported by the runtime: an honest 501, not a server error.
-	writeJSONError(w, http.StatusNotImplemented, connectContainerNetwork(p["id"], req.Container).Error())
-}
-
-func handleNetworkDisconnect(w http.ResponseWriter, r *http.Request, p routeParams) {
-	var req struct {
-		Container string `json:"Container"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Container == "" {
-		writeJSONError(w, http.StatusBadRequest, "missing Container")
-		return
-	}
-	// Not supported by the runtime: an honest 501, not a server error.
-	writeJSONError(w, http.StatusNotImplemented, disconnectContainerNetwork(p["id"], req.Container).Error())
-}
-
 func handleNetworksPrune(w http.ResponseWriter, r *http.Request, _ routeParams) {
 	deleted, err := pruneDockerNetworks(r.Context())
 	if err != nil {

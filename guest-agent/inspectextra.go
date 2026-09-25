@@ -205,20 +205,6 @@ func containerStatsReading(ctx context.Context, id string) map[string]interface{
 	return r
 }
 
-// connectContainerNetwork attaches a running container to another network.
-// Live network attach is not
-// supported by the runtime; return a Docker-shaped, actionable error
-// instead of a bare 404.
-func connectContainerNetwork(network, container string) error {
-	return fmt.Errorf("network connect is not supported by the runtime; recreate the container with --network %s", network)
-}
-
-// disconnectContainerNetwork detaches a container from a network.
-// Not supported by the runtime.
-func disconnectContainerNetwork(network, container string) error {
-	return fmt.Errorf("network disconnect is not supported by the runtime; recreate the container without --network %s", network)
-}
-
 // handleSystemDF implements GET /system/df: reclaimable-space overview.
 func handleSystemDF(ctx context.Context, w http.ResponseWriter) {
 	images, err := listDockerImages(ctx)

@@ -136,6 +136,11 @@ func handleContainerStart(w http.ResponseWriter, r *http.Request, p routeParams)
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// A user start puts the restart policy back in force (the monitor's
+	// restarts call startDockerContainer directly and must not re-arm).
+	if ns, cid, _, err := resolveDockerID(r.Context(), p["id"]); err == nil {
+		restarts.rearm(dockerID(ns, cid))
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -100,6 +100,24 @@ func (m *restartMonitor) update(ns, containerdID, name string, max int, running 
 	}
 }
 
+// rearm re-activates the requested policy after a user start or restart.
+// A user stop/kill disarms the policy (clear), but Docker keeps it: the
+// next docker start or docker restart puts it back in force, with the
+// restart count reset. The monitor's own restarts must not come through
+// here — re-arming resets the backoff they are paced by.
+func (m *restartMonitor) rearm(dockerID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.specs[dockerID]
+	if !ok || p.name == "" || p.name == "no" {
+		return
+	}
+	m.policies[dockerID] = p
+	delete(m.stopped, dockerID)
+	delete(m.counts, dockerID)
+	m.resetLocked(dockerID)
+}
+
 // policySpecFor returns the requested spec for docker inspect.
 func (m *restartMonitor) policySpecFor(dockerID string) dockerRestartPolicy {
 	m.mu.Lock()

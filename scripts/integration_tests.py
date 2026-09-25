@@ -1015,28 +1015,91 @@ def test_system_df() -> None:
 
 
 def test_network_connect() -> None:
-    """Live network attach is not supported by the runtime (no network connect,
-    `network connect`); the API must fail with an actionable error rather
-    than a bare 404."""
-    net, name = f"{PREFIX}-conn", f"{PREFIX}-connc"
+    """docker network connect/disconnect on a running container: a second
+    interface appears live, peers on the new network resolve it by name, and
+    disconnect removes it again."""
+    net = f"{PREFIX}-conn"
+    name, peer = f"{PREFIX}-connc", f"{PREFIX}-connp"
     try:
         docker("network", "create", net)
-        docker("run", "-d", "--name", name, "alpine", "sleep", "60")
-        proc = docker("network", "connect", net, name, check=False)
-        if proc.returncode == 0:
-            # If a future runtime gains support, verify the attach visible.
-            nets = docker("inspect", "--format",
-                          r"{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}", name)
-            record("network connect/disconnect", "PASS",
-                   f"runtime now supports live attach: {nets.stdout.strip()}")
-        elif "not supported" in proc.stderr:
-            record("network connect/disconnect", "SKIP",
-                   "runtime has no live attach; actionable error returned")
-        else:
-            raise RuntimeError(f"unexpected error: {proc.stderr.strip()[-200:]}")
+        docker("run", "-d", "--name", name, "alpine", "sleep", "300")
+        docker("run", "-d", "--name", peer, "--network", net, "alpine", "sleep", "300")
+        docker("network", "connect", "--alias", "extra-alias", net, name)
+        nets = json.loads(docker("inspect", "-f", "{{json .NetworkSettings.Networks}}", name).stdout)
+        if net not in nets or not nets[net]["IPAddress"]:
+            raise RuntimeError(f"inspect after connect: {nets}")
+        ip = nets[net]["IPAddress"]
+        links = docker("exec", name, "ip", "-o", "-4", "addr").stdout
+        if ip not in links or "eth1" not in links:
+            raise RuntimeError(f"eth1 with {ip} not in the container: {links!r}")
+        for target in (name, "extra-alias"):
+            out = docker("exec", peer, "ping", "-c", "1", "-W", "3", target, check=False)
+            if out.returncode != 0 or ip not in out.stdout:
+                raise RuntimeError(f"peer cannot reach {target} at {ip}: {out.stdout!r} {out.stderr!r}")
+        res = docker("network", "connect", net, name, check=False)
+        if res.returncode == 0 or "already exists" not in res.stderr:
+            raise RuntimeError(f"double connect: rc={res.returncode} {res.stderr.strip()!r}")
+        # survives a restart (attached again as a secondary endpoint)
+        docker("restart", "-t", "1", name)
+        nets = json.loads(docker("inspect", "-f", "{{json .NetworkSettings.Networks}}", name).stdout)
+        if not nets.get(net, {}).get("IPAddress"):
+            raise RuntimeError(f"secondary network lost on restart: {nets}")
+        docker("network", "disconnect", net, name)
+        nets = json.loads(docker("inspect", "-f", "{{json .NetworkSettings.Networks}}", name).stdout)
+        if net in nets:
+            raise RuntimeError(f"still attached after disconnect: {nets}")
+        if "eth1" in docker("exec", name, "ip", "-o", "link").stdout:
+            raise RuntimeError("eth1 left behind after disconnect")
+        res = docker("network", "disconnect", "bridge", name, check=False)
+        if res.returncode == 0:
+            raise RuntimeError("disconnecting the running primary network was accepted")
+        record("network connect/disconnect", "PASS", "live eth1, DNS by name+alias, restart, disconnect")
     finally:
-        cleanup(name)
+        cleanup(name, peer)
         docker("network", "rm", net, check=False, timeout=60.0)
+
+
+def test_compose_multi_network() -> None:
+    """A compose service on two networks is attached to both (compose sends
+    every network in the create request) and reachable from each side."""
+    project = f"{PREFIX}-mnet"
+    with tempfile.TemporaryDirectory() as tmp:
+        compose_file = Path(tmp) / "compose.yml"
+        compose_file.write_text("""services:
+  api:
+    image: alpine
+    command: sleep 300
+    networks: [front, back]
+  web:
+    image: alpine
+    command: sleep 300
+    networks: [front]
+  db:
+    image: alpine
+    command: sleep 300
+    networks: [back]
+networks:
+  front: {}
+  back: {}
+""")
+        base = ["compose", "-p", project, "-f", str(compose_file)]
+        try:
+            docker(*base, "up", "-d", timeout=300.0)
+            nets = json.loads(docker("inspect", "-f", "{{json .NetworkSettings.Networks}}",
+                                     f"{project}-api-1").stdout)
+            if sorted(nets) != sorted([f"{project}_front", f"{project}_back"]):
+                raise RuntimeError(f"api networks: {sorted(nets)}")
+            for src, dst in (("web", "api"), ("db", "api"), ("api", "web"), ("api", "db")):
+                out = docker(*base, "exec", "-T", src, "ping", "-c", "1", "-W", "3", dst, check=False)
+                if out.returncode != 0:
+                    raise RuntimeError(f"{src} -> {dst} failed: {out.stdout!r} {out.stderr!r}")
+            out = docker(*base, "exec", "-T", "web", "ping", "-c", "1", "-W", "2", "db", check=False)
+            if out.returncode == 0:
+                raise RuntimeError("web reached db across networks it does not share")
+            record("compose service on two networks", "PASS", "attached to both, isolation kept")
+        finally:
+            subprocess.run(["docker", *base, "down", "-v", "--timeout", "5"],
+                           capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
 
 
 def test_logs_tail_timestamps() -> None:
@@ -2059,6 +2122,34 @@ def test_rosetta_amd64() -> None:
     record("rosetta amd64", "PASS", "--platform linux/amd64 = x86_64, arm64 default kept, amd64-only image runs")
 
 
+
+def test_restart_policy_survives_stop_start() -> None:
+    """docker stop disarms --restart, docker start re-arms it (Docker keeps
+    the policy); docker restart keeps it too."""
+    name = f"{PREFIX}-rearm"
+    try:
+        docker("run", "-d", "--name", name, "--restart", "always", "alpine", "sh", "-c",
+               "rm -f /tmp/stop; while [ ! -f /tmp/stop ]; do sleep 0.2; done; exit 1")
+        docker("stop", "-t", "1", name)
+        time.sleep(3)
+        if docker("inspect", "-f", "{{.State.Running}}", name).stdout.strip() != "false":
+            raise RuntimeError("stopped container was restarted by its policy")
+        for how in ("start", "restart"):
+            docker(how, name)
+            docker("exec", name, "touch", "/tmp/stop", check=False)
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                st = docker("inspect", "-f", "{{.State.Running}} {{.RestartCount}}", name).stdout.split()
+                if st[0] == "true" and st[1] != "0":
+                    break
+                time.sleep(1)
+            else:
+                raise RuntimeError(f"policy not re-armed after docker {how}: {st}")
+        record("restart policy after stop/start", "PASS", "re-armed by docker start and docker restart")
+    finally:
+        cleanup(name)
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -2131,6 +2222,8 @@ TESTS = [
     ("commit", test_commit),
     ("ssh agent forwarding", test_ssh_agent_forwarding),
     ("rosetta amd64", test_rosetta_amd64),
+    ("compose multi-network", test_compose_multi_network),
+    ("restart policy after stop/start", test_restart_policy_survives_stop_start),
 ]
 
 

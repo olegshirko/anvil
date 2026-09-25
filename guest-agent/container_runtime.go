@@ -795,7 +795,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		Namespace:        ns,
 		ImageRef:         imgRef,
 		Ports:            portMappings,
-		Networks:         []string{effectiveNetworkName(req.HostConfig.NetworkMode)},
+		Networks:         append([]string{effectiveNetworkName(req.HostConfig.NetworkMode)}, secondaryNetworksFromCreate(req)...),
 		Aliases:          requestedNetworkAliases(req),
 		TTY:              req.Tty,
 		AutoRemove:       req.HostConfig.AutoRemove,

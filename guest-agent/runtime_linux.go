@@ -14,6 +14,10 @@ import (
 
 	cniclient "github.com/containerd/go-cni"
 	"github.com/containerd/log"
+	cnilibrary "github.com/containernetworking/cni/libcni"
+	"github.com/containernetworking/cni/pkg/invoke"
+	types100 "github.com/containernetworking/cni/pkg/types/100"
+	"github.com/containernetworking/cni/pkg/version"
 	unix "golang.org/x/sys/unix"
 )
 
@@ -254,4 +258,72 @@ func resultAddresses(res *cniclient.Result) (ip, mac string) {
 // encoding/json import at call sites above.
 func jsonUnmarshal(data []byte, v interface{}) error {
 	return json.Unmarshal(data, v)
+}
+
+// --- secondary interfaces ---------------------------------------------------
+
+// go-cni names interfaces by position in its own network list, so every
+// single-conflist instance above yields eth0. Secondary networks (compose
+// services on several networks, docker network connect) need eth1, eth2...:
+// they go through libcni directly with an explicit interface name. No port
+// mappings there — published ports live on the primary network.
+var extraCNI = cnilibrary.NewCNIConfig([]string{cniBinDir}, &invoke.DefaultExec{
+	RawExec:       &invoke.RawExec{Stderr: os.Stderr},
+	PluginDecoder: version.PluginDecoder{},
+})
+
+func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName string) (string, string, error) {
+	conflist, err := findConflistForNetwork(netName)
+	if err != nil {
+		return "", "", err
+	}
+	list, err := cnilibrary.ConfListFromFile(conflist)
+	if err != nil {
+		return "", "", fmt.Errorf("cni config %s: %w", netName, err)
+	}
+	raw, err := extraCNI.AddNetworkList(ctx, list, &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: ifName})
+	if err != nil {
+		return "", "", fmt.Errorf("cni setup %s (%s): %w", netName, ifName, err)
+	}
+	res, err := types100.NewResultFromResult(raw)
+	if err != nil {
+		return "", "", fmt.Errorf("cni result %s: %w", netName, err)
+	}
+	ip, mac := extraResultAddresses(res, ifName)
+	log.G(ctx).WithField("network", netName).Debugf("[cni] %s attached %s ip=%s", id[:12], ifName, ip)
+	return ip, mac, nil
+}
+
+func detachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName string) error {
+	conflist, err := findConflistForNetwork(netName)
+	if err != nil {
+		return err
+	}
+	list, err := cnilibrary.ConfListFromFile(conflist)
+	if err != nil {
+		return err
+	}
+	return extraCNI.DelNetworkList(ctx, list, &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: ifName})
+}
+
+// extraResultAddresses picks the IPv4 address and MAC of ifName.
+func extraResultAddresses(res *types100.Result, ifName string) (ip, mac string) {
+	idx := -1
+	for i, iface := range res.Interfaces {
+		if iface != nil && iface.Name == ifName && iface.Sandbox != "" {
+			idx, mac = i, iface.Mac
+		}
+	}
+	for _, cfg := range res.IPs {
+		if cfg == nil || (cfg.Interface != nil && idx >= 0 && *cfg.Interface != idx) {
+			continue
+		}
+		if v4 := cfg.Address.IP.To4(); v4 != nil {
+			return v4.String(), mac
+		}
+		if ip == "" {
+			ip = cfg.Address.IP.String()
+		}
+	}
+	return ip, mac
 }

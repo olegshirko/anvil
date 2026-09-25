@@ -264,9 +264,20 @@ Notable details:
   (`restart.go`), not by any external supervisor: it reads the authoritative
   task state from containerd,
   restarts with an exponential backoff that resets once the container is
-  observed running, and clears the policy on any user stop/kill/rm.
-  `docker inspect` reports `RestartPolicy`/`RestartCount` from the
+  observed running, and clears the policy on any user stop/kill/rm. A user
+  `docker start`/`docker restart` re-arms it (and resets the count), as
+  Docker does; the monitor's own restarts never re-arm, so their backoff
+  holds. `docker inspect` reports `RestartPolicy`/`RestartCount` from the
   monitor's registry.
+- A container may sit on several networks. The first one is primary: eth0
+  through go-cni, carrying the published ports and the address the port
+  forwarder targets. Further networks — every entry of a compose service's
+  `EndpointsConfig`, or `docker network connect` (live) — are secondary
+  endpoints eth1, eth2... attached through libcni directly (go-cni cannot
+  name an interface). net.json keeps the primary at its top level and the
+  secondaries in `Extra`. Each container's managed `/etc/hosts` block is the
+  union of its networks' entries, every peer at its address on the shared
+  network.
 - On a hijacked exec/attach connection the client's stdin is always a raw
   byte stream (only the output is multiplexed). It must be forwarded to the
   process as is: the buildx docker-container driver runs gRPC through

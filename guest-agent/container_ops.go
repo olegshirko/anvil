@@ -32,6 +32,8 @@ type containerNetInfo struct {
 	IP      string `json:"IP"`
 	Mac     string `json:"Mac,omitempty"`
 	Network string `json:"Network"`
+	// Extra holds the secondary endpoints (eth1...), see container_networks.go.
+	Extra []netEndpoint `json:"Extra,omitempty"`
 }
 
 func saveNetInfo(ns, id string, ni containerNetInfo) error {
@@ -148,10 +150,18 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 		if aerr != nil {
 			return fmt.Errorf("cni attach: %w", aerr)
 		}
-		saveNetInfo(ns, id, containerNetInfo{IP: ip, Mac: mac, Network: netName})
+		extra, xerr := attachSecondaryNetworks(ctx, id, meta.Networks[1:])
+		if xerr != nil {
+			dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports) //nolint:errcheck
+			cancel()
+			return fmt.Errorf("cni attach: %w", xerr)
+		}
+		saveNetInfo(ns, id, containerNetInfo{IP: ip, Mac: mac, Network: netName, Extra: extra})
 		defer func() {
 			if err != nil {
 				dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				detachSecondaryNetworks(dctx, id, extra)
 				detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports) //nolint:errcheck
 				cancel()
 				removeNetInfo(ns, id)
@@ -242,6 +252,9 @@ func watchTaskExit(ctx context.Context, ns, id, netName string, ports []cniPortM
 
 	if !usesHostNetworkName(netName) {
 		dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		if ni, ok := loadNetInfo(ns, id); ok {
+			detachSecondaryNetworks(dctx, id, ni.Extra)
+		}
 		if derr := detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports); derr != nil {
 			debugLog("[cni] detach %s/%s: %v", ns, truncateID(id), derr)
 		}
@@ -340,6 +353,7 @@ func teardownNetwork(ctx context.Context, ns, id string) {
 		ports = meta.Ports
 	}
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	detachSecondaryNetworks(dctx, id, ni.Extra)
 	detachNetwork(dctx, ni.Network, ns, id, netnsPathFor(id), ports) //nolint:errcheck
 	cancel()
 	removeNetInfo(ns, id)
@@ -417,6 +431,7 @@ func deleteNativeContainer(ctx context.Context, ns, id string, force bool) error
 			ports = meta.Ports
 		}
 		dctx, dcancel := context.WithTimeout(ctx, 10*time.Second)
+		detachSecondaryNetworks(dctx, id, ni.Extra)
 		detachNetwork(dctx, ni.Network, ns, id, netnsPathFor(id), ports) //nolint:errcheck
 		dcancel()
 		removeNetInfo(ns, id)

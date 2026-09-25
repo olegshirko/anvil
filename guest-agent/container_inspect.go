@@ -276,10 +276,17 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 				networkName = meta.Networks[0]
 			}
 			endpoint := dockerEndpointStats{}
-			if ni, ok := loadNetInfo(ns, c.ID()); ok {
+			ni, niOK := loadNetInfo(ns, c.ID())
+			if niOK {
 				endpoint = dockerEndpointStats{IPAddress: ni.IP, MacAddress: ni.Mac}
 			} else if usesHostNetworkName(networkName) {
 				endpoint = dockerEndpointStats{IPAddress: detectGuestIP()}
+			}
+			endpoints := map[string]dockerEndpointStats{networkName: endpoint}
+			if meta != nil && len(meta.Networks) > 1 {
+				for _, n := range meta.Networks[1:] {
+					endpoints[n], _ = ni.endpointOn(n)
+				}
 			}
 			containerIP := endpoint.IPAddress
 			if containerIP == "" {
@@ -324,7 +331,7 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 				NetworkSettings: dockerNetworkSettings{
 					IPAddress: containerIP,
 					Ports:     portBindings,
-					Networks:  map[string]dockerEndpointStats{networkName: endpoint},
+					Networks:  endpoints,
 				},
 			}, nil
 		}
@@ -338,15 +345,21 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 func containerNetworkInfo(ns, containerdID, name string) (map[string]dockerEndpointStats, string) {
 	primary := dockerEndpointStats{}
 	networkName := "bridge"
+	var secondary []string
 	if meta, err := loadContainerMeta(ns, containerdID); err == nil && len(meta.Networks) > 0 {
 		networkName = meta.Networks[0]
+		secondary = meta.Networks[1:]
 	}
-	if ni, ok := loadNetInfo(ns, containerdID); ok {
+	ni, niOK := loadNetInfo(ns, containerdID)
+	if niOK {
 		primary = dockerEndpointStats{IPAddress: ni.IP, MacAddress: ni.Mac}
 	} else if usesHostNetworkName(networkName) {
 		primary.IPAddress = detectGuestIP()
 	}
 	networks := map[string]dockerEndpointStats{networkName: primary}
+	for _, n := range secondary {
+		networks[n], _ = ni.endpointOn(n)
+	}
 	return networks, primary.IPAddress
 }
 

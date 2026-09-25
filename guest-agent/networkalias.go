@@ -60,44 +60,60 @@ func refreshHostsForContainer(ns, containerdID string) {
 	}
 }
 
-// refreshNetworkHosts regenerates the managed section of the hosts file of
-// every container on the network. Members come from persisted metadata
-// (create-time network membership); entries only for members that currently
-// have a CNI address (running tasks — net.json is removed on stop).
+// refreshNetworkHosts regenerates the managed hosts section of every
+// container on the network. A container on several networks gets the union
+// of all its networks' entries (one managed block per hosts file), each peer
+// at its address on the shared network. Members come from persisted
+// metadata; entries only for members with a live endpoint on that network
+// (running tasks — net.json is removed on stop).
 func refreshNetworkHosts(network string) {
 	metas, err := containerMetas()
 	if err != nil {
 		return
 	}
 	var members []*containerMeta
-	var entries []string
 	for _, m := range metas {
-		if !stringIn(m.Networks, network) {
-			continue
-		}
-		members = append(members, m)
-		names := append([]string{m.Name}, m.Aliases...)
-		if ip := containerAddress(m.Namespace, m.ID); ip != "" && containerOnNetwork(m.Namespace, m.ID, network) {
-			entries = append(entries, ip+"\t"+strings.Join(dedupeStrings(names), " "))
+		if stringIn(m.Networks, network) {
+			members = append(members, m)
 		}
 	}
-	block := ""
-	if len(entries) > 0 {
-		block = netHostsBegin + "\n" + strings.Join(entries, "\n") + "\n" + netHostsEnd + "\n"
-	}
+	entries := networkHostsEntries(metas, func(ns, id string) (containerNetInfo, bool) { return loadNetInfo(ns, id) })
 	for _, m := range members {
-		rewriteHostsManagedSection(containerHostsPath(m.Namespace, m.ID), block)
+		rewriteHostsManagedSection(containerHostsPath(m.Namespace, m.ID), hostsBlockFor(m, entries))
 	}
-	log.Printf("[net-alias] network %s refreshed: %d entries across %d members", network, len(entries), len(members))
+	log.Printf("[net-alias] network %s refreshed: %d entries across %d members", network, len(entries[network]), len(members))
 }
 
-// containerOnNetwork reports whether the container's live CNI endpoint
-// (net.json) is currently attached to the named network.
-func containerOnNetwork(ns, id, network string) bool {
-	if ni, ok := loadNetInfo(ns, id); ok {
-		return ni.Network == network
+// networkHostsEntries maps each network to its "ip\tnames" lines.
+func networkHostsEntries(metas []*containerMeta, netInfo func(ns, id string) (containerNetInfo, bool)) map[string][]string {
+	out := map[string][]string{}
+	for _, m := range metas {
+		ni, ok := netInfo(m.Namespace, m.ID)
+		if !ok {
+			continue
+		}
+		names := strings.Join(dedupeStrings(append([]string{m.Name}, m.Aliases...)), " ")
+		for _, n := range m.Networks {
+			if ip := ni.ipOn(n); ip != "" {
+				out[n] = append(out[n], ip+"\t"+names)
+			}
+		}
 	}
-	return false
+	return out
+}
+
+// hostsBlockFor renders the managed block of one member: the entries of
+// every network it belongs to, first occurrence of a line wins.
+func hostsBlockFor(m *containerMeta, entries map[string][]string) string {
+	var lines []string
+	for _, n := range m.Networks {
+		lines = append(lines, entries[n]...)
+	}
+	lines = dedupeStrings(lines)
+	if len(lines) == 0 {
+		return ""
+	}
+	return netHostsBegin + "\n" + strings.Join(lines, "\n") + "\n" + netHostsEnd + "\n"
 }
 
 // rewriteHostsManagedSection replaces the anvil-managed block of a hosts

@@ -84,8 +84,10 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name, p
 	// Make sure the per-network CNI conflist exists before creating the
 	// container, otherwise CNI attach fails with "no such network".
 	if !usesHostNetwork(req) {
-		if err := generateCNIConfig(effectiveNetworkName(networkMode)); err != nil {
-			log.Printf("[docker-api] ensure cni config for %s: %v", networkMode, err)
+		for _, n := range append([]string{effectiveNetworkName(networkMode)}, secondaryNetworksFromCreate(req)...) {
+			if err := generateCNIConfig(n); err != nil {
+				log.Printf("[docker-api] ensure cni config for %s: %v", n, err)
+			}
 		}
 	}
 
@@ -526,8 +528,17 @@ func restartDockerContainer(ctx context.Context, id string, timeout int) error {
 	if err != nil {
 		return err
 	}
+	// Disarm during the stop so the monitor cannot race its own start in
+	// between; re-armed below, as Docker keeps the policy across restart.
+	did := dockerID(ns, containerdID)
+	restarts.clear(did)
 	if err := stopNativeTask(ctx, ns, containerdID, timeout); err != nil {
+		restarts.rearm(did)
 		return err
 	}
-	return startNativeTask(ctx, ns, containerdID)
+	if err := startNativeTask(ctx, ns, containerdID); err != nil {
+		return err
+	}
+	restarts.rearm(did)
+	return nil
 }
