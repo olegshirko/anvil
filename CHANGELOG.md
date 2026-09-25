@@ -2,6 +2,9 @@
 
 ### Fixed
 - d07e3cc fix: multi-network containers, live network connect/disconnect, restart policy re-armed by start
+
+### Internal
+- 5d15350 build(guest-agent): go.mod lists libcni as a direct dependency
 ## v1.3.0 (2026-09-25)
 
 ### Added
