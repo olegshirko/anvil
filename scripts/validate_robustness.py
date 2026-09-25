@@ -118,8 +118,10 @@ DOCKER_SOCKET = Path.home() / ".anvil-vz" / "docker.sock"
 def docker(*args: str, network: str | None = None,
            timeout: float = 60.0) -> subprocess.CompletedProcess:
     full = ["docker", "--host", f"unix://{DOCKER_SOCKET}"]
-    if network:
-        full += ["--network", network]
+    if network and args:
+        # --network is a run/create flag: it goes after the subcommand (the
+        # CLI rejects it as a global flag).
+        args = (args[0], "--network", network, *args[1:])
     return run_host([*full, *args], timeout=timeout)
 
 
@@ -471,8 +473,8 @@ def test_two_projects() -> None:
         # conflict check in guest-agent this must fail before the container is
         # created, with a clear error message.
         conflict = run_host(
-            ["docker", "--host", f"unix://{DOCKER_SOCKET}", "--network", "project-b",
-             "run", "-d", "-p", "8080:80", "--name", "nginx-b-conflict", "nginx"],
+            ["docker", "--host", f"unix://{DOCKER_SOCKET}", "run", "--network", "project-b",
+             "-d", "-p", "8080:80", "--name", "nginx-b-conflict", "nginx"],
             timeout=30.0,
             check=False,
         )
