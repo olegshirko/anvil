@@ -2403,7 +2403,8 @@ def test_volume_copy_up_and_image_volume() -> None:
 
 
 def test_network_events() -> None:
-    net, name = f"{PREFIX}-evnet", f"{PREFIX}-evc"
+    # unique per run: the --since window reaches back past earlier runs
+    net, name = f"{PREFIX}-evnet-{int(time.time())}", f"{PREFIX}-evc"
     try:
         since = str(int(time.time()) - 30)  # guest clock may trail the Mac's
         docker("network", "create", net)
@@ -2610,15 +2611,17 @@ def test_health_status_events() -> None:
         # Generous: event times come from the guest clock, which may trail
         # the Mac's by a moment after a resume.
         since = str(int(time.time()) - 30)
-        docker("run", "-d", "--name", name, "--health-cmd", "test -f /tmp/ok", "--health-interval", "1s",
-               "--health-retries", "2", "alpine", "sh", "-c", "touch /tmp/ok; sleep 4; rm /tmp/ok; sleep 300")
+        cid = docker("run", "-d", "--name", name, "--health-cmd", "test -f /tmp/ok", "--health-interval", "1s",
+                     "--health-retries", "2", "alpine", "sh", "-c",
+                     "touch /tmp/ok; sleep 4; rm /tmp/ok; sleep 300").stdout.strip()
         deadline = time.time() + 30
         while time.time() < deadline:
             if docker("inspect", "-f", "{{.State.Health.Status}}", name).stdout.strip() == "unhealthy":
                 break
             time.sleep(1)
         out = docker("events", "--since", since, "--until", str(int(time.time()) + 1),
-                     "--filter", f"container={name}", "--filter", "event=health_status",
+                     # by ID: the name is reused by earlier runs of this test
+                     "--filter", f"container={cid}", "--filter", "event=health_status",
                      "--format", "{{.Action}}", timeout=30.0).stdout.splitlines()
         if out != ["health_status: healthy", "health_status: unhealthy"]:
             raise RuntimeError(f"health events {out}")
