@@ -1,3 +1,7 @@
+## v1.3.2 (2026-09-25)
+
+### Fixed
+- 00a3b15 fix: docker cp without a shell in the image, --network none, network rm in use, save under GC
 ## v1.3.1 (2026-09-25)
 
 ### Fixed
