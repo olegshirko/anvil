@@ -1,3 +1,7 @@
+## v1.3.3 (2026-09-25)
+
+### Fixed
+- dd6ce27 fix(security): docker cp/export cannot escape the container root; review fixes
 ## v1.3.2 (2026-09-25)
 
 ### Fixed
