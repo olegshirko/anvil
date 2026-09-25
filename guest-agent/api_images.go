@@ -21,6 +21,7 @@ var imageRoutes = []apiRoute{
 	newRoute(http.MethodGet, "/images/get", func(w http.ResponseWriter, r *http.Request, _ routeParams) {
 		handleImagesGet(w, r)
 	}),
+	newRoute(http.MethodGet, "/images/search", handleImageSearch),
 	newRoute(http.MethodPost, "/build/prune", handleBuildPrune),
 
 	newRoute(http.MethodPost, "/images/*name/tag", handleImageTag),
@@ -29,6 +30,7 @@ var imageRoutes = []apiRoute{
 		handleImageGet(w, r, p["name"])
 	}),
 	newRoute(http.MethodGet, "/images/*name/json", handleImageInspect),
+	newRoute(http.MethodGet, "/images/*name/history", handleImageHistory),
 	newRoute(http.MethodDelete, "/images/*name", handleImageDelete),
 }
 
@@ -150,4 +152,14 @@ func handleImageInspect(w http.ResponseWriter, r *http.Request, p routeParams) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(info)
+}
+
+func handleImageHistory(w http.ResponseWriter, r *http.Request, p routeParams) {
+	items, err := imageHistory(r.Context(), p["name"])
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(items)
 }

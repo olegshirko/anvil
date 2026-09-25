@@ -460,21 +460,9 @@ func pruneDockerImages(ctx context.Context, dangling bool) ([]map[string]string,
 // inspectDockerImage returns a Docker-compatible image inspect payload,
 // searching all namespaces for the image.
 func inspectDockerImage(ctx context.Context, name string) (map[string]interface{}, error) {
-	ns := findImageNamespace(ctx, name)
-	if ns == "" {
-		ns = "default"
-	}
-	cl, err := pc.get(ctx)
+	img, nsCtx, err := lookupDockerImage(ctx, name)
 	if err != nil {
-		return nil, fmt.Errorf("containerd client: %w", err)
-	}
-	nsCtx := namespaces.WithNamespace(ctx, ns)
-	img, gerr := cl.GetImage(nsCtx, canonicalizeImageRef(name))
-	if gerr != nil {
-		img, gerr = cl.GetImage(nsCtx, name)
-	}
-	if gerr != nil {
-		return nil, fmt.Errorf("No such image: %s", name)
+		return nil, err
 	}
 	spec, serr := img.Spec(nsCtx)
 	if serr != nil {

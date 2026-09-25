@@ -17,8 +17,7 @@ func TestUnsupportedHostConfigWarnings(t *testing.T) {
 		bad  []string // substrings that must NOT appear
 	}{
 		{"empty", dockerHostConfig{}, nil, nil},
-		{"init true", dockerHostConfig{Init: &yes},
-			[]string{"Init"}, nil},
+		{"init true is honored, not warned", dockerHostConfig{Init: &yes}, nil, []string{"Init"}},
 		{"init false", dockerHostConfig{Init: &no}, nil, []string{"Init"}},
 		{"userns", dockerHostConfig{UsernsMode: "remap"},
 			[]string{"UsernsMode"}, nil},

@@ -136,6 +136,14 @@ chmod +x bin/guest-agent
 mkdir -p opt/containerd/bin
 tar -xzf "$TOOLS_DIR/containerd.tgz" -C opt/containerd/bin --strip-components=1 2>/dev/null || true
 cp "$TOOLS_DIR/runc" opt/containerd/bin/runc
+# docker-init (static tini): the guest-agent bind-mounts it into containers
+# run with --init / compose `init: true`.
+if [[ ! -f "$TOOLS_DIR/tini" ]]; then
+    echo "tini not found at $TOOLS_DIR/tini; run 'make container-tools' first"
+    exit 1
+fi
+cp "$TOOLS_DIR/tini" opt/containerd/bin/docker-init
+chmod +x opt/containerd/bin/docker-init
 # buildkitd + buildctl for `docker build` (the agent calls buildkitd via gRPC). These
 # build-only binaries (~150 MB unpacked, the largest part of the initramfs)
 # are packed as ONE compressed tarball in /opt instead of loose rootfs

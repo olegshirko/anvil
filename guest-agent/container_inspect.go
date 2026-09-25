@@ -144,8 +144,9 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 			command := ""
 			var spec specs.Spec
 			if info.Spec != nil && json.Unmarshal(info.Spec.GetValue(), &spec) == nil && spec.Process != nil {
-				args := make([]string, len(spec.Process.Args))
-				for i, a := range spec.Process.Args {
+				userArgs := userProcessArgs(spec.Process.Args)
+				args := make([]string, len(userArgs))
+				for i, a := range userArgs {
 					if strings.ContainsAny(a, " \t") {
 						args[i] = `"` + a + `"`
 					} else {
@@ -268,7 +269,7 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 			envList, cmdList, openStdin := []string{}, []string{}, false
 			if spec, err := c.Spec(nsCtx); err == nil && spec != nil && spec.Process != nil {
 				envList = spec.Process.Env
-				cmdList = spec.Process.Args
+				cmdList = userProcessArgs(spec.Process.Args)
 			}
 			networkName := "bridge"
 			if meta != nil && len(meta.Networks) > 0 {
@@ -381,9 +382,6 @@ func portBindingsFromMeta(meta *containerMeta) map[string][]dockerHostPort {
 // by validateHostConfig instead — this is only for accepted-but-degraded.
 func unsupportedHostConfigWarnings(hc dockerHostConfig) []string {
 	var w []string
-	if hc.Init != nil && *hc.Init {
-		w = append(w, "HostConfig.Init is not supported; no init process is injected")
-	}
 	if m := hc.UsernsMode; m != "" && m != "host" {
 		w = append(w, fmt.Sprintf("HostConfig.UsernsMode %q is not supported", m))
 	}

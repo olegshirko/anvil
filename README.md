@@ -226,24 +226,25 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
 - Apple Silicon only; no amd64 emulation yet (Rosetta support is planned).
   `docker run --platform linux/amd64` is rejected with an explicit error
   rather than silently substituting an arm64 image.
-- **Containers run with no seccomp filter.** Unlike Docker, whose default
-  profile blocks several dozen syscalls, anvil applies no seccomp/LSM
-  confinement — `--security-opt seccomp=unconfined` is effectively the
-  default for every container. This weakens the inner sandbox; the VM
-  boundary and the hypervisor are the primary isolation. `no-new-privileges`
-  is honored; custom seccomp profiles, AppArmor and SELinux labels are
-  rejected. A default seccomp profile is planned.
+- No AppArmor/SELinux in the guest. Seccomp matches Docker: unprivileged
+  containers get the default profile, `--security-opt seccomp=unconfined` and
+  `--privileged` lift it, and custom profiles (`seccomp=profile.json`, Docker
+  format) are honored. `no-new-privileges` is honored; AppArmor and SELinux
+  labels are rejected.
 - HostConfig surface: `--cpus/--cpuset-cpus/--pids-limit/--ulimit/--shm-size/
-  --memory-swap/--group-add (numeric)/--uts=host/--ipc=host/--cgroupns=host`
-  are honored. Refused with a 400 naming the flag: `--oom-kill-disable`,
-  `--blkio-weight`, `--storage-opt`, `--isolation`, `--runtime`,
-  `--log-driver` other than `json-file`/`none`, custom seccomp profiles,
-  AppArmor/SELinux. Not yet implemented: `--volumes-from`, `--init` (warned,
-  not rejected).
+  --memory-swap/--group-add (numeric)/--uts=host/--ipc=host/--cgroupns=host/
+  --init/--volumes-from` are honored. Refused with a 400 naming the flag:
+  `--oom-kill-disable`, `--blkio-weight`, `--storage-opt`, `--isolation`,
+  `--runtime`, `--log-driver` other than `json-file`/`none`, AppArmor/SELinux.
+- `host.docker.internal` and `gateway.docker.internal` resolve to the Mac in
+  every container (as in Docker Desktop), and so does `--add-host
+  name:host-gateway`. They reach Mac services listening on all interfaces;
+  services bound only to the Mac's `127.0.0.1` are not reachable.
 - Docker API is emulated, not complete: it covers what `docker` CLI and
   `docker compose` actually use. Not implemented: Swarm and its whole CLI
-  surface, `docker commit`, `docker update`, `docker diff`/`/changes`,
-  `docker export`, plugins and some prune endpoints.
+  surface, `docker commit`, `docker update`, plugins and some prune
+  endpoints. `docker search` queries Docker Hub only. `docker diff` does not
+  report files hidden by an opaque directory (`rm -rf dir && mkdir dir`).
 - With the remote buildx driver, plain `docker build` keeps the result in the
   build cache — add `--load` to import it into the image store (compose does
   this automatically). The buildx `docker-container` driver (which pulls a

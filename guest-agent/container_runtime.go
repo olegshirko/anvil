@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -72,27 +74,7 @@ func prepareContainerRoot(ns, id, hostname string, dns []string, extraHosts []st
 		return err
 	}
 
-	hosts := "127.0.0.1\tlocalhost\n" +
-		"::1\tlocalhost ip6-localhost ip6-loopback\n" +
-		"fe00::0\tip6-localnet\n" +
-		"ff00::0\tip6-mcastprefix\n" +
-		"ff02::1\tip6-allnodes\n" +
-		"ff02::2\tip6-allrouters\n" +
-		"127.0.0.1\t" + hostname + "\n"
-	for _, eh := range extraHosts {
-		parts := strings.SplitN(eh, ":", 2)
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-			continue
-		}
-		ip := parts[1]
-		if ip == "host-gateway" {
-			ip = detectGuestIP()
-			if ip == "" {
-				ip = "10.10.0.1"
-			}
-		}
-		hosts += ip + "\t" + parts[0] + "\n"
-	}
+	hosts := containerHostsContent(hostname, extraHosts, hostGatewayIP())
 	if err := os.WriteFile(containerHostsPath(ns, id), []byte(hosts), 0o644); err != nil {
 		return err
 	}
@@ -109,6 +91,78 @@ func prepareContainerRoot(ns, id, hostname string, dns []string, extraHosts []st
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "hostname"), []byte(hostname+"\n"), 0o644)
+}
+
+// Docker Desktop names for the Mac, resolvable in every container.
+var desktopHostNames = []string{"host.docker.internal", "gateway.docker.internal"}
+
+// containerHostsContent renders a container's /etc/hosts. hostIP is what
+// "host-gateway" and the Docker Desktop names resolve to — the Mac, not the
+// VM: on macOS that is what users mean by "the host". An explicit
+// --add-host for one of those names wins over the built-in entry.
+func containerHostsContent(hostname string, extraHosts []string, hostIP string) string {
+	hosts := "127.0.0.1\tlocalhost\n" +
+		"::1\tlocalhost ip6-localhost ip6-loopback\n" +
+		"fe00::0\tip6-localnet\n" +
+		"ff00::0\tip6-mcastprefix\n" +
+		"ff02::1\tip6-allnodes\n" +
+		"ff02::2\tip6-allrouters\n" +
+		"127.0.0.1\t" + hostname + "\n"
+	overridden := map[string]bool{}
+	for _, eh := range extraHosts {
+		// The API carries "name:ip"; newer CLIs also accept "name=ip".
+		// Split at the first separator only: IPv6 addresses contain ':'.
+		sep := strings.IndexAny(eh, ":=")
+		if sep <= 0 || sep == len(eh)-1 {
+			continue
+		}
+		name, ip := eh[:sep], eh[sep+1:]
+		if ip == "host-gateway" {
+			ip = hostIP
+		}
+		hosts += ip + "\t" + name + "\n"
+		overridden[name] = true
+	}
+	for _, n := range desktopHostNames {
+		if !overridden[n] {
+			hosts += hostIP + "\t" + n + "\n"
+		}
+	}
+	return hosts
+}
+
+// hostGatewayIP is the Mac's address as seen from the VM: the default
+// gateway of the Virtualization.framework NAT. Containers reach it through
+// the CNI bridge's masquerade like any other off-subnet address. Falls back
+// to the VM's own address (the pre-Desktop-compat behavior) when there is no
+// default route yet.
+func hostGatewayIP() string {
+	if data, err := os.ReadFile("/proc/net/route"); err == nil {
+		if gw := parseDefaultGateway(string(data)); gw != "" {
+			return gw
+		}
+	}
+	if ip := detectGuestIP(); ip != "" {
+		return ip
+	}
+	return "10.10.0.1"
+}
+
+// parseDefaultGateway extracts the IPv4 default gateway from the contents of
+// /proc/net/route (little-endian hex addresses).
+func parseDefaultGateway(routeTable string) string {
+	for _, line := range strings.Split(routeTable, "\n")[1:] {
+		f := strings.Fields(line)
+		if len(f) < 3 || f[1] != "00000000" {
+			continue
+		}
+		v, err := strconv.ParseUint(f[2], 16, 32)
+		if err != nil || v == 0 {
+			continue
+		}
+		return fmt.Sprintf("%d.%d.%d.%d", byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+	}
+	return ""
 }
 
 // --- mounts ---------------------------------------------------------------
@@ -179,11 +233,26 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 		}
 	}
 	for _, m := range req.HostConfig.Mounts {
-		if m.Type == "tmpfs" || m.Source == "" || m.Target == "" {
+		// A volume mount without a source is anonymous (compose `- /data`).
+		if m.Type == "tmpfs" || m.Target == "" || (m.Source == "" && m.Type != "volume") {
 			continue
 		}
 		if err := addHostOrVolume(m.Source, m.Target, m.ReadOnly); err != nil {
 			return nil, nil, fmt.Errorf("mount %q: %w", m.Target, err)
+		}
+	}
+	// The CLI sends a bare `-v /path` as Config.Volumes, not as a bind.
+	// Paths something else already mounts need no anonymous volume.
+	taken := map[string]bool{}
+	for _, m := range mounts {
+		taken[filepath.Clean(m.Destination)] = true
+	}
+	for _, dst := range slices.Sorted(maps.Keys(req.Volumes)) {
+		if taken[filepath.Clean(dst)] {
+			continue
+		}
+		if err := addHostOrVolume("", dst, false); err != nil {
+			return nil, nil, fmt.Errorf("volume %q: %w", dst, err)
 		}
 	}
 	for path, optsStr := range req.HostConfig.TmpFs {
@@ -213,6 +282,90 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 			Destination: "/etc/hostname", Options: []string{"rbind"}},
 	)
 	return mounts, anonVols, nil
+}
+
+// volumesFromMounts resolves --volumes-from: every volume and bind mount of
+// the referenced containers, read from their OCI specs (which already
+// include what they inherited themselves). A ":ro"/":rw" suffix overrides
+// the access mode, as in Docker.
+func volumesFromMounts(ctx context.Context, refs []string) ([]specs.Mount, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("containerd client: %w", err)
+	}
+	var out []specs.Mount
+	for _, ref := range refs {
+		name, mode := ref, ""
+		if i := strings.LastIndexByte(ref, ':'); i > 0 {
+			name, mode = ref[:i], ref[i+1:]
+		}
+		if mode != "" && mode != "ro" && mode != "rw" {
+			return nil, fmt.Errorf("volumes-from %q: invalid mode %q", ref, mode)
+		}
+		srcNS, srcID, _, rerr := resolveDockerID(ctx, name)
+		if rerr != nil {
+			return nil, fmt.Errorf("volumes-from %q: %w", name, rerr)
+		}
+		nsCtx := namespaces.WithNamespace(ctx, srcNS)
+		c, lerr := cl.LoadContainer(nsCtx, srcID)
+		if lerr != nil {
+			return nil, fmt.Errorf("volumes-from %q: %w", name, lerr)
+		}
+		spec, serr := c.Spec(nsCtx)
+		if serr != nil {
+			return nil, fmt.Errorf("volumes-from %q: spec: %w", name, serr)
+		}
+		out = append(out, inheritableMounts(spec.Mounts, mode)...)
+	}
+	return out, nil
+}
+
+// inheritableMounts picks the user volumes out of a container's OCI mounts:
+// bind mounts, minus the per-container /etc files and docker-init.
+func inheritableMounts(all []specs.Mount, mode string) []specs.Mount {
+	var out []specs.Mount
+	for _, m := range all {
+		if m.Type != "bind" {
+			continue
+		}
+		switch m.Destination {
+		case "/etc/hosts", "/etc/resolv.conf", "/etc/hostname", containerInitPath:
+			continue
+		}
+		opts := []string{}
+		for _, o := range m.Options {
+			if o != "ro" && o != "rw" {
+				opts = append(opts, o)
+			}
+		}
+		if mode == "ro" || (mode == "" && slices.Contains(m.Options, "ro")) {
+			opts = append(opts, "ro")
+		}
+		m.Options = opts
+		out = append(out, m)
+	}
+	return out
+}
+
+// mergeInheritedMounts adds inherited mounts whose destination the
+// container does not mount itself: its own -v/--mount wins, as in Docker.
+func mergeInheritedMounts(own, inherited []specs.Mount) []specs.Mount {
+	taken := map[string]bool{}
+	for _, m := range own {
+		taken[filepath.Clean(m.Destination)] = true
+	}
+	for _, m := range inherited {
+		dst := filepath.Clean(m.Destination)
+		if taken[dst] {
+			continue
+		}
+		taken[dst] = true
+		own = append(own, m)
+	}
+	return own
 }
 
 // --- OCI spec construction -------------------------------------------------
@@ -254,6 +407,31 @@ func mergeEnv(lists ...[]string) []string {
 	return out
 }
 
+// docker-init (a static tini) ships in the guest and is bind-mounted into
+// containers that ask for --init, at the path Docker uses.
+const (
+	guestInitPath     = "/opt/containerd/bin/docker-init"
+	containerInitPath = "/sbin/docker-init"
+)
+
+// dockerInitMount is the read-only bind of the guest's docker-init.
+func dockerInitMount() (specs.Mount, error) {
+	if _, err := os.Stat(guestInitPath); err != nil {
+		return specs.Mount{}, fmt.Errorf("--init: %s is missing from the guest (rebuild the initramfs)", guestInitPath)
+	}
+	return specs.Mount{Type: "bind", Source: guestInitPath, Destination: containerInitPath,
+		Options: []string{"rbind", "ro"}}, nil
+}
+
+// userProcessArgs strips the injected docker-init prefix, so ps/inspect
+// show the command the user asked for, as Docker does.
+func userProcessArgs(args []string) []string {
+	if len(args) >= 2 && args[0] == containerInitPath && args[1] == "--" {
+		return args[2:]
+	}
+	return args
+}
+
 // cpuPeriod is the CFS period Docker and runc use by default (100 ms).
 const cpuPeriod = 100000
 
@@ -270,6 +448,14 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 	argv := append(append([]string{}, entrypoint...), cmdArgs...)
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("no command specified and image has no CMD")
+	}
+	if req.HostConfig.Init != nil && *req.HostConfig.Init {
+		initMount, ierr := dockerInitMount()
+		if ierr != nil {
+			return nil, ierr
+		}
+		mounts = append(mounts, initMount)
+		argv = append([]string{containerInitPath, "--"}, argv...)
 	}
 
 	env := mergeEnv(imageEnv(imgCfg), req.Env)
@@ -405,13 +591,9 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 			switch {
 			case opt == "no-new-privileges" || opt == "no-new-privileges:true":
 				opts = append(opts, oci.WithNoNewPrivileges)
-			case opt == "seccomp=unconfined":
-				// already the effective default: no seccomp filter is applied
-			case opt == "seccomp=false": // docker's legacy alias for unconfined
+			case strings.HasPrefix(opt, "seccomp=") || strings.HasPrefix(opt, "seccomp:"):
+				// applied last by seccompSpecOpt (it needs the final caps)
 			default:
-				if strings.HasPrefix(opt, "seccomp=") {
-					return nil, fmt.Errorf("security-opt %q: custom seccomp profiles are not supported (no default profile exists yet)", opt)
-				}
 				if strings.HasPrefix(opt, "apparmor=") {
 					return nil, fmt.Errorf("security-opt %q: no AppArmor in the anvil guest", opt)
 				}
@@ -507,6 +689,14 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 			Path: netnsPathFor(id),
 		}))
 	}
+	// Last: the profile is resolved against the final capability set.
+	seccompOpt, err := seccompSpecOpt(req.HostConfig.SecurityOpt, req.HostConfig.Privileged)
+	if err != nil {
+		return nil, err
+	}
+	if seccompOpt != nil {
+		opts = append(opts, seccompOpt)
+	}
 	return opts, nil
 }
 
@@ -572,6 +762,11 @@ func createNativeContainer(ctx context.Context, ns, name string, req dockerCreat
 		return "", merr
 	}
 	anonVols = vols
+	inherited, verr := volumesFromMounts(ctx, req.HostConfig.VolumesFrom)
+	if verr != nil {
+		return "", verr
+	}
+	mounts = mergeInheritedMounts(mounts, inherited)
 
 	var imgCfg *ocispecImageConfig
 	if spec, serr := img.Spec(nsCtx); serr == nil {

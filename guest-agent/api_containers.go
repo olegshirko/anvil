@@ -46,6 +46,8 @@ var containerRoutes = []apiRoute{
 	newRoute(http.MethodGet, "/containers/:id/archive", containerArchive),
 	newRoute(http.MethodPut, "/containers/:id/archive", containerArchive),
 	newRoute(http.MethodPost, "/containers/:id/exec", handleContainerExecCreate),
+	newRoute(http.MethodGet, "/containers/:id/export", handleContainerExport),
+	newRoute(http.MethodGet, "/containers/:id/changes", handleContainerChanges),
 
 	newRoute(http.MethodPost, "/exec/:id/start", handleContainerExecStart),
 	newRoute(http.MethodGet, "/exec/:id/json", handleContainerExecInspect),

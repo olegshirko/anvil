@@ -20,6 +20,7 @@ type dockerCreateRequest struct {
 	WorkingDir       string                `json:"WorkingDir"`
 	StopSignal       string                `json:"StopSignal"`
 	Image            string                `json:"Image"`
+	Volumes          map[string]struct{}   `json:"Volumes"` // anonymous `-v /path`
 	Labels           map[string]string     `json:"Labels"`
 	NetworkingConfig *dockerNetworkingConf `json:"NetworkingConfig,omitempty"`
 	HostConfig       dockerHostConfig      `json:"HostConfig"`
@@ -55,6 +56,7 @@ type dockerHostConfig struct {
 	Sysctls         map[string]string           `json:"Sysctls"`
 	Devices         []dockerDevice              `json:"Devices"`
 	Links           []string                    `json:"Links"`
+	VolumesFrom     []string                    `json:"VolumesFrom"`
 
 	// Resource knobs beyond Memory/NanoCpus. Zero values mean "unset" and are
 	// skipped; docker semantics for sentinel values (-1) are honored.

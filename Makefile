@@ -263,6 +263,8 @@ CONTAINERD_URL := https://github.com/containerd/containerd/releases/download/v2.
 RUNC_URL := https://github.com/opencontainers/runc/releases/download/v1.5.1/runc.arm64
 CNI_PLUGINS_URL := https://github.com/containernetworking/plugins/releases/download/v1.9.1/cni-plugins-linux-arm64-v1.9.1.tgz
 BUILDKIT_URL := https://github.com/moby/buildkit/releases/download/v0.32.2/buildkit-v0.32.2.linux-arm64.tar.gz
+# docker-init for `docker run --init` (static, bind-mounted into containers).
+TINI_URL := https://github.com/krallin/tini/releases/download/v0.19.0/tini-static-arm64
 DOCKER_URL := https://download.docker.com/linux/static/stable/aarch64/docker-29.6.1.tgz
 
 # Alpine linux-virt kernel + modules, both from the SAME apk (guaranteed
@@ -298,6 +300,10 @@ container-tools: $(CONTAINER_TOOLS_DIR)
 	fi
 	if [ ! -f $(CONTAINER_TOOLS_DIR)/buildkit.tgz ]; then \
 	    curl -L -o $(CONTAINER_TOOLS_DIR)/buildkit.tgz $(BUILDKIT_URL); \
+	fi
+	if [ ! -f $(CONTAINER_TOOLS_DIR)/tini ]; then \
+	    curl -fL -o $(CONTAINER_TOOLS_DIR)/tini $(TINI_URL); \
+	    chmod +x $(CONTAINER_TOOLS_DIR)/tini; \
 	fi
 
 # Alpine iptables + libs needed by CNI bridge/portmap/firewall plugins.
