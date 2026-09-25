@@ -404,7 +404,7 @@ final class VMLifecycleManager: NSObject {
                     self.phaseTimer.mark("vm_restore")
                     self.snapshot.invalidateBeforeResume()
                     let resumeStart = Date()
-                    vm.resume { result in
+                    vm.resume { [weak self] result in
                         DispatchQueue.main.async { [weak self] in
                             guard let self = self else { return }
                             let resumeDuration = Date().timeIntervalSince(resumeStart)

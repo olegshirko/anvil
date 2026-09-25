@@ -551,7 +551,6 @@ private final class Listener {
     private func pumpUDPReplies(fd: Int32) {
         udpClientsLock.lock()
         let clients = udpClients
-        let keysByFd = Dictionary(uniqueKeysWithValues: udpClients.map { ($0.value.fd, $0.key) })
         udpClientsLock.unlock()
         var buffer = [UInt8](repeating: 0, count: 65536)
         for (key, c) in clients {
@@ -777,7 +776,7 @@ private final class Listener {
 private func connectWithTimeout(_ fd: Int32, _ addr: sockaddr_in, timeout: TimeInterval) -> Bool {
     let flags = fcntl(fd, F_GETFL, 0)
     guard flags >= 0 else { return false }
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 
     let rc = withUnsafePointer(to: addr) { ptr -> Int32 in
         ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -785,7 +784,7 @@ private func connectWithTimeout(_ fd: Int32, _ addr: sockaddr_in, timeout: TimeI
         }
     }
     if rc == 0 {
-        fcntl(fd, F_SETFL, flags)
+        _ = fcntl(fd, F_SETFL, flags)
         return true
     }
     guard errno == EINPROGRESS else { return false }
@@ -796,7 +795,7 @@ private func connectWithTimeout(_ fd: Int32, _ addr: sockaddr_in, timeout: TimeI
     var len = socklen_t(MemoryLayout<Int32>.size)
     getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &len)
     // Restore blocking mode: the relay pumps rely on blocking recv/send.
-    fcntl(fd, F_SETFL, flags)
+    _ = fcntl(fd, F_SETFL, flags)
     return soError == 0
 }
 
