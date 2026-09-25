@@ -537,8 +537,11 @@ def test_restart_policy_survives_resume() -> None:
 
         # The policy registry is in guest-agent memory, which IS the
         # snapshot: after resume the monitor must still own the policy.
-        # Kill the process (exit 137) and expect a restart.
-        docker("kill", "restarting", timeout=30.0)
+        # Make the workload fail on its own (killing its sleep sends the
+        # `||` branch: exit 1) and expect a restart. Not `docker kill`: as
+        # in Docker, a user kill disables the policy (ExitOnNext).
+        docker("exec", "restarting", "pkill", "sleep", timeout=30.0)
+        time.sleep(2.0)
         restarted = wait_running()
         # A user stop must still win after the resume.
         docker("stop", "-t", "1", "restarting", timeout=60.0)
@@ -567,7 +570,10 @@ def test_udp_survives_resume() -> None:
         vz_pull("project-a", "alpine")
         docker("run", "-d", "-p", "25361:15361/udp",
                 "--name", "udpecho", "alpine", "sh", "-c",
-                "while true; do echo -n UDP-UP | nc -l -u -p 15361; done",
+                # busybox nc -l -u serves only its first sender until it
+                # exits; the host relays each client (and every daemon
+                # instance) from a new source port, so recycle it.
+                "while true; do echo -n UDP-UP | timeout 3 nc -l -u -p 15361; done",
                 network="project-a")
         time.sleep(2.0)
 
@@ -580,7 +586,7 @@ def test_udp_survives_resume() -> None:
         stop_daemon(proc)  # save
         proc = start_daemon(fresh=False)  # resume
         wait_for_marker("daemon ready", timeout=60.0)
-        time.sleep(2.0)  # scanner push + listener rebind
+        time.sleep(4.0)  # scanner push + listener rebind + a fresh nc
         after = udp_probe()
 
         docker("rm", "-f", "udpecho", timeout=30.0)
