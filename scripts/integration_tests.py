@@ -2775,6 +2775,25 @@ TESTS = [
 ]
 
 
+# A few minutes' cross-section of the suite for every branch (make smoke):
+# the core run/attach/exec/logs/cp/port/volume/network/compose paths.
+SMOKE = [
+    "docker version/info handshake",
+    "run --rm attach + exit code",
+    "docker wait",
+    "published port forwarded",
+    "container lifecycle",
+    "logs",
+    "exec",
+    "cp",
+    "bind mount /Users",
+    "network connect/disconnect",
+    "compose up",
+    "volume copy-up",
+    "run --rm latency",
+]
+
+
 def main() -> int:
     if not DOCKER_SOCKET.exists():
         log(f"docker socket not found: {DOCKER_SOCKET}")
@@ -2796,9 +2815,19 @@ def main() -> int:
         return 2
 
     import sys as _sys
-    only = _sys.argv[1:]
+    args = _sys.argv[1:]
+    smoke = "--smoke" in args
+    only = [a for a in args if a != "--smoke"]
+    if smoke:
+        known = {n for n, _ in TESTS}
+        missing = [n for n in SMOKE if n not in known]
+        if missing:
+            log(f"SMOKE lists unknown tests: {missing}")
+            return 2
     selected = 0
     for name, fn in TESTS:
+        if smoke and name not in SMOKE:
+            continue
         if only and not any(o in name for o in only):
             continue
         selected += 1

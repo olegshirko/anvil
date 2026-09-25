@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -50,11 +49,10 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ds.Close()
 
-	untar := exec.Command("/bin/tar", "-xf", "-", "-C", ctxDir)
-	untar.Stdin = ds
-	untarOut, err := untar.CombinedOutput()
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("failed to extract build context: %s: %s", err, stripANSI(string(untarOut))))
+	// Go tar inside a chroot of the context dir: symlinks in the uploaded
+	// context resolve within it (same mechanism as docker cp).
+	if err := inChroot(ctxDir, func() error { return extractTar(ds, "/") }); err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("failed to extract build context: %v", err))
 		return
 	}
 	if _, err := os.Stat(filepath.Join(ctxDir, dockerfile)); err != nil {

@@ -8,7 +8,7 @@
     download-ubuntu ubuntu-modules \
     guest-agent initramfs-agent initramfs-ubuntu initramfs-containerd \
     boot-containerd-fresh alpine-virt-modules alpine-iptables download-upx \
-    container-tools time-boot time-service validate doctor unit-tests integration \
+    container-tools time-boot time-service validate doctor unit-tests integration smoke \
     harness harness-prepull harness-tests harness-all bench-all \
     prune clean-containers disk-compact \
     release replace-release update-brew release-notes bottle
@@ -170,6 +170,10 @@ unit-tests:
 # `make service-start` first; pulls alpine/nginx/busybox on first run).
 integration:
 	python3 scripts/integration_tests.py
+
+# A few-minute cross-section of the integration suite, for every branch.
+smoke:
+	python3 scripts/integration_tests.py --smoke
 
 time-boot: sign
 	python3 scripts/time_boot.py
