@@ -25,6 +25,7 @@ var containerRoutes = []apiRoute{
 		handleContainerWait(w, r, p["id"])
 	}),
 	newRoute(http.MethodPost, "/containers/:id/rename", handleContainerRename),
+	newRoute(http.MethodPost, "/containers/:id/update", handleContainerUpdate),
 	newRoute(http.MethodPost, "/containers/:id/pause", handleContainerPause),
 	newRoute(http.MethodPost, "/containers/:id/unpause", handleContainerUnpause),
 	newRoute(http.MethodGet, "/containers/:id/top", func(w http.ResponseWriter, r *http.Request, p routeParams) {

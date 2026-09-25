@@ -74,7 +74,7 @@ func prepareContainerRoot(ns, id, hostname string, dns []string, extraHosts []st
 		return err
 	}
 
-	hosts := containerHostsContent(hostname, extraHosts, hostGatewayIP())
+	hosts := containerHostsContent(hostname, extraHosts, desktopHostIP(), hostGatewayIP())
 	if err := os.WriteFile(containerHostsPath(ns, id), []byte(hosts), 0o644); err != nil {
 		return err
 	}
@@ -93,14 +93,12 @@ func prepareContainerRoot(ns, id, hostname string, dns []string, extraHosts []st
 	return os.WriteFile(filepath.Join(dir, "hostname"), []byte(hostname+"\n"), 0o644)
 }
 
-// Docker Desktop names for the Mac, resolvable in every container.
-var desktopHostNames = []string{"host.docker.internal", "gateway.docker.internal"}
-
 // containerHostsContent renders a container's /etc/hosts. hostIP is what
-// "host-gateway" and the Docker Desktop names resolve to — the Mac, not the
-// VM: on macOS that is what users mean by "the host". An explicit
-// --add-host for one of those names wins over the built-in entry.
-func containerHostsContent(hostname string, extraHosts []string, hostIP string) string {
+// "host-gateway" and host.docker.internal resolve to — the Mac, not the VM:
+// on macOS that is what users mean by "the host" (see desktopHostIP).
+// gateway.docker.internal is the VM's gateway, the Mac's NAT address. An
+// explicit --add-host for one of those names wins over the built-in entry.
+func containerHostsContent(hostname string, extraHosts []string, hostIP, gatewayIP string) string {
 	hosts := "127.0.0.1\tlocalhost\n" +
 		"::1\tlocalhost ip6-localhost ip6-loopback\n" +
 		"fe00::0\tip6-localnet\n" +
@@ -123,9 +121,9 @@ func containerHostsContent(hostname string, extraHosts []string, hostIP string) 
 		hosts += ip + "\t" + name + "\n"
 		overridden[name] = true
 	}
-	for _, n := range desktopHostNames {
-		if !overridden[n] {
-			hosts += hostIP + "\t" + n + "\n"
+	for _, e := range [][2]string{{"host.docker.internal", hostIP}, {"gateway.docker.internal", gatewayIP}} {
+		if !overridden[e[0]] {
+			hosts += e[1] + "\t" + e[0] + "\n"
 		}
 	}
 	return hosts

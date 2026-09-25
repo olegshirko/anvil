@@ -1756,10 +1756,11 @@ def test_buildx_remote_load() -> None:
 
 
 def test_host_docker_internal() -> None:
-    """host.docker.internal / gateway.docker.internal / host-gateway point at
-    the Mac, and a Mac service is reachable through them."""
+    """host.docker.internal / host-gateway reach the Mac's localhost (a
+    service bound only to 127.0.0.1, as in Docker Desktop);
+    gateway.docker.internal is the NAT gateway."""
     import http.server
-    srv = http.server.HTTPServer(("0.0.0.0", 0), http.server.SimpleHTTPRequestHandler)
+    srv = http.server.HTTPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
     port = srv.server_address[1]
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
@@ -1772,13 +1773,19 @@ def test_host_docker_internal() -> None:
             for name in ("host.docker.internal", "gateway.docker.internal", "mac.test"):
                 if len(parts) >= 2 and name in parts[1:]:
                     ips[name] = parts[0]
-        if len(ips) != 3 or len(set(ips.values())) != 1:
-            raise RuntimeError(f"desktop names not mapped to one host IP: {ips} in {hosts!r}")
-        out = docker("run", "--rm", "alpine", "wget", "-q", "-T", "5", "-O", "/dev/null",
-                     "-S", f"http://host.docker.internal:{port}/", check=False)
+        if len(ips) != 3 or ips["host.docker.internal"] != ips["mac.test"]:
+            raise RuntimeError(f"desktop names not mapped: {ips} in {hosts!r}")
+        for name in ("host.docker.internal", "mac.test"):
+            out = docker("run", "--rm", "--add-host", "mac.test:host-gateway", "alpine",
+                         "wget", "-q", "-T", "5", "-O", "/dev/null", f"http://{name}:{port}/", check=False)
+            if out.returncode != 0:
+                raise RuntimeError(f"Mac 127.0.0.1:{port} unreachable via {name}: {out.stderr.strip()}")
+        out = docker("run", "--rm", "--network", "host", "alpine",
+                     "wget", "-q", "-T", "5", "-O", "/dev/null", f"http://host.docker.internal:{port}/", check=False)
         if out.returncode != 0:
-            raise RuntimeError(f"Mac service unreachable via host.docker.internal: {out.stderr.strip()}")
-        record("host.docker.internal", "PASS", f"-> {ips['host.docker.internal']}, Mac :{port} reachable")
+            raise RuntimeError(f"host-network container cannot reach the Mac's localhost: {out.stderr.strip()}")
+        record("host.docker.internal", "PASS",
+               f"-> {ips['host.docker.internal']}, Mac 127.0.0.1:{port} reachable (bridge + host network)")
     finally:
         srv.shutdown()
 
@@ -1914,6 +1921,111 @@ def test_export_and_diff() -> None:
         cleanup(name)
 
 
+
+def test_container_update() -> None:
+    name = f"{PREFIX}-update"
+    try:
+        # exits 1 once /tmp/stop exists: a failure the restart policy sees
+        docker("run", "-d", "--name", name, "--memory", "256m", "alpine", "sh", "-c",
+               "rm -f /tmp/stop; while [ ! -f /tmp/stop ]; do sleep 0.2; done; exit 1")
+        docker("update", "--memory", "512m", "--memory-swap", "1g", "--cpus", "1.5",
+               "--pids-limit", "64", "--restart", "unless-stopped", name)
+        mem = docker("exec", name, "cat", "/sys/fs/cgroup/memory.max").stdout.strip()
+        if mem != str(512 << 20):
+            raise RuntimeError(f"memory.max = {mem}, want {512 << 20}")
+        cpu = docker("exec", name, "cat", "/sys/fs/cgroup/cpu.max").stdout.split()
+        if cpu[:2] != ["150000", "100000"]:
+            raise RuntimeError(f"cpu.max = {cpu}")
+        pids = docker("exec", name, "cat", "/sys/fs/cgroup/pids.max").stdout.strip()
+        if pids != "64":
+            raise RuntimeError(f"pids.max = {pids}")
+        insp = json.loads(docker("inspect", name).stdout)[0]["HostConfig"]
+        if insp["Memory"] != 512 << 20 or insp["NanoCpus"] != 1_500_000_000 \
+                or insp["RestartPolicy"]["Name"] != "unless-stopped":
+            raise RuntimeError(f"inspect not updated: Memory={insp['Memory']} "
+                               f"NanoCpus={insp['NanoCpus']} Restart={insp['RestartPolicy']}")
+        # the restart policy is live: the monitor brings the container back
+        docker("exec", name, "touch", "/tmp/stop", check=False)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if docker("inspect", "-f", "{{.State.Running}}", name).stdout.strip() == "true" \
+                    and docker("inspect", "-f", "{{.RestartCount}}", name).stdout.strip() != "0":
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError("updated restart policy did not restart the container")
+        # limits survive a stop/start (written into the container spec)
+        docker("stop", name, timeout=60.0)
+        docker("start", name)
+        mem = docker("exec", name, "cat", "/sys/fs/cgroup/memory.max").stdout.strip()
+        if mem != str(512 << 20):
+            raise RuntimeError(f"memory.max after restart = {mem}")
+        res = docker("update", "--memory", "2g", name, check=False)
+        if res.returncode == 0:
+            raise RuntimeError("memory above the swap limit accepted")
+        record("docker update", "PASS", "memory/cpus/pids live + persisted, restart policy armed")
+    finally:
+        cleanup(name)
+
+
+def test_commit() -> None:
+    name = f"{PREFIX}-commit"
+    image = f"{PREFIX}-committed:v1"
+    try:
+        docker("run", "--name", name, "-e", "FROM_RUN=1", "-w", "/srv", "alpine",
+               "sh", "-c", "echo committed > /srv/file")
+        docker("commit", "-c", "CMD [\"cat\", \"/srv/file\"]", "-c", "ENV EXTRA=yes",
+               "-c", "LABEL it=1", "-m", "msg", "-a", "tester", name, image)
+        out = docker("run", "--rm", image).stdout.strip()
+        if out != "committed":
+            raise RuntimeError(f"committed image output {out!r}")
+        env = docker("run", "--rm", image, "env").stdout
+        if "FROM_RUN=1" not in env or "EXTRA=yes" not in env:
+            raise RuntimeError(f"env not committed: {env!r}")
+        cfg = json.loads(docker("image", "inspect", image).stdout)[0]
+        if cfg["Config"]["WorkingDir"] != "/srv" or cfg["Config"]["Labels"].get("it") != "1" \
+                or cfg["Author"] != "tester":
+            raise RuntimeError(f"config not committed: {cfg['Config']} author={cfg['Author']}")
+        hist = docker("history", "--format", "{{.Comment}}", image).stdout.splitlines()
+        if not hist or hist[0] != "msg":
+            raise RuntimeError(f"history comment: {hist[:2]}")
+        # a running container commits too (paused during the diff)
+        docker("rm", "-f", name)
+        docker("run", "-d", "--name", name, "alpine", "sh", "-c", "touch /live && sleep 300")
+        time.sleep(0.5)
+        docker("commit", name, f"{PREFIX}-committed:live")
+        docker("run", "--rm", f"{PREFIX}-committed:live", "test", "-f", "/live")
+        if docker("inspect", "-f", "{{.State.Running}}", name).stdout.strip() != "true":
+            raise RuntimeError("container not resumed after commit")
+        record("docker commit", "PASS", "layer + config + changes; running container resumed")
+    finally:
+        cleanup(name)
+        docker("rmi", "-f", image, f"{PREFIX}-committed:live", check=False)
+
+
+def test_ssh_agent_forwarding() -> None:
+    """/run/host-services/ssh-auth.sock reaches the Mac's ssh-agent: the
+    agent's key count, asked over the raw protocol, matches ssh-add -l."""
+    sock = os.environ.get("SSH_AUTH_SOCK") or subprocess.run(
+        ["launchctl", "getenv", "SSH_AUTH_SOCK"], capture_output=True, text=True).stdout.strip()
+    if not sock:
+        record("ssh agent forwarding", "SKIP", "no ssh-agent on the Mac")
+        return
+    host = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True,
+                          env={**os.environ, "SSH_AUTH_SOCK": sock})
+    host_keys = len(host.stdout.splitlines()) if host.returncode == 0 else 0
+    # SSH_AGENTC_REQUEST_IDENTITIES (11) -> SSH_AGENT_IDENTITIES_ANSWER (12)
+    # + key count; perl ships in the nginx (debian) image, no network needed.
+    probe = ('$s=IO::Socket::UNIX->new(Peer=>"/run/host-services/ssh-auth.sock") or die "connect: $!";'
+             ' print $s pack("NC",1,11); read($s,$h,4)==4 or die "no reply";'
+             ' read($s,$b,unpack("N",$h)); printf "%d %d\\n", unpack("C",$b), unpack("N",substr($b,1,4));')
+    out = docker("run", "--rm",
+                 "-v", "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock",
+                 "nginx", "perl", "-MIO::Socket::UNIX", "-e", probe, check=False)
+    if out.returncode != 0 or out.stdout.split() != ["12", str(host_keys)]:
+        raise RuntimeError(f"agent answer {out.stdout.strip()!r} (want '12 {host_keys}'): {out.stderr.strip()}")
+    record("ssh agent forwarding", "PASS", f"agent answered, {host_keys} key(s) like the Mac")
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -1982,6 +2094,9 @@ TESTS = [
     ("image history", test_image_history),
     ("image search", test_image_search),
     ("export and diff", test_export_and_diff),
+    ("container update", test_container_update),
+    ("commit", test_commit),
+    ("ssh agent forwarding", test_ssh_agent_forwarding),
 ]
 
 

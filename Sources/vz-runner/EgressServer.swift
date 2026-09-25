@@ -143,34 +143,46 @@ func dialEgressTarget(_ target: String, timeoutSeconds: Int) -> Result<Int32, Eg
             lastError = "refusing loopback target \(target)"
             continue
         }
-        let fd = socket(ai.pointee.ai_family, SOCK_STREAM, 0)
-        guard fd >= 0 else { continue }
-        setSocketNoSigPipe(fd)
-        let flags = fcntl(fd, F_GETFL)
-        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
-        var rc = connect(fd, addr, ai.pointee.ai_addrlen)
-        if rc != 0 && errno == EINPROGRESS {
-            var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
-            let ready = poll(&pfd, 1, Int32(timeoutSeconds * 1000))
-            if ready == 1 {
-                var soErr: Int32 = 0
-                var len = socklen_t(MemoryLayout<Int32>.size)
-                getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &len)
-                rc = soErr == 0 ? 0 : -1
-                if soErr != 0 { errno = soErr }
-            } else {
-                rc = -1
-                errno = ETIMEDOUT
-            }
-        }
-        if rc == 0 {
-            _ = fcntl(fd, F_SETFL, flags)
+        switch connectWithTimeout(addr, ai.pointee.ai_addrlen, timeoutSeconds: timeoutSeconds) {
+        case .success(let fd):
             return .success(fd)
+        case .failure(let error):
+            lastError = "connect \(target): \(error.message)"
         }
-        lastError = "connect \(target): \(String(cString: strerror(errno)))"
-        close(fd)
     }
     return .failure(EgressError(message: lastError))
+}
+
+/// Non-blocking TCP connect bounded by a timeout; the returned socket is
+/// back in blocking mode.
+func connectWithTimeout(_ addr: UnsafePointer<sockaddr>, _ len: socklen_t, timeoutSeconds: Int) -> Result<Int32, EgressError> {
+    let fd = socket(Int32(addr.pointee.sa_family), SOCK_STREAM, 0)
+    guard fd >= 0 else { return .failure(EgressError(message: String(cString: strerror(errno)))) }
+    setSocketNoSigPipe(fd)
+    let flags = fcntl(fd, F_GETFL)
+    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    var rc = connect(fd, addr, len)
+    if rc != 0 && errno == EINPROGRESS {
+        var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        let ready = poll(&pfd, 1, Int32(timeoutSeconds * 1000))
+        if ready == 1 {
+            var soErr: Int32 = 0
+            var optLen = socklen_t(MemoryLayout<Int32>.size)
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &optLen)
+            rc = soErr == 0 ? 0 : -1
+            if soErr != 0 { errno = soErr }
+        } else {
+            rc = -1
+            errno = ETIMEDOUT
+        }
+    }
+    if rc == 0 {
+        _ = fcntl(fd, F_SETFL, flags)
+        return .success(fd)
+    }
+    let message = String(cString: strerror(errno))
+    close(fd)
+    return .failure(EgressError(message: message))
 }
 
 /// Copy bytes in both directions until both sides are done, half-closing

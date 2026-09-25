@@ -22,6 +22,7 @@ var imageRoutes = []apiRoute{
 		handleImagesGet(w, r)
 	}),
 	newRoute(http.MethodGet, "/images/search", handleImageSearch),
+	newRoute(http.MethodPost, "/commit", handleCommit),
 	newRoute(http.MethodPost, "/build/prune", handleBuildPrune),
 
 	newRoute(http.MethodPost, "/images/*name/tag", handleImageTag),

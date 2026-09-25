@@ -83,6 +83,23 @@ func (m *restartMonitor) registerLocked(dockerID, name string, max int) {
 	m.resetLocked(dockerID)
 }
 
+// update replaces a container's policy (docker update --restart). The new
+// policy is armed only while the container runs: like Docker, updating a
+// stopped container must not start it.
+func (m *restartMonitor) update(ns, containerdID, name string, max int, running bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	did := dockerID(ns, containerdID)
+	m.where[did] = containerRef{ns: ns, id: containerdID}
+	p := restartPolicy{name: name, max: max}
+	m.specs[did] = p
+	delete(m.policies, did)
+	m.resetLocked(did)
+	if running && name != "" && name != "no" {
+		m.policies[did] = p
+	}
+}
+
 // policySpecFor returns the requested spec for docker inspect.
 func (m *restartMonitor) policySpecFor(dockerID string) dockerRestartPolicy {
 	m.mu.Lock()

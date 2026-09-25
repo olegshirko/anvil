@@ -15,14 +15,14 @@ func TestContainerHostsContentDesktopNames(t *testing.T) {
 		"v6.test:::1",
 		"mac:host-gateway",
 		"broken",
-	}, "192.168.64.1")
+	}, "192.168.65.254", "192.168.64.1")
 	for _, want := range []string{
 		"127.0.0.1\tweb\n",
 		"1.2.3.4\tdb.test\n",
 		"5.6.7.8\teq.test\n",
 		"::1\tv6.test\n",
-		"192.168.64.1\tmac\n",
-		"192.168.64.1\thost.docker.internal\n",
+		"192.168.65.254\tmac\n",
+		"192.168.65.254\thost.docker.internal\n",
 		"192.168.64.1\tgateway.docker.internal\n",
 	} {
 		if !strings.Contains(hosts, want) {
@@ -34,7 +34,7 @@ func TestContainerHostsContentDesktopNames(t *testing.T) {
 	}
 
 	// An explicit --add-host for a Desktop name replaces the built-in one.
-	hosts = containerHostsContent("web", []string{"host.docker.internal:10.0.0.9"}, "192.168.64.1")
+	hosts = containerHostsContent("web", []string{"host.docker.internal:10.0.0.9"}, "192.168.65.254", "192.168.64.1")
 	if strings.Count(hosts, "host.docker.internal") != 1 || !strings.Contains(hosts, "10.0.0.9\thost.docker.internal\n") {
 		t.Errorf("override not honored:\n%s", hosts)
 	}

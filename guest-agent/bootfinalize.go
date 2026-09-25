@@ -70,6 +70,10 @@ killall -9 runc 2>/dev/null && killed=1
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+
+	// host.docker.internal -> the Mac's localhost. Before the Docker API
+	// opens, so every container's /etc/hosts gets the redirect address.
+	setupHostLoopback()
 }
 
 // cleanupStaleContainers deletes every task and container record left over

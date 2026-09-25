@@ -103,6 +103,7 @@ func main() {
 	go servePortProxy()
 	routeDefaultTransportThroughEgress()
 	go serveEgressProxy()
+	go serveSSHAgentForward()
 	go runRestartMonitor()
 
 	// Recreate CNI conflists from the host share after a cold boot, and set

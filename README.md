@@ -236,14 +236,17 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   --init/--volumes-from` are honored. Refused with a 400 naming the flag:
   `--oom-kill-disable`, `--blkio-weight`, `--storage-opt`, `--isolation`,
   `--runtime`, `--log-driver` other than `json-file`/`none`, AppArmor/SELinux.
-- `host.docker.internal` and `gateway.docker.internal` resolve to the Mac in
-  every container (as in Docker Desktop), and so does `--add-host
-  name:host-gateway`. They reach Mac services listening on all interfaces;
-  services bound only to the Mac's `127.0.0.1` are not reachable.
+- `host.docker.internal` (and `--add-host name:host-gateway`) reaches the
+  Mac's localhost over TCP, services bound only to `127.0.0.1` included, as
+  in Docker Desktop; UDP to it goes to the Mac's NAT address.
+  `gateway.docker.internal` is the NAT gateway.
+- SSH agent forwarding as in Docker Desktop: mount
+  `/run/host-services/ssh-auth.sock` and point `SSH_AUTH_SOCK` at it.
 - Docker API is emulated, not complete: it covers what `docker` CLI and
   `docker compose` actually use. Not implemented: Swarm and its whole CLI
-  surface, `docker commit`, `docker update`, plugins and some prune
-  endpoints. `docker search` queries Docker Hub only. `docker diff` does not
+  surface, plugins and some prune endpoints. `docker update` covers
+  memory/swap/reservation, CPU (cpus, shares, quota/period, cpuset), pids and
+  the restart policy; blkio and device limits are not updatable. `docker search` queries Docker Hub only. `docker diff` does not
   report files hidden by an opaque directory (`rm -rf dir && mkdir dir`).
 - With the remote buildx driver, plain `docker build` keeps the result in the
   build cache — add `--load` to import it into the image store (compose does

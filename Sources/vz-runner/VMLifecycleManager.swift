@@ -54,6 +54,8 @@ final class VMLifecycleManager: NSObject {
     var portCheckServer: PortCheckServer?
     /// Outbound connections for the guest through the Mac's network stack.
     let egressServer = EgressServer()
+    /// SSH agent forwarding and the Mac's localhost (host.docker.internal).
+    let hostServicesServer = HostServicesServer()
 
     var socketDevice: VZVirtioSocketDevice? {
         vm?.socketDevices.first as? VZVirtioSocketDevice
@@ -67,6 +69,7 @@ final class VMLifecycleManager: NSObject {
         guard let device = socketDevice else { return }
         portCheckServer?.attach(to: device)
         egressServer.attach(to: device)
+        hostServicesServer.attach(to: device)
     }
 
     init(args: BootArgs, phaseTimer: BootPhaseTimer = BootPhaseTimer()) {
