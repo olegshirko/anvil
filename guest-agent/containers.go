@@ -59,7 +59,12 @@ func waitContainerTask(ctx context.Context, ns, containerdID string) (int, error
 	}
 	st := <-exitCh
 	if serr := st.Error(); serr != nil {
+		// The client went away (docker run -d drops its /wait right after
+		// /start): containerd reports exit status 255, which is not the
+		// container's. Returning it as an exit let it be cached, and the
+		// next docker wait answered 255 at once.
 		debugLog("[docker-api] wait %s/%s: %v", ns, truncateID(containerdID), serr)
+		return 0, fmt.Errorf("wait aborted: %w", serr)
 	}
 	exit := int(st.ExitCode())
 	if cached, ok := takeContainerExitCode(did); ok && cached != 0 {

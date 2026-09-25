@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"path"
+	"strings"
 )
 
 var imageRoutes = []apiRoute{
@@ -41,8 +43,76 @@ func handleImagesList(w http.ResponseWriter, r *http.Request, _ routeParams) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	filters := parseDockerFilters(r.URL.Query().Get("filters"))
+	// Old clients send `docker images <name>` as ?filter=<name>.
+	if legacy := r.URL.Query().Get("filter"); legacy != "" {
+		if filters["reference"] == nil {
+			filters["reference"] = map[string]bool{}
+		}
+		filters["reference"][legacy] = true
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(images)
+	json.NewEncoder(w).Encode(filterImageSummaries(images, filters))
+}
+
+// filterImageSummaries applies docker images' reference, dangling and label
+// filters. A reference filter also narrows RepoTags to the matching tags,
+// as dockerd does.
+func filterImageSummaries(in []dockerImageSummary, filters map[string]map[string]bool) []dockerImageSummary {
+	out := make([]dockerImageSummary, 0, len(in))
+	for _, img := range in {
+		if d := filters["dangling"]; len(d) > 0 {
+			dangling := len(img.RepoTags) == 0
+			if (d["true"] || d["1"]) != dangling {
+				continue
+			}
+		}
+		if !matchesLabelFilters(img.Labels, filters) {
+			continue
+		}
+		if refs := filters["reference"]; len(refs) > 0 {
+			var kept []string
+			for _, tag := range img.RepoTags {
+				for pattern := range refs {
+					if familiarMatch(pattern, tag) {
+						kept = append(kept, tag)
+						break
+					}
+				}
+			}
+			if len(kept) == 0 {
+				continue
+			}
+			img.RepoTags = kept
+		}
+		out = append(out, img)
+	}
+	return out
+}
+
+// familiarMatch is reference.FamiliarMatch: the pattern (path.Match syntax)
+// against the short form ("busybox:latest", "me/app:1"), then against the
+// name alone ("busybox").
+func familiarMatch(pattern, ref string) bool {
+	familiar := familiarRef(ref)
+	if ok, _ := path.Match(pattern, familiar); ok {
+		return true
+	}
+	name, _ := splitRepoTag(familiar)
+	ok, _ := path.Match(pattern, name)
+	return ok
+}
+
+// familiarRef shortens docker.io references the way the docker CLI prints
+// them: docker.io/library/busybox:latest -> busybox:latest.
+func familiarRef(ref string) string {
+	if rest, ok := strings.CutPrefix(ref, "docker.io/library/"); ok {
+		return rest
+	}
+	if rest, ok := strings.CutPrefix(ref, "docker.io/"); ok {
+		return rest
+	}
+	return ref
 }
 
 func handleImageCreate(w http.ResponseWriter, r *http.Request, _ routeParams) {

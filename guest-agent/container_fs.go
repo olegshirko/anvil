@@ -140,7 +140,21 @@ func containerChanges(ctx context.Context, ref string) ([]containerChange, error
 			ignore[path.Clean("/"+m.Destination)] = true
 		}
 	}
-	return overlayChanges(upper, lowers, ignore)
+	// A running container can swap directories of its upper layer for
+	// symlinks while the walk runs: walk it chrooted, and look lower paths
+	// up beneath each layer's directory without following symlinks.
+	inLower, closeLowers, err := lowerLookup(lowers)
+	if err != nil {
+		return nil, err
+	}
+	defer closeLowers()
+	var changes []containerChange
+	err = inChroot(upper, func() error {
+		var werr error
+		changes, werr = overlayChanges("/", inLower, ignore)
+		return werr
+	})
+	return changes, err
 }
 
 // overlayLayers extracts the upper and lower directories (top first) from a
@@ -189,21 +203,13 @@ func isOverlayWhiteout(fi fs.FileInfo) bool {
 //
 // Simplification: opaque directories are not special-cased; lower entries
 // they hide are not reported as deleted.
-func overlayChanges(upper string, lowers []string, ignore map[string]bool) ([]containerChange, error) {
+func overlayChanges(upper string, inLower func(p string) bool, ignore map[string]bool) ([]containerChange, error) {
 	type entry struct {
 		kind  int
 		isDir bool
 	}
 	entries := map[string]entry{}
 	hasChildren := map[string]bool{}
-	inLower := func(p string) bool {
-		for _, l := range lowers {
-			if fi, err := os.Lstat(filepath.Join(l, p)); err == nil {
-				return !isOverlayWhiteout(fi)
-			}
-		}
-		return false
-	}
 	err := filepath.WalkDir(upper, func(full string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err

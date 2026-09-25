@@ -328,7 +328,7 @@ private final class Listener {
     }
 
     func start(onFailure: @escaping () -> Void) {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        startLoopThread(name: "listener-\(mapping.hostPort)") { [weak self] in
             guard let self = self else { return }
             if (self.mapping.protocol ?? "tcp") == "udp" {
                 self.startUDP(onFailure: onFailure)
@@ -649,11 +649,9 @@ private final class Listener {
         setsockopt(targetFd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
         setsockopt(targetFd, IPPROTO_TCP, TCP_NODELAY, &nodelay, socklen_t(MemoryLayout<Int32>.size))
 
-        let group = DispatchGroup()
-        relay(group: group, from: clientFd, to: targetFd)
-        relay(group: group, from: targetFd, to: clientFd)
-
-        group.notify(queue: .global(qos: .utility)) {
+        runOnConnectionThread(name: "port-\(mapping.hostPort)", limiter: hostConnectionLimiter,
+                              onReject: { close(clientFd); close(targetFd) }) {
+            relayBothWays(clientFd, targetFd)
             close(clientFd)
             close(targetFd)
         }
@@ -743,29 +741,6 @@ private final class Listener {
             return total
         }
         return bodySent == body.count
-    }
-
-    private func relay(group: DispatchGroup, from: Int32, to: Int32) {
-        group.enter()
-        DispatchQueue.global(qos: .utility).async {
-            var buffer = [UInt8](repeating: 0, count: 65536)
-            while true {
-                let n = recv(from, &buffer, buffer.count, 0)
-                if n <= 0 { break }
-                var sent = 0
-                let written = buffer.withUnsafeBufferPointer { ptr -> Int in
-                    while sent < n {
-                        let w = send(to, ptr.baseAddress!.advanced(by: sent), n - sent, 0)
-                        if w <= 0 { break }
-                        sent += w
-                    }
-                    return sent
-                }
-                if written < n { break }
-            }
-            shutdown(to, SHUT_WR)
-            group.leave()
-        }
     }
 }
 

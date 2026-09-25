@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"maps"
 	"os"
 	"path/filepath"
@@ -168,9 +169,34 @@ func parseDefaultGateway(routeTable string) string {
 // computeContainerMounts translates Binds/Mounts/TmpFs into OCI mounts plus
 // the standard /etc file bind-mounts. Named volumes are created on demand;
 // anonymous volumes are tracked for removal on delete.
-func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mount, []string, error) {
+// isMountMode reports whether s is a -v mode list ("ro", "rw,nocopy", "z").
+func isMountMode(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, m := range strings.Split(s, ",") {
+		switch m {
+		case "ro", "rw", "nocopy", "z", "Z", "shared", "rshared", "slave", "rslave",
+			"private", "rprivate", "consistent", "cached", "delegated":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// volumeMount is a volume (named or anonymous, never a host bind) mounted
+// into the container: a candidate for copy-up from the image.
+type volumeMount struct {
+	dir, dst string
+	nocopy   bool
+}
+
+func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mount, []string, []volumeMount, error) {
 	var mounts []specs.Mount
 	var anonVols []string
+	var volMounts []volumeMount
+	nocopy := false // set per spec below
 
 	addBind := func(src, dst string, ro bool) {
 		opts := []string{"rbind"}
@@ -185,6 +211,7 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 			return err
 		}
 		addBind(dir, dst, ro)
+		volMounts = append(volMounts, volumeMount{dir: dir, dst: dst, nocopy: nocopy})
 		return nil
 	}
 	newAnonVolName := func() string {
@@ -199,6 +226,7 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 			if err := addNamedVolume(name, dst, ro); err != nil {
 				return err
 			}
+			markAnonymousVolume(ns, name)
 			anonVols = append(anonVols, name)
 		case strings.HasPrefix(src, "/"):
 			os.MkdirAll(src, 0o755) //nolint:errcheck — docker creates missing host dirs
@@ -218,16 +246,27 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 		case 1:
 			return addHostOrVolume("", parts[0], false)
 		case 2:
+			// "dst:mode" (-v /data:ro) is an anonymous volume with a mode,
+			// as Docker reads it; otherwise it is "src:dst".
+			if isMountMode(parts[1]) {
+				modes := strings.Split(parts[1], ",")
+				nocopy = slices.Contains(modes, "nocopy")
+				defer func() { nocopy = false }()
+				return addHostOrVolume("", parts[0], slices.Contains(modes, "ro"))
+			}
 			return addHostOrVolume(parts[0], parts[1], false)
 		case 3:
-			return addHostOrVolume(parts[0], parts[1], parts[2] == "ro")
+			modes := strings.Split(parts[2], ",")
+			nocopy = slices.Contains(modes, "nocopy")
+			defer func() { nocopy = false }()
+			return addHostOrVolume(parts[0], parts[1], slices.Contains(modes, "ro"))
 		}
 		return fmt.Errorf("invalid mount spec")
 	}
 
 	for _, b := range req.HostConfig.Binds {
 		if err := parseBindSpec(b); err != nil {
-			return nil, nil, fmt.Errorf("bind %q: %w", b, err)
+			return nil, nil, nil, fmt.Errorf("bind %q: %w", b, err)
 		}
 	}
 	for _, m := range req.HostConfig.Mounts {
@@ -235,8 +274,11 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 		if m.Type == "tmpfs" || m.Target == "" || (m.Source == "" && m.Type != "volume") {
 			continue
 		}
-		if err := addHostOrVolume(m.Source, m.Target, m.ReadOnly); err != nil {
-			return nil, nil, fmt.Errorf("mount %q: %w", m.Target, err)
+		nocopy = m.VolumeOptions != nil && m.VolumeOptions.NoCopy
+		err := addHostOrVolume(m.Source, m.Target, m.ReadOnly)
+		nocopy = false
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("mount %q: %w", m.Target, err)
 		}
 	}
 	// The CLI sends a bare `-v /path` as Config.Volumes, not as a bind.
@@ -250,7 +292,7 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 			continue
 		}
 		if err := addHostOrVolume("", dst, false); err != nil {
-			return nil, nil, fmt.Errorf("volume %q: %w", dst, err)
+			return nil, nil, nil, fmt.Errorf("volume %q: %w", dst, err)
 		}
 	}
 	for path, optsStr := range req.HostConfig.TmpFs {
@@ -279,7 +321,7 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 		specs.Mount{Type: "bind", Source: filepath.Join(containerMetaDir(ns, id), "hostname"),
 			Destination: "/etc/hostname", Options: []string{"rbind"}},
 	)
-	return mounts, anonVols, nil
+	return mounts, anonVols, volMounts, nil
 }
 
 // volumesFromMounts resolves --volumes-from: every volume and bind mount of
@@ -330,7 +372,7 @@ func inheritableMounts(all []specs.Mount, mode string) []specs.Mount {
 			continue
 		}
 		switch m.Destination {
-		case "/etc/hosts", "/etc/resolv.conf", "/etc/hostname", containerInitPath:
+		case "/etc/hosts", "/etc/resolv.conf", "/etc/hostname", containerInitPath, rosettaCacheSocket:
 			continue
 		}
 		opts := []string{}
@@ -767,7 +809,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		return "", nil, perr
 	}
 
-	mounts, vols, merr := computeContainerMounts(ns, id, req)
+	mounts, vols, volMounts, merr := computeContainerMounts(ns, id, req)
 	if merr != nil {
 		return "", nil, merr
 	}
@@ -777,9 +819,23 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		return "", nil, verr
 	}
 	mounts = mergeInheritedMounts(mounts, inherited)
+	if m, ok := rosettaCacheMount(actualPlatform); ok {
+		mounts = append(mounts, m)
+	}
 
 	var imgCfg *ocispecImageConfig
 	if spec, serr := img.Spec(nsCtx); serr == nil {
+		// The image's VOLUME paths not mounted otherwise get an anonymous
+		// volume each (after --volumes-from, which takes precedence).
+		imgVols, imgMounts, ierr := imageVolumeMounts(ns, spec.Config.Volumes, mounts)
+		if ierr != nil {
+			return "", nil, ierr
+		}
+		anonVols = append(anonVols, imgVols...)
+		for _, vm := range imgMounts {
+			mounts = append(mounts, specs.Mount{Type: "bind", Source: vm.dir, Destination: vm.dst, Options: []string{"rbind"}})
+		}
+		volMounts = append(volMounts, imgMounts...)
 		imgCfg = &ocispecImageConfig{
 			Entrypoint: spec.Config.Entrypoint,
 			Cmd:        spec.Config.Cmd,
@@ -815,6 +871,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		Healthcheck:      req.Healthcheck,
 		HostConfig:       &req.HostConfig,
 		Platform:         actualPlatform,
+		MountPoints:      mountPointsFor(mounts),
 	}
 	if serr := saveContainerMeta(meta); serr != nil {
 		return "", nil, serr
@@ -843,6 +900,13 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		client.WithNewSpec(specOpts...),
 	); cerr != nil {
 		return "", nil, fmt.Errorf("new container: %w", cerr)
+	}
+	// Seed empty volumes with the image's content at their mount point, as
+	// Docker does on first mount. Best effort: the container exists now.
+	if len(volMounts) > 0 {
+		if cerr := copyUpVolumes(ns, id, volMounts); cerr != nil {
+			log.Printf("[docker-api] volume copy-up for %s: %v", truncateID(id), cerr)
+		}
 	}
 	return id, warnings, nil
 }

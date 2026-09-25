@@ -511,6 +511,14 @@ func inspectDockerImage(ctx context.Context, name string) (map[string]interface{
 	if spec.Config.StopSignal != "" {
 		config["StopSignal"] = spec.Config.StopSignal
 	}
+	// Compose recreate hands a container's anonymous volumes to its
+	// replacement only for paths listed here.
+	if len(spec.Config.Volumes) > 0 {
+		config["Volumes"] = spec.Config.Volumes
+	}
+	if len(spec.Config.ExposedPorts) > 0 && config["ExposedPorts"] == nil {
+		config["ExposedPorts"] = spec.Config.ExposedPorts
+	}
 	for k, v := range dockerConfigExtensions(nsCtx, img) {
 		config[k] = v
 	}

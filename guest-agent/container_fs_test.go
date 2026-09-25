@@ -46,7 +46,12 @@ func TestOverlayChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := overlayChanges(upper, []string{lower}, map[string]bool{"/etc/hosts": true, "/run/secret": true})
+	inLower, done, lerr := lowerLookup([]string{lower})
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	defer done()
+	got, err := overlayChanges(upper, inLower, map[string]bool{"/etc/hosts": true, "/run/secret": true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +72,7 @@ func TestOverlayChanges(t *testing.T) {
 	// Nothing changed: an empty list, not null.
 	empty := filepath.Join(root, "empty")
 	os.MkdirAll(empty, 0o755)
-	if got, _ := overlayChanges(empty, []string{lower}, nil); got == nil || len(got) != 0 {
+	if got, _ := overlayChanges(empty, inLower, nil); got == nil || len(got) != 0 {
 		t.Errorf("empty upper: %v", got)
 	}
 }

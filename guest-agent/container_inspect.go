@@ -169,6 +169,11 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 				State:   state,
 				Status:  formatHealthStatus(did, status),
 			}
+			if meta, merr := loadContainerMeta(ns, c.ID()); merr == nil {
+				summary.Mounts = inspectMountPoints(meta)
+			} else {
+				summary.Mounts = []dockerMountPoint{}
+			}
 			if matchesContainerFilters(summary, filters) {
 				result = append(result, summary)
 			}
@@ -308,6 +313,7 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 					Health:   getHealthState(did),
 				},
 				RestartCount: restarts.countFor(did),
+				Mounts:       inspectMountPoints(meta),
 				Config: dockerContainerConfig{
 					Labels:      labels,
 					Image:       imageName,
@@ -415,4 +421,12 @@ func inspectHostConfig(meta *containerMeta, live dockerHostConfig) dockerHostCon
 	snap.PortBindings = live.PortBindings
 	snap.RestartPolicy = live.RestartPolicy
 	return snap
+}
+
+// inspectMountPoints is .Mounts (an empty list, never null, like Docker).
+func inspectMountPoints(meta *containerMeta) []dockerMountPoint {
+	if meta == nil || meta.MountPoints == nil {
+		return []dockerMountPoint{}
+	}
+	return meta.MountPoints
 }

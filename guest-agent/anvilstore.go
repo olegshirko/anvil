@@ -92,6 +92,8 @@ type containerMeta struct {
 	// Platform is the image platform the container was created from
 	// ("linux/amd64", "linux/arm64/v8").
 	Platform string `json:"Platform,omitempty"`
+	// MountPoints is what docker inspect reports under .Mounts.
+	MountPoints []dockerMountPoint `json:"MountPoints,omitempty"`
 }
 
 // aliasesOn returns the container's aliases on network.

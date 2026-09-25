@@ -370,6 +370,7 @@ func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*
 	if err := saveNetworkLabels(req.Name, labels); err != nil {
 		log.Printf("[docker-api] save network labels for %s: %v", req.Name, err)
 	}
+	publishNetworkEvent("create", req.Name, networkID(req.Name), "")
 	return &dockerNetwork{
 		Id:      networkID(req.Name),
 		Name:    req.Name,
@@ -415,6 +416,7 @@ func removeDockerNetwork(ctx context.Context, name string) error {
 		deleteNetworkLabels(netName)
 		deleteNetworkPool(netName)
 	}
+	publishNetworkEvent("destroy", fileName, networkID(fileName), "")
 	return nil
 }
 

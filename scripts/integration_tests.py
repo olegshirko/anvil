@@ -2353,6 +2353,232 @@ def test_rosetta_explicit_arm64() -> None:
     record("rosetta explicit arm64", "PASS", "no silent amd64 fallback for an explicit arm64")
 
 
+
+def test_images_reference_filter() -> None:
+    docker("pull", "busybox", timeout=300.0)
+    names = docker("images", "busybox", "--format", "{{.Repository}}").stdout.split()
+    if not names or any(n not in ("busybox", "docker.io/library/busybox") for n in names):
+        raise RuntimeError(f"docker images busybox listed {sorted(set(names))}")
+    tagged = docker("images", "--filter", "reference=alpine:*", "--format", "{{.Repository}}").stdout.split()
+    if not tagged or any("alpine" not in n for n in tagged):
+        raise RuntimeError(f"reference=alpine:* listed {sorted(set(tagged))}")
+    record("docker images <name>", "PASS", "reference filter applied")
+
+
+def test_volume_copy_up_and_image_volume() -> None:
+    vol, image, name = f"{PREFIX}-cpup", f"{PREFIX}-imgvol:1", f"{PREFIX}-imgvolc"
+    try:
+        # anonymous volume over an image directory: seeded from the image
+        out = docker("run", "--rm", "-v", "/etc", "alpine", "cat", "/etc/alpine-release").stdout.strip()
+        if not out:
+            raise RuntimeError("anonymous volume at /etc was not seeded from the image")
+        # named volume: seeded once, then keeps its own content
+        docker("volume", "create", vol)
+        docker("run", "--rm", "-v", f"{vol}:/etc", "alpine", "sh", "-c", "echo mine > /etc/marker")
+        out = docker("run", "--rm", "-v", f"{vol}:/etc", "alpine", "sh", "-c",
+                     "cat /etc/marker; test -f /etc/alpine-release && echo seeded").stdout.split()
+        if out != ["mine", "seeded"]:
+            raise RuntimeError(f"named volume content: {out}")
+        # nocopy
+        out = docker("run", "--rm", "-v", "/etc:nocopy", "alpine", "/bin/ls", "-A", "/etc").stdout.split()
+        # runc creates the /etc/hosts, /etc/hostname, /etc/resolv.conf
+        # mountpoints inside the volume, as with Docker; nothing else.
+        if set(out) - {"hosts", "hostname", "resolv.conf"}:
+            raise RuntimeError(f"nocopy volume was seeded: {out!r}")
+        # VOLUME in the image becomes an anonymous volume seeded with its content
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "Dockerfile").write_text(
+                "FROM alpine\nRUN mkdir /data && echo from-image > /data/f && chown 1000:1000 /data\nVOLUME /data\n")
+            docker("build", "-t", image, tmp, timeout=300.0)
+        docker("run", "--name", name, image, "sh", "-c", "cat /data/f; stat -c %u /data; echo new > /data/g")
+        logs = docker("logs", name).stdout.split()
+        if logs[:2] != ["from-image", "1000"]:
+            raise RuntimeError(f"image VOLUME not seeded with content/owner: {logs}")
+        mounts = json.loads(docker("inspect", "-f", "{{json .Mounts}}", name).stdout or "null")
+        record("volume copy-up + image VOLUME", "PASS", f"anon/named/nocopy/VOLUME ok ({len(mounts or [])} mounts)")
+    finally:
+        cleanup(name)
+        docker("rmi", "-f", image, check=False)
+        docker("volume", "rm", "-f", vol, check=False)
+
+
+def test_network_events() -> None:
+    net, name = f"{PREFIX}-evnet", f"{PREFIX}-evc"
+    try:
+        since = str(int(time.time()) - 1)
+        docker("network", "create", net)
+        docker("run", "-d", "--name", name, "alpine", "sleep", "300")
+        docker("network", "connect", net, name)
+        docker("network", "disconnect", net, name)
+        docker("rm", "-f", name)
+        docker("network", "rm", net)
+        out = docker("events", "--since", since, "--until", str(int(time.time()) + 1),
+                     "--filter", "type=network", "--format", "{{.Action}} {{.Actor.Attributes.name}}",
+                     timeout=30.0).stdout.splitlines()
+        want = [f"create {net}", f"connect {net}", f"disconnect {net}", f"destroy {net}"]
+        got = [l for l in out if net in l]
+        if got != want:
+            raise RuntimeError(f"network events {got}, want {want}")
+        record("network events", "PASS", "create/connect/disconnect/destroy")
+    finally:
+        cleanup(name)
+        docker("network", "rm", net, check=False)
+
+
+def test_idle_connections_do_not_starve_daemon() -> None:
+    """Many idle connections to a published port (LAN peers can open them)
+    must not stall the daemon: the relays run on their own threads."""
+    name, port = f"{PREFIX}-idleconn", PORT_BASE + 290
+    socks = []
+    try:
+        docker("run", "-d", "--name", name, "-p", f"{port}:80", "nginx")
+        if curl_status(port) != "200":
+            raise RuntimeError("nginx not reachable")
+        for _ in range(200):
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            socks.append(s)
+        t0 = time.time()
+        docker("ps", "-q", timeout=20.0)
+        if curl_status(port, wait=10) != "200":
+            raise RuntimeError("a fresh request failed with 200 idle connections open")
+        if time.time() - t0 > 10:
+            raise RuntimeError("daemon slowed down under idle connections")
+        record("idle connections vs daemon", "PASS", "200 idle port connections, API and port still responsive")
+    finally:
+        for s in socks:
+            s.close()
+        cleanup(name)
+
+
+def test_rosetta_aot_cache() -> None:
+    probe = docker("run", "--rm", "--platform", "linux/amd64", "alpine", "true", check=False, timeout=300.0)
+    if probe.returncode != 0 and "ANVIL_ROSETTA=1" in probe.stderr:
+        record("rosetta AOT cache", "SKIP", "Rosetta off")
+        return
+    mounts = docker("run", "--rm", "--platform", "linux/amd64", "alpine", "sh", "-c",
+                    "test -S /run/rosettad/rosetta.sock && echo socket").stdout.strip()
+    if mounts != "socket":
+        raise RuntimeError("rosettad socket not mounted into the amd64 container")
+    docker("run", "--rm", "--platform", "linux/amd64", "alpine", "sh", "-c", "ls / >/dev/null")
+    files = docker("run", "--rm", "-v", "/var/lib/rosettad:/c", "alpine", "sh", "-c",
+                   "ls /c | grep -c aotcache || true").stdout.strip()
+    if not files or int(files) == 0:
+        raise RuntimeError("no .aotcache files after running amd64 binaries")
+    record("rosetta AOT cache", "PASS", f"{files} cached translations")
+
+
+
+def test_compose_recreate_keeps_anonymous_volume() -> None:
+    """A service whose image declares VOLUME keeps that data when compose
+    recreates it (compose hands the old anonymous volume over via .Mounts)."""
+    project = f"{PREFIX}-anonkeep"
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "Dockerfile").write_text("FROM alpine\nVOLUME /data\n")
+        compose_file = Path(tmp) / "compose.yml"
+        def write(env: str) -> None:
+            compose_file.write_text(f"""services:
+  db:
+    build: .
+    image: {project}-db:1
+    command: sleep 300
+    environment:
+      REV: "{env}"
+""")
+        base = ["compose", "-p", project, "-f", str(compose_file)]
+        try:
+            write("1")
+            docker(*base, "up", "-d", "--build", timeout=300.0)
+            docker(*base, "exec", "-T", "db", "sh", "-c", "echo precious > /data/f")
+            mounts = json.loads(docker("inspect", "-f", "{{json .Mounts}}", f"{project}-db-1").stdout)
+            vols = [m for m in mounts if m.get("Type") == "volume" and m.get("Destination") == "/data"]
+            if len(vols) != 1 or not vols[0].get("Name"):
+                raise RuntimeError(f"inspect .Mounts: {mounts}")
+            write("2")  # config change -> recreate
+            docker(*base, "up", "-d", timeout=300.0)
+            out = docker(*base, "exec", "-T", "db", "cat", "/data/f", check=False).stdout
+            if out != "precious\n":
+                raise RuntimeError(f"anonymous volume data lost on recreate: {out!r}")
+            record("compose recreate keeps VOLUME data", "PASS", f"volume {vols[0]['Name'][:12]} carried over")
+        finally:
+            subprocess.run(["docker", *base, "down", "-v", "--rmi", "local", "--timeout", "5"],
+                           capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
+
+
+
+def test_stats_real_numbers() -> None:
+    name = f"{PREFIX}-statsreal"
+    try:
+        docker("run", "-d", "--name", name, "--memory", "256m", "alpine", "sh", "-c",
+               "sleep 1000 & sleep 1000 & while :; do :; done")
+        time.sleep(2)
+        out = docker("stats", "--no-stream", "--format",
+                     "{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}|{{.NetIO}}|{{.BlockIO}}", name, timeout=60.0).stdout.strip()
+        cpu, mem, pids, net, blk = out.split("|")
+        if float(cpu.rstrip("%")) < 30:
+            raise RuntimeError(f"busy loop shows {cpu} CPU")
+        if int(pids) < 3:
+            raise RuntimeError(f"PIDs = {pids}, want the whole container (>= 3)")
+        if "256MiB" not in mem:
+            raise RuntimeError(f"memory limit not reported: {mem}")
+        record("docker stats", "PASS", f"cpu {cpu}, pids {pids}, mem {mem}, net {net}, block {blk}")
+    finally:
+        cleanup(name)
+
+
+def test_compose_cp_and_watch() -> None:
+    project = f"{PREFIX}-watch"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "src").mkdir()
+        (root / "src" / "app.txt").write_text("v1\n")
+        (root / "compose.yml").write_text("""services:
+  app:
+    image: alpine
+    command: sleep 300
+    develop:
+      watch:
+        - action: sync
+          path: ./src
+          target: /app
+""")
+        base = ["compose", "-p", project, "-f", str(root / "compose.yml")]
+        watcher = None
+        try:
+            docker(*base, "up", "-d", timeout=300.0)
+            # compose cp both ways
+            docker(*base, "cp", str(root / "src" / "app.txt"), "app:/tmp/cp.txt")
+            docker(*base, "cp", "app:/tmp/cp.txt", str(root / "back.txt"))
+            if (root / "back.txt").read_text() != "v1\n":
+                raise RuntimeError("compose cp did not round-trip")
+            # compose watch: a host edit reaches the container
+            watcher = subprocess.Popen(["docker", *base, "watch", "--no-up"], cwd=tmp, env=DOCKER_ENV,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            time.sleep(4)
+            (root / "src" / "app.txt").write_text("v2\n")
+            deadline = time.time() + 30
+            got = ""
+            while time.time() < deadline:
+                got = docker(*base, "exec", "-T", "app", "cat", "/app/app.txt", check=False).stdout
+                if got == "v2\n":
+                    break
+                time.sleep(1)
+            if got != "v2\n":
+                log_out = ""
+                if watcher.poll() is not None:
+                    log_out = watcher.stdout.read()[-400:]
+                raise RuntimeError(f"compose watch did not sync: {got!r} {log_out}")
+            record("compose cp + watch", "PASS", "cp both ways, watch synced an edit")
+        finally:
+            if watcher is not None:
+                watcher.terminate()
+                try:
+                    watcher.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    watcher.kill()
+            subprocess.run(["docker", *base, "down", "--timeout", "5"],
+                           capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -2437,6 +2663,14 @@ TESTS = [
     ("commit keeps config", test_commit_keeps_healthcheck_labels_user),
     ("connect alias scoped", test_connect_alias_scoped_to_network),
     ("rosetta explicit arm64", test_rosetta_explicit_arm64),
+    ("images reference filter", test_images_reference_filter),
+    ("volume copy-up", test_volume_copy_up_and_image_volume),
+    ("network events", test_network_events),
+    ("idle connections", test_idle_connections_do_not_starve_daemon),
+    ("rosetta AOT cache", test_rosetta_aot_cache),
+    ("compose recreate anonymous volume", test_compose_recreate_keeps_anonymous_volume),
+    ("stats real numbers", test_stats_real_numbers),
+    ("compose cp and watch", test_compose_cp_and_watch),
 ]
 
 

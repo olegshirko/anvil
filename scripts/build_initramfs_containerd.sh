@@ -751,6 +751,29 @@ bmark containerd_started
 # (runBootFinalize) after the control channel is up; the Docker API server
 # there waits for them, so container operations cannot race the cleanup.
 
+# Rosetta ahead-of-time translation cache (ANVIL_ROSETTA=1 only): rosettad
+# must run from the share itself, keeps its cache on the persistent disk and
+# creates its socket under it; the host told Rosetta to use
+# /run/rosettad/rosetta.sock, which the guest-agent bind-mounts into amd64
+# containers. Off the critical path: Rosetta works without it.
+if [ -x /mnt/rosetta/rosettad ]; then
+    mkdir -p /var/lib/rosettad /run/rosettad
+    (
+        /mnt/rosetta/rosettad daemon /var/lib/rosettad >/var/lib/rosettad/daemon.log 2>&1 &
+        i=0
+        while [ ! -S /var/lib/rosettad/uds/rosetta.sock ] && [ $i -lt 100 ]; do
+            sleep 0.1
+            i=$((i + 1))
+        done
+        if [ -S /var/lib/rosettad/uds/rosetta.sock ]; then
+            chmod a+rw /var/lib/rosettad/uds/rosetta.sock
+            ln -sf /var/lib/rosettad/uds/rosetta.sock /run/rosettad/rosetta.sock
+        else
+            echo "[stage2] rosettad socket did not appear (AOT cache off)"
+        fi
+    ) &
+fi
+
 # Start guest agent in foreground.
 echo "[stage2] starting guest-agent"
 bmark agent_start

@@ -55,6 +55,38 @@ final class ConnectionLimiter {
 
 let guestConnectionLimiter = ConnectionLimiter(limit: maxGuestConnections)
 
+/// Cap on concurrent host-side client connections (docker.sock, buildkit
+/// sock, published ports). Published ports listen on all interfaces by
+/// default, so LAN peers can open these; long-lived docker clients (logs -f,
+/// events, attach) are legitimate, hence the higher bound.
+let hostConnectionLimiter = ConnectionLimiter(limit: 1024)
+
+/// Run body on a dedicated thread (never GCD's shared pool: blocking relays
+/// there starve the whole daemon). Over the limiter's cap, onReject runs
+/// instead, on the caller's thread.
+func runOnConnectionThread(name: String, limiter: ConnectionLimiter,
+                           onReject: () -> Void, _ body: @escaping () -> Void) {
+    guard limiter.tryAcquire() else {
+        onReject()
+        return
+    }
+    let thread = Thread {
+        defer { limiter.release() }
+        body()
+    }
+    thread.name = name
+    thread.stackSize = 256 * 1024
+    thread.start()
+}
+
+/// Start a long-running loop (an accept loop) on its own thread.
+func startLoopThread(name: String, _ body: @escaping () -> Void) {
+    let thread = Thread(block: body)
+    thread.name = name
+    thread.stackSize = 256 * 1024
+    thread.start()
+}
+
 /// Run body for a guest connection on a dedicated thread, closing the
 /// connection afterwards. Over the cap the connection is closed at once.
 func runGuestConnection(_ connection: VZVirtioSocketConnection, name: String,

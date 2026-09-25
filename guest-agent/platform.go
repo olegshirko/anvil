@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/containerd/containerd/v2/client"
@@ -163,4 +166,24 @@ func imagePlatform(ctx context.Context, img client.Image) string {
 		return ""
 	}
 	return platforms.Format(platforms.Normalize(ocispec.Platform{OS: cfg.OS, Architecture: cfg.Architecture, Variant: cfg.Variant}))
+}
+
+// rosettaCacheSocket is where Rosetta (configured by vz-runner) looks for
+// the ahead-of-time translation daemon; stage2 links rosettad's socket
+// there.
+const rosettaCacheSocket = "/run/rosettad/rosetta.sock"
+
+// rosettaCacheMount bind-mounts the rosettad socket into an amd64 container,
+// whose own mount namespace would not see it: repeated runs of the same
+// binaries then skip translation. Only amd64 containers get it, and only
+// while the daemon is up (Rosetta runs fine without it).
+func rosettaCacheMount(platform string) (specs.Mount, bool) {
+	if !rosettaActive() || !strings.HasPrefix(platform, "linux/amd64") {
+		return specs.Mount{}, false
+	}
+	target, err := filepath.EvalSymlinks(rosettaCacheSocket)
+	if err != nil {
+		return specs.Mount{}, false
+	}
+	return specs.Mount{Type: "bind", Source: target, Destination: rosettaCacheSocket, Options: []string{"rbind"}}, true
 }

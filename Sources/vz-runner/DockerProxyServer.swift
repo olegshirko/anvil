@@ -77,7 +77,7 @@ final class DockerProxyServer {
         }
 
         let listenFD = fd
-        DispatchQueue.global().async { [weak self] in
+        startLoopThread(name: "docker-proxy-accept") { [weak self] in
             while let self = self, self.isListening(on: listenFD) {
                 let client = accept(listenFD, nil, nil)
                 guard client >= 0 else {
@@ -85,8 +85,13 @@ final class DockerProxyServer {
                     continue
                 }
                 setSocketNoSigPipe(client)
-                DispatchQueue.global().async { [weak self] in
-                    self?.handleClient(fd: client)
+                runOnConnectionThread(name: "docker-proxy-client", limiter: hostConnectionLimiter,
+                                      onReject: { close(client) }) { [weak self] in
+                    guard let self = self else {
+                        close(client)
+                        return
+                    }
+                    self.handleClient(fd: client)
                 }
             }
         }
@@ -166,66 +171,6 @@ final class DockerProxyServer {
             }
         }
 
-        let vfd = conn.fileDescriptor
-        let group = DispatchGroup()
-
-        // Host client -> guest Docker API.
-        group.enter()
-        DispatchQueue.global().async {
-            var buf = [UInt8](repeating: 0, count: 65536)
-            var total: Int = 0
-            while true {
-                let n = read(clientFd, &buf, buf.count)
-                if n <= 0 { break }
-                total += n
-                if !self.writeAll(fd: vfd, buffer: buf, count: n) { break }
-            }
-            if self.debug {
-                print("[docker-proxy] host -> guest: \(total) bytes")
-            }
-            _ = shutdown(vfd, Int32(SHUT_WR))
-            group.leave()
-        }
-
-        // Guest Docker API -> host client.
-        group.enter()
-        DispatchQueue.global().async {
-            var buf = [UInt8](repeating: 0, count: 65536)
-            var total: Int = 0
-            while true {
-                let n = read(vfd, &buf, buf.count)
-                if n <= 0 { break }
-                total += n
-                if !self.writeAll(fd: clientFd, buffer: buf, count: n) { break }
-            }
-            if self.debug {
-                print("[docker-proxy] guest -> host: \(total) bytes")
-            }
-            _ = shutdown(clientFd, Int32(SHUT_WR))
-            group.leave()
-        }
-
-        group.wait()
-    }
-
-    /// Write the whole buffer, looping over short writes. Blocking vsock and
-    /// unix-socket fds may return fewer bytes than requested under memory
-    /// pressure; dropping the remainder silently corrupts the proxied stream
-    /// (e.g. truncated `docker load` request bodies).
-    private func writeAll(fd: Int32, buffer: [UInt8], count: Int) -> Bool {
-        var total = 0
-        while total < count {
-            let n = buffer.withUnsafeBytes { raw -> Int in
-                guard let base = raw.baseAddress else { return -1 }
-                return write(fd, base.advanced(by: total), count - total)
-            }
-            if n < 0 {
-                if errno == EINTR { continue }
-                return false
-            }
-            if n == 0 { return false }
-            total += n
-        }
-        return true
+        relayBothWays(clientFd, conn.fileDescriptor)
     }
 }

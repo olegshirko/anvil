@@ -233,6 +233,9 @@ func connectContainerNetwork(ctx context.Context, networkRef, container string, 
 	}
 	updateNetworksLabel(ctx, ns, id, meta.Networks)
 	refreshHostsForContainer(ns, id)
+	if running, _, _ := containerTaskState(ctx, ns, id); running {
+		publishNetworkEvent("connect", network, networkIDFor(ctx, network), dockerID(ns, id))
+	}
 	log.Printf("[docker-api] connected %s to %s", truncateID(id), network)
 	return nil
 }
@@ -290,6 +293,9 @@ func disconnectContainerNetwork(ctx context.Context, networkRef, container strin
 	updateNetworksLabel(ctx, ns, id, meta.Networks)
 	refreshNetworkHosts(network)
 	refreshHostsForContainer(ns, id)
+	if running {
+		publishNetworkEvent("disconnect", network, networkIDFor(ctx, network), dockerID(ns, id))
+	}
 	log.Printf("[docker-api] disconnected %s from %s", truncateID(id), network)
 	return nil
 }

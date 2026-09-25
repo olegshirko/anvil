@@ -159,6 +159,7 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 			return fmt.Errorf("cni attach: %w", xerr)
 		}
 		saveNetInfo(ns, id, containerNetInfo{IP: ip, Mac: mac, Network: netName, Extra: extra})
+		publishEndpointEvents("connect", ns, id, netName, extra)
 		defer func() {
 			if err != nil {
 				dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -255,6 +256,7 @@ func watchTaskExit(ctx context.Context, ns, id, netName string, ports []cniPortM
 		dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		if ni, ok := loadNetInfo(ns, id); ok {
 			detachSecondaryNetworks(dctx, id, ni.Extra)
+			publishEndpointEvents("disconnect", ns, id, netName, ni.Extra)
 		}
 		if derr := detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports); derr != nil {
 			debugLog("[cni] detach %s/%s: %v", ns, truncateID(id), derr)
@@ -451,13 +453,14 @@ func deleteNativeContainer(ctx context.Context, ns, id string, force, removeVolu
 	// and never while another container still mounts one (--volumes-from):
 	// that would delete data out from under it.
 	if meta != nil && removeVolumes {
-		for _, v := range meta.AnonymousVolumes {
-			dir := volumeDataDir(ns, v)
+		for _, v := range removableAnonymousVolumes(ns, meta) {
+			dir := volumeDataDir(v.ns, v.name)
 			if volumeDirInUse(ctx, dir) {
-				log.Printf("[docker-api] keeping volume %s: still mounted by another container", truncateID(v))
+				log.Printf("[docker-api] keeping volume %s: still mounted by another container", truncateID(v.name))
 				continue
 			}
 			os.RemoveAll(dir)
+			os.Remove(volumeMetaPath(v.ns, v.name))
 		}
 	}
 	return nil
@@ -689,4 +692,32 @@ func parseUint32(s string) (uint32, error) {
 		return 0, fmt.Errorf("empty")
 	}
 	return uint32(v), nil
+}
+
+type volumeRef struct{ ns, name string }
+
+// removableAnonymousVolumes lists the anonymous volumes a container mounts:
+// the ones it created, plus anonymous volumes it was handed by name (compose
+// passes the old container's anonymous volumes to the recreated one).
+func removableAnonymousVolumes(ns string, meta *containerMeta) []volumeRef {
+	seen := map[volumeRef]bool{}
+	var out []volumeRef
+	add := func(r volumeRef) {
+		if !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	for _, v := range meta.AnonymousVolumes {
+		add(volumeRef{ns, v})
+	}
+	for _, mp := range meta.MountPoints {
+		if mp.Type != "volume" {
+			continue
+		}
+		if vns, name, ok := volumeRefFromDir(mp.Source); ok && isAnonymousVolume(vns, name) {
+			add(volumeRef{vns, name})
+		}
+	}
+	return out
 }

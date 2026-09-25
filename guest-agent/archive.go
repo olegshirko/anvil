@@ -205,7 +205,9 @@ func withRootfsMount(ns, containerdID string, fn func(root string) error) error 
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(root)
+	// Remove, never RemoveAll: if the unmount below fails, the directory
+	// still holds the container's rootfs.
+	defer os.Remove(root)
 	if err := mountAll(mounts, root); err != nil {
 		return fmt.Errorf("mount rootfs: %w", err)
 	}

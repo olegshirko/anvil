@@ -164,3 +164,50 @@ func TestEventKeyDedup(t *testing.T) {
 		t.Error("eventKey must be equal for same event and differ on TimeNano")
 	}
 }
+
+func TestAgentNetworkEvents(t *testing.T) {
+	ch, unsubscribe := subscribeAgentEvents()
+	defer unsubscribe()
+	publishNetworkEvent("connect", "proj_back", "netid123", "cid456")
+	ev := <-ch
+	if ev.Type != "network" || ev.Action != "connect" || ev.Actor.ID != "netid123" ||
+		ev.Actor.Attributes["container"] != "cid456" || ev.Actor.Attributes["name"] != "proj_back" || ev.TimeNano == 0 {
+		t.Fatalf("event = %+v", ev)
+	}
+	// Recorded for --since replay too.
+	found := false
+	for _, e := range eventLogSnapshot(time.Unix(0, ev.TimeNano-1)) {
+		if e.Actor.ID == "netid123" && e.Action == "connect" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("network event not in the replay buffer")
+	}
+
+	for _, tc := range []struct {
+		filters string
+		want    bool
+	}{
+		{`{"type":["network"]}`, true},
+		{`{"type":["container"]}`, false},
+		{`{"container":["cid4"]}`, true},
+		{`{"container":["other"]}`, false},
+		{`{"network":["proj_back"]}`, true},
+		{`{"network":["netid"]}`, true},
+		{`{"network":["front"]}`, false},
+	} {
+		f, err := parseEventFilters(tc.filters)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := f.match(ev); got != tc.want {
+			t.Errorf("%s: match = %v, want %v", tc.filters, got, tc.want)
+		}
+	}
+	// A container-type event is not matched by a network filter.
+	f, _ := parseEventFilters(`{"network":["proj_back"]}`)
+	if f.match(dockerEvent{Type: "container", Action: "start", Actor: dockerEventActor{ID: "x"}}) {
+		t.Error("network filter matched a container event")
+	}
+}

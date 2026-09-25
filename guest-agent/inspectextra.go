@@ -5,11 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"os/exec"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
@@ -121,89 +118,6 @@ func runGuestShell(script string) (string, string, int, error) {
 // handleContainerStats implements GET /containers/{id}/stats. With
 // stream=false a single reading is returned (what `docker stats
 // --no-stream` needs); streaming mode sends one reading per second.
-func handleContainerStats(ctx context.Context, w http.ResponseWriter, id string, stream bool) {
-	w.Header().Set("Content-Type", "application/json")
-	reading := func() map[string]interface{} {
-		return containerStatsReading(ctx, id)
-	}
-	if !stream {
-		json.NewEncoder(w).Encode(reading())
-		return
-	}
-	flusher, _ := w.(http.Flusher)
-	for {
-		json.NewEncoder(w).Encode(reading())
-		if flusher != nil {
-			flusher.Flush()
-		}
-		// One reading per second, like Docker. The connection closing makes
-		// the next Encode fail, which ends the stream.
-		sleepms(1000)
-	}
-}
-
-func sleepms(ms int) {
-	time.Sleep(time.Duration(ms) * time.Millisecond)
-}
-
-// containerStatsReading builds a Docker-shaped stats sample from
-// /sys/fs/cgroup of the container's task pid and /proc/<pid>/stat for CPU.
-func containerStatsReading(ctx context.Context, id string) map[string]interface{} {
-	zero := func(s string) uint64 { v, _ := strconv.ParseUint(s, 10, 64); return v }
-	reading := func() map[string]interface{} {
-		ns, containerdID, _, err := resolveDockerID(ctx, id)
-		if err != nil {
-			return nil
-		}
-		pid, ok := containerTaskPid(ctx, ns, containerdID)
-		if !ok || pid <= 0 {
-			return nil
-		}
-		readFile := func(p string) string {
-			b, err := os.ReadFile(p)
-			if err != nil {
-				return ""
-			}
-			return strings.TrimSpace(string(b))
-		}
-		memCurrent := zero(readFile(fmt.Sprintf("/sys/fs/cgroup/memory/%d/memory.current", pid)))
-		if memCurrent == 0 {
-			// cgroup v2 nested layout used by runc: /sys/fs/cgroup/<...>/memory.current
-			// The exact path varies; fall back to /proc/<pid>/status VmRSS.
-			status := readFile(fmt.Sprintf("/proc/%d/status", pid))
-			for _, l := range strings.Split(status, "\n") {
-				if strings.HasPrefix(l, "VmRSS:") {
-					f := strings.Fields(l)
-					if len(f) > 1 {
-						memCurrent = zero(f[1]) * 1024
-					}
-				}
-			}
-		}
-		utime := uint64(0)
-		if stat := strings.Fields(readFile(fmt.Sprintf("/proc/%d/stat", pid))); len(stat) >= 14 {
-			utime = zero(stat[13])
-		}
-		return map[string]interface{}{
-			"read":    "0001-01-01T00:00:00Z",
-			"preread": "0001-01-01T00:00:00Z",
-			"memory_stats": map[string]interface{}{
-				"usage": memCurrent,
-				"stats": map[string]interface{}{"cache": 0},
-			},
-			"cpu_stats":    map[string]interface{}{"cpu_usage": map[string]interface{}{"total_usage": utime}},
-			"precpu_stats": map[string]interface{}{"cpu_usage": map[string]interface{}{"total_usage": 0}},
-			"pids_stats":   map[string]interface{}{"current": 0},
-			"networks":     map[string]interface{}{},
-			"name":         id, "id": id,
-		}
-	}
-	r := reading()
-	if r == nil {
-		r = map[string]interface{}{"name": id, "id": id}
-	}
-	return r
-}
 
 // handleSystemDF implements GET /system/df: reclaimable-space overview.
 func handleSystemDF(ctx context.Context, w http.ResponseWriter) {

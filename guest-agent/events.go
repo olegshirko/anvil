@@ -78,6 +78,8 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 	// the replay and the live stream; duplicates at the seam are suppressed
 	// by the dedupe key set below.
 	eventCh, errCh := cl.Subscribe(ctx)
+	agentCh, unsubscribe := subscribeAgentEvents()
+	defer unsubscribe()
 	snapshotNano := time.Now().UnixNano()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -126,6 +128,16 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[docker-api] events stream error: %v", err)
 			}
 			return
+		case ev := <-agentCh:
+			// Agent events go into the buffer when published; one from
+			// before the snapshot was already replayed.
+			if ev.TimeNano <= snapshotNano && replayed != nil {
+				continue
+			}
+			if !send(ev) {
+				return
+			}
+			flusher.Flush()
 		case env, ok := <-eventCh:
 			if !ok {
 				return
@@ -255,6 +267,7 @@ func recordEventStream(ctx context.Context, cl *client.Client) {
 // eventFilters carries the supported docker events --filter values.
 type eventFilters struct {
 	containers []string // container ID prefix or name
+	networks   []string // network ID prefix or name
 	events     []string // action name (create/start/die/...)
 	types      []string // event type (container)
 	images     []string // image reference substring match
@@ -293,6 +306,7 @@ func parseEventFilters(raw string) (*eventFilters, error) {
 		return list
 	}
 	f.containers = pick("container")
+	f.networks = pick("network")
 	f.events = pick("event")
 	f.types = pick("type")
 	f.images = pick("image")
@@ -319,10 +333,30 @@ func (f *eventFilters) match(ev dockerEvent) bool {
 	}
 	if len(f.containers) > 0 {
 		name := ev.Actor.Attributes["name"]
+		id := ev.Actor.ID
+		if ev.Type == "network" {
+			// Network events carry the container as an attribute.
+			id, name = ev.Actor.Attributes["container"], ""
+		}
 		matched := false
 		for _, c := range f.containers {
 			c = strings.TrimPrefix(c, "/")
-			if strings.HasPrefix(ev.Actor.ID, c) || (name != "" && name == c) {
+			if (id != "" && strings.HasPrefix(id, c)) || (name != "" && name == c) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	if len(f.networks) > 0 {
+		if ev.Type != "network" {
+			return false
+		}
+		matched := false
+		for _, n := range f.networks {
+			if strings.HasPrefix(ev.Actor.ID, n) || ev.Actor.Attributes["name"] == n {
 				matched = true
 				break
 			}
@@ -470,4 +504,81 @@ func translateDockerEvent(ctx context.Context, cl *client.Client, env *events.En
 		Time:     ts.Unix(),
 		TimeNano: ts.UnixNano(),
 	}, true
+}
+
+// --- events the agent itself originates --------------------------------------
+
+// Network events (create/destroy/connect/disconnect) are not containerd
+// events: the agent publishes them into the same ring buffer (for --since)
+// and fans them out to every open /events stream.
+var agentEventSubs = struct {
+	sync.Mutex
+	subs map[chan dockerEvent]struct{}
+}{subs: map[chan dockerEvent]struct{}{}}
+
+func subscribeAgentEvents() (<-chan dockerEvent, func()) {
+	ch := make(chan dockerEvent, 64)
+	agentEventSubs.Lock()
+	agentEventSubs.subs[ch] = struct{}{}
+	agentEventSubs.Unlock()
+	return ch, func() {
+		agentEventSubs.Lock()
+		delete(agentEventSubs.subs, ch)
+		agentEventSubs.Unlock()
+	}
+}
+
+// publishAgentEvent stamps, records and broadcasts ev. A stream that is not
+// keeping up misses it rather than stalling the publisher.
+func publishAgentEvent(ev dockerEvent) {
+	now := time.Now()
+	ev.Time, ev.TimeNano = now.Unix(), now.UnixNano()
+	if ev.Scope == "" {
+		ev.Scope = "local"
+	}
+	eventLogRecord(ev)
+	agentEventSubs.Lock()
+	defer agentEventSubs.Unlock()
+	for ch := range agentEventSubs.subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// publishNetworkEvent emits a Docker network event. containerID is the
+// Docker container ID for connect/disconnect, "" for create/destroy.
+func publishNetworkEvent(action, network, networkID, containerID string) {
+	if networkID == "" {
+		networkID = network
+	}
+	attrs := map[string]string{"name": network, "type": "bridge"}
+	if containerID != "" {
+		attrs["container"] = containerID
+	}
+	publishAgentEvent(dockerEvent{Type: "network", Action: action,
+		Actor: dockerEventActor{ID: networkID, Attributes: attrs}})
+}
+
+// networkIDFor resolves a network name to its ID for events ("" if unknown).
+func networkIDFor(ctx context.Context, network string) string {
+	if nw, err := inspectDockerNetwork(ctx, network); err == nil {
+		return nw.Id
+	}
+	return ""
+}
+
+// publishEndpointEvents emits one network event per endpoint of a container
+// (the primary network and its secondaries) — Docker's join/leave on
+// start/stop. --network none has no endpoint to report.
+func publishEndpointEvents(action, ns, id, primary string, extra []netEndpoint) {
+	did := dockerID(ns, id)
+	ctx := context.Background()
+	if primary != noneNetwork && !usesHostNetworkName(primary) {
+		publishNetworkEvent(action, primary, networkIDFor(ctx, primary), did)
+	}
+	for _, e := range extra {
+		publishNetworkEvent(action, e.Network, networkIDFor(ctx, e.Network), did)
+	}
 }

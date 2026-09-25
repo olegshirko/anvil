@@ -437,13 +437,19 @@ define require_version
 		{ echo "Usage: make $@ VERSION=x.y.z (got '$(VERSION)')"; exit 1; }
 endef
 
-# Poll the GitHub API until CI has published the release for the new tag.
+# Poll until CI has published the release for the new tag. Through gh when
+# available (authenticated): 80 anonymous API calls in 20 minutes exceed
+# GitHub's unauthenticated rate limit and the wait never sees the release.
 define wait_for_release
 	@echo "[$@] waiting for CI to publish release..."
 	@i=0; while [ $$i -lt 80 ]; do \
 		sleep 15; \
-		curl -sf $${GITHUB_TOKEN:+-H "Authorization: token $$GITHUB_TOKEN"} \
-			"https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && exit 0; \
+		if command -v gh >/dev/null 2>&1; then \
+			gh release view "v$(VERSION)" --repo olegshirko/anvil >/dev/null 2>&1 && exit 0; \
+		else \
+			curl -sf $${GITHUB_TOKEN:+-H "Authorization: token $$GITHUB_TOKEN"} \
+				"https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && exit 0; \
+		fi; \
 		i=$$((i + 1)); printf "."; \
 	done; \
 	echo ""; echo "[$@] timeout. Check https://github.com/olegshirko/anvil/actions"; exit 1

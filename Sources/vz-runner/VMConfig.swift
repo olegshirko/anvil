@@ -22,6 +22,12 @@ func usersSharePath() -> String? {
 /// Virtiofs tag for the Rosetta runtime share (amd64 containers).
 let rosettaShareTag = "rosetta"
 
+/// Guest path of the rosettad socket: Rosetta asks the ahead-of-time
+/// translation daemon there for cached translations. stage2 starts rosettad
+/// and links its socket here; the guest-agent bind-mounts it into amd64
+/// containers (their mount namespace would not see it otherwise).
+let rosettaCacheSocketPath = "/run/rosettad/rosetta.sock"
+
 /// Rosetta for linux/amd64 containers: opt-in with ANVIL_ROSETTA=1 and only
 /// when Rosetta is installed on the Mac (softwareupdate --install-rosetta).
 /// Off by default: once registered, binfmt_misc hands every x86-64 binary in
@@ -194,7 +200,11 @@ func makeConfiguration(
         switch VZLinuxRosettaDirectoryShare.availability {
         case .installed:
             let fsConfig = VZVirtioFileSystemDeviceConfiguration(tag: rosettaShareTag)
-            fsConfig.share = try VZLinuxRosettaDirectoryShare()
+            let share = try VZLinuxRosettaDirectoryShare()
+            // AOT caching: repeated runs of the same amd64 binaries skip
+            // translation. Harmless while rosettad is not (yet) running.
+            try share.setCachingOptions(.unixSocket(rosettaCacheSocketPath))
+            fsConfig.share = share
             sharingDevices.append(fsConfig)
         case .notInstalled:
             print("[anvil] ANVIL_ROSETTA=1 but Rosetta is not installed: run 'softwareupdate --install-rosetta'")

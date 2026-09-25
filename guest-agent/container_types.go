@@ -99,10 +99,15 @@ type dockerHostPort struct {
 }
 
 type dockerMount struct {
-	Type     string `json:"Type"`
-	Source   string `json:"Source"`
-	Target   string `json:"Target"`
-	ReadOnly bool   `json:"ReadOnly"`
+	Type          string               `json:"Type"`
+	Source        string               `json:"Source"`
+	Target        string               `json:"Target"`
+	ReadOnly      bool                 `json:"ReadOnly"`
+	VolumeOptions *dockerVolumeOptions `json:"VolumeOptions,omitempty"`
+}
+
+type dockerVolumeOptions struct {
+	NoCopy bool `json:"NoCopy"`
 }
 
 type dockerDevice struct {
@@ -147,6 +152,9 @@ type dockerContainerSummary struct {
 	Labels  map[string]string `json:"Labels"`
 	State   string            `json:"State"`
 	Status  string            `json:"Status"`
+	// Mounts: compose's recreate reads the old container's anonymous
+	// volumes from the list endpoint, not from inspect.
+	Mounts []dockerMountPoint `json:"Mounts"`
 }
 
 // dockerContainerInspect is a minimal subset of GET /containers/{id}/json.
@@ -158,6 +166,7 @@ type dockerContainerInspect struct {
 	Config          dockerContainerConfig `json:"Config"`
 	HostConfig      dockerHostConfig      `json:"HostConfig"`
 	NetworkSettings dockerNetworkSettings `json:"NetworkSettings"`
+	Mounts          []dockerMountPoint    `json:"Mounts"`
 	// Docker exposes RestartCount at the top level (not under State).
 	RestartCount int `json:"RestartCount"`
 }
