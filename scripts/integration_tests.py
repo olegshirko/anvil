@@ -1326,14 +1326,16 @@ def test_run_flags_wave3() -> None:
                  "sh", "-c", "echo hi > /dev/mynull && echo dev-ok").stdout.strip()
     if out != "dev-ok":
         raise RuntimeError(f"device: {out!r}")
-    # --link alias resolves to the target container
+    # --link alias resolves to the target container. `; echo` terminates the
+    # 15-byte probe line: output without a trailing newline is lost when a
+    # --rm container exits (README: current limitations).
     target = f"{PREFIX}-lkt"
     try:
         docker("run", "-d", "--name", target, "nginx:alpine")
         wait_http_ok = False
         for _ in range(10):
             probe = docker("run", "--rm", "--link", f"{target}:myalias", "alpine",
-                           "sh", "-c", "wget -qO- --timeout=3 http://myalias 2>/dev/null | head -c 15",
+                           "sh", "-c", "wget -qO- --timeout=3 http://myalias 2>/dev/null | head -c 15; echo",
                            check=False)
             if "DOCTYPE" in probe.stdout or "html" in probe.stdout:
                 wait_http_ok = True
@@ -1422,7 +1424,8 @@ def test_run_flags_wave4() -> None:
         res = docker(*args, check=False)
         if res.returncode == 0 or needle not in res.stderr:
             raise RuntimeError(f"{flag} not rejected: rc={res.returncode} err={res.stderr[-200:]!r}")
-    # seccomp=unconfined is accepted (it is the effective default)
+    # seccomp=unconfined is accepted (and lifts the default profile, see
+    # test_seccomp)
     docker("run", "--rm", "--security-opt", "seccomp=unconfined", "alpine", "true")
     # log driver none: container runs, logs return nothing
     name = f"{PREFIX}-lognone"
@@ -1748,6 +1751,169 @@ def test_buildx_remote_load() -> None:
             docker("rmi", "-f", tag, check=False, timeout=60.0)
 
 
+
+# --- Docker Desktop parity ---------------------------------------------------
+
+
+def test_host_docker_internal() -> None:
+    """host.docker.internal / gateway.docker.internal / host-gateway point at
+    the Mac, and a Mac service is reachable through them."""
+    import http.server
+    srv = http.server.HTTPServer(("0.0.0.0", 0), http.server.SimpleHTTPRequestHandler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        hosts = docker("run", "--rm", "--add-host", "mac.test:host-gateway",
+                       "alpine", "cat", "/etc/hosts").stdout
+        ips = {}
+        for line in hosts.splitlines():
+            parts = line.split()
+            for name in ("host.docker.internal", "gateway.docker.internal", "mac.test"):
+                if len(parts) >= 2 and name in parts[1:]:
+                    ips[name] = parts[0]
+        if len(ips) != 3 or len(set(ips.values())) != 1:
+            raise RuntimeError(f"desktop names not mapped to one host IP: {ips} in {hosts!r}")
+        out = docker("run", "--rm", "alpine", "wget", "-q", "-T", "5", "-O", "/dev/null",
+                     "-S", f"http://host.docker.internal:{port}/", check=False)
+        if out.returncode != 0:
+            raise RuntimeError(f"Mac service unreachable via host.docker.internal: {out.stderr.strip()}")
+        record("host.docker.internal", "PASS", f"-> {ips['host.docker.internal']}, Mac :{port} reachable")
+    finally:
+        srv.shutdown()
+
+
+def test_seccomp() -> None:
+    """Default seccomp profile on, unconfined/privileged off, custom Docker-format
+    profiles honored."""
+    def mode(*args: str) -> str:
+        out = docker("run", "--rm", *args, "alpine", "grep", "^Seccomp:", "/proc/self/status").stdout
+        return out.split()[-1]
+    if mode() != "2":
+        raise RuntimeError("default profile not applied (Seccomp mode != 2)")
+    if mode("--security-opt", "seccomp=unconfined") != "0":
+        raise RuntimeError("seccomp=unconfined still filtered")
+    if mode("--privileged") != "0":
+        raise RuntimeError("--privileged still filtered")
+    profile = {
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "archMap": [{"architecture": "SCMP_ARCH_AARCH64", "subArchitectures": []}],
+        "syscalls": [{"names": ["mkdirat"], "action": "SCMP_ACT_ERRNO"}],
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(profile, f)
+        path = f.name
+    try:
+        res = docker("run", "--rm", "--security-opt", f"seccomp={path}",
+                     "alpine", "mkdir", "/tmp/x", check=False)
+        if res.returncode == 0:
+            raise RuntimeError("custom profile blocking mkdirat did not apply")
+        docker("run", "--rm", "--security-opt", f"seccomp={path}", "alpine", "true")
+    finally:
+        os.unlink(path)
+    record("seccomp profiles", "PASS", "default=2, unconfined/privileged=0, custom profile enforced")
+
+
+def test_run_init() -> None:
+    """--init runs docker-init as PID 1 and reaps zombies; ps/inspect show the
+    user command."""
+    name = f"{PREFIX}-init"
+    try:
+        comm = docker("run", "--rm", "--init", "alpine", "cat", "/proc/1/comm").stdout.strip()
+        if comm != "docker-init":
+            raise RuntimeError(f"PID 1 is {comm!r}, want docker-init")
+        docker("run", "-d", "--name", name, "--init", "alpine", "sleep", "300")
+        cmd = docker("inspect", "-f", "{{json .Config.Cmd}}", name).stdout.strip()
+        if "docker-init" in cmd or "sleep" not in cmd:
+            raise RuntimeError(f"inspect Cmd leaks the init wrapper: {cmd}")
+        # SIGTERM reaches the child through tini: stop is fast, not a 10 s kill
+        t0 = time.time()
+        docker("stop", name, timeout=30.0)
+        if time.time() - t0 > 5:
+            raise RuntimeError("docker stop with --init took the full timeout")
+        record("run --init", "PASS", "PID 1 docker-init, stop forwards SIGTERM")
+    finally:
+        cleanup(name)
+
+
+def test_volumes_from() -> None:
+    src = f"{PREFIX}-vfsrc"
+    try:
+        docker("run", "--name", src, "-v", "/shared", "alpine",
+               "sh", "-c", "echo from-src > /shared/f")
+        out = docker("run", "--rm", "--volumes-from", src, "alpine", "cat", "/shared/f").stdout
+        if "from-src" not in out:
+            raise RuntimeError(f"volume not inherited: {out!r}")
+        res = docker("run", "--rm", "--volumes-from", f"{src}:ro", "alpine",
+                     "touch", "/shared/g", check=False)
+        if res.returncode == 0:
+            raise RuntimeError(":ro volumes-from is writable")
+        res = docker("run", "--rm", "--volumes-from", "no-such-container-xyz", "alpine", "true", check=False)
+        if res.returncode == 0:
+            raise RuntimeError("unknown --volumes-from source accepted")
+        record("--volumes-from", "PASS", "inherits volumes, :ro honored, unknown source rejected")
+    finally:
+        cleanup(src)
+
+
+def test_image_history() -> None:
+    rows = docker("history", "--no-trunc", "--format", "{{.ID}}\t{{.Size}}\t{{.CreatedBy}}", "alpine").stdout.splitlines()
+    if not rows or not rows[0].startswith("sha256:"):
+        raise RuntimeError(f"history top row is not the image id: {rows[:2]}")
+    if not any("ADD" in r or "COPY" in r for r in rows):
+        raise RuntimeError(f"no layer-creating step in history: {rows}")
+    image_id = docker("image", "inspect", "-f", "{{.Id}}", "alpine").stdout.strip()
+    if not rows[0].startswith(image_id):
+        raise RuntimeError(f"history id {rows[0]!r} != inspect id {image_id}")
+    record("docker history", "PASS", f"{len(rows)} rows, top = image id")
+
+
+def test_image_search() -> None:
+    res = docker("search", "--limit", "5", "--filter", "is-official=true", "alpine",
+                 "--format", "{{.Name}} {{.IsOfficial}}", check=False, timeout=60.0)
+    if res.returncode != 0:
+        raise RuntimeError(f"docker search failed: {res.stderr.strip()}")
+    lines = res.stdout.splitlines()
+    if not lines or not any(l.split()[0] == "alpine" for l in lines):
+        raise RuntimeError(f"official alpine not found: {lines}")
+    if len(lines) > 5:
+        raise RuntimeError(f"--limit ignored: {len(lines)} rows")
+    record("docker search", "PASS", f"{len(lines)} official result(s)")
+
+
+def test_export_and_diff() -> None:
+    name = f"{PREFIX}-export"
+    try:
+        docker("run", "--name", name, "alpine", "sh", "-c",
+               "echo exported > /root/marker && rm /etc/motd && echo x >> /etc/profile")
+        diff = set(docker("diff", name).stdout.splitlines())
+        for want in ("A /root/marker", "D /etc/motd", "C /etc/profile", "C /etc"):
+            if want not in diff:
+                raise RuntimeError(f"diff missing {want!r}: {sorted(diff)}")
+        for noise in ("A /etc/hosts", "A /etc/hostname", "A /etc/resolv.conf"):
+            if noise in diff:
+                raise RuntimeError(f"diff reports runc mountpoint {noise!r}")
+        with tempfile.TemporaryDirectory() as tmp:
+            tar = Path(tmp) / "fs.tar"
+            docker("export", "-o", str(tar), name, timeout=120.0)
+            listing = subprocess.run(["tar", "-tf", str(tar)], capture_output=True, text=True, check=True).stdout
+            names = {n.lstrip("./") for n in listing.splitlines()}
+            if "root/marker" not in names or "bin/busybox" not in names:
+                raise RuntimeError("export tar lacks the container's files")
+            if "etc/motd" in names:
+                raise RuntimeError("export includes a deleted file")
+        # a running container exports through the live rootfs
+        docker("rm", "-f", name)
+        docker("run", "-d", "--name", name, "alpine", "sh", "-c", "touch /live && sleep 300")
+        time.sleep(0.5)
+        live = subprocess.run(["docker", "export", name], capture_output=True, env=DOCKER_ENV, timeout=120)
+        if live.returncode != 0 or b"live" not in live.stdout:
+            raise RuntimeError("export of a running container failed")
+        record("docker export/diff", "PASS", f"{len(diff)} changes, export of stopped+running")
+    finally:
+        cleanup(name)
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -1809,6 +1975,13 @@ TESTS = [
     ("classic build after rmi", test_classic_build_after_rmi),
     ("buildx builder selection", test_buildx_builder_selection),
     ("buildx remote --load", test_buildx_remote_load),
+    ("host.docker.internal", test_host_docker_internal),
+    ("seccomp profiles", test_seccomp),
+    ("run --init", test_run_init),
+    ("volumes-from", test_volumes_from),
+    ("image history", test_image_history),
+    ("image search", test_image_search),
+    ("export and diff", test_export_and_diff),
 ]
 
 
