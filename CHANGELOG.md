@@ -1,3 +1,7 @@
+## v1.3.1 (2026-09-25)
+
+### Fixed
+- d07e3cc fix: multi-network containers, live network connect/disconnect, restart policy re-armed by start
 ## v1.3.0 (2026-09-25)
 
 ### Added
