@@ -1,3 +1,14 @@
+## v1.4.1 (2026-09-25)
+
+### Fixed
+- bcdabcc fix: docker volume prune removed volumes in use; log rotation; health_status events
+
+### Changed
+- 330dd77 perf: docker run returns ~4x faster (2.5 s -> 0.6 s)
+
+### Internal
+- a5628b7 test: event tests select their own container/network across runs
+- c65ef96 test: event tests tolerate a guest clock that trails the Mac's
 ## v1.4.0 (2026-09-25)
 
 ### Added
