@@ -412,8 +412,12 @@ func handleContainerWait(w http.ResponseWriter, r *http.Request, id string) {
 	exitCode, err := waitContainerTask(r.Context(), ns, containerdID)
 	if err != nil {
 		log.Printf("[docker-api] wait %s task error: %v", id, err)
+	} else {
+		// Only a real exit is cached. `docker run -d` opens a /wait and
+		// drops it right after /start; caching that aborted wait's 0 made
+		// the next `docker wait <name>` return 0 immediately.
+		cacheContainerExitCode(did, exitCode)
 	}
-	cacheContainerExitCode(did, exitCode)
 	log.Printf("[docker-api] wait %s returning StatusCode=%d", id, exitCode)
 	fmt.Fprintf(w, `{"StatusCode":%d}`, exitCode)
 }

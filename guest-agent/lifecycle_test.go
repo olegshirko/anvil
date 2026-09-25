@@ -4,11 +4,13 @@ package main
 // from one run of a container into the next.
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // docker stop, the task exit watcher and the restart path all stop the health
@@ -113,5 +115,25 @@ func TestPickContainerRefOrder(t *testing.T) {
 	twins := []containerRef{{ns: "a", id: "1", name: "web"}, {ns: "b", id: "2", name: "web"}}
 	if _, err := pickContainerRef("web", twins); err == nil {
 		t.Fatal("a name in two namespaces is ambiguous")
+	}
+}
+
+// `docker run -d` sends /wait and disconnects right after /start. The
+// aborted wait must not cache an exit code, or the next `docker wait`
+// returns it immediately instead of blocking until the real exit.
+func TestAbortedWaitDoesNotCacheExitCode(t *testing.T) {
+	startFakeContainerd(t, fakeNamespace, fixtureNS()...)
+	did := dockerID(fakeNamespace, "c2-idle")
+	t.Cleanup(func() { takeContainerExitCode(did) })
+
+	// Cancelled while the handler polls for the (never created) task, i.e.
+	// after the container was resolved — the client hanging up.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/containers/"+did+"/wait", nil).WithContext(ctx)
+	handleContainerWait(httptest.NewRecorder(), req, did)
+
+	if code, ok := takeContainerExitCode(did); ok {
+		t.Fatalf("aborted wait cached exit code %d", code)
 	}
 }
