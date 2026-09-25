@@ -406,10 +406,14 @@ func generateCNIConfigLocked(ns string, extraLabels map[string]string) error {
 				"type": "loopback",
 			},
 			map[string]interface{}{
-				"type":        "bridge",
-				"bridge":      bridge,
-				"isGateway":   true,
-				"ipMasq":      true,
+				"type":      "bridge",
+				"bridge":    bridge,
+				"isGateway": true,
+				// Masquerading is one static rule per subnet
+				// (ensureNetworkMasquerade), not a chain per container:
+				// the bridge plugin's per-container chain cost ~150 ms
+				// per stop and kept its teardown bound to a live netns.
+				"ipMasq":      false,
 				"hairpinMode": true,
 				"ipam": map[string]interface{}{
 					"type": "host-local",

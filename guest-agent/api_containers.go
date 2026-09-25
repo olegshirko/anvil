@@ -175,7 +175,7 @@ func handleContainerKill(w http.ResponseWriter, r *http.Request, p routeParams) 
 }
 
 func handleContainerRestart(w http.ResponseWriter, r *http.Request, p routeParams) {
-	timeout := 0
+	timeout := 10 // as docker stop: no -t means the default grace period
 	if t := r.URL.Query().Get("t"); t != "" {
 		if v, err := strconv.Atoi(t); err == nil {
 			timeout = v

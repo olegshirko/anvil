@@ -407,6 +407,9 @@ func removeDockerNetwork(ctx context.Context, name string) error {
 		return fmt.Errorf("No such network: %s", name)
 	}
 	removeStaleBridge(path)
+	if netName != "" {
+		removeNetworkMasquerade(netName)
+	}
 
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("remove conflist: %w", err)

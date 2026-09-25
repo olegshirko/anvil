@@ -57,6 +57,86 @@ func loadNetInfo(ns, id string) (containerNetInfo, bool) {
 	return ni, true
 }
 
+// netInfoMu makes claimNetInfo atomic; releasing tracks claimed records
+// whose detach is still running, so stop and delete can wait for it.
+var (
+	netInfoMu sync.Mutex
+	releasing = map[string]chan struct{}{}
+)
+
+// claimNetInfo takes a container's live endpoint record for teardown:
+// stop, the exit watcher and delete all race to detach a stopped
+// container's network, and every CNI DEL costs a few iptables runs — with a
+// dozen containers going down at once (compose down) the duplicates made
+// up most of the wait. Only the caller that claims the record detaches.
+func claimNetInfo(ns, id string) (containerNetInfo, bool) {
+	netInfoMu.Lock()
+	defer netInfoMu.Unlock()
+	ni, ok := loadNetInfo(ns, id)
+	if ok {
+		removeNetInfo(ns, id)
+		releasing[ns+"/"+id] = make(chan struct{})
+	}
+	return ni, ok
+}
+
+// awaitNetRelease blocks until a detach another caller claimed is done: a
+// stop must not return (and a restart attach) while the veth still exists.
+func awaitNetRelease(ns, id string) {
+	netInfoMu.Lock()
+	ch := releasing[ns+"/"+id]
+	netInfoMu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	case <-time.After(20 * time.Second):
+	}
+}
+
+func finishNetRelease(ns, id string) {
+	netInfoMu.Lock()
+	defer netInfoMu.Unlock()
+	if ch := releasing[ns+"/"+id]; ch != nil {
+		close(ch)
+		delete(releasing, ns+"/"+id)
+	}
+}
+
+// releaseEndpoints detaches a claimed endpoint record (secondaries first)
+// and publishes the network disconnect events.
+func releaseEndpoints(ctx context.Context, ns, id string, ni containerNetInfo, ports []cniPortMapping) {
+	defer finishNetRelease(ns, id)
+	if usesHostNetworkName(ni.Network) {
+		return
+	}
+	dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	// Destroy the netns first: the kernel then tears the veths down on its
+	// own, and the bridge plugin's DEL skips the synchronous in-netns link
+	// removal (~240 ms each, serialized on the RTNL across a compose down).
+	// Only where the bridge plugin does not masquerade per container — it
+	// would skip removing that chain too. start recreates the netns.
+	fast := !networkUsesPluginMasq(ni.Network)
+	for _, e := range ni.Extra {
+		fast = fast && !networkUsesPluginMasq(e.Network)
+	}
+	if fast {
+		releaseNamedNetNS(id)
+	}
+	detachSecondaryNetworks(dctx, id, ni.Extra)
+	start := time.Now()
+	if err := detachNetwork(dctx, ni.Network, ns, id, netnsPathFor(id), ports); err != nil {
+		debugLog("[cni] detach %s/%s: %v", ns, truncateID(id), err)
+	}
+	debugLog("[cni] detach %s from %s took %v", truncateID(id), ni.Network, time.Since(start))
+	publishEndpointEvents("disconnect", ns, id, ni.Network, ni.Extra)
+	// The endpoint is gone — drop the container's name/aliases from the
+	// hosts files of its network peers, whichever path released it.
+	refreshHostsForContainer(ns, id)
+}
+
 func removeNetInfo(ns, id string) {
 	os.Remove(filepath.Join(containerMetaDir(ns, id), "net.json"))
 }
@@ -133,6 +213,13 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 	}
 
 	if !usesHostNetworkName(netName) {
+		// A stop/exit detach of the previous run may still be going: its
+		// CNI DEL shares this container's cache and IPAM keys with the ADD
+		// below. Then recreate the netns that detach released.
+		awaitNetRelease(ns, id)
+		if nerr := ensureNamedNetNS(id); nerr != nil {
+			return fmt.Errorf("netns: %w", nerr)
+		}
 		// Self-healing attach: the exit watcher's CNI detach is asynchronous,
 		// so a restart (the monitor, docker restart, compose) can race it and
 		// hit a leftover veth ("eth0 peer already exists") or a torn-down
@@ -259,16 +346,9 @@ func watchTaskExit(ctx context.Context, ns, id, netName string, ports []cniPortM
 	stopHealthCheck(did)
 
 	if !usesHostNetworkName(netName) {
-		dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		if ni, ok := loadNetInfo(ns, id); ok {
-			detachSecondaryNetworks(dctx, id, ni.Extra)
-			publishEndpointEvents("disconnect", ns, id, netName, ni.Extra)
+		if ni, ok := claimNetInfo(ns, id); ok {
+			releaseEndpoints(ctx, ns, id, ni, ports)
 		}
-		if derr := detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports); derr != nil {
-			debugLog("[cni] detach %s/%s: %v", ns, truncateID(id), derr)
-		}
-		cancel()
-		removeNetInfo(ns, id)
 	}
 	debugLog("[runtime] task %s/%s exited code=%d", ns, truncateID(id), code)
 }
@@ -311,10 +391,16 @@ func stopNativeTask(ctx context.Context, ns, id string, timeoutSec int) error {
 	if kerr := task.Kill(nsCtx, sig); kerr != nil {
 		return kerr
 	}
-	if timeoutSec <= 0 {
-		timeoutSec = 10
+	// Docker: -t 0 kills at once, -t -1 waits for as long as it takes.
+	// (0 used to be read as "default", so `stop -t 0`, `rm -f` of a
+	// signal-ignoring process and `compose down -t 0` waited 10 s.)
+	var deadline time.Time
+	switch {
+	case timeoutSec < 0:
+		deadline = time.Now().Add(100 * 365 * 24 * time.Hour)
+	default:
+		deadline = time.Now().Add(time.Duration(timeoutSec) * time.Second)
 	}
-	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
 		cur, err := task.Status(nsCtx)
@@ -352,8 +438,13 @@ func stopNativeTask(ctx context.Context, ns, id string, timeoutSec int) error {
 // Best effort and idempotent (a late exit-watcher detach on an already
 // detached endpoint is harmless).
 func teardownNetwork(ctx context.Context, ns, id string) {
-	ni, ok := loadNetInfo(ns, id)
-	if !ok || usesHostNetworkName(ni.Network) {
+	ni, ok := claimNetInfo(ns, id)
+	if !ok {
+		awaitNetRelease(ns, id) // the exit watcher got there first
+		return
+	}
+	if usesHostNetworkName(ni.Network) {
+		finishNetRelease(ns, id)
 		return
 	}
 	meta, _ := loadContainerMeta(ns, id)
@@ -361,14 +452,7 @@ func teardownNetwork(ctx context.Context, ns, id string) {
 	if meta != nil {
 		ports = meta.Ports
 	}
-	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	detachSecondaryNetworks(dctx, id, ni.Extra)
-	detachNetwork(dctx, ni.Network, ns, id, netnsPathFor(id), ports) //nolint:errcheck
-	cancel()
-	removeNetInfo(ns, id)
-	// The endpoint is gone — drop the container's name/aliases from the
-	// hosts files of its network peers.
-	refreshHostsForContainer(ns, id)
+	releaseEndpoints(ctx, ns, id, ni, ports)
 }
 
 // logOnlyIO mirrors cio.LogURI but can flag the IO config as a terminal,
@@ -434,16 +518,14 @@ func deleteNativeContainer(ctx context.Context, ns, id string, force, removeVolu
 	}
 
 	// CNI teardown if the exit watcher lost the race (or never ran).
-	if ni, ok := loadNetInfo(ns, id); ok && !usesHostNetworkName(ni.Network) {
+	if ni, ok := claimNetInfo(ns, id); ok {
 		var ports []cniPortMapping
 		if meta != nil {
 			ports = meta.Ports
 		}
-		dctx, dcancel := context.WithTimeout(ctx, 10*time.Second)
-		detachSecondaryNetworks(dctx, id, ni.Extra)
-		detachNetwork(dctx, ni.Network, ns, id, netnsPathFor(id), ports) //nolint:errcheck
-		dcancel()
-		removeNetInfo(ns, id)
+		releaseEndpoints(ctx, ns, id, ni, ports)
+	} else {
+		awaitNetRelease(ns, id) // before the netns goes away under it
 	}
 
 	releaseNamedNetNS(id)

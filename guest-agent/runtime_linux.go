@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -171,6 +172,9 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 	conflist, err := findConflistForNetwork(netName)
 	if err != nil {
 		return "", "", err
+	}
+	if err := ensureNetworkMasquerade(netName); err != nil {
+		log.G(ctx).WithError(err).Warnf("[cni] masquerade rule for %s", netName)
 	}
 	c, err := cnim.forConflist(conflist)
 	if err != nil {
@@ -361,4 +365,113 @@ func detachLoopbackOnly(ctx context.Context, id, netnsPath string) error {
 		return err
 	}
 	return extraCNI.DelNetworkList(ctx, list, &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: "lo"})
+}
+
+// --- fast endpoint teardown -------------------------------------------------
+
+// ensureNamedNetNS recreates the container's named netns when a previous
+// stop released it (see releaseEndpoints).
+func ensureNamedNetNS(name string) error {
+	var st unix.Statfs_t
+	if err := unix.Statfs(filepath.Join(netnsDir, name), &st); err == nil && st.Type == unix.NSFS_MAGIC {
+		return nil
+	}
+	_, err := createNamedNetNS(name)
+	return err
+}
+
+// networkConflist is the part of a conflist teardown decisions need.
+type networkConflist struct {
+	Plugins []struct {
+		Type   string `json:"type"`
+		IPMasq bool   `json:"ipMasq"`
+		IPAM   struct {
+			Ranges [][]struct {
+				Subnet string `json:"subnet"`
+			} `json:"ranges"`
+		} `json:"ipam"`
+	} `json:"plugins"`
+}
+
+func readNetworkConflist(netName string) (*networkConflist, error) {
+	path, err := findConflistForNetwork(netName)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cl networkConflist
+	if err := json.Unmarshal(data, &cl); err != nil {
+		return nil, err
+	}
+	return &cl, nil
+}
+
+// networkUsesPluginMasq reports whether the bridge plugin masquerades per
+// container (networks created before the static rule).
+func networkUsesPluginMasq(netName string) bool {
+	cl, err := readNetworkConflist(netName)
+	if err != nil {
+		return true // unknown: take the conservative teardown order
+	}
+	for _, p := range cl.Plugins {
+		if p.Type == "bridge" {
+			return p.IPMasq
+		}
+	}
+	return false
+}
+
+func networkSubnets(cl *networkConflist) []string {
+	var out []string
+	for _, p := range cl.Plugins {
+		for _, rs := range p.IPAM.Ranges {
+			for _, r := range rs {
+				if r.Subnet != "" {
+					out = append(out, r.Subnet)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func masqueradeRule(netName, subnet string) []string {
+	return []string{"-t", "nat", "POSTROUTING", "-s", subnet, "!", "-d", subnet,
+		"-m", "comment", "--comment", "anvil-masq " + netName, "-j", "MASQUERADE"}
+}
+
+// ensureNetworkMasquerade installs the network's outbound masquerade rule
+// (idempotent: one iptables -C when present).
+func ensureNetworkMasquerade(netName string) error {
+	cl, err := readNetworkConflist(netName)
+	if err != nil {
+		return err
+	}
+	for _, p := range cl.Plugins {
+		if p.Type == "bridge" && p.IPMasq {
+			return nil // the plugin masquerades itself
+		}
+	}
+	for _, subnet := range networkSubnets(cl) {
+		if err := ensureIptablesRule(masqueradeRule(netName, subnet)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// removeNetworkMasquerade drops the rule when the network goes away.
+func removeNetworkMasquerade(netName string) {
+	cl, err := readNetworkConflist(netName)
+	if err != nil {
+		return
+	}
+	for _, subnet := range networkSubnets(cl) {
+		rule := masqueradeRule(netName, subnet)
+		args := append([]string{rule[0], rule[1], "-D"}, rule[2:]...)
+		exec.Command("iptables", args...).Run() //nolint:errcheck — best effort
+	}
 }

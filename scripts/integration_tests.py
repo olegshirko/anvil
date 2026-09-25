@@ -2676,6 +2676,107 @@ def test_run_rm_latency() -> None:
     record("docker run --rm latency", "PASS", f"median {median:.2f}s, output complete")
 
 
+def test_stop_timeout_zero() -> None:
+    """docker stop -t 0 kills at once (it used to mean "default 10 s"), and
+    -t N waits N seconds for a process that ignores SIGTERM."""
+    name = f"{PREFIX}-stop0"
+    try:
+        for t, lo, hi in (("0", 0.0, 2.0), ("2", 1.5, 4.5)):
+            docker("rm", "-f", name, check=False, timeout=60.0)
+            # sleep as PID 1 has no SIGTERM handler: only SIGKILL stops it.
+            docker("run", "-d", "--name", name, "alpine", "sleep", "300")
+            t0 = time.time()
+            docker("stop", "-t", t, name, timeout=60.0)
+            took = time.time() - t0
+            if not lo <= took <= hi:
+                raise RuntimeError(f"stop -t {t} took {took:.2f}s (want {lo}-{hi}s)")
+    finally:
+        docker("rm", "-f", name, check=False, timeout=60.0)
+    record("stop -t 0 is immediate", "PASS", "-t 0 < 2s, -t 2 waits ~2s")
+
+
+def test_compose_many_services() -> None:
+    """compose up of 15 services starts all of them (a short listen backlog
+    on the Docker socket used to refuse compose's parallel connections),
+    they reach each other and the outside, and down tears it all down."""
+    project = f"{PREFIX}-many"
+    n = 15
+    with tempfile.TemporaryDirectory() as tmp:
+        compose_file = Path(tmp) / "compose.yml"
+        compose_file.write_text("services:\n" + "".join(
+            f"  s{i}:\n    image: alpine\n    command: sleep 300\n" for i in range(1, n + 1)))
+        base = ["compose", "-p", project, "-f", str(compose_file)]
+        try:
+            t0 = time.time()
+            docker(*base, "up", "-d", timeout=300.0)
+            up = time.time() - t0
+            ps = docker(*base, "ps", "--format", "{{.State}}").stdout.split()
+            if ps.count("running") != n:
+                raise RuntimeError(f"{ps.count('running')}/{n} running after up: {ps}")
+            out = docker(*base, "exec", "-T", "s1", "ping", "-c", "1", "-W", "3", f"s{n}", check=False)
+            if out.returncode != 0:
+                raise RuntimeError(f"s1 cannot reach s{n}: {out.stdout!r} {out.stderr!r}")
+            out = docker(*base, "exec", "-T", "s2", "wget", "-q", "-O", "/dev/null", "-T", "10",
+                         "http://example.com", check=False, timeout=60.0)
+            if out.returncode != 0:
+                raise RuntimeError(f"no egress from a compose network: {out.stderr!r}")
+            t0 = time.time()
+            docker(*base, "down", "-t", "0", timeout=300.0)
+            down = time.time() - t0
+            left = docker("ps", "-a", "--filter", f"label=com.docker.compose.project={project}",
+                          "--format", "{{.Names}}").stdout.split()
+            if left:
+                raise RuntimeError(f"containers left after down: {left}")
+        finally:
+            docker(*base, "down", "-t", "0", check=False, timeout=300.0)
+    record("compose 15 services", "PASS", f"up {up:.1f}s, down -t 0 {down:.1f}s, mesh + egress ok")
+
+
+def test_system_df_verbose() -> None:
+    """docker system df -v reports real volume sizes and reference counts."""
+    vol = f"{PREFIX}-dfvol"
+    name = f"{PREFIX}-dfc"
+    try:
+        docker("volume", "create", vol)
+        docker("run", "-d", "--name", name, "-v", f"{vol}:/data", "alpine", "sh", "-c",
+               "head -c 3000000 /dev/zero > /data/f && sleep 300")
+        time.sleep(1.0)
+        out = docker("system", "df", "-v", "--format", "{{json .}}", timeout=120.0).stdout
+        data = json.loads(out)
+        vols = {v["Name"]: v for v in data.get("Volumes") or []}
+        if vol not in vols:
+            raise RuntimeError(f"volume {vol} missing from df -v: {list(vols)}")
+        v = vols[vol]
+        if str(v.get("Links")) != "1" or v.get("Size") in ("0B", "", "N/A"):
+            raise RuntimeError(f"volume usage not reported: {v}")
+    finally:
+        docker("rm", "-f", name, check=False, timeout=60.0)
+        docker("volume", "rm", "-f", vol, check=False, timeout=60.0)
+    record("system df -v", "PASS", f"volume size {v.get('Size')}, links {v.get('Links')}")
+
+
+def test_build_context_symlinks() -> None:
+    """Symlinks in the build context stay symlinks in the image, absolute
+    ones included (the context is extracted chrooted into its directory)."""
+    tag = f"{PREFIX}-ctxlink:1"
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / "real.txt").write_text("ctx-ok\n")
+        os.symlink("real.txt", d / "rel")
+        os.symlink("/etc/hostname", d / "abs")
+        (d / "Dockerfile").write_text(
+            "FROM alpine\nCOPY . /ctx\nRUN cat /ctx/rel && readlink /ctx/abs > /ctx/abs.target\n")
+        try:
+            docker("build", "-t", tag, tmp, timeout=600.0)
+            out = docker("run", "--rm", tag, "sh", "-c",
+                         "cat /ctx/rel; readlink /ctx/rel; cat /ctx/abs.target").stdout.split()
+            if out != ["ctx-ok", "real.txt", "/etc/hostname"]:
+                raise RuntimeError(f"context symlinks not preserved: {out}")
+        finally:
+            docker("rmi", "-f", tag, check=False, timeout=60.0)
+    record("build context symlinks", "PASS", "relative and absolute links kept")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -2694,6 +2795,10 @@ TESTS = [
     ("pause/unpause", test_pause_unpause),
     ("top + stats", test_top_and_stats),
     ("system df", test_system_df),
+    ("system df -v", test_system_df_verbose),
+    ("stop -t 0 is immediate", test_stop_timeout_zero),
+    ("compose 15 services", test_compose_many_services),
+    ("build context symlinks", test_build_context_symlinks),
     ("network connect/disconnect", test_network_connect),
     ("logs", test_logs),
     ("logs --tail/-t", test_logs_tail_timestamps),

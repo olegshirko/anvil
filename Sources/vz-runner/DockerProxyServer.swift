@@ -69,7 +69,10 @@ final class DockerProxyServer {
         // The Docker socket is root-equivalent inside the VM; restrict it to
         // the owner.
         chmod(socketPath, 0o600)
-        guard listen(fd, 5) == 0 else {
+        // SOMAXCONN: compose opens a connection per service at once; with a
+        // backlog of 5 the excess got ECONNREFUSED ("Cannot connect to the
+        // Docker daemon") mid-`compose up`.
+        guard listen(fd, SOMAXCONN) == 0 else {
             print("[docker-proxy] failed to listen unix socket: \(String(cString: strerror(errno)))")
             close(fd)
             fd = -1

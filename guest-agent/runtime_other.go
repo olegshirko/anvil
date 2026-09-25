@@ -48,3 +48,7 @@ func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName stri
 func detachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName string) error {
 	return fmt.Errorf("CNI not supported on this platform")
 }
+
+func ensureNamedNetNS(name string) error        { return nil }
+func networkUsesPluginMasq(netName string) bool { return true }
+func removeNetworkMasquerade(netName string)    {}
