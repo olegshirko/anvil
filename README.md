@@ -260,6 +260,10 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
 - `FROM` in a Dockerfile resolves through the registry; if Docker Hub is
   fully unreachable, a build with a brand-new base image fails (local
   fallback only works for tags already pulled).
+- The VM reaches the internet through the macOS NAT. A full-tunnel VPN on
+  the Mac (e.g. a Tailscale exit node) can block that traffic while the Mac
+  itself stays online: pulls then fail with `dial tcp …: i/o timeout`.
+  `anvil doctor` checks it (`vm internet`), and pull errors say so.
 - The control socket is unauthenticated (local-user trust model) — do not
   expose it.
 

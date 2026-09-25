@@ -99,6 +99,30 @@ func cmdDoctor(args: [String]) {
         check("docker api", ping == "OK", ping.isEmpty ? "no answer on /_ping" : ping)
     }
 
+    // Internet from inside the VM. The guest leaves through the macOS NAT; a
+    // full-tunnel VPN can swallow that traffic while the Mac stays online, and
+    // every pull then fails with a bare i/o timeout.
+    if daemonRunning {
+        let vpn = defaultRouteInterface(fromRouteOutput: shell("route", "-n", "get", "default"))
+            .flatMap { $0.hasPrefix("utun") ? $0 : nil }
+        let vpnHint = vpn.map {
+            " — the Mac's default route goes through \($0), a full-tunnel VPN (e.g. a Tailscale exit node); " +
+            "VM traffic behind the macOS NAT does not pass through it. Turn the exit node off or split-tunnel."
+        } ?? ""
+        do {
+            let resp = try ControlClient.request("egress")
+            if resp.status == "ok" {
+                check("vm internet", true, "the VM reaches registry-1.docker.io:443")
+            } else if let err = resp.error, err.hasPrefix("unknown command") {
+                check("vm internet", true, "skipped (guest-agent predates this check)")
+            } else {
+                check("vm internet", false, (resp.error ?? "no answer") + vpnHint)
+            }
+        } catch {
+            check("vm internet", false, "control socket: \(error)")
+        }
+    }
+
     // Host /Users share for bind mounts. Turning it off is a choice, not a
     // failure.
     if usersSharePath() != nil {
@@ -171,4 +195,16 @@ func cmdLogs(args: [String]) {
         }
         print("")
     }
+}
+
+/// The interface of the default route from `route -n get default` output.
+func defaultRouteInterface(fromRouteOutput output: String) -> String? {
+    for line in output.split(separator: "\n") {
+        let parts = line.split(separator: ":", maxSplits: 1)
+        if parts.count == 2, parts[0].trimmingCharacters(in: .whitespaces) == "interface" {
+            let iface = parts[1].trimmingCharacters(in: .whitespaces)
+            return iface.isEmpty ? nil : iface
+        }
+    }
+    return nil
 }

@@ -294,6 +294,8 @@ func dispatch(req *Request) Response {
 		return Response{Status: "ok"}
 	case "exec":
 		return runExec(req.Args)
+	case "egress":
+		return egressStatus()
 	default:
 		return Response{Error: fmt.Sprintf("unknown command: %s", req.Cmd), ExitCode: 1}
 	}

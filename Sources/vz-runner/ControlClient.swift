@@ -35,6 +35,12 @@ enum ControlClient {
         }
     }
 
+    /// One request on the control socket, for callers that inspect the
+    /// answer themselves (doctor).
+    static func request(_ cmd: String) throws -> ControlResponse {
+        try sendUnix(request: ControlRequest(cmd: cmd, args: nil))
+    }
+
     // MARK: - Private
 
     private static func sendUnix(request: ControlRequest) throws -> ControlResponse {

@@ -221,7 +221,7 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs string, auth *reg
 		debugLog("pull attempt %d for %s failed: %v", attempt+1, canonicalRef, perr)
 	}
 	if perr != nil {
-		pullErr := fmt.Errorf("pull failed: %w", perr)
+		pullErr := fmt.Errorf("pull failed: %w", explainEgressFailure(perr))
 		// Fallback: docker-mirror GitHub release (used when the registry is
 		// unreachable or rate-limited but a mirror exists). Only silent on a
 		// clean 404 ("not mirrored yet"); other download errors are logged.
@@ -335,6 +335,6 @@ func pullDockerImage(ctx context.Context, image string, auth *registryAuth) (str
 		} else if !errors.Is(mErr, errMirrorNotFound) {
 			log.Printf("[images] mirror fallback for %q: %v", image, mErr)
 		}
-		return "", fmt.Errorf("pull failed: %w", pullErr)
+		return "", fmt.Errorf("pull failed: %w", explainEgressFailure(pullErr))
 	}
 }
