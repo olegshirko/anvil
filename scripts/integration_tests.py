@@ -2405,7 +2405,7 @@ def test_volume_copy_up_and_image_volume() -> None:
 def test_network_events() -> None:
     net, name = f"{PREFIX}-evnet", f"{PREFIX}-evc"
     try:
-        since = str(int(time.time()) - 1)
+        since = str(int(time.time()) - 30)  # guest clock may trail the Mac's
         docker("network", "create", net)
         docker("run", "-d", "--name", name, "alpine", "sleep", "300")
         docker("network", "connect", net, name)
@@ -2607,7 +2607,9 @@ def test_log_rotation() -> None:
 def test_health_status_events() -> None:
     name = f"{PREFIX}-healthev"
     try:
-        since = str(int(time.time()) - 1)
+        # Generous: event times come from the guest clock, which may trail
+        # the Mac's by a moment after a resume.
+        since = str(int(time.time()) - 30)
         docker("run", "-d", "--name", name, "--health-cmd", "test -f /tmp/ok", "--health-interval", "1s",
                "--health-retries", "2", "alpine", "sh", "-c", "touch /tmp/ok; sleep 4; rm /tmp/ok; sleep 300")
         deadline = time.time() + 30
