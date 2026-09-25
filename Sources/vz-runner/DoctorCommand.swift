@@ -113,6 +113,12 @@ func cmdDoctor(args: [String]) {
             let resp = try ControlClient.request("egress")
             if resp.status == "ok" {
                 check("vm internet", true, "the VM reaches registry-1.docker.io:443")
+            } else if resp.status == "via-host" {
+                // Pulls and builds work (registry traffic falls back to the
+                // Mac), but containers themselves have no internet.
+                check("vm internet", false,
+                      "direct access blocked (\(resp.error ?? "?")); registry traffic goes through the Mac, " +
+                      "so pulls and builds work, but containers have no internet" + vpnHint)
             } else if let err = resp.error, err.hasPrefix("unknown command") {
                 check("vm internet", true, "skipped (guest-agent predates this check)")
             } else {

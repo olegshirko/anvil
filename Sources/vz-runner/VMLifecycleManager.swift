@@ -52,6 +52,8 @@ final class VMLifecycleManager: NSObject {
     /// Optional host-port availability endpoint; attached to the VM's socket
     /// device before every start/restore. Set by the daemon only.
     var portCheckServer: PortCheckServer?
+    /// Outbound connections for the guest through the Mac's network stack.
+    let egressServer = EgressServer()
 
     var socketDevice: VZVirtioSocketDevice? {
         vm?.socketDevices.first as? VZVirtioSocketDevice
@@ -64,6 +66,7 @@ final class VMLifecycleManager: NSObject {
     func attachPortCheckServer() {
         guard let device = socketDevice else { return }
         portCheckServer?.attach(to: device)
+        egressServer.attach(to: device)
     }
 
     init(args: BootArgs, phaseTimer: BootPhaseTimer = BootPhaseTimer()) {

@@ -101,6 +101,8 @@ func main() {
 	// them so they do not accumulate as zombies and deadlock containerd-shim.
 	go reapZombies()
 	go servePortProxy()
+	routeDefaultTransportThroughEgress()
+	go serveEgressProxy()
 	go runRestartMonitor()
 
 	// Recreate CNI conflists from the host share after a cold boot, and set

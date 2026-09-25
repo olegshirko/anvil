@@ -45,10 +45,21 @@ func egressStatus() Response {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	var d net.Dialer
-	if msg := checkEgress(ctx, egressProbeTarget, net.DefaultResolver.LookupHost, d.DialContext); msg != "" {
-		return Response{Error: msg, ExitCode: 1}
+	msg := checkEgress(ctx, egressProbeTarget, net.DefaultResolver.LookupHost, d.DialContext)
+	if msg == "" {
+		return Response{Status: "ok"}
 	}
-	return Response{Status: "ok"}
+	// Direct access is broken; say whether registry traffic still gets
+	// through the host (egressproxy.go).
+	hctx, hcancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer hcancel()
+	if conn, err := dialViaHost(hctx, egressProbeTarget); err == nil {
+		conn.Close()
+		return Response{Status: "via-host", Error: msg, ExitCode: 1}
+	} else {
+		msg += "; through the host: " + err.Error()
+	}
+	return Response{Error: msg, ExitCode: 1}
 }
 
 // isEgressFailure reports whether err looks like the VM cannot reach the
@@ -59,6 +70,11 @@ func isEgressFailure(err error) bool {
 		return false
 	}
 	if errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) {
+		return true
+	}
+	// A DNS lookup that times out means no resolver answered at all.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsTimeout {
 		return true
 	}
 	var netErr net.Error

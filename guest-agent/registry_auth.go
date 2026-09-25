@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
@@ -111,29 +110,24 @@ func (a *registryAuth) credentials(host string) (string, string, error) {
 // registry cannot wedge docker login / docker pull forever. Response-header
 // (not total) timeout: blob downloads may legitimately stream for minutes,
 // but a server that never answers headers is dead.
+// Connections go through dialOut, which falls back to the host when the
+// VM has no direct internet access (egressproxy.go).
 var authHTTPClient = &http.Client{
-	Transport: &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-	},
+	Transport: registryTransport(),
 }
 
-// authResolverOpts returns pull/push remote options wiring the credentials
-// through containerd's Docker registry authorizer. Anonymous requests get no
-// options, preserving the default resolver behavior.
+// authResolverOpts returns pull/push remote options: a resolver whose
+// registry traffic goes through dialOut, with the credentials wired through
+// containerd's Docker registry authorizer when there are any.
 func authResolverOpts(a *registryAuth) []client.RemoteOpt {
-	if a.empty() {
-		return nil
+	authOpts := []docker.AuthorizerOpt{docker.WithAuthClient(authHTTPClient)}
+	if !a.empty() {
+		authOpts = append(authOpts, docker.WithAuthCreds(a.credentials))
 	}
-	creds := a.credentials
 	resolver := docker.NewResolver(docker.ResolverOptions{
 		Hosts: docker.ConfigureDefaultRegistries(
 			docker.WithClient(authHTTPClient),
-			docker.WithAuthorizer(docker.NewDockerAuthorizer(
-				docker.WithAuthClient(authHTTPClient),
-				docker.WithAuthCreds(creds),
-			)),
+			docker.WithAuthorizer(docker.NewDockerAuthorizer(authOpts...)),
 		),
 	})
 	return []client.RemoteOpt{client.WithResolver(resolver)}

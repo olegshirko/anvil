@@ -262,8 +262,11 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   fallback only works for tags already pulled).
 - The VM reaches the internet through the macOS NAT. A full-tunnel VPN on
   the Mac (e.g. a Tailscale exit node) can block that traffic while the Mac
-  itself stays online: pulls then fail with `dial tcp …: i/o timeout`.
-  `anvil doctor` checks it (`vm internet`), and pull errors say so.
+  itself stays online. Registry traffic (pull, push, login, `FROM` in
+  builds) then falls back to connections made by vz-runner on the Mac, so
+  it keeps working; the containers themselves (`RUN apk add`, apps) have no
+  internet until the VPN lets VM traffic through. `anvil doctor` reports it
+  (`vm internet`).
 - The control socket is unauthenticated (local-user trust model) — do not
   expose it.
 

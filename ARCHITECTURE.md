@@ -181,6 +181,29 @@ Restoring it after a crash would replay a stale ext4 view over newer
 metadata, so a crash of a running VM cold-boots instead. The config hash,
 machine identifier and network config stay for the next save.
 
+### 3.6 EgressServer
+
+The VM reaches the internet through the macOS NAT (`VZNATNetworkDeviceAttachment`).
+A full-tunnel VPN on the Mac — a Tailscale exit node, most corporate VPNs —
+can drop that NATed traffic while the Mac itself stays online: DNS through
+the NAT gateway still answers, every TCP connect to the internet times out.
+
+`EgressServer` listens on vsock port 1028 and opens outbound TCP connections
+for the guest from vz-runner itself, so they follow the Mac's routing,
+VPN included. The request is a length-prefixed JSON `{"target":"host:port"}`,
+the answer `{}` (or `{"error":…}`), then raw bytes both ways. Loopback
+targets are refused: the guest must not reach services bound to the Mac's
+localhost.
+
+The guest-agent decides per connection (`egressproxy.go`): connect directly
+first; after a connect timeout or an unreachable network, go through the
+host and keep doing so for 60 s. Its registry clients (pull, push, login,
+the docker-mirror fallback) dial this way, and buildkitd is started with
+`HTTPS_PROXY=http://127.0.0.1:3128`, a CONNECT proxy in the agent that uses
+the same dialer (private and loopback destinations are in `NO_PROXY`). The
+traffic of containers themselves is not covered — that would need a
+userspace network stack. `anvil doctor` reports the state (`vm internet`).
+
 ## 4. Guest side: guest-agent
 
 ### 4.1 Startup and the PID 1 role
