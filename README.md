@@ -248,12 +248,6 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   build cache — add `--load` to import it into the image store (compose does
   this automatically). The buildx `docker-container` driver (which pulls a
   moby/buildkit image) does not work.
-- A container's final output line is lost if the process exits without a
-  trailing newline (`printf tail`, `cmd | head -c N`). The last write(2) of a
-  dying process is dropped by containerd's runc-v2 shim, which closes the
-  task's IO pipe before the logging reader drains it — a known upstream shim
-  behavior, not an anvil bug. Complete lines stream correctly, and any output
-  after the tail flushes everything.
 - `docker events --since` replays only what the in-memory event log kept
   (last 1024 events since first boot — the buffer survives snapshot pauses);
   live events, `--until` and filters are unaffected.
