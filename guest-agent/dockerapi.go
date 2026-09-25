@@ -151,7 +151,11 @@ func streamTaskLogToTTY(out io.Writer, ns, id string, follow bool, tty bool) {
 		n++
 		emit(stream, line)
 	}
-	err := readTaskLog(logPath, logReadOptions{follow: follow, tail: -1, stop: taskExitedStopper(ns, id, follow)}, emitWrap)
+	quiet := stopQuietDefault
+	if tty {
+		quiet = stopQuietTTY
+	}
+	err := readTaskLog(logPath, logReadOptions{follow: follow, tail: -1, stop: taskExitedStopper(ns, id, follow), stopQuiet: quiet}, emitWrap)
 	debugLog("attach %s: readTaskLog done err=%v emitted=%d tty=%v follow=%v", id, err, n, tty, follow)
 }
 

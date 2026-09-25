@@ -61,6 +61,8 @@ type PortMapState struct {
 
 func main() {
 	log.SetPrefix("[guest-agent] ")
+	// Microseconds: request-level latency is invisible at 1 s resolution.
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	setupDebugLogRotation()
 
 	// Hidden logging subcommand: the containerd shim spawns us as the

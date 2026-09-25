@@ -2653,6 +2653,24 @@ def test_volume_prune_semantics() -> None:
         docker("volume", "rm", "-f", named, check=False)
 
 
+
+def test_run_rm_latency() -> None:
+    """docker run --rm of a trivial command returns promptly: the attach
+    stream ends shortly after the exit (it used to wait 2 s of log quiet)."""
+    docker("run", "--rm", "alpine", "true")  # warm the image and the path
+    times = []
+    for _ in range(3):
+        t0 = time.time()
+        out = docker("run", "--rm", "alpine", "sh", "-c", "echo out; printf tail").stdout
+        times.append(time.time() - t0)
+        if out != "out\ntail":
+            raise RuntimeError(f"output lost: {out!r}")
+    median = sorted(times)[1]
+    if median > 1.5:
+        raise RuntimeError(f"docker run --rm median {median:.2f}s (want < 1.5s)")
+    record("docker run --rm latency", "PASS", f"median {median:.2f}s, output complete")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -2748,6 +2766,7 @@ TESTS = [
     ("log rotation", test_log_rotation),
     ("health status events", test_health_status_events),
     ("volume prune", test_volume_prune_semantics),
+    ("run --rm latency", test_run_rm_latency),
 ]
 
 

@@ -89,7 +89,7 @@ func runJSONLogger(path string, rot logRotation) error {
 // short-lived container ends before its last partial line reaches the log
 // — and with --rm the container is gone by then. Splitting a slowly
 // written line into several records does not change the replayed bytes.
-const partialFlushAfter = 250 * time.Millisecond
+const partialFlushAfter = 100 * time.Millisecond
 
 // maxPartialRecord bounds an unterminated tail held in memory.
 const maxPartialRecord = 16 * 1024
@@ -244,7 +244,21 @@ type logReadOptions struct {
 	// noStopWait bounds the follow when the log file never appears and no
 	// stop condition can fire (zero = 30s production default; tests shrink it).
 	noStopWait time.Duration
+	// stopQuiet is how long the log must stay quiet after the task exit
+	// before the follow ends (zero = stopQuietDefault). TTY tasks get
+	// longer: the shim copies the console after the process is gone.
+	stopQuiet time.Duration
 }
+
+// stopQuietDefault bounds the wait for the logger's last writes after the
+// task exit. The logger reads the stream fifos as bytes arrive and flushes
+// an unterminated tail after partialFlushAfter, so the log is final well
+// within this. `docker run` returns this long after the container exits,
+// so it is kept tight: twice partialFlushAfter.
+const (
+	stopQuietDefault = 2 * partialFlushAfter
+	stopQuietTTY     = 500 * time.Millisecond
+)
 
 // readTaskLog replays the container's json-file log. Each decoded record is
 // passed to emit as (stream, payload); payloads are formatted per Docker
@@ -318,7 +332,7 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 		}
 		if opts.stop() {
 			stopCount++
-			if stopCount >= 3 {
+			if stopCount >= 2 {
 				return true
 			}
 		} else {
@@ -390,16 +404,24 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 			// The logging binary's final flush can land after the task
 			// exit is observable; end only once no new bytes arrived for
 			// a second (or the hard stop deadline passes).
-			if time.Since(quietSince) >= 2*time.Second || time.Now().After(stopDeadline) {
+			quiet := opts.stopQuiet
+			if quiet <= 0 {
+				quiet = stopQuietDefault
+			}
+			if time.Since(quietSince) >= quiet || time.Now().After(stopDeadline) {
 				debugLog("follow %s: ended by stop condition (quiet %v, hard deadline %v)",
-					logPath, time.Since(quietSince) >= 2*time.Second, time.Now().After(stopDeadline))
+					logPath, time.Since(quietSince) >= quiet, time.Now().After(stopDeadline))
 				return nil
 			}
 		}
 		if !fileSeen && !noStopDeadline.IsZero() && time.Now().After(noStopDeadline) {
 			return nil // the task never started and no stop condition exists
 		}
-		time.Sleep(100 * time.Millisecond)
+		if stopCount > 0 {
+			time.Sleep(50 * time.Millisecond) // exiting: finish promptly
+		} else {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 }
 
