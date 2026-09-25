@@ -1,3 +1,8 @@
+## v1.3.0 (2026-09-25)
+
+### Added
+- bc8b6d3 feat: linux/amd64 containers through Rosetta (opt-in, ANVIL_ROSETTA=1)
+- c89a02d feat: docker update, docker commit, SSH agent forwarding, Mac localhost via host.docker.internal
 ## v1.2.0 (2026-09-25)
 
 ### Added
