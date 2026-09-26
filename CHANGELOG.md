@@ -1,3 +1,10 @@
+## v1.5.0 (2026-09-26)
+
+### Added
+- 03b3852 feat: real docker system df; build context through the chrooted Go tar; make smoke; runner setup docs
+
+### Changed
+- 245d5a9 perf: compose up/down on many services, docker stop -t 0
 ## v1.4.1 (2026-09-25)
 
 ### Fixed
