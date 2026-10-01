@@ -17,12 +17,14 @@ enum DaemonCommand {
         // phase marks land in daemon.log for boot profiling.
         let phaseTimer = BootPhaseTimer()
 
-        if diskCompactInProgress() {
-            print("[anvil] anvil disk-compact is rewriting the disk; start again when it is done")
-            exit(1)
-        }
         guard acquireDaemonLock() else {
-            print("[anvil] daemon already running")
+            // disk-compact holds the same lock while it rewrites the disk;
+            // its lock file only words the message.
+            if diskCompactInProgress() {
+                print("[anvil] anvil disk-compact is rewriting the disk; start again when it is done")
+            } else {
+                print("[anvil] daemon already running")
+            }
             exit(1)
         }
         phaseTimer.mark("lock")
@@ -68,6 +70,14 @@ enum DaemonCommand {
             return false
         }
         lockFD = fd
+
+        // A daemon from an install before the flock never takes it: refuse
+        // to boot a second VM on its disk.
+        if let pid = daemonPID(), pid != getpid(), kill(pid, 0) == 0, isAnvilProcess(pid) {
+            close(fd)
+            lockFD = -1
+            return false
+        }
 
         let pidFile = daemonPIDFile
         let ownPid = getpid()

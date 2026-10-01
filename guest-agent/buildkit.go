@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -172,7 +173,14 @@ func proxyBuildkitConn(conn net.Conn) {
 // running daemon there is no cache to reclaim.
 func pruneBuildCache(opts ...bkclient.PruneOption) (int64, []string, error) {
 	if !buildkitUp() {
-		return 0, []string{}, nil
+		// buildkitd starts lazily, but its cache survives cold boots on
+		// the disk: start it when there is something to prune.
+		if entries, _ := os.ReadDir("/var/lib/buildkit"); len(entries) == 0 {
+			return 0, []string{}, nil
+		}
+		if err := ensureBuildkitd(); err != nil {
+			return 0, nil, err
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -248,7 +256,10 @@ func buildPruneOptions(q url.Values) ([]bkclient.PruneOption, error) {
 	for key, values := range parseDockerFilters(q.Get("filters")) {
 		vals := slices.Sorted(maps.Keys(values))
 		switch key {
-		case "until":
+		case "label", "label!":
+			// Accepted and ignored, as dockerd does (docker system prune
+			// forwards its label filters here).
+		case "until", "unused-for":
 			if len(vals) != 1 {
 				return nil, errInvalid("filters: until takes one value")
 			}
@@ -276,7 +287,10 @@ func buildPruneOptions(q url.Values) ([]bkclient.PruneOption, error) {
 		}
 	}
 	if len(filter) > 0 {
-		opts = append(opts, bkclient.WithFilter(filter))
+		// One element, comma-joined: buildkit ANDs within an element and
+		// ORs across elements (dockerd sends it the same way).
+		slices.Sort(filter)
+		opts = append(opts, bkclient.WithFilter([]string{strings.Join(filter, ",")}))
 	}
 	if keep > 0 || reserved > 0 || maxUsed > 0 || minFree > 0 {
 		opts = append(opts, bkclient.WithKeepOpt(keep, reserved, maxUsed, minFree))

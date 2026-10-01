@@ -9,6 +9,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -93,12 +95,29 @@ func handleArchiveGet(w http.ResponseWriter, r *http.Request, ns, containerdID, 
 // into dstPath, streaming: nothing is buffered in the agent's memory.
 func handleArchivePut(w http.ResponseWriter, r *http.Request, ns, containerdID, dstPath string) {
 	dst := containerPath(dstPath)
+	// docker cp -a: everything belongs to the container's USER, as dockerd
+	// does it (without -a the archive's own ownership is kept).
+	user := ""
+	copyUIDGID := queryBool(r.URL.Query(), "copyUIDGID")
+	if copyUIDGID {
+		if meta, merr := loadContainerMeta(ns, containerdID); merr == nil {
+			user = meta.ConfigUser
+		}
+	}
 	err := withContainerFS(r.Context(), ns, containerdID, func(root string) error {
 		return inChroot(root, func() error {
 			if err := os.MkdirAll(dst, 0o755); err != nil {
 				return err
 			}
-			return extractTar(r.Body, dst)
+			var owner *[2]int
+			if copyUIDGID {
+				uid, gid, uerr := resolveContainerUser(user)
+				if uerr != nil {
+					return uerr
+				}
+				owner = &[2]int{uid, gid}
+			}
+			return extractTarOwned(r.Body, dst, owner)
 		})
 	})
 	if err != nil {
@@ -217,4 +236,48 @@ func withRootfsMount(ns, containerdID string, withBinds bool, fn func(root strin
 		mountContainerBinds(ctx, c, root)
 	}
 	return fn(root)
+}
+
+// resolveContainerUser resolves a Config.User value ("", "name", "uid",
+// "name:group", "uid:gid") against the container's own /etc/passwd and
+// /etc/group; the caller is chrooted into the container's root.
+func resolveContainerUser(user string) (int, int, error) {
+	if user == "" {
+		return 0, 0, nil
+	}
+	name, group, hasGroup := strings.Cut(user, ":")
+	lookup := func(file, key string, idField int) (int, int, bool) {
+		data, _ := os.ReadFile(file)
+		for _, line := range strings.Split(string(data), "\n") {
+			f := strings.Split(line, ":")
+			if len(f) < 4 || (f[0] != key && f[2] != key) {
+				continue
+			}
+			id, err1 := strconv.Atoi(f[2])
+			other, err2 := strconv.Atoi(f[idField])
+			if err1 != nil || err2 != nil {
+				continue
+			}
+			return id, other, true
+		}
+		return 0, 0, false
+	}
+	uid, gid, ok := lookup("/etc/passwd", name, 3)
+	if !ok {
+		n, err := strconv.Atoi(name)
+		if err != nil {
+			return 0, 0, fmt.Errorf("unable to find user %s: no matching entries in passwd file", name)
+		}
+		uid, gid = n, 0 // as libcontainer's GetExecUser defaults it
+	}
+	if hasGroup {
+		if g, _, ok := lookup("/etc/group", group, 2); ok {
+			gid = g
+		} else if n, err := strconv.Atoi(group); err == nil {
+			gid = n
+		} else {
+			return 0, 0, fmt.Errorf("unable to find group %s: no matching entries in group file", group)
+		}
+	}
+	return uid, gid, nil
 }

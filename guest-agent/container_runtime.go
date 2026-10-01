@@ -293,8 +293,12 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) (_ []specs.M
 			if serr != nil {
 				return nil, nil, nil, nil, fmt.Errorf("mount %q: %w", m.Target, serr)
 			}
-			addBind(dir, m.Target, m.ReadOnly)
-			subpaths = append(subpaths, subpathMount{VolumeDir: volumeDataDir(ns, m.Source), Subpath: m.VolumeOptions.Subpath, Source: dir})
+			// runc mounts a staging mountpoint that every start re-arms
+			// from a beneath-the-volume resolution (armSubpathMounts), not
+			// the path itself, which a container could swap meanwhile.
+			staging := subpathStagingPath(ns, id, len(subpaths))
+			addBind(staging, m.Target, m.ReadOnly)
+			subpaths = append(subpaths, subpathMount{VolumeDir: volumeDataDir(ns, m.Source), Subpath: m.VolumeOptions.Subpath, Source: dir, Staging: staging})
 			continue
 		}
 		if m.Type != "" && m.Type != "bind" && m.Type != "volume" {
@@ -363,39 +367,66 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) (_ []specs.M
 // the referenced containers, read from their OCI specs (which already
 // include what they inherited themselves). A ":ro"/":rw" suffix overrides
 // the access mode, as in Docker.
-func volumesFromMounts(ctx context.Context, refs []string) ([]specs.Mount, error) {
+//
+// A volume-subpath mount is carried over as a subpath of the new container
+// (ns/id, with staging indexes from firstIndex): the source's staging
+// mountpoint is its own, gone when it is removed or the VM cold-boots.
+func volumesFromMounts(ctx context.Context, refs []string, ns, id string, firstIndex int) ([]specs.Mount, []subpathMount, error) {
 	if len(refs) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	cl, err := pc.get(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("containerd client: %w", err)
+		return nil, nil, fmt.Errorf("containerd client: %w", err)
 	}
 	var out []specs.Mount
+	var subpaths []subpathMount
 	for _, ref := range refs {
 		name, mode := ref, ""
 		if i := strings.LastIndexByte(ref, ':'); i > 0 {
 			name, mode = ref[:i], ref[i+1:]
 		}
 		if mode != "" && mode != "ro" && mode != "rw" {
-			return nil, fmt.Errorf("volumes-from %q: invalid mode %q", ref, mode)
+			return nil, nil, fmt.Errorf("volumes-from %q: invalid mode %q", ref, mode)
 		}
 		srcNS, srcID, _, rerr := resolveDockerID(ctx, name)
 		if rerr != nil {
-			return nil, fmt.Errorf("volumes-from %q: %w", name, rerr)
+			return nil, nil, fmt.Errorf("volumes-from %q: %w", name, rerr)
 		}
 		nsCtx := namespaces.WithNamespace(ctx, srcNS)
 		c, lerr := cl.LoadContainer(nsCtx, srcID)
 		if lerr != nil {
-			return nil, fmt.Errorf("volumes-from %q: %w", name, lerr)
+			return nil, nil, fmt.Errorf("volumes-from %q: %w", name, lerr)
 		}
 		spec, serr := c.Spec(nsCtx)
 		if serr != nil {
-			return nil, fmt.Errorf("volumes-from %q: spec: %w", name, serr)
+			return nil, nil, fmt.Errorf("volumes-from %q: spec: %w", name, serr)
 		}
-		out = append(out, inheritableMounts(spec.Mounts, mode)...)
+		staged := stagedSubpaths(srcNS, srcID)
+		for _, m := range inheritableMounts(spec.Mounts, mode) {
+			if sp, ok := staged[filepath.Clean(m.Source)]; ok {
+				sp.Staging = subpathStagingPath(ns, id, firstIndex+len(subpaths))
+				m.Source = sp.Staging
+				subpaths = append(subpaths, sp)
+			}
+			out = append(out, m)
+		}
 	}
-	return out, nil
+	return out, subpaths, nil
+}
+
+// stagedSubpaths maps a container's subpath staging mountpoints to their
+// subpath mounts.
+func stagedSubpaths(ns, id string) map[string]subpathMount {
+	out := map[string]subpathMount{}
+	if meta, err := loadContainerMeta(ns, id); err == nil {
+		for _, sp := range meta.SubpathMounts {
+			if sp.Staging != "" {
+				out[filepath.Clean(sp.Staging)] = sp
+			}
+		}
+	}
+	return out
 }
 
 // inheritableMounts picks the user volumes out of a container's OCI mounts:
@@ -880,10 +911,11 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		return "", nil, merr
 	}
 	anonVols = vols
-	inherited, verr := volumesFromMounts(ctx, req.HostConfig.VolumesFrom)
+	inherited, inheritedSubpaths, verr := volumesFromMounts(ctx, req.HostConfig.VolumesFrom, ns, id, len(subpaths))
 	if verr != nil {
 		return "", nil, verr
 	}
+	subpaths = append(subpaths, inheritedSubpaths...)
 	mounts = mergeInheritedMounts(mounts, inherited)
 	if m, ok := rosettaCacheMount(actualPlatform); ok {
 		mounts = append(mounts, m)
@@ -1278,6 +1310,17 @@ type subpathMount struct {
 	VolumeDir string `json:"VolumeDir"`
 	Subpath   string `json:"Subpath"`
 	Source    string `json:"Source"`
+	// Staging is the mountpoint the spec binds (containers created before
+	// it existed bind Source directly and are only re-verified).
+	Staging string `json:"Staging,omitempty"`
+}
+
+// subpathStagingRoot holds the per-container subpath mountpoints (tmpfs:
+// re-armed at every start, so a cold boot needs nothing).
+const subpathStagingRoot = "/run/anvil/subpath"
+
+func subpathStagingPath(ns, id string, i int) string {
+	return filepath.Join(subpathStagingRoot, ns, id, strconv.Itoa(i))
 }
 
 // verifySubpathMounts re-resolves the container's subpath mounts.

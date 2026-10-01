@@ -153,6 +153,23 @@ func (m *cniManager) forConflist(path string) (cniclient.CNI, error) {
 	return c, nil
 }
 
+// staticCNI is a one-off CNI instance over the widened conflist (not
+// cached: static attaches are rare and the variant must follow the file).
+func staticCNI(conflist string) (cniclient.CNI, error) {
+	data, err := os.ReadFile(conflist)
+	if err != nil {
+		return nil, err
+	}
+	if data, err = staticConflistBytes(data); err != nil {
+		return nil, err
+	}
+	return cniclient.New(
+		cniclient.WithPluginDir([]string{cniBinDir}),
+		cniclient.WithInterfacePrefix("eth"),
+		cniclient.WithConfListBytes(data),
+	)
+}
+
 // findConflistForNetwork locates the conflist file for a logical network
 // name. Files are written by generateCNIConfigWithLabels with name == netName.
 func findConflistForNetwork(netName string) (string, error) {
@@ -192,7 +209,13 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 	if err := ensureNetworkMasquerade(netName); err != nil {
 		log.G(ctx).WithError(err).Warnf("[cni] masquerade rule for %s", netName)
 	}
-	c, err := cnim.forConflist(conflist)
+	staticIP := staticIPFor(ns, id, netName)
+	var c cniclient.CNI
+	if staticIP != "" {
+		c, err = staticCNI(conflist)
+	} else {
+		c, err = cnim.forConflist(conflist)
+	}
 	if err != nil {
 		return "", "", err
 	}
@@ -217,8 +240,8 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 		opts = append(opts, cniclient.WithCapabilityPortMap(pms))
 	}
 	// A static address: host-local takes it from CNI_ARGS IP.
-	if ip := staticIPFor(ns, id, netName); ip != "" {
-		opts = append(opts, cniclient.WithArgs("IgnoreUnknown", "1"), cniclient.WithArgs("IP", ip))
+	if staticIP != "" {
+		opts = append(opts, cniclient.WithArgs("IgnoreUnknown", "1"), cniclient.WithArgs("IP", staticIP))
 	}
 	res, err := c.Setup(ctx, id, netnsPath, opts...)
 	if err != nil {
@@ -320,7 +343,14 @@ func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName, sta
 	if err != nil {
 		return "", "", err
 	}
-	list, err := cnilibrary.ConfListFromFile(conflist)
+	data, err := os.ReadFile(conflist)
+	if err == nil && staticIP != "" {
+		data, err = staticConflistBytes(data)
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("cni config %s: %w", netName, err)
+	}
+	list, err := cnilibrary.ConfListFromBytes(data)
 	if err != nil {
 		return "", "", fmt.Errorf("cni config %s: %w", netName, err)
 	}

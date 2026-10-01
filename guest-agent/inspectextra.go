@@ -32,10 +32,39 @@ func containerTaskPid(ctx context.Context, ns, containerdID string) (int, bool) 
 		return 0, false
 	}
 	st, serr := task.Status(nsCtx)
-	if serr != nil || st.Status != "running" {
+	if serr != nil || (st.Status != "running" && st.Status != "paused") {
 		return 0, false
 	}
 	return int(task.Pid()), true
+}
+
+// containerTaskPids lists every process of the container's task, from its
+// own cgroup (nested cgroups included): DinD and systemd move their init
+// into a child cgroup, so walking the init's cgroup missed their siblings.
+func containerTaskPids(ctx context.Context, ns, containerdID string) []int {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return nil
+	}
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	c, err := cl.LoadContainer(nsCtx, containerdID)
+	if err != nil {
+		return nil
+	}
+	task, err := c.Task(nsCtx, nil)
+	if err != nil {
+		return nil
+	}
+	procs, err := task.Pids(nsCtx)
+	if err != nil {
+		return nil
+	}
+	pids := make([]int, 0, len(procs))
+	for _, p := range procs {
+		pids = append(pids, int(p.Pid))
+	}
+	slices.Sort(pids)
+	return pids
 }
 
 // pauseDockerContainer pauses (pause=true) or unpauses a container by
@@ -94,7 +123,10 @@ func handleContainerTop(ctx context.Context, w http.ResponseWriter, id string) {
 		writeJSONError(w, http.StatusConflict, fmt.Sprintf("container %s is not running", truncateID(containerdID)))
 		return
 	}
-	pids := cgroupPids(cgroupDir(pid))
+	pids := containerTaskPids(ctx, ns, containerdID)
+	if len(pids) == 0 {
+		pids = cgroupPids(cgroupDir(pid))
+	}
 	if len(pids) == 0 {
 		pids = []int{pid}
 	}

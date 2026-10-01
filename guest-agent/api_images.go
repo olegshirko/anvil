@@ -324,8 +324,18 @@ func handleImageDelete(w http.ResponseWriter, r *http.Request, p routeParams) {
 			}
 		}
 	}
-	// Deleted only when no other record still points at the image.
+	// Deleted only when no other record still points at the image. The
+	// <none> record an untagged build keeps is not a reference: removing
+	// the last tag deletes the image, as in Docker.
 	if id != "" {
+		if left, _ := imageRecordsByID(r.Context(), id); len(left) > 0 &&
+			!slices.ContainsFunc(left, func(n string) bool { return !strings.HasPrefix(n, "<none>") }) {
+			for _, n := range left {
+				if err := removeDockerImage(r.Context(), n, force); err != nil {
+					log.Printf("[docker-api] rmi %s: keeping %s: %v", name, n, err)
+				}
+			}
+		}
 		if left, _ := imageRecordsByID(r.Context(), id); len(left) == 0 {
 			resp = append(resp, map[string]string{"Deleted": id})
 		}

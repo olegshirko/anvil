@@ -99,6 +99,12 @@ func writeTarTree(tw *tar.Writer, src, prefix string) error {
 // names are confined lexically to dst; within the chroot the kernel keeps
 // symlink resolution inside the container as well.
 func extractTar(r io.Reader, dst string) error {
+	return extractTarOwned(r, dst, nil)
+}
+
+// extractTarOwned extracts like extractTar; a non-nil owner ({uid, gid})
+// replaces the ownership recorded in the archive (docker cp -a).
+func extractTarOwned(r io.Reader, dst string, owner *[2]int) error {
 	type dirTime struct {
 		path  string
 		mtime time.Time
@@ -166,7 +172,11 @@ func extractTar(r io.Reader, dst string) error {
 		default:
 			continue // xattr-only and other extended records
 		}
-		if err := os.Lchown(target, hdr.Uid, hdr.Gid); err != nil && !errors.Is(err, fs.ErrPermission) {
+		uid, gid := hdr.Uid, hdr.Gid
+		if owner != nil {
+			uid, gid = owner[0], owner[1]
+		}
+		if err := os.Lchown(target, uid, gid); err != nil && !errors.Is(err, fs.ErrPermission) {
 			return err
 		}
 		if hdr.Typeflag != tar.TypeSymlink {
@@ -190,7 +200,7 @@ func extractTar(r io.Reader, dst string) error {
 // for a path ending in "/." (copy the directory's contents), which
 // cleaning would lose.
 func cpBaseName(p string) string {
-	p = strings.TrimSpace(p)
+	p = strings.TrimRight(strings.TrimSpace(p), "/")
 	if p == "." || strings.HasSuffix(p, "/.") {
 		return "."
 	}

@@ -110,6 +110,7 @@ func cmdDiskCompact() {
     }
     let before = allocatedBytes(disk)
     let tmp = disk + ".new"
+    try? FileManager.default.removeItem(atPath: tmp) // left by an interrupted run
     // A lock the start paths honor: an `anvil start` in this window would
     // open the disk and then have a stale copy swapped under it.
     // The daemon's own flock makes it atomic: a daemon holding it owns the

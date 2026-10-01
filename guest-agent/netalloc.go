@@ -315,3 +315,31 @@ func isolationOnTop(rules, comment string) bool {
 	}
 	return false
 }
+
+// staticConflistBytes widens a conflist's host-local ranges to the whole
+// subnet: Docker lets --ip / ipv4_address take any address of the subnet,
+// and keeping static ones outside ip_range is the usual compose layout.
+// The network name, and with it host-local's allocation store, is
+// unchanged, so dynamic and static leases still cannot collide.
+func staticConflistBytes(data []byte) ([]byte, error) {
+	var conf map[string]any
+	if err := json.Unmarshal(data, &conf); err != nil {
+		return nil, err
+	}
+	plugins, _ := conf["plugins"].([]any)
+	for _, p := range plugins {
+		plugin, _ := p.(map[string]any)
+		ipam, _ := plugin["ipam"].(map[string]any)
+		ranges, _ := ipam["ranges"].([]any)
+		for _, set := range ranges {
+			entries, _ := set.([]any)
+			for _, e := range entries {
+				if r, ok := e.(map[string]any); ok {
+					delete(r, "rangeStart")
+					delete(r, "rangeEnd")
+				}
+			}
+		}
+	}
+	return json.Marshal(conf)
+}

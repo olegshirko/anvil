@@ -57,3 +57,6 @@ func removeNetworkMasquerade(netName string)    {}
 func findConflistForNetwork(netName string) (string, error) {
 	return "", errors.New("CNI is only available on linux")
 }
+
+func armSubpathMounts(m *containerMeta) error { return verifySubpathMounts(m) }
+func releaseSubpathMounts(ns, id string)      {}

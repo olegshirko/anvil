@@ -106,6 +106,14 @@ func (p *pullProgress) poll(ctx context.Context, cs content.Store, stop <-chan s
 			if st.Expected != "" {
 				id = shortDigest(st.Expected.String())
 			}
+			// Only this pull's layers: concurrent pulls (compose) share
+			// the namespace's content store.
+			p.mu.Lock()
+			ours := p.seen[id]
+			p.mu.Unlock()
+			if !ours {
+				continue
+			}
 			p.send(map[string]any{
 				"status":         "Downloading",
 				"id":             id,

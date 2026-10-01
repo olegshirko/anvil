@@ -285,7 +285,7 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 	// the pty itself (runc refuses a terminal spec with no console socket
 	// otherwise) and duplicates the console output into the log URI.
 	if meta != nil {
-		if verr := verifySubpathMounts(meta); verr != nil {
+		if verr := armSubpathMounts(meta); verr != nil {
 			err = verr
 			return err
 		}
@@ -642,6 +642,7 @@ func deleteNativeContainer(ctx context.Context, ns, id string, force, removeVolu
 	}
 
 	releaseNamedNetNS(id)
+	releaseSubpathMounts(ns, id)
 	deleteContainerMeta(ns, id)
 	// Refresh the hosts files of the deleted container's network peers
 	// (its own metadata is gone, so iterate its former networks directly).
@@ -699,10 +700,19 @@ func mountedBindSources(ctx context.Context) (map[string]bool, error) {
 			if err != nil {
 				continue
 			}
+			// A subpath mount binds a staging mountpoint: what is in use
+			// is the volume behind it.
+			staged := stagedSubpaths(ns, c.ID())
 			for _, m := range spec.Mounts {
-				if m.Type == "bind" {
-					out[filepath.Clean(m.Source)] = true
+				if m.Type != "bind" {
+					continue
 				}
+				if sp, ok := staged[filepath.Clean(m.Source)]; ok {
+					out[filepath.Clean(sp.VolumeDir)] = true
+					out[filepath.Clean(sp.Source)] = true
+					continue
+				}
+				out[filepath.Clean(m.Source)] = true
 			}
 		}
 	}

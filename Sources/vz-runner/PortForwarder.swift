@@ -138,6 +138,7 @@ final class PortForwarder {
     /// after the port check): those are retried while still desired.
     private var desiredMappings: [String: PortMapping] = [:]
     private var retryDelay: [String: Double] = [:]
+    private var lastFailure: [String: Date] = [:]
 
     /// Guards `running` and `subscription`. `stop()` is called from other
     /// threads while `runLoop()` occupies `queue` for good, so it cannot be
@@ -294,6 +295,7 @@ final class PortForwarder {
         let current: [String: PortMapping] = listeners.mapValues { $0.mapping }
         desiredMappings = desiredByKey
         retryDelay = retryDelay.filter { desiredByKey[$0.key] != nil }
+        lastFailure = lastFailure.filter { desiredByKey[$0.key] != nil }
         listenersLock.unlock()
 
         let desiredKeys = Set(desiredByKey.keys)
@@ -358,6 +360,11 @@ final class PortForwarder {
             listenersLock.unlock()
             return
         }
+        // A listener that worked for a while starts the backoff over.
+        if let last = lastFailure[key], Date().timeIntervalSince(last) > 120 {
+            retryDelay[key] = nil
+        }
+        lastFailure[key] = Date()
         let delay = min((retryDelay[key] ?? 1) * 2, 30)
         retryDelay[key] = delay
         listenersLock.unlock()
@@ -366,10 +373,14 @@ final class PortForwarder {
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self = self else { return }
+            // Serialized with pushes and stop(): a retry must not resurrect
+            // a mapping a newer push replaced, nor bind after shutdown.
+            self.applyLock.lock()
+            defer { self.applyLock.unlock() }
             self.listenersLock.lock()
             let wanted = self.desiredMappings[key] == mapping && self.listeners[key] == nil
             self.listenersLock.unlock()
-            if wanted {
+            if wanted && self.isRunning {
                 self.startListener(mapping: mapping)
             }
         }

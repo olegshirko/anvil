@@ -53,12 +53,12 @@ func servePortProxy() {
 
 func handlePortProxyClient(conn net.Conn) {
 	defer conn.Close()
-	// Only the Mac's forwarder, which connects to the VM's eth0 address.
-	// A container reaching the proxy through its bridge gateway could
-	// otherwise dial any address the VM can: unpublished ports of other
+	// Only the Mac's forwarder, a peer on eth0's subnet. A container
+	// (which may dial the eth0 address too, through its bridge) could
+	// otherwise reach any address the VM can: unpublished ports of other
 	// projects, the agent's loopback services, out of an --internal
 	// network.
-	if !arrivedOnInterface(conn, "eth0") {
+	if !peerOnInterfaceSubnet(conn, "eth0") {
 		log.Printf("[port-proxy] refused %s (not from the host)", conn.RemoteAddr())
 		return
 	}
@@ -116,10 +116,11 @@ func readPortProxyHeader(conn net.Conn) (*portProxyHeader, error) {
 	return &h, nil
 }
 
-// arrivedOnInterface reports whether conn's local address belongs to the
-// named interface.
-func arrivedOnInterface(conn net.Conn, name string) bool {
-	local, ok := conn.LocalAddr().(*net.TCPAddr)
+// peerOnInterfaceSubnet reports whether conn's peer is another host on the
+// named interface's subnet (container addresses never are: they live on
+// the CNI bridges, and local delivery is not masqueraded).
+func peerOnInterfaceSubnet(conn net.Conn, name string) bool {
+	peer, ok := conn.RemoteAddr().(*net.TCPAddr)
 	if !ok {
 		return false
 	}
@@ -132,7 +133,7 @@ func arrivedOnInterface(conn net.Conn, name string) bool {
 		return false
 	}
 	for _, a := range addrs {
-		if ipn, ok := a.(*net.IPNet); ok && ipn.IP.Equal(local.IP) {
+		if ipn, ok := a.(*net.IPNet); ok && ipn.Contains(peer.IP) && !ipn.IP.Equal(peer.IP) {
 			return true
 		}
 	}

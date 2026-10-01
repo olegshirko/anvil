@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"golang.org/x/sys/unix"
 )
 
@@ -29,11 +30,23 @@ func mountContainerBinds(ctx context.Context, c client.Container, root string) {
 		ro       bool
 	}
 	var binds []bind
+	ns, _ := namespaces.Namespace(ctx)
+	staged := stagedSubpaths(ns, c.ID())
 	for _, m := range spec.Mounts {
 		if m.Type != "bind" || m.Source == "" || m.Destination == "" {
 			continue
 		}
-		binds = append(binds, bind{m.Source, m.Destination, slices.Contains(m.Options, "ro")})
+		src := m.Source
+		if sp, ok := staged[filepath.Clean(src)]; ok {
+			// The staging mountpoint is armed only while the container
+			// runs: resolve the subpath in the volume now instead.
+			real, err := volumeSubpath(sp.VolumeDir, sp.Subpath)
+			if err != nil {
+				continue
+			}
+			src = real
+		}
+		binds = append(binds, bind{src, m.Destination, slices.Contains(m.Options, "ro")})
 	}
 	// Parents before children.
 	sort.Slice(binds, func(i, j int) bool {

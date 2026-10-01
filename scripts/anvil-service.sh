@@ -6,6 +6,7 @@
 # On stop: stops the daemon and restores the previously saved Docker context.
 
 set -euo pipefail
+shopt -s extglob
 
 # launchd starts jobs with PATH=/usr/bin:/bin:/usr/sbin:/sbin: docker and a
 # brew-installed vz-runner live elsewhere.
@@ -51,6 +52,9 @@ if [[ -f "$STATE_DIR/config" ]]; then
         key="${key//[[:space:]]/}"
         [[ "$key" =~ ^ANVIL_[A-Z_]+$ ]] || continue
         [[ -n "${!key:-}" ]] && continue
+        # Trimmed as `anvil start` trims it: " 4" must not become a
+        # different VM config (and snapshot hash) on this path.
+        value="${value#"${value%%[![:space:]]*}"}"; value="${value%"${value##*[![:space:]]}"}"
         value="${value%\"}"; value="${value#\"}"; value="${value%\'}"; value="${value#\'}"
         export "$key=$value"
     done < "$STATE_DIR/config"
@@ -146,7 +150,7 @@ is_running() {
         # The pid must still be a vz-runner: a stale file (the daemon died
         # with the Mac) can name a reused pid we must not signal.
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && \
-           [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == *vz-runner ]]; then
+           [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == @(*vz-runner|*/anvil) ]]; then
             return 0
         fi
     fi

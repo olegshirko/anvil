@@ -96,6 +96,9 @@ final class PortCheckServer: NSObject {
                 Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
             }
         }
+        if bindResult != 0 && errno == EADDRNOTAVAIL {
+            return true // no such address here (a Mac without ::1): nothing can hold it
+        }
         guard bindResult == 0, listen(fd, 1) == 0 else { return false }
         return true
     }

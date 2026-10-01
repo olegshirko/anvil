@@ -3530,6 +3530,19 @@ def test_api_parity_audit() -> None:
             docker("cp", f"{name}:/d/.", f"{d}/out")
             if not Path(d, "out", "sub", "f").is_file():
                 raise RuntimeError(f"cp /. layout: {list(Path(d).rglob('*'))}")
+        # cp -a gives the container's USER ownership; plain cp keeps the archive's.
+        owned = f"{PREFIX}-cpowner"
+        try:
+            docker("run", "-d", "--user", "nobody", "--name", owned, "alpine", "sleep", "60")
+            with tempfile.TemporaryDirectory() as d:
+                Path(d, "f").write_text("x")
+                docker("cp", "-a", f"{d}/f", f"{owned}:/tmp/fa")
+                docker("cp", f"{d}/f", f"{owned}:/tmp/fp")
+            own = docker("exec", owned, "stat", "-c", "%u %n", "/tmp/fa", "/tmp/fp").stdout.split("\n")
+            if not own[0].startswith("65534 ") or own[1].startswith("65534 "):
+                raise RuntimeError(f"cp ownership: {own}")
+        finally:
+            cleanup(owned)
         # top lists exec'd processes too.
         docker("exec", "-d", name, "sleep", "123")
         time.sleep(0.5)
@@ -3564,6 +3577,62 @@ def test_api_parity_audit() -> None:
         record("api parity (audit fixes)", "PASS", "exec w/o Upgrade, cp /., top, ps -s, stop -s, --rm name, plugins, events, pull")
     finally:
         cleanup(name)
+
+
+def test_static_ip_outside_ip_range() -> None:
+    net = f"{PREFIX}-iprange"
+    name = f"{PREFIX}-iprange-c"
+    try:
+        docker("network", "create", "--subnet", "10.77.0.0/24", "--ip-range", "10.77.0.128/25", net)
+        docker("run", "-d", "--name", name, "--network", net, "--ip", "10.77.0.10", "alpine", "sleep", "60")
+        ip = docker("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name).stdout.strip()
+        dyn = docker("run", "--rm", "--network", net, "alpine", "sh", "-c",
+                     "ip -4 -o addr show eth0 | awk '{print $4}'").stdout.strip()
+        if ip != "10.77.0.10" or not dyn.startswith("10.77.0.") or int(dyn.split(".")[3].split("/")[0]) < 128:
+            raise RuntimeError(f"static {ip!r}, dynamic {dyn!r}")
+        record("static IP outside ip_range", "PASS", f"static {ip}, dynamic {dyn}")
+    finally:
+        cleanup(name)
+        docker("network", "rm", net, check=False)
+
+
+def test_volume_subpath() -> None:
+    vol = f"{PREFIX}-subvol"
+    name = f"{PREFIX}-subpath"
+    try:
+        docker("volume", "create", vol)
+        docker("run", "--rm", "-v", f"{vol}:/v", "alpine", "sh", "-c",
+               "mkdir -p /v/a/b && echo inner > /v/a/b/file && echo single > /v/one && ln -s /etc /v/escape")
+        out = docker("run", "--rm", "--mount", f"type=volume,src={vol},dst=/x,volume-subpath=a/b",
+                     "--mount", f"type=volume,src={vol},dst=/one.txt,volume-subpath=one", "alpine",
+                     "sh", "-c", "cat /x/file /one.txt").stdout.split()
+        if out != ["inner", "single"]:
+            raise RuntimeError(f"subpath contents: {out}")
+        r = docker("run", "--rm", "--mount", f"type=volume,src={vol},dst=/x,volume-subpath=escape",
+                   "alpine", "ls", "/x/passwd", check=False)
+        if r.returncode == 0:
+            raise RuntimeError("a symlink out of the volume was followed")
+        docker("run", "-d", "--name", name, "--mount", f"type=volume,src={vol},dst=/x,volume-subpath=a",
+               "alpine", "sleep", "60")
+        docker("restart", "-t", "0", name)
+        if docker("exec", name, "cat", "/x/b/file").stdout.strip() != "inner":
+            raise RuntimeError("subpath lost across restart")
+        # Used only through a subpath, the volume is in use: prune keeps it,
+        # and docker cp into the stopped container reaches it.
+        docker("stop", "-t", "0", name)
+        docker("volume", "prune", "-af")
+        if vol not in docker("volume", "ls", "-q").stdout.split():
+            raise RuntimeError("volume prune removed a volume in use through a subpath")
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "cpd").write_text("via-cp")
+            docker("cp", f"{d}/cpd", f"{name}:/x/cpd")
+        out = docker("run", "--rm", "-v", f"{vol}:/v", "alpine", "cat", "/v/a/cpd").stdout.strip()
+        if out != "via-cp":
+            raise RuntimeError(f"docker cp into a stopped subpath mount: {out!r}")
+        record("volume subpath", "PASS", "dir and file subpaths, escape refused, re-armed on restart")
+    finally:
+        cleanup(name)
+        docker("volume", "rm", "-f", vol, check=False)
 
 
 TESTS = [
@@ -3699,6 +3768,8 @@ TESTS = [
     ("bind source checks", test_bind_source_checks),
     ("internal network isolation", test_internal_network_isolation),
     ("api parity (audit fixes)", test_api_parity_audit),
+    ("static IP outside ip_range", test_static_ip_outside_ip_range),
+    ("volume subpath", test_volume_subpath),
 ]
 
 
