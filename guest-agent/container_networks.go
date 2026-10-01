@@ -29,6 +29,9 @@ const noneNetwork = "none"
 
 // validateNetworkMode refuses what Docker refuses for --network none.
 func validateNetworkMode(req dockerCreateRequest) error {
+	if ips := requestedNetworkIPs(req); ips["bridge"] != "" && effectiveNetworkName(req.HostConfig.NetworkMode) == "bridge" {
+		return fmt.Errorf("user specified IP address is supported on user defined networks only")
+	}
 	if req.HostConfig.NetworkMode != noneNetwork && !isContainerNetworkMode(req.HostConfig.NetworkMode) {
 		return nil
 	}
@@ -107,11 +110,11 @@ func secondaryNetworksFromCreate(req dockerCreateRequest) []string {
 
 // attachSecondaryNetworks attaches networks as eth1, eth2...; on failure it
 // detaches what it attached and returns the error.
-func attachSecondaryNetworks(ctx context.Context, id string, networks []string) ([]netEndpoint, error) {
+func attachSecondaryNetworks(ctx context.Context, ns, id string, networks []string) ([]netEndpoint, error) {
 	var eps []netEndpoint
 	for _, n := range networks {
 		ifName := nextIfName(eps)
-		ip, mac, err := attachExtraNetwork(ctx, n, id, netnsPathFor(id), ifName)
+		ip, mac, err := attachExtraNetwork(ctx, n, id, netnsPathFor(id), ifName, staticIPFor(ns, id, n))
 		if err != nil {
 			detachSecondaryNetworks(ctx, id, eps)
 			return nil, err
@@ -135,11 +138,9 @@ func detachSecondaryNetworks(ctx context.Context, id string, eps []netEndpoint) 
 // --- docker network connect / disconnect ------------------------------------
 
 type networkConnectRequest struct {
-	Container      string `json:"Container"`
-	Force          bool   `json:"Force"`
-	EndpointConfig *struct {
-		Aliases []string `json:"Aliases"`
-	} `json:"EndpointConfig"`
+	Container      string          `json:"Container"`
+	Force          bool            `json:"Force"`
+	EndpointConfig *dockerEndpoint `json:"EndpointConfig"`
 }
 
 func handleNetworkConnect(w http.ResponseWriter, r *http.Request, p routeParams) {
@@ -149,10 +150,14 @@ func handleNetworkConnect(w http.ResponseWriter, r *http.Request, p routeParams)
 		return
 	}
 	var aliases []string
+	ip := ""
 	if req.EndpointConfig != nil {
 		aliases = req.EndpointConfig.Aliases
+		if req.EndpointConfig.IPAMConfig != nil {
+			ip = req.EndpointConfig.IPAMConfig.IPv4Address
+		}
 	}
-	if err := connectContainerNetwork(r.Context(), p["id"], req.Container, aliases); err != nil {
+	if err := connectContainerNetwork(r.Context(), p["id"], req.Container, aliases, ip); err != nil {
 		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
@@ -183,7 +188,7 @@ func resolveNetworkName(ctx context.Context, ref string) (string, error) {
 
 // connectContainerNetwork adds network to the container's networks and, when
 // it runs, attaches the endpoint live.
-func connectContainerNetwork(ctx context.Context, networkRef, container string, aliases []string) error {
+func connectContainerNetwork(ctx context.Context, networkRef, container string, aliases []string, staticIP string) error {
 	network, err := resolveNetworkName(ctx, networkRef)
 	if err != nil {
 		return err
@@ -208,7 +213,7 @@ func connectContainerNetwork(ctx context.Context, networkRef, container string, 
 	if running, _, _ := containerTaskState(ctx, ns, id); running {
 		ni, _ := loadNetInfo(ns, id)
 		ifName := nextIfName(ni.Extra)
-		ip, mac, err := attachExtraNetwork(ctx, network, id, netnsPathFor(id), ifName)
+		ip, mac, err := attachExtraNetwork(ctx, network, id, netnsPathFor(id), ifName, staticIP)
 		if err != nil {
 			return err
 		}
@@ -218,20 +223,33 @@ func connectContainerNetwork(ctx context.Context, networkRef, container string, 
 			return err
 		}
 	}
-	meta.Networks = append(meta.Networks, network)
-	if meta.NetworkAliases == nil {
-		// Freeze the legacy flat list onto the networks it applied to, so
-		// the new network's aliases stay on the new network only.
-		meta.NetworkAliases = map[string][]string{}
-		for _, n := range meta.Networks[:len(meta.Networks)-1] {
-			meta.NetworkAliases[n] = meta.Aliases
+	// Applied to the current metadata (a concurrent connect must not be
+	// lost to the copy loaded above).
+	var networks []string
+	if err := updateContainerMeta(ns, id, func(m *containerMeta) {
+		if m.NetworkAliases == nil {
+			// Freeze the legacy flat list onto the networks it applied
+			// to, so the new network's aliases stay on it only.
+			m.NetworkAliases = map[string][]string{}
+			for _, n := range m.Networks {
+				m.NetworkAliases[n] = m.Aliases
+			}
 		}
-	}
-	meta.NetworkAliases[network] = dedupeStrings(aliases)
-	if err := saveContainerMeta(meta); err != nil {
+		if !slices.Contains(m.Networks, network) {
+			m.Networks = append(m.Networks, network)
+		}
+		m.NetworkAliases[network] = dedupeStrings(aliases)
+		networks = m.Networks
+		if staticIP != "" {
+			if m.NetworkIPs == nil {
+				m.NetworkIPs = map[string]string{}
+			}
+			m.NetworkIPs[network] = staticIP
+		}
+	}); err != nil {
 		return err
 	}
-	updateNetworksLabel(ctx, ns, id, meta.Networks)
+	updateNetworksLabel(ctx, ns, id, networks)
 	refreshHostsForContainer(ns, id)
 	if running, _, _ := containerTaskState(ctx, ns, id); running {
 		publishNetworkEvent("connect", network, networkIDFor(ctx, network), dockerID(ns, id))
@@ -285,12 +303,18 @@ func disconnectContainerNetwork(ctx context.Context, networkRef, container strin
 			return err
 		}
 	}
-	meta.Networks = slices.Delete(meta.Networks, idx, idx+1)
-	delete(meta.NetworkAliases, network)
-	if err := saveContainerMeta(meta); err != nil {
+	// Applied to the current metadata, not the copy loaded above, so a
+	// concurrent connect is not lost; a static IP goes with the network.
+	var networks []string
+	if err := updateContainerMeta(ns, id, func(m *containerMeta) {
+		m.Networks = slices.DeleteFunc(m.Networks, func(n string) bool { return n == network })
+		delete(m.NetworkAliases, network)
+		delete(m.NetworkIPs, network)
+		networks = m.Networks
+	}); err != nil {
 		return err
 	}
-	updateNetworksLabel(ctx, ns, id, meta.Networks)
+	updateNetworksLabel(ctx, ns, id, networks)
 	refreshNetworkHosts(network)
 	refreshHostsForContainer(ns, id)
 	if running {

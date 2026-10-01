@@ -7,6 +7,7 @@ import (
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
 	"log"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -28,6 +29,53 @@ type dockerImageSummary struct {
 	Labels      map[string]string `json:"Labels"`
 	ParentId    string            `json:"ParentId"`
 	Containers  int               `json:"Containers"`
+	SharedSize  int64             `json:"SharedSize"`
+}
+
+// mergeImageSummaries turns the per-record list into Docker's shape: one
+// entry per image ID carrying all of its tags and digests (in the familiar
+// form the engine reports), newest first. Clients key rows by Id.
+func mergeImageSummaries(in []dockerImageSummary) []dockerImageSummary {
+	byID := map[string]int{}
+	out := make([]dockerImageSummary, 0, len(in))
+	for _, img := range in {
+		i, ok := byID[img.Id]
+		if !ok {
+			i = len(out)
+			byID[img.Id] = i
+			merged := img
+			merged.RepoTags, merged.RepoDigests = []string{}, []string{}
+			merged.SharedSize = -1
+			out = append(out, merged)
+		}
+		m := &out[i]
+		for _, t := range img.RepoTags {
+			if strings.HasPrefix(t, "<none>") {
+				continue
+			}
+			if f := familiarRef(canonicalizeImageRef(t)); !slices.Contains(m.RepoTags, f) {
+				m.RepoTags = append(m.RepoTags, f)
+			}
+		}
+		for _, d := range img.RepoDigests {
+			if strings.HasPrefix(d, "<none>") {
+				continue
+			}
+			if f := familiarRef(canonicalizeImageRef(d)); !slices.Contains(m.RepoDigests, f) {
+				m.RepoDigests = append(m.RepoDigests, f)
+			}
+		}
+		if img.Created > m.Created {
+			m.Created = img.Created
+		}
+	}
+	sort.SliceStable(out, func(a, b int) bool {
+		if out[a].Created != out[b].Created {
+			return out[a].Created > out[b].Created
+		}
+		return out[a].Id < out[b].Id
+	})
+	return out
 }
 
 // canonicalizeImageRef returns a fully-qualified containerd image reference.
@@ -484,6 +532,24 @@ func inspectDockerImage(ctx context.Context, name string) (map[string]interface{
 	var repoDigests []string
 	if target.Digest != "" {
 		repoDigests = []string{repo + "@" + target.Digest.String()}
+	}
+	// Every name the image goes by, as Docker reports (not only the one
+	// it was looked up under).
+	if names, _ := imageRecordsByID(ctx, target.Digest.String()); len(names) > 0 {
+		var all []dockerImageSummary
+		for _, n := range names {
+			r, t := splitRepoTag(n)
+			s := dockerImageSummary{Id: target.Digest.String()}
+			if t != "" {
+				s.RepoTags = []string{r + ":" + t}
+			}
+			if !strings.HasPrefix(r, "<none>") {
+				s.RepoDigests = []string{r + "@" + target.Digest.String()}
+			}
+			all = append(all, s)
+		}
+		merged := mergeImageSummaries(all)[0]
+		repoTags, repoDigests = merged.RepoTags, merged.RepoDigests
 	}
 
 	size := int64(0)

@@ -47,6 +47,8 @@ type execSpec struct {
 	// proc is the containerd exec process while it runs; kept for TTY resize
 	// (POST /exec/{id}/resize) between start and exit.
 	proc client.Process
+	// pid is the exec process's pid (kept after exit, as Docker does).
+	pid uint32
 }
 
 // setProcess records (or clears with nil) the live containerd exec process.
@@ -54,6 +56,9 @@ func (s *execSpec) setProcess(p client.Process) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.proc = p
+	if p != nil {
+		s.pid = p.Pid()
+	}
 }
 
 // currentProcess returns the live exec process, or nil when not running.
@@ -78,10 +83,16 @@ func (s *execSpec) finishedBefore(t time.Time) bool {
 	return !s.running && !s.finished.IsZero() && s.finished.Before(t)
 }
 
-func (s *execSpec) state() (bool, int) {
+// inspectState is what exec inspect reports: the exit code only once the
+// process has exited (null before, as in Docker), and its pid.
+func (s *execSpec) inspectState() (running bool, exitCode *int, pid uint32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.running, s.exitCode
+	if !s.running && !s.finished.IsZero() {
+		code := s.exitCode
+		exitCode = &code
+	}
+	return s.running, exitCode, s.pid
 }
 
 // execStore keeps pending and finished exec instances keyed by Docker exec ID.
@@ -128,11 +139,12 @@ func (s *execStore) get(id string) *execSpec {
 	return s.byID[id]
 }
 
+// newExecID returns a 64-hex-digit ID, the length Docker's exec IDs have.
 func newExecID() string {
-	b := make([]byte, 16)
+	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		// Fallback to a timestamp-based ID if randomness fails.
-		return fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))))[:32]
+		return fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))))
 	}
 	return fmt.Sprintf("%x", b)
 }
@@ -167,7 +179,9 @@ type dockerExecStartRequest struct {
 type dockerExecInspectResponse struct {
 	ID            string `json:"ID"`
 	Running       bool   `json:"Running"`
-	ExitCode      int    `json:"ExitCode"`
+	ExitCode      *int   `json:"ExitCode"`
+	Pid           uint32 `json:"Pid"`
+	DetachKeys    string `json:"DetachKeys"`
 	OpenStdin     bool   `json:"OpenStdin"`
 	OpenStdout    bool   `json:"OpenStdout"`
 	OpenStderr    bool   `json:"OpenStderr"`
@@ -177,14 +191,25 @@ type dockerExecInspectResponse struct {
 		Tty        bool     `json:"tty"`
 		Entrypoint string   `json:"entrypoint"`
 		Arguments  []string `json:"arguments"`
+		User       string   `json:"user,omitempty"`
+		Privileged bool     `json:"privileged"`
 	} `json:"ProcessConfig"`
 }
 
 // createDockerExec creates an exec instance and returns its Docker-compatible ID.
 func createDockerExec(ctx context.Context, containerID string, req dockerExecCreateRequest) (string, error) {
+	if len(req.Cmd) == 0 {
+		return "", errInvalid("No exec command specified")
+	}
 	ns, containerdID, name, err := resolveDockerID(ctx, containerID)
 	if err != nil {
 		return "", err
+	}
+	if st, known := currentTaskStatus(ctx, ns, containerdID); known && st != "running" {
+		if st == "paused" {
+			return "", errConflict("Container %s is paused, unpause the container before exec", truncateID(dockerID(ns, containerdID)))
+		}
+		return "", errConflict("container %s is not running", truncateID(dockerID(ns, containerdID)))
 	}
 
 	spec := &execSpec{
@@ -217,8 +242,8 @@ func startDetachedExec(id string) error {
 		return fmt.Errorf("No such exec instance: %s", id)
 	}
 	go func() {
-		res, err := runSimpleExecStdin(context.Background(), spec.Namespace,
-			spec.ContainerdID, spec.Cmd, spec.User, spec.WorkingDir, nil, time.Hour)
+		res, err := runSimpleExecEnv(context.Background(), spec.Namespace,
+			spec.ContainerdID, spec.Cmd, spec.User, spec.WorkingDir, spec.Env, nil, -1)
 		if err != nil {
 			spec.setExit(126)
 			return
@@ -250,9 +275,7 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	defer conn.Close()
 
-	// Write the upgrade response. Docker CLI expects 101 UPGRADED for attach.
-	fmt.Fprintf(bufrw, "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
-	if err := bufrw.Flush(); err != nil {
+	if err := writeHijackHeader(bufrw, r, spec.Tty); err != nil {
 		return
 	}
 
@@ -322,10 +345,11 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		}()
 	}
 
+	ctrEnv, ctrCwd := containerProcessDefaults(nsCtx, container)
 	pspec := &specs.Process{
 		Args:     spec.Cmd,
-		Env:      mergeEnv([]string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}, spec.Env),
-		Cwd:      defaultString(spec.WorkingDir, "/"),
+		Env:      mergeEnv(ctrEnv, spec.Env),
+		Cwd:      defaultString(spec.WorkingDir, ctrCwd),
 		User:     execUserFor(nsCtx, container, spec.User),
 		Terminal: spec.Tty,
 	}
@@ -386,6 +410,7 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		failExec("start", serr)
 		return
 	}
+	spec.setProcess(process) // again: the pid exists only now
 	publishContainerEvent("exec_start: "+strings.Join(spec.Cmd, " "), spec.Namespace, spec.ContainerdID,
 		map[string]string{"execID": spec.ID})
 
@@ -393,7 +418,15 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	if werr != nil {
 		process.Kill(context.WithoutCancel(nsCtx), syscall.SIGKILL)          //nolint:errcheck
 		process.Delete(context.WithoutCancel(nsCtx), client.WithProcessKill) //nolint:errcheck
+		// The stream readers end only on EOF of their pipes.
+		stdoutW.Close()
+		stderrW.Close()
+		if stdinWriteCloser != nil {
+			stdinWriteCloser.Close()
+		}
 		wg.Wait()
+		stdoutR.Close()
+		stderrR.Close()
 		spec.setExit(126)
 		return
 	}
@@ -434,11 +467,12 @@ func inspectDockerExec(id string) (*dockerExecInspectResponse, error) {
 	if spec == nil {
 		return nil, fmt.Errorf("No such exec instance: %s", id)
 	}
-	running, code := spec.state()
+	running, code, pid := spec.inspectState()
 	resp := &dockerExecInspectResponse{
 		ID:          id,
 		Running:     running,
 		ExitCode:    code,
+		Pid:         pid,
 		OpenStdin:   spec.AttachStdin,
 		OpenStdout:  spec.AttachStdout,
 		OpenStderr:  spec.AttachStderr,
@@ -446,6 +480,8 @@ func inspectDockerExec(id string) (*dockerExecInspectResponse, error) {
 		ContainerID: spec.ContainerDockerID,
 	}
 	resp.ProcessConfig.Tty = spec.Tty
+	resp.ProcessConfig.User = spec.User
+	resp.ProcessConfig.Privileged = spec.Privileged
 	if len(spec.Cmd) > 0 {
 		resp.ProcessConfig.Entrypoint = spec.Cmd[0]
 		resp.ProcessConfig.Arguments = spec.Cmd[1:]

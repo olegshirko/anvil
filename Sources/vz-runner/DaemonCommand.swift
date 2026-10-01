@@ -6,12 +6,21 @@ fileprivate var globalDaemon: DaemonCommand.Daemon?
 enum DaemonCommand {
     static func run(args: [String]) {
         setbuf(stdout, nil)
+        // Relays write to vsock fds, which have no SO_NOSIGPIPE: a guest end
+        // closing mid-write must fail the write, not kill the daemon.
+        signal(SIGPIPE, SIG_IGN)
+        timestampedOutput = true
+        raiseOpenFileLimit()
         let cliArgs = parseDaemonArgs(args)
 
         // Measures the whole daemon spawn -> control-socket-bound window;
         // phase marks land in daemon.log for boot profiling.
         let phaseTimer = BootPhaseTimer()
 
+        if diskCompactInProgress() {
+            print("[anvil] anvil disk-compact is rewriting the disk; start again when it is done")
+            exit(1)
+        }
         guard acquireDaemonLock() else {
             print("[anvil] daemon already running")
             exit(1)
@@ -42,18 +51,26 @@ enum DaemonCommand {
 
     // MARK: - Private
 
+    /// Held (flock) for the daemon's lifetime: two daemons racing past the
+    /// pid-file check cannot both own the VM's disk.
+    private static var lockFD: Int32 = -1
+
     private static func acquireDaemonLock() -> Bool {
         try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        // Snapshots hold VM memory: the state dir is the user's alone, also
+        // when the service wrapper created it.
+        chmod(stateDir.path, 0o700)
+
+        let fd = open(daemonLockFile.path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { return false }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            return false
+        }
+        lockFD = fd
 
         let pidFile = daemonPIDFile
         let ownPid = getpid()
-        if let data = try? Data(contentsOf: pidFile),
-           let s = String(data: data, encoding: .utf8),
-           let pid = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)),
-           pid != ownPid,
-           kill(pid, 0) == 0 {
-            return false
-        }
 
         if let data = String(ownPid).data(using: .utf8) {
             try? data.write(to: pidFile, options: .atomic)
@@ -555,4 +572,25 @@ private let daemonPIDFile = stateDir.appendingPathComponent("daemon.pid")
 func daemonRestartDelay(attempt: Int) -> TimeInterval {
     let delay = TimeInterval(1 << min(max(attempt, 0), 6))
     return min(delay, 60)
+}
+
+/// launchd and default shells give 256 descriptors. Every forwarded
+/// connection and docker client holds two or more, so a busy connection
+/// pool hit EMFILE long before the relay caps; failed vsock connects then
+/// looked like a dead guest and restarted the VM.
+func raiseOpenFileLimit() {
+    var rl = rlimit()
+    guard getrlimit(RLIMIT_NOFILE, &rl) == 0 else { return }
+    var maxPerProc: Int32 = 0
+    var size = MemoryLayout<Int32>.size
+    var target = rl.rlim_max
+    if sysctlbyname("kern.maxfilesperproc", &maxPerProc, &size, nil, 0) == 0, maxPerProc > 0 {
+        target = min(target, rlim_t(maxPerProc))
+    }
+    target = min(target, 65536)
+    guard target > rl.rlim_cur else { return }
+    rl.rlim_cur = target
+    if setrlimit(RLIMIT_NOFILE, &rl) != 0 {
+        print("[daemon] cannot raise the open file limit: \(String(cString: strerror(errno)))")
+    }
 }

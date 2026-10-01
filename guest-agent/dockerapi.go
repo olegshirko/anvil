@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -277,8 +278,7 @@ func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	defer conn.Close()
 
-	fmt.Fprintf(bufrw, "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
-	if err := bufrw.Flush(); err != nil {
+	if err := writeHijackHeader(bufrw, r, tty); err != nil {
 		return
 	}
 	// Client stdin: into the container's stdin, or drained so the client
@@ -466,6 +466,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 	if ul, err := listenGuestDockerSocket(); err != nil {
 		log.Printf("[docker-api] %s: %v", guestDockerSocket, err)
 	} else {
+		defer ul.Close()
 		go func() {
 			if err := srv.Serve(ul); err != nil {
 				log.Printf("[docker-api] serve %s: %v", guestDockerSocket, err)
@@ -478,6 +479,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		log.Printf("[docker-api] listen: %v", err)
 		return
 	}
+	defer l.Close() // a restart after a panic binds again
 	log.Printf("[docker-api] listening on vsock port %d", dockerAPIPort)
 	if err := srv.Serve(l); err != nil {
 		log.Printf("[docker-api] serve: %v", err)
@@ -701,7 +703,13 @@ func pruneDockerVolumes(ctx context.Context, filters map[string]map[string]bool)
 	deleted := []string{}
 	var reclaimed int64
 	for _, v := range volumes {
-		if mounted[filepath.Clean(v.Mountpoint)] {
+		if volumeInUse(mounted, v.Mountpoint) {
+			continue
+		}
+		// A bind-backed volume is mounted from its device, not its own
+		// directory: without this it always looked unused, and pruning it
+		// dropped the options its next mount needs.
+		if dev, ok := bindDeviceOption(v.Options); ok && mounted[filepath.Clean(dev)] {
 			continue
 		}
 		if _, anon := v.Labels[labelAnonymousVolume]; !anon && !all {
@@ -748,4 +756,22 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"message": message})
+}
+
+// writeHijackHeader starts a hijacked attach/exec stream as dockerd does:
+// 101 UPGRADED only when the client asked to upgrade, otherwise 200 OK
+// with the raw stream following (docker-java execs without stdin send no
+// Upgrade header and parse a 101 as the end of the response). Non-TTY
+// output is announced as multiplexed.
+func writeHijackHeader(bufrw *bufio.ReadWriter, r *http.Request, tty bool) error {
+	contentType := "application/vnd.docker.multiplexed-stream"
+	if tty {
+		contentType = "application/vnd.docker.raw-stream"
+	}
+	if r.Header.Get("Upgrade") != "" {
+		fmt.Fprintf(bufrw, "HTTP/1.1 101 UPGRADED\r\nContent-Type: %s\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n", contentType)
+	} else {
+		fmt.Fprintf(bufrw, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n\r\n", contentType)
+	}
+	return bufrw.Flush()
 }

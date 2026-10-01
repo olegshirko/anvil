@@ -34,7 +34,10 @@ final class ContainerdCacheManager {
 
         do {
             try process.run()
-            process.waitUntilExit()
+            guard waitForExit(process, timeout: 600) else {
+                print("[containerd-cache] sync timed out")
+                return
+            }
             if process.terminationStatus != 0 {
                 print("[containerd-cache] sync exited with status \(process.terminationStatus)")
             } else {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	tasks "github.com/containerd/containerd/api/services/tasks/v1"
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -65,13 +67,13 @@ func matchesContainerFilters(s dockerContainerSummary, filters map[string]map[st
 	}
 	name := strings.TrimPrefix(s.Names[0], "/")
 	checks := []bool{
-		anyMatch(filters["name"], func(v string) bool { return v != "" && strings.Contains(name, strings.TrimPrefix(v, "/")) }),
+		anyMatch(filters["name"], func(v string) bool { return v != "" && (nameFilterMatch(v, name) || nameFilterMatch(v, "/"+name)) }),
 		anyMatch(filters["id"], func(v string) bool { return strings.HasPrefix(s.Id, v) }),
 		anyMatch(filters["status"], func(v string) bool { return v == s.State }),
 		anyMatch(filters["ancestor"], func(v string) bool { return imageMatchesAncestor(s.Image, s.ImageID, v) }),
 		anyMatch(filters["network"], func(v string) bool {
 			for _, n := range s.networks {
-				if n == v || strings.HasPrefix(networkID(networkNamespace(n)), v) {
+				if n == v || (s.networkIDs[n] != "" && strings.HasPrefix(s.networkIDs[n], v)) {
 					return true
 				}
 			}
@@ -164,6 +166,7 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 	}
 
 	result := make([]dockerContainerSummary, 0)
+	netIDs := networkIDsByName()
 	for _, ns := range nss {
 		nsCtx := namespaces.WithNamespace(ctx, ns)
 		containers, err := cl.Containers(nsCtx)
@@ -172,7 +175,20 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 			continue
 		}
 		// One task list per namespace instead of Task+Status per container.
-		taskStates := namespaceTaskStates(nsCtx, cl)
+		taskStates, tasksKnown := namespaceTaskStates(nsCtx, cl)
+		// Image name -> ID (its target digest), looked up once per name.
+		imageIDs := map[string]string{}
+		imageIDOf := func(name string) string {
+			if id, ok := imageIDs[name]; ok {
+				return id
+			}
+			id := ""
+			if img, err := cl.GetImage(nsCtx, name); err == nil {
+				id = img.Target().Digest.String()
+			}
+			imageIDs[name] = id
+			return id
+		}
 
 		for _, c := range containers {
 			// The list call already returned the record: no per-container
@@ -205,6 +221,10 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 			var startedAt, finishedAt time.Time
 			if meta != nil {
 				startedAt, finishedAt = meta.StartedAt, meta.FinishedAt
+				if _, hasTask := taskStates[c.ID()]; tasksKnown && !hasTask && !startedAt.IsZero() {
+					// Ran before a cold boot took its task: exited.
+					state, exitCode = "exited", meta.ExitCode
+				}
 			}
 			status := dockerStatusText(state, exitCode, startedAt, finishedAt, time.Now())
 
@@ -258,7 +278,7 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 				Id:      did,
 				Names:   []string{"/" + name},
 				Image:   imageName,
-				ImageID: info.Image,
+				ImageID: imageIDOf(info.Image),
 				Command: command,
 				Created: info.CreatedAt.Unix(),
 				Ports:   ports,
@@ -267,6 +287,7 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 				Status:  formatHealthStatus(did, status),
 			}
 			summary.exitCode = exitCode
+			summary.networkIDs = netIDs
 			summary.created = info.CreatedAt.UnixNano()
 			if hs := getHealthState(did); hs != nil {
 				summary.health = hs.Status
@@ -274,6 +295,18 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 			if meta != nil {
 				summary.networks = meta.Networks
 				summary.exposed = meta.ExposedPorts
+			}
+			summary.NetworkSettings.Networks = map[string]dockerEndpointStats{}
+			if meta != nil && len(meta.Networks) > 0 {
+				summary.HostConfig.NetworkMode = meta.Networks[0]
+				if !isContainerNetworkMode(meta.Networks[0]) {
+					ni, _ := loadNetInfo(ns, c.ID())
+					for _, n := range meta.Networks {
+						ep, _ := ni.endpointOn(n)
+						ep.NetworkID = netIDs[n]
+						summary.NetworkSettings.Networks[n] = ep
+					}
+				}
 			}
 			if meta != nil {
 				summary.Mounts = inspectMountPoints(meta)
@@ -286,7 +319,11 @@ func listDockerContainers(ctx context.Context, filters map[string]map[string]boo
 		}
 	}
 
+	// Newest first, as docker ps lists them (ties broken by ID).
 	sort.Slice(result, func(i, j int) bool {
+		if result[i].created != result[j].created {
+			return result[i].created > result[j].created
+		}
 		return result[i].Id < result[j].Id
 	})
 	return result, nil
@@ -300,16 +337,16 @@ type taskSnapshot struct {
 
 // namespaceTaskStates maps containerd container ID -> task state for one
 // namespace.
-func namespaceTaskStates(nsCtx context.Context, cl *client.Client) map[string]taskSnapshot {
+func namespaceTaskStates(nsCtx context.Context, cl *client.Client) (map[string]taskSnapshot, bool) {
 	out := map[string]taskSnapshot{}
 	resp, err := cl.TaskService().List(nsCtx, &tasks.ListTasksRequest{})
 	if err != nil {
-		return out
+		return out, false
 	}
 	for _, p := range resp.Tasks {
 		out[p.ID] = taskSnapshot{status: strings.ToLower(p.Status.String()), exitCode: int(p.ExitStatus)}
 	}
-	return out
+	return out, true
 }
 
 // inspectDockerContainer returns a minimal inspect payload for a container.
@@ -357,6 +394,9 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 			exitCode := 0
 			pid := 0
 			task, err := c.Task(nsCtx, nil)
+			// Only "not found" means no task: a transient containerd error
+			// must not show a running container as exited.
+			hasTask := err == nil || !errdefs.IsNotFound(err)
 			if err == nil {
 				if st, serr := task.Status(nsCtx); serr == nil {
 					status = dockerStatus(string(st.Status))
@@ -369,8 +409,13 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 			}
 
 			imageName := info.Image
+			imageID := ""
 			if img, err := c.Image(nsCtx); err == nil && img != nil {
 				imageName = img.Name()
+				imageID = img.Target().Digest.String()
+			}
+			if imageID == "" {
+				imageID = imageName
 			}
 
 			did := dockerID(ns, c.ID())
@@ -380,6 +425,10 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 				}
 			}
 			meta, _ := loadContainerMeta(ns, c.ID())
+			if !hasTask && meta != nil && !meta.StartedAt.IsZero() {
+				// Ran before a cold boot took its task: exited.
+				status, exitCode = "exited", meta.ExitCode
+			}
 
 			// Process config comes from the OCI spec; env/cmd reflect what
 			// will actually run (image config merged with overrides).
@@ -443,12 +492,18 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 				portBindings = portBindingsFromMeta(meta)
 			}
 			return &dockerContainerInspect{
-				Id:      did,
-				Created: dockerTime(info.CreatedAt),
-				Path:    path,
-				Args:    args,
-				Name:    "/" + name,
-				Image:   imageName,
+				Id:             did,
+				Created:        dockerTime(info.CreatedAt),
+				Path:           path,
+				Args:           args,
+				Name:           "/" + name,
+				Image:          imageID,
+				ResolvConfPath: containerResolvPath(ns, c.ID()),
+				HostnamePath:   filepath.Join(containerMetaDir(ns, c.ID()), "hostname"),
+				HostsPath:      containerHostsPath(ns, c.ID()),
+				LogPath:        containerLogPath(ns, c.ID()),
+				Driver:         "overlayfs",
+				Platform:       "linux",
 				State: dockerContainerState{
 					Status:     status,
 					Running:    running,
@@ -644,11 +699,17 @@ func enrichEndpoints(endpoints map[string]dockerEndpointStats, meta *containerMe
 	}
 }
 
-// networkNamespace is the key a network's ID derives from (networkID):
-// its name, except the default bridge, which is keyed "default".
-func networkNamespace(name string) string {
-	if name == "bridge" {
-		return "default"
+// networkIDsByName maps network names to their IDs, read from the conflists
+// (the ID stored there is what network ls/inspect report).
+func networkIDsByName() map[string]string {
+	out := map[string]string{}
+	conflists, err := loadCNIConflists()
+	if err != nil {
+		return out
 	}
-	return name
+	for _, cl := range conflists {
+		dn := conflistToDockerNetwork(cl)
+		out[dn.Name] = dn.Id
+	}
+	return out
 }

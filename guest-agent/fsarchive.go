@@ -39,6 +39,12 @@ func writeTarTree(tw *tar.Writer, src, prefix string) error {
 			return nil
 		}
 		name := filepath.ToSlash(filepath.Join(prefix, rel))
+		if prefix == "." { // dir/. : "./" and "./file", as Docker sends
+			name = "./" + filepath.ToSlash(rel)
+			if rel == "." {
+				name = "."
+			}
+		}
 		fi, err := d.Info()
 		if err != nil {
 			return err
@@ -178,6 +184,17 @@ func extractTar(r io.Reader, dst string) error {
 		os.Chtimes(dirs[i].path, dirs[i].mtime, dirs[i].mtime) //nolint:errcheck
 	}
 	return nil
+}
+
+// cpBaseName is the name a docker cp path archives under: its base, or "."
+// for a path ending in "/." (copy the directory's contents), which
+// cleaning would lose.
+func cpBaseName(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "." || strings.HasSuffix(p, "/.") {
+		return "."
+	}
+	return filepath.Base(containerPath(p))
 }
 
 // containerPath normalizes a docker cp path to an absolute path within the

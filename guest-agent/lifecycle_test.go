@@ -130,7 +130,9 @@ func TestAbortedWaitDoesNotCacheExitCode(t *testing.T) {
 	// after the container was resolved — the client hanging up.
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	req := httptest.NewRequest(http.MethodPost, "/containers/"+did+"/wait", nil).WithContext(ctx)
+	// next-exit (docker run): not-running answers a never-started
+	// container at once, as Docker does.
+	req := httptest.NewRequest(http.MethodPost, "/containers/"+did+"/wait?condition=next-exit", nil).WithContext(ctx)
 	handleContainerWait(httptest.NewRecorder(), req, did)
 
 	if code, ok := takeContainerExitCode(did); ok {

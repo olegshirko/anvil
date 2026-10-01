@@ -16,3 +16,23 @@ final class DaemonRestartTests: XCTestCase {
         XCTAssertEqual(daemonRestartDelay(attempt: -3), 1, "negative attempt clamps to the base delay")
     }
 }
+
+final class StartConfigTests: XCTestCase {
+    func testParseAnvilConfig() {
+        let cfg = parseAnvilConfig("# c\nANVIL_MEMORY=4\nexport ANVIL_CPUS=\"3\"\n\nbad line\nANVIL_IDLE = '120'\n")
+        XCTAssertEqual(cfg["ANVIL_MEMORY"], "4")
+        XCTAssertEqual(cfg["ANVIL_CPUS"], "3")
+        XCTAssertEqual(cfg["ANVIL_IDLE"], "120")
+        XCTAssertNil(cfg["bad line"])
+    }
+
+    func testBootAssetsPreferPackageOverStateDir() {
+        let brew = bootAssetCandidates(stateDir: "/s", stateBinDir: "/s/bin", brewAssets: "/b", projectRoot: nil)
+        XCTAssertEqual(brew.kernels.first, "/b/vmlinuz-raw")
+        XCTAssertEqual(brew.initrds.first, "/b/initramfs-containerd")
+        let src = bootAssetCandidates(stateDir: "/s", stateBinDir: "/s/bin", brewAssets: nil, projectRoot: "/p")
+        XCTAssertEqual(src.kernels.first, "/p/.download/alpine/vmlinuz-raw")
+        XCTAssertEqual(src.initrds.first, "/p/.download/ubuntu/initramfs-containerd")
+    }
+
+}

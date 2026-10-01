@@ -36,7 +36,28 @@ func isDaemonRunning() -> Bool {
           let pid = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)) else {
         return false
     }
-    return kill(pid, 0) == 0
+    return kill(pid, 0) == 0 && isAnvilProcess(pid)
+}
+
+func daemonPID() -> Int32? {
+    guard let s = try? String(contentsOf: daemonPIDFile, encoding: .utf8) else { return nil }
+    return Int32(s.trimmingCharacters(in: .whitespacesAndNewlines))
+}
+
+func executablePath(of pid: Int32) -> String? {
+    var buf = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+    guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { return nil }
+    return String(cString: buf)
+}
+
+/// Whether pid runs an anvil binary. A pid file left by a daemon that died
+/// with the Mac (power loss, SIGKILL at logout) can name a reused pid; such
+/// a process must neither block a start nor receive our signals.
+func isAnvilProcess(_ pid: Int32) -> Bool {
+    // Not inspectable (another user's process): not anvil.
+    guard let path = executablePath(of: pid) else { return false }
+    let name = (path as NSString).lastPathComponent
+    return name == "vz-runner" || name == "anvil"
 }
 
 func saveDockerContext() {
@@ -59,7 +80,10 @@ func saveDockerContext() {
 
 func restoreDockerContext() {
     let current = shell("docker", "context", "show").trimmingCharacters(in: .whitespacesAndNewlines)
-    guard current == "anvil-remote" else { return }
+    guard current == "anvil" else { return }
+    // buildx keeps its selected builder per context: put the previous one
+    // back while anvil's context is still current.
+    restoreBuildxBuilder()
     let target: String
     if let ctx = try? String(contentsOf: prevContextFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
        !ctx.isEmpty {
@@ -69,7 +93,6 @@ func restoreDockerContext() {
     }
     _ = shell("docker", "context", "use", target)
     try? FileManager.default.removeItem(at: prevContextFile)
-    restoreBuildxBuilder()
 }
 
 // MARK: - buildx integration
@@ -168,6 +191,15 @@ func waitForControlSocket(timeout: TimeInterval = 60, process: Process? = nil) -
 // MARK: - Commands
 
 func cmdStart(args: [String]) {
+    // After an upgrade the old daemon keeps running the old binary (and, for
+    // Homebrew, assets of a keg the upgrade deletes): restart it, as the
+    // service wrapper does.
+    if isDaemonRunning(), let pid = daemonPID(), let running = executablePath(of: pid),
+       URL(fileURLWithPath: running).resolvingSymlinksInPath().path
+        != URL(fileURLWithPath: currentExecutablePath()).resolvingSymlinksInPath().path {
+        print("[anvil] daemon runs another binary (\(running)); restarting it")
+        cmdStop(args: [])
+    }
     if isDaemonRunning() {
         let pid = (try? String(contentsOf: daemonPIDFile, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "?"
         print("[anvil] daemon already running (pid \(pid))")
@@ -182,38 +214,27 @@ func cmdStart(args: [String]) {
 
     let brewAssets = brewAssetsDir()
 
-    // Resolve kernel path: flag > stateDir > brew assets > project root
-    var kernelCandidates = [stateDir.appendingPathComponent("vmlinuz-raw").path,
-                            stateBinDir.appendingPathComponent("vmlinuz-raw").path]
-    if let brewAssets = brewAssets {
-        kernelCandidates.append("\(brewAssets)/vmlinuz-raw")
+    // Same order as anvil-service.sh: a source tree's fresh build first;
+    // otherwise the installed package's assets before state-dir copies, so a
+    // stale ~/.anvil-vz kernel or initramfs never shadows an upgrade.
+    let projectRoot = findProjectRoot()
+    if findArg(args, "--kernel") == nil, projectRoot == nil {
+        refreshUnpackedKernel(stateDir: stateDir, stateBinDir: stateBinDir, brewAssets: brewAssets)
     }
-    var kernel = findArg(args, "--kernel")
-        ?? findFile(kernelCandidates,
-                    fallback: findProjectRoot().map { "\($0)/.download/alpine/vmlinuz-raw" }
-                        ?? findProjectRoot().map { "\($0)/.download/ubuntu/vmlinuz-raw" })
-    // Releases/bottles ship the kernel gzipped and the service script
-    // normally unpacks it; when `anvil start` runs directly (e.g. under
-    // zerobrew, which has no services), unpack it ourselves.
-    if kernel == nil {
-        kernel = unpackBundledKernel(stateDir: stateDir, stateBinDir: stateBinDir, brewAssets: brewAssets)
-    }
-
-    // Resolve initrd path: flag > stateDir > brew assets > project root
-    var initrdCandidates = [stateDir.appendingPathComponent("initramfs-containerd").path,
-                            stateBinDir.appendingPathComponent("initramfs-containerd").path]
-    if let brewAssets = brewAssets {
-        initrdCandidates.append("\(brewAssets)/initramfs-containerd")
-    }
-    let initrd = findArg(args, "--initrd")
-        ?? findFile(initrdCandidates,
-                    fallback: findProjectRoot().map { "\($0)/.download/ubuntu/initramfs-containerd" })
+    let assets = bootAssetCandidates(stateDir: stateDir.path, stateBinDir: stateBinDir.path,
+                                     brewAssets: brewAssets, projectRoot: projectRoot)
+    let kernel = findArg(args, "--kernel") ?? findFile(assets.kernels, fallback: nil)
+    let initrd = findArg(args, "--initrd") ?? findFile(assets.initrds, fallback: nil)
 
     let share = findArg(args, "--share")
         ?? findProjectRoot().map { "\($0)" }
         ?? stateDir.path
-    let memory = findArg(args, "--memory") ?? "2"
-    let idle = findArg(args, "--idle") ?? "600"
+    // Flags, then ANVIL_* from the environment or ~/.anvil-vz/config — the
+    // service wrapper reads the same settings, so switching between the two
+    // start paths keeps the snapshot hash (and skips a cold boot).
+    let memory = findArg(args, "--memory") ?? anvilSetting("ANVIL_MEMORY") ?? "2"
+    let idle = findArg(args, "--idle") ?? anvilSetting("ANVIL_IDLE") ?? "600"
+    let cpus = findArg(args, "--cpus") ?? anvilSetting("ANVIL_CPUS")
     let containerdDisk = stateDir.appendingPathComponent("containerd-disk.img").path
 
     guard let kernelPath = kernel, let initrdPath = initrd else {
@@ -232,7 +253,16 @@ func cmdStart(args: [String]) {
     // State dir holds the containerd disk (user data) and the sockets;
     // keep it owner-only.
     chmod(stateDir.path, 0o700)
-    try? "".write(toFile: daemonLogFile.path, atomically: true, encoding: .utf8)
+    // Appended across starts (the previous run's crash stays readable),
+    // bounded like the service wrapper's: 10 MB, one old copy.
+    if let size = (try? FileManager.default.attributesOfItem(atPath: daemonLogFile.path))?[.size] as? Int,
+       size > 10 << 20 {
+        try? FileManager.default.removeItem(atPath: daemonLogFile.path + ".1")
+        try? FileManager.default.moveItem(atPath: daemonLogFile.path, toPath: daemonLogFile.path + ".1")
+    }
+    if !FileManager.default.fileExists(atPath: daemonLogFile.path) {
+        FileManager.default.createFile(atPath: daemonLogFile.path, contents: nil)
+    }
 
     // Create the containerd persistent disk if it doesn't exist, or grow it
     // when the target size (ANVIL_DISK_GB, default 64) exceeds the current
@@ -240,7 +270,7 @@ func cmdStart(args: [String]) {
     // Growing changes the file size, which is part of the snapshot config
     // hash — the next boot is a cold boot and stage2 extends the ext4 fs
     // with resize2fs. Never shrink an existing image.
-    let diskGB = UInt64(ProcessInfo.processInfo.environment["ANVIL_DISK_GB"] ?? "") ?? 64
+    let diskGB = UInt64(anvilSetting("ANVIL_DISK_GB") ?? "") ?? 64
     let diskBytes = diskGB * 1024 * 1024 * 1024
     if !FileManager.default.fileExists(atPath: containerdDisk) {
         print("[anvil] creating containerd disk image (\(diskGB) GiB sparse)...")
@@ -266,6 +296,9 @@ func cmdStart(args: [String]) {
         "--memory", memory,
         "--idle", idle,
     ]
+    if let cpus = cpus, !cpus.isEmpty {
+        cmdArgs += ["--cpus", cpus]
+    }
     if !share.isEmpty {
         cmdArgs += ["--share", share]
     }
@@ -277,7 +310,9 @@ func cmdStart(args: [String]) {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: currentExecutablePath())
     proc.arguments = cmdArgs
-    proc.standardOutput = FileHandle(forWritingAtPath: daemonLogFile.path)
+    let logHandle = FileHandle(forWritingAtPath: daemonLogFile.path)
+    logHandle?.seekToEndOfFile()
+    proc.standardOutput = logHandle
     proc.standardError = proc.standardOutput
     do {
         try proc.run()
@@ -319,7 +354,7 @@ func cmdStop(args: [String]) {
         restoreDockerContext()
         return
     }
-    guard kill(pid, 0) == 0 else {
+    guard kill(pid, 0) == 0, isAnvilProcess(pid) else {
         print("[anvil] daemon not running (stale pid file)")
         try? FileManager.default.removeItem(at: daemonPIDFile)
         restoreDockerContext()
@@ -425,16 +460,36 @@ func findFile(_ candidates: [String], fallback: String?) -> String? {
 /// Unpack the gzipped kernel shipped in release tarballs/bottles into the
 /// state dir. Returns the unpacked path, or nil when no gzipped kernel is
 /// available anywhere.
-func unpackBundledKernel(stateDir: URL, stateBinDir: URL, brewAssets: String?) -> String? {
+/// Candidate boot assets in priority order (see cmdStart).
+func bootAssetCandidates(stateDir: String, stateBinDir: String, brewAssets: String?,
+                         projectRoot: String?) -> (kernels: [String], initrds: [String]) {
+    let stateK = ["\(stateDir)/vmlinuz-raw", "\(stateBinDir)/vmlinuz-raw"]
+    let stateI = ["\(stateDir)/initramfs-containerd", "\(stateBinDir)/initramfs-containerd"]
+    let brewK = brewAssets.map { ["\($0)/vmlinuz-raw"] } ?? []
+    let brewI = brewAssets.map { ["\($0)/initramfs-containerd"] } ?? []
+    if let root = projectRoot {
+        return (["\(root)/.download/alpine/vmlinuz-raw", "\(root)/.download/ubuntu/vmlinuz-raw"] + stateK + brewK,
+                ["\(root)/.download/ubuntu/initramfs-containerd"] + stateI + brewI)
+    }
+    return (brewK + stateK, brewI + stateI)
+}
+
+/// Releases ship the kernel gzipped; unpack it into the state dir when the
+/// packaged copy is newer than the unpacked one (first start, or an upgrade
+/// — the old unpacked kernel would otherwise boot with the new initramfs).
+func refreshUnpackedKernel(stateDir: URL, stateBinDir: URL, brewAssets: String?) {
     var candidates = [stateDir.appendingPathComponent("vmlinuz-raw.gz").path,
                       stateBinDir.appendingPathComponent("vmlinuz-raw.gz").path]
     if let brewAssets = brewAssets {
-        candidates.append("\(brewAssets)/vmlinuz-raw.gz")
+        candidates.insert("\(brewAssets)/vmlinuz-raw.gz", at: 0)
     }
     guard let gz = candidates.first(where: { FileManager.default.isReadableFile(atPath: $0) }) else {
-        return nil
+        return
     }
     let dest = stateDir.appendingPathComponent("vmlinuz-raw").path
+    if let gzDate = modificationDate(gz), let destDate = modificationDate(dest), destDate >= gzDate {
+        return
+    }
     print("[anvil] unpacking bundled kernel \(gz) -> \(dest)")
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/gunzip")
@@ -442,30 +497,69 @@ func unpackBundledKernel(stateDir: URL, stateBinDir: URL, brewAssets: String?) -
     let pipe = Pipe()
     proc.standardOutput = pipe
     proc.standardError = FileHandle.nullDevice
-    guard (try? proc.run()) != nil else { return nil }
+    guard (try? proc.run()) != nil else { return }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     proc.waitUntilExit()
     // gunzip exits 2 on warnings (e.g. "trailing garbage ignored") although
     // the payload decoded fine; only a fully empty output is a real failure.
-    guard (proc.terminationStatus == 0 || proc.terminationStatus == 2), !data.isEmpty else { return nil }
-    // On a fresh install the state dir does not exist yet (cmdStart creates
-    // it later), so create it here; a failed write must not look like success.
+    guard (proc.terminationStatus == 0 || proc.terminationStatus == 2), !data.isEmpty else { return }
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
-    guard FileManager.default.createFile(atPath: dest, contents: data) else { return nil }
-    chmod(dest, 0o600)
-    return dest
+    if FileManager.default.createFile(atPath: dest, contents: data) {
+        chmod(dest, 0o600)
+    }
+}
+
+private func modificationDate(_ path: String) -> Date? {
+    (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+}
+
+/// An ANVIL_* setting: the environment wins, then ~/.anvil-vz/config
+/// (KEY=VALUE lines), which the LaunchAgent-started service reads as well.
+func anvilSetting(_ key: String) -> String? {
+    if let v = ProcessInfo.processInfo.environment[key], !v.isEmpty {
+        return v
+    }
+    return parseAnvilConfig(
+        (try? String(contentsOf: stateDir.appendingPathComponent("config"), encoding: .utf8)) ?? "")[key]
+}
+
+/// Parses KEY=VALUE lines (# comments, optional quotes, `export` prefix).
+func parseAnvilConfig(_ text: String) -> [String: String] {
+    var out: [String: String] = [:]
+    for raw in text.split(separator: "\n") {
+        var line = raw.trimmingCharacters(in: .whitespaces)
+        if line.isEmpty || line.hasPrefix("#") { continue }
+        if line.hasPrefix("export ") { line = String(line.dropFirst(7)) }
+        guard let eq = line.firstIndex(of: "=") else { continue }
+        let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+        var value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        if value.count >= 2, let f = value.first, f == "\"" || f == "'", value.last == f {
+            value = String(value.dropFirst().dropLast())
+        }
+        if !key.isEmpty { out[key] = value }
+    }
+    return out
+}
+
+/// An anvil source tree, not just any SwiftPM package: running `anvil
+/// start` inside another Swift project made that directory the VM share.
+func isAnvilSourceTree(_ dir: URL) -> Bool {
+    let fm = FileManager.default
+    return fm.fileExists(atPath: dir.appendingPathComponent("Package.swift").path)
+        && fm.fileExists(atPath: dir.appendingPathComponent("scripts/anvil-service.sh").path)
+        && fm.fileExists(atPath: dir.appendingPathComponent("guest-agent/go.mod").path)
 }
 
 func findProjectRoot() -> String? {
     // Check current working directory first (user is in the project tree).
     let cwd = FileManager.default.currentDirectoryPath
-    if FileManager.default.fileExists(atPath: URL(fileURLWithPath: cwd).appendingPathComponent("Package.swift").path) {
+    if isAnvilSourceTree(URL(fileURLWithPath: cwd)) {
         return cwd
     }
-    // Walk up from the executable looking for Package.swift.
+    // Walk up from the executable looking for the source tree.
     var url = URL(fileURLWithPath: currentExecutablePath()).deletingLastPathComponent()
     for _ in 0..<10 {
-        if FileManager.default.fileExists(atPath: url.appendingPathComponent("Package.swift").path) {
+        if isAnvilSourceTree(url) {
             return url.path
         }
         let parent = url.deletingLastPathComponent()
@@ -481,6 +575,18 @@ func brewAssetsDir() -> String? {
     //   -> /opt/homebrew/Cellar/anvil/<version>/share/anvil/assets
     let exe = currentExecutablePath()
     let url = URL(fileURLWithPath: exe).deletingLastPathComponent().deletingLastPathComponent()
+    // Prefer the version-independent <prefix>/opt/<formula> link: `brew
+    // upgrade` deletes the old keg, and a daemon restarted after a crash
+    // would look for its kernel there.
+    let parts = url.pathComponents
+    if let cellar = parts.firstIndex(of: "Cellar"), cellar + 1 < parts.count {
+        let prefix = NSString.path(withComponents: Array(parts[..<cellar]))
+        let opt = URL(fileURLWithPath: prefix).appendingPathComponent("opt")
+            .appendingPathComponent(parts[cellar + 1]).appendingPathComponent("share/anvil/assets")
+        if FileManager.default.fileExists(atPath: opt.path) {
+            return opt.path
+        }
+    }
     let assetsDir = url.appendingPathComponent("share/anvil/assets")
     if FileManager.default.fileExists(atPath: assetsDir.path) {
         return assetsDir.path

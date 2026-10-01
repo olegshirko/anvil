@@ -67,24 +67,26 @@ type dockerIPAMConfig struct {
 
 // dockerNetworkCreateRequest mirrors Docker's POST /networks/create body.
 type dockerNetworkCreateRequest struct {
-	Name      string            `json:"Name"`
-	Driver    string            `json:"Driver"`
-	Scope     string            `json:"Scope"`
-	IPAM      dockerIPAM        `json:"IPAM"`
-	Options   map[string]string `json:"Options"`
-	Labels    map[string]string `json:"Labels"`
-	Internal  bool              `json:"Internal"`
-	Namespace string            `json:"-"`
+	Name       string            `json:"Name"`
+	Driver     string            `json:"Driver"`
+	Scope      string            `json:"Scope"`
+	IPAM       dockerIPAM        `json:"IPAM"`
+	Options    map[string]string `json:"Options"`
+	Labels     map[string]string `json:"Labels"`
+	Internal   bool              `json:"Internal"`
+	EnableIPv6 bool              `json:"EnableIPv6"`
+	Namespace  string            `json:"-"`
 }
 
 // cniConflist is the subset of our generated CNI conflist files that network
 // listing/inspecting needs. The conflists in /etc/cni/net.d are the single
 // source of truth for networks.
 type cniConflist struct {
-	Name    string            `json:"name"`
-	AnvilID string            `json:"anvilID"`
-	Labels  map[string]string `json:"anvilLabels"`
-	Plugins []struct {
+	Name     string            `json:"name"`
+	AnvilID  string            `json:"anvilID"`
+	Labels   map[string]string `json:"anvilLabels"`
+	Internal bool              `json:"anvilInternal"`
+	Plugins  []struct {
 		Type   string `json:"type"`
 		Bridge string `json:"bridge"`
 		IPAM   struct {
@@ -152,6 +154,7 @@ func conflistToDockerNetwork(cl cniConflist) dockerNetwork {
 		Driver:     "bridge",
 		Scope:      "local",
 		Created:    time.Now().UTC().Format(time.RFC3339),
+		Internal:   cl.Internal,
 		IPAM:       ipam,
 		Options:    map[string]string{},
 		Labels:     labels,
@@ -192,12 +195,21 @@ func inspectDockerNetwork(ctx context.Context, name string) (*dockerNetwork, err
 	if err != nil {
 		return nil, fmt.Errorf("list cni conflists: %w", err)
 	}
+	// An exact name wins over an ID prefix, as in Docker (map order must
+	// not decide between network "db" and an ID starting with db).
+	var match *cniConflist
 	for _, cl := range conflists {
-		if cl.Name != name && !(cl.AnvilID != "" && strings.HasPrefix(cl.AnvilID, name)) {
-			continue
+		if cl.Name == name || cl.AnvilID == name {
+			match = &cl
+			break
 		}
-		dn := conflistToDockerNetwork(cl)
-		dn.Containers = networkEndpoints(cl.Name, networkPrefixLen(dn.IPAM))
+		if match == nil && name != "" && cl.AnvilID != "" && strings.HasPrefix(cl.AnvilID, name) {
+			match = &cl
+		}
+	}
+	if match != nil {
+		dn := conflistToDockerNetwork(*match)
+		dn.Containers = networkEndpoints(match.Name, networkPrefixLen(dn.IPAM))
 		return &dn, nil
 	}
 	return nil, fmt.Errorf("No such network: %s", name)
@@ -322,7 +334,14 @@ func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*
 	// previous compose run), return it. Do this before writing the CNI conflist,
 	// otherwise inspectDockerNetwork would report the conflist as an existing
 	// network and we would skip label persistence.
-	if existing, err := inspectDockerNetwork(ctx, req.Name); err == nil && existing != nil {
+	if existing, err := inspectDockerNetwork(ctx, req.Name); err == nil && existing != nil && existing.Name == req.Name {
+		// A network someone created through the API is a conflict, as in
+		// Docker; one that only exists because a container referenced it
+		// (no persisted labels) is adopted.
+		if _, serr := os.Stat(networkLabelsPath(existing.Name)); serr == nil {
+			return nil, &apiError{status: http.StatusConflict,
+				msg: fmt.Sprintf("network with name %s already exists", req.Name)}
+		}
 		return existing, nil
 	}
 
@@ -351,6 +370,11 @@ func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*
 				return fmt.Errorf("save ipam pool for %s: %w", req.Name, err)
 			}
 		}
+		if req.Internal {
+			if err := markNetworkInternal(req.Name); err != nil {
+				return fmt.Errorf("mark %s internal: %w", req.Name, err)
+			}
+		}
 		return generateCNIConfigLocked(req.Name, req.Labels)
 	}(); err != nil {
 		if _, ok := err.(*apiError); ok {
@@ -371,14 +395,15 @@ func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*
 	}
 	publishNetworkEvent("create", req.Name, networkID(req.Name), "")
 	return &dockerNetwork{
-		Id:      networkID(req.Name),
-		Name:    req.Name,
-		Driver:  defaultString(req.Driver, "bridge"),
-		Scope:   "local",
-		Created: time.Now().UTC().Format(time.RFC3339),
-		IPAM:    dockerIPAM{Driver: defaultString(req.IPAM.Driver, "default"), Config: []dockerIPAMConfig{responsePool(subnet, pool)}},
-		Labels:  labels,
-		Options: req.Options,
+		Id:       networkID(req.Name),
+		Name:     req.Name,
+		Driver:   defaultString(req.Driver, "bridge"),
+		Scope:    "local",
+		Created:  time.Now().UTC().Format(time.RFC3339),
+		Internal: req.Internal,
+		IPAM:     dockerIPAM{Driver: defaultString(req.IPAM.Driver, "default"), Config: []dockerIPAMConfig{responsePool(subnet, pool)}},
+		Labels:   labels,
+		Options:  req.Options,
 	}, nil
 }
 

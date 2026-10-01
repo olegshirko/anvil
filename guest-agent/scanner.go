@@ -440,11 +440,21 @@ func generateCNIConfigLocked(ns string, extraLabels map[string]string) error {
 		labels[k] = v
 	}
 
+	// An --internal network has no way out, so it must not take the
+	// default route: a container also on a normal network leaves through
+	// that one (and one only on this network fails fast, as in Docker).
+	internal := networkIsInternal(netName)
+	var routes []interface{}
+	if !internal {
+		routes = []interface{}{map[string]interface{}{"dst": "0.0.0.0/0"}}
+	}
+
 	conf := map[string]interface{}{
-		"cniVersion":  cniVersion,
-		"name":        netName,
-		"anvilID":     networkID(ns),
-		"anvilLabels": labels,
+		"cniVersion":    cniVersion,
+		"name":          netName,
+		"anvilID":       networkID(ns),
+		"anvilLabels":   labels,
+		"anvilInternal": internal,
 		"plugins": []interface{}{
 			// The loopback plugin brings `lo` up inside the fresh netns —
 			// without it 127.0.0.1 does not answer inside containers.
@@ -466,9 +476,7 @@ func generateCNIConfigLocked(ns string, extraLabels map[string]string) error {
 					"ranges": []interface{}{
 						[]interface{}{ipRange},
 					},
-					"routes": []interface{}{
-						map[string]interface{}{"dst": "0.0.0.0/0"},
-					},
+					"routes": routes,
 				},
 			},
 			map[string]interface{}{

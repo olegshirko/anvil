@@ -3240,6 +3240,332 @@ def test_lifecycle_events() -> None:
         docker("volume", "rm", "-f", vol, check=False)
 
 
+def test_exec_inherits_env_and_cwd() -> None:
+    name = f"{PREFIX}-execenv"
+    try:
+        docker("run", "-d", "--name", name, "-e", "FOO=bar", "-w", "/tmp", "alpine", "sleep", "300")
+        out = docker("exec", name, "sh", "-c", "echo $FOO; pwd").stdout.split()
+        if out != ["bar", "/tmp"]:
+            raise RuntimeError(f"exec saw {out}, want ['bar', '/tmp']")
+        out = docker("exec", "-e", "FOO=override", "-w", "/", name, "sh", "-c", "echo $FOO; pwd").stdout.split()
+        if out != ["override", "/"]:
+            raise RuntimeError(f"exec -e/-w: {out}")
+        docker("stop", "-t", "1", name)
+        p = docker("exec", name, "true", check=False)
+        if p.returncode == 0 or "is not running" not in p.stderr:
+            raise RuntimeError(f"exec on a stopped container: rc={p.returncode} {p.stderr.strip()!r}")
+        record("exec env/cwd", "PASS", "container env and WORKDIR inherited, -e/-w override, stopped -> error")
+    finally:
+        cleanup(name)
+
+
+def test_healthcheck_image_and_start_period() -> None:
+    """HEALTHCHECK from the image applies (with the container's env), and a
+    start period does not delay a healthy result."""
+    tag = "anvil-it-hcimage:1"
+    name = f"{PREFIX}-hcimg"
+    with tempfile.TemporaryDirectory() as d:
+        Path(d, "Dockerfile").write_text(
+            "FROM alpine\nENV PROBE_FILE=/tmp/ok\n"
+            'HEALTHCHECK --interval=30s --start-period=60s --start-interval=1s CMD test -f "$PROBE_FILE"\n')
+        docker("build", "--load", "-t", tag, d, timeout=300.0, check=False)
+        if docker("image", "inspect", tag, check=False).returncode != 0:
+            docker("build", "-t", tag, d, timeout=300.0)
+    try:
+        docker("run", "-d", "--name", name, tag, "sh", "-c", "touch /tmp/ok; sleep 300")
+        t0 = time.time()
+        status = ""
+        while time.time() - t0 < 20:
+            status = docker("inspect", name, "--format", "{{if .State.Health}}{{.State.Health.Status}}{{end}}").stdout.strip()
+            if status == "healthy":
+                break
+            time.sleep(0.5)
+        if status != "healthy":
+            raise RuntimeError(f"health after {time.time() - t0:.0f}s: {status!r} (image HEALTHCHECK / start interval)")
+        record("image HEALTHCHECK + start period", "PASS", f"healthy after {time.time() - t0:.1f}s inside a 60s start period")
+    finally:
+        cleanup(name)
+        docker("rmi", tag, check=False)
+
+
+def test_list_filters_and_limits() -> None:
+    net = f"{PREFIX}-fnet"
+    a, b = f"{PREFIX}-lim-a", f"{PREFIX}-lim-b"
+    try:
+        docker("network", "create", net)
+        names = docker("network", "ls", "--filter", f"name={net}", "--format", "{{.Name}}").stdout.split()
+        if names != [net]:
+            raise RuntimeError(f"network ls name filter: {names}")
+        dup = docker("network", "create", net, check=False)
+        if dup.returncode == 0:
+            raise RuntimeError("duplicate network create succeeded")
+        docker("create", "--name", a, "alpine", "true")
+        docker("create", "--name", b, "alpine", "true")
+        last = docker("ps", "-l", "--format", "{{.Names}}").stdout.split()
+        if last != [b]:
+            raise RuntimeError(f"ps -l: {last}")
+        bad = docker("network", "ls", "--filter", "bogus=1", check=False)
+        if bad.returncode == 0:
+            raise RuntimeError("unknown network filter accepted")
+        record("network/ps filters and limits", "PASS", "name filter, duplicate 409, ps -l, unknown filter rejected")
+    finally:
+        cleanup(a, b)
+        docker("network", "rm", net, check=False)
+
+
+def test_api_odds() -> None:
+    """Classic /build reports the image ID; distribution inspect; swarm
+    endpoints answer 503 like a non-swarm engine."""
+    with tempfile.TemporaryDirectory() as d:
+        Path(d, "Dockerfile").write_text("FROM alpine\nRUN echo built > /built\n")
+        tar = Path(d, "ctx.tar")
+        subprocess.run(["tar", "-cf", str(tar), "-C", d, "Dockerfile"], check=True)
+        out = subprocess.run(
+            ["curl", "-s", "--max-time", "300", "--unix-socket", str(DOCKER_SOCKET),
+             "-X", "POST", "-H", "Content-Type: application/x-tar", "--data-binary", f"@{tar}",
+             "http://anvil/build?q=1"], capture_output=True, text=True).stdout
+    ids = [json.loads(l)["aux"]["ID"] for l in out.splitlines() if '"aux"' in l]
+    if not ids or not ids[0].startswith("sha256:"):
+        raise RuntimeError(f"/build gave no aux ID: {out[-300:]!r}")
+    if docker("image", "inspect", ids[0], check=False).returncode != 0:
+        raise RuntimeError(f"built image {ids[0]} not inspectable")
+    if not re.search(r"Successfully built [0-9a-f]{12}", out):
+        raise RuntimeError(f"no 'Successfully built <id>' line: {out[-200:]!r}")
+    docker("rmi", ids[0], check=False)
+    dist = subprocess.run(["curl", "-s", "--max-time", "60", "--unix-socket", str(DOCKER_SOCKET),
+                           "http://anvil/distribution/alpine:latest/json"], capture_output=True, text=True).stdout
+    d = json.loads(dist or "{}")
+    if not d.get("Descriptor", {}).get("digest", "").startswith("sha256:") or not d.get("Platforms"):
+        raise RuntimeError(f"distribution inspect: {dist[:200]!r}")
+    if api_status("GET", "/swarm") != 503:
+        raise RuntimeError("/swarm is not 503")
+    record("build aux ID, distribution, swarm 503", "PASS", f"built {ids[0][:19]}, {len(d['Platforms'])} platforms")
+
+
+def test_static_ip() -> None:
+    """--ip / compose ipv4_address on a user-defined network."""
+    net, name = f"{PREFIX}-ipnet", f"{PREFIX}-staticip"
+    try:
+        docker("network", "create", "--subnet", "10.10.251.0/24", net)
+        docker("run", "-d", "--name", name, "--network", net, "--ip", "10.10.251.77", "alpine", "sleep", "300")
+        ip = docker("inspect", name, "--format", "{{(index .NetworkSettings.Networks \"%s\").IPAddress}}" % net).stdout.strip()
+        if ip != "10.10.251.77":
+            raise RuntimeError(f"address {ip!r}, want 10.10.251.77")
+        docker("restart", "-t", "1", name)
+        ip = docker("inspect", name, "--format", "{{(index .NetworkSettings.Networks \"%s\").IPAddress}}" % net).stdout.strip()
+        if ip != "10.10.251.77":
+            raise RuntimeError(f"address after restart {ip!r}")
+        bad = docker("run", "--rm", "--ip", "10.10.0.5", "alpine", "true", check=False)
+        if bad.returncode == 0:
+            raise RuntimeError("--ip on the default bridge accepted")
+        record("static IP", "PASS", "kept across restart; default bridge rejects --ip")
+    finally:
+        cleanup(name)
+        docker("network", "rm", net, check=False)
+
+
+def test_cp_into_volume_before_start() -> None:
+    """docker cp into a created (not started) container lands in its volume
+    (Testcontainers copies files before start)."""
+    name, vol = f"{PREFIX}-cpvol", f"{PREFIX}-cpvol-data"
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d, "seed.txt")
+        f.write_text("seeded-before-start")
+        try:
+            docker("create", "--name", name, "-v", f"{vol}:/data", "alpine", "cat", "/data/seed.txt")
+            docker("cp", str(f), f"{name}:/data/seed.txt")
+            out = docker("start", "-a", name).stdout.strip()
+            if out != "seeded-before-start":
+                raise RuntimeError(f"container read {out!r} from its volume")
+            back = docker("run", "--rm", "-v", f"{vol}:/v", "alpine", "cat", "/v/seed.txt").stdout.strip()
+            if back != "seeded-before-start":
+                raise RuntimeError(f"volume holds {back!r}")
+            record("cp into volume before start", "PASS", "file landed in the volume")
+        finally:
+            cleanup(name)
+            docker("volume", "rm", "-f", vol, check=False)
+
+
+def test_bind_mounts_tmp_and_var_folders() -> None:
+    """/tmp and $TMPDIR (/var/folders) bind mounts reach the Mac's files, as
+    with Docker Desktop."""
+    checks = []
+    for base in ("/tmp", tempfile.gettempdir()):
+        d = tempfile.mkdtemp(dir=base)
+        try:
+            Path(d, "f").write_text("from-mac")
+            # Use the path as the user would write it (/tmp/..., /var/folders/...).
+            src = d.replace("/private", "", 1) if d.startswith("/private/") else d
+            out = docker("run", "--rm", "-v", f"{src}:/m", "alpine", "cat", "/m/f", check=False).stdout.strip()
+            checks.append((src, out == "from-mac"))
+        finally:
+            subprocess.run(["rm", "-rf", d])
+    bad = [s for s, ok in checks if not ok]
+    if bad:
+        raise RuntimeError(f"bind mounts not shared: {bad}")
+    record("bind mounts /tmp and /var/folders", "PASS", ", ".join(s for s, _ in checks))
+
+
+def test_pid_container_mode() -> None:
+    target = f"{PREFIX}-pidtarget"
+    try:
+        docker("run", "-d", "--name", target, "alpine", "sleep", "4242")
+        out = docker("run", "--rm", "--pid", f"container:{target}", "alpine", "ps").stdout
+        if "sleep 4242" not in out:
+            raise RuntimeError(f"target's process not visible: {out!r}")
+        record("--pid container:<x>", "PASS", "target's processes visible")
+    finally:
+        cleanup(target)
+
+
+def test_docker_import() -> None:
+    name = f"{PREFIX}-importsrc"
+    tag = "anvil-it-imported:1"
+    with tempfile.TemporaryDirectory() as d:
+        tarf = Path(d, "fs.tar")
+        try:
+            docker("create", "--name", name, "alpine", "true")
+            docker("export", "-o", str(tarf), name)
+            docker("import", "--change", "CMD [\"/bin/echo\", \"imported-ok\"]", str(tarf), tag)
+            out = docker("run", "--rm", tag).stdout.strip()
+            if out != "imported-ok":
+                raise RuntimeError(f"imported image ran {out!r}")
+            record("docker import", "PASS", "export -> import --change -> run")
+        finally:
+            cleanup(name)
+            docker("rmi", tag, check=False)
+
+
+def test_bind_source_checks() -> None:
+    # A Mac path anvil does not share must fail, not become an empty dir
+    # in guest RAM; -v creates a missing dir on a share; --mount does not.
+    r = docker("run", "--rm", "-v", "/opt/anvil-it-unshared-dir:/x", "alpine", "true", check=False)
+    if r.returncode == 0 or "not shared" not in r.stderr:
+        raise RuntimeError(f"unshared bind was accepted: rc={r.returncode} {r.stderr.strip()!r}")
+    with tempfile.TemporaryDirectory(dir=str(Path.home())) as d:
+        created = Path(d, "made-by-v")
+        docker("run", "--rm", "-v", f"{created}:/x", "alpine", "true")
+        if not created.is_dir():
+            raise RuntimeError("-v did not create its missing source on the share")
+        missing = Path(d, "missing")
+        r = docker("run", "--rm", "--mount", f"type=bind,src={missing},dst=/x", "alpine", "true", check=False)
+        if r.returncode == 0 or "does not exist" not in r.stderr:
+            raise RuntimeError(f"--mount bind of a missing source: rc={r.returncode} {r.stderr.strip()!r}")
+        if missing.exists():
+            raise RuntimeError("--mount bind created its source")
+    # The compose idiom binds the VM's own zone files (UTC, as Docker Desktop).
+    out = docker("run", "--rm", "-v", "/etc/localtime:/etc/localtime:ro",
+                 "-v", "/etc/timezone:/etc/timezone:ro", "--entrypoint", "date", "nginx", "+%Z").stdout.strip()
+    if out != "UTC":
+        raise RuntimeError(f"/etc/localtime bind: zone {out!r}")
+    record("bind source checks", "PASS", "unshared refused, -v creates, --mount refuses missing, localtime")
+
+
+def test_internal_network_isolation() -> None:
+    net = f"{PREFIX}-internal"
+    peer = f"{PREFIX}-internal-peer"
+    probe = "nc -w 3 1.1.1.1 80 </dev/null >/dev/null 2>&1 && echo open || echo closed"
+    try:
+        docker("network", "create", "--internal", net)
+        if docker("network", "inspect", "-f", "{{.Internal}}", net).stdout.strip() != "true":
+            raise RuntimeError("network inspect does not report Internal")
+        docker("run", "-d", "--name", peer, "--network", net, "alpine", "sleep", "60")
+        peer_ip = docker("inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", peer).stdout.strip()
+        out = docker("run", "--rm", "--network", net, "alpine", "sh", "-c",
+                     f"{probe}; ping -c1 -W2 {peer_ip} >/dev/null && echo peer-ok").stdout.split()
+        if out != ["closed", "peer-ok"]:
+            raise RuntimeError(f"internal network: {out} (want outbound closed, peer reachable)")
+        out = docker("run", "--rm", "alpine", "sh", "-c", probe).stdout.strip()
+        if out != "open":
+            raise RuntimeError(f"default network lost outbound access: {out}")
+        record("internal network isolation", "PASS", "no outbound, peers reachable")
+    finally:
+        cleanup(peer)
+        docker("network", "rm", net, check=False)
+
+
+def raw_api(method: str, path: str, body: bytes = b"", headers: dict | None = None, timeout: float = 30.0) -> tuple[str, bytes]:
+    """One HTTP/1.1 request on docker.sock, read to EOF: (status line, rest)."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect(str(DOCKER_SOCKET))
+    hdrs = {"Host": "docker", "Connection": "close", **(headers or {})}
+    if body:
+        hdrs["Content-Type"] = "application/json"
+        hdrs["Content-Length"] = str(len(body))
+    req = f"{method} {path} HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in hdrs.items()) + "\r\n"
+    sock.sendall(req.encode() + body)
+    data = b""
+    try:
+        while chunk := sock.recv(65536):
+            data += chunk
+    except socket.timeout:
+        pass
+    sock.close()
+    status, _, rest = data.partition(b"\r\n")
+    return status.decode(errors="replace"), rest
+
+
+def test_api_parity_audit() -> None:
+    name = f"{PREFIX}-parity"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sh", "-c", "mkdir -p /d/sub && echo x > /d/sub/f && sleep 300")
+        # exec start without an Upgrade header (docker-java): 200 OK + stream.
+        cid = docker("inspect", "-f", "{{.Id}}", name).stdout.strip()
+        st, rest = raw_api("POST", f"/v1.51/containers/{cid}/exec",
+                           json.dumps({"AttachStdout": True, "AttachStderr": True, "Cmd": ["echo", "no-upgrade"]}).encode())
+        m = re.search(rb'"Id":"([0-9a-f]+)"', rest)
+        exec_id = m.group(1).decode() if m else ""
+        if len(exec_id) != 64:
+            raise RuntimeError(f"exec create: {st} {rest[-200:]!r}")
+        st, rest = raw_api("POST", f"/v1.51/exec/{exec_id}/start", json.dumps({"Detach": False, "Tty": False}).encode())
+        if "200" not in st or b"no-upgrade" not in rest or b"multiplexed-stream" not in rest:
+            raise RuntimeError(f"exec start without Upgrade: {st} {rest[:300]!r}")
+        m = re.search(rb"\{.*\}", raw_api("GET", f"/v1.51/exec/{exec_id}/json")[1], re.S)
+        insp = json.loads(m.group(0)) if m else {}
+        if insp.get("ExitCode") != 0 or not insp.get("Pid"):
+            raise RuntimeError(f"exec inspect: {insp}")
+        # docker cp ctr:/d/. copies the contents only.
+        with tempfile.TemporaryDirectory() as d:
+            docker("cp", f"{name}:/d/.", f"{d}/out")
+            if not Path(d, "out", "sub", "f").is_file():
+                raise RuntimeError(f"cp /. layout: {list(Path(d).rglob('*'))}")
+        # top lists exec'd processes too.
+        docker("exec", "-d", name, "sleep", "123")
+        time.sleep(0.5)
+        top = docker("top", name).stdout
+        if "sleep 123" not in top or "UID" not in top:
+            raise RuntimeError(f"docker top: {top!r}")
+        # ps -s reports sizes.
+        sizes = docker("ps", "-s", "--filter", f"name={name}", "--format", "{{.Size}}").stdout.strip()
+        if not sizes or "virtual" not in sizes:
+            raise RuntimeError(f"ps -s: {sizes!r}")
+        # stop -s honours the signal (SIGKILL: 137, no grace period).
+        t0 = time.time()
+        docker("stop", "-s", "SIGKILL", "-t", "30", name)
+        code = docker("inspect", "-f", "{{.State.ExitCode}}", name).stdout.strip()
+        if code != "137" or time.time() - t0 > 10:
+            raise RuntimeError(f"stop -s SIGKILL: exit {code} after {time.time() - t0:.1f}s")
+        # run --rm frees the name by the time the CLI returns (wait condition=removed).
+        rm_name = f"{PREFIX}-rmname"
+        for _ in range(2):
+            docker("run", "--rm", "--name", rm_name, "alpine", "true")
+        # plugins list, unknown events filter.
+        st, rest = raw_api("GET", "/v1.51/plugins")
+        if "200" not in st or not rest.rstrip().endswith(b"[]"):
+            raise RuntimeError(f"/plugins: {st} {rest[-100:]!r}")
+        st, _ = raw_api("GET", "/v1.51/events?filters=" + "%7B%22bogus%22%3A%5B%22x%22%5D%7D", timeout=5)
+        if "400" not in st:
+            raise RuntimeError(f"events with an unknown filter: {st}")
+        # pull reports progress and the Docker status wording.
+        out = docker("pull", "busybox").stdout
+        if "Digest: sha256:" not in out or ("Image is up to date" not in out and "Downloaded newer image" not in out):
+            raise RuntimeError(f"pull output: {out!r}")
+        record("api parity (audit fixes)", "PASS", "exec w/o Upgrade, cp /., top, ps -s, stop -s, --rm name, plugins, events, pull")
+    finally:
+        cleanup(name)
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -3361,6 +3687,18 @@ TESTS = [
     ("network container mode", test_network_container_mode),
     ("local registry push/pull", test_local_registry_push_pull),
     ("lifecycle events", test_lifecycle_events),
+    ("exec env/cwd", test_exec_inherits_env_and_cwd),
+    ("image HEALTHCHECK + start period", test_healthcheck_image_and_start_period),
+    ("network/ps filters and limits", test_list_filters_and_limits),
+    ("build aux ID, distribution, swarm", test_api_odds),
+    ("static IP", test_static_ip),
+    ("cp into volume before start", test_cp_into_volume_before_start),
+    ("bind mounts /tmp and /var/folders", test_bind_mounts_tmp_and_var_folders),
+    ("pid container mode", test_pid_container_mode),
+    ("docker import", test_docker_import),
+    ("bind source checks", test_bind_source_checks),
+    ("internal network isolation", test_internal_network_isolation),
+    ("api parity (audit fixes)", test_api_parity_audit),
 ]
 
 

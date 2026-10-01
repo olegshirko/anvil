@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -270,4 +271,47 @@ func loadNetworkPool(name string) *ipamPool {
 
 func deleteNetworkPool(name string) {
 	_ = os.Remove(networkPoolPath(name))
+	_ = os.Remove(networkInternalPath(name))
+}
+
+// An --internal network is marked next to its pool, so the flag survives
+// the cold boots that regenerate its conflist.
+func networkInternalPath(name string) string {
+	return filepath.Join(anvilRunDir, "networks", sanitizeCNIName(name)+".internal")
+}
+
+func networkIsInternal(name string) bool {
+	_, err := os.Stat(networkInternalPath(name))
+	return err == nil
+}
+
+func markNetworkInternal(name string) error {
+	path := networkInternalPath(name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, nil, 0o644)
+}
+
+// isolationOnTop reports whether, in `iptables -S FORWARD` output, both of
+// a network's isolation rules come before any jump into another chain or
+// ACCEPT.
+func isolationOnTop(rules, comment string) bool {
+	found := 0
+	for _, line := range strings.Split(rules, "\n") {
+		if !strings.HasPrefix(line, "-A FORWARD") {
+			continue
+		}
+		if strings.Contains(line, comment) {
+			found++
+			if found == 2 {
+				return true
+			}
+			continue
+		}
+		if !strings.Contains(line, "anvil-internal ") {
+			return false
+		}
+	}
+	return false
 }

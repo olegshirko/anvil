@@ -320,7 +320,9 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 		}
 		line := []byte(rec.Log)
 		if timestamps := opts.timestamps; timestamps {
-			line = append([]byte(rec.Time.Format(time.RFC3339Nano)+" "), line...)
+			// Fixed nine fraction digits, as dockerd writes them (RFC3339Nano
+			// drops trailing zeros, which breaks column-aligned parsers).
+			line = append([]byte(rec.Time.UTC().Format("2006-01-02T15:04:05.000000000Z07:00")+" "), line...)
 		}
 		emit(stream, line)
 	}

@@ -4,9 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net/http"
-	"os/exec"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
@@ -75,8 +80,9 @@ func pauseDockerContainer(ctx context.Context, id string, pause bool) error {
 	return nil
 }
 
-// handleContainerTop implements GET /containers/{id}/top: process list of
-// the container, read from the task's cgroup procs via the guest.
+// handleContainerTop implements GET /containers/{id}/top as `ps -ef` over
+// every process in the container's cgroup (execs and deep descendants
+// included).
 func handleContainerTop(ctx context.Context, w http.ResponseWriter, id string) {
 	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
@@ -85,50 +91,103 @@ func handleContainerTop(ctx context.Context, w http.ResponseWriter, id string) {
 	}
 	pid, ok := containerTaskPid(ctx, ns, containerdID)
 	if !ok || pid <= 0 {
-		writeJSONError(w, http.StatusConflict, "container not running")
+		writeJSONError(w, http.StatusConflict, fmt.Sprintf("container %s is not running", truncateID(containerdID)))
 		return
 	}
-	// Container processes are descendants of the task pid. /proc/<pid>/task/<pid>/children
-	// gives direct children (runc init + the app); include the app itself.
-	cmdline := fmt.Sprintf(
-		`echo "%d $(cat /proc/%d/comm 2>/dev/null)"; kids=$(cat /proc/%d/task/%d/children 2>/dev/null); for k in $kids; do echo "$k $(cat /proc/$k/comm 2>/dev/null)"; ck=$(cat /proc/$k/task/$k/children 2>/dev/null); for c in $ck; do echo "$c $(cat /proc/$c/comm 2>/dev/null)"; done; done`,
-		pid, pid, pid, pid)
-	out, _, execCode, _ := runGuestShell(cmdline)
-	if execCode != 0 {
-		out = ""
-	}
-	titles := []string{"PID", "COMMAND"}
-	var processes [][]string
-	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(strings.TrimSpace(line))
-		if len(fields) == 2 {
-			processes = append(processes, fields)
-		}
+	pids := cgroupPids(cgroupDir(pid))
+	if len(pids) == 0 {
+		pids = []int{pid}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"Titles":    titles,
-		"Processes": processes,
+		"Titles":    []string{"UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"},
+		"Processes": psRows(pids, time.Now()),
 	})
 }
 
-// runGuestShell runs a shell one-liner in the guest root (host namespace).
-func runGuestShell(script string) (string, string, int, error) {
-	cmd := exec.Command("/bin/sh", "-c", script)
-	cmd.Env = append(cmd.Env, "PATH=/bin:/sbin:/usr/bin:/usr/sbin")
-	var outBuf, errBuf strings.Builder
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-	err := cmd.Run()
-	code := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			code = exitErr.ExitCode()
-		} else {
-			code = 1
+// cgroupPids lists the processes of a cgroup and its descendants, sorted.
+func cgroupPids(dir string) []int {
+	var pids []int
+	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error { //nolint:errcheck
+		if err != nil || d.IsDir() || d.Name() != "cgroup.procs" {
+			return nil
+		}
+		data, _ := os.ReadFile(p)
+		for _, f := range strings.Fields(string(data)) {
+			if n, err := strconv.Atoi(f); err == nil {
+				pids = append(pids, n)
+			}
+		}
+		return nil
+	})
+	slices.Sort(pids)
+	return slices.Compact(pids)
+}
+
+// psRows renders processes the way `ps -ef` does.
+func psRows(pids []int, now time.Time) [][]string {
+	const hz = 100 // USER_HZ
+	var bootTime time.Time
+	procStat, _ := os.ReadFile("/proc/stat")
+	for _, line := range strings.Split(string(procStat), "\n") {
+		if v, ok := strings.CutPrefix(line, "btime "); ok {
+			if sec, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+				bootTime = time.Unix(sec, 0)
+			}
 		}
 	}
-	return outBuf.String(), errBuf.String(), code, err
+	rows := [][]string{}
+	for _, pid := range pids {
+		stat := readProc(pid, "stat")
+		end := strings.LastIndex(stat, ")")
+		if end < 0 {
+			continue // exited meanwhile
+		}
+		comm := stat[strings.IndexByte(stat, '(')+1 : end]
+		f := strings.Fields(stat[end+1:])
+		if len(f) < 20 {
+			continue
+		}
+		// f[0]=state f[1]=ppid f[4]=tty_nr f[11]=utime f[12]=stime f[19]=starttime
+		ppid := f[1]
+		cpuTicks := parseUint(f[11]) + parseUint(f[12])
+		started := bootTime.Add(time.Duration(parseUint(f[19])) * time.Second / hz)
+		elapsed := now.Sub(started).Seconds()
+		c := 0
+		if elapsed > 0 {
+			c = int(float64(cpuTicks) / hz / elapsed * 100)
+		}
+		stime := started.Format("15:04")
+		if now.Sub(started) > 24*time.Hour {
+			stime = started.Format("Jan02")
+		}
+		tty := "?"
+		if nr := parseUint(f[4]); nr != 0 {
+			major, minor := (nr>>8)&0xfff, (nr&0xff)|((nr>>12)&0xfff00)
+			if major == 136 {
+				tty = fmt.Sprintf("pts/%d", minor)
+			}
+		}
+		secs := cpuTicks / hz
+		cpuTime := fmt.Sprintf("%02d:%02d:%02d", secs/3600, secs/60%60, secs%60)
+		uid := "?"
+		for _, line := range strings.Split(readProc(pid, "status"), "\n") {
+			if v, ok := strings.CutPrefix(line, "Uid:"); ok {
+				if fs := strings.Fields(v); len(fs) > 0 {
+					uid = fs[0]
+				}
+			}
+		}
+		if uid == "0" {
+			uid = "root"
+		}
+		cmd := strings.TrimSpace(strings.ReplaceAll(readProc(pid, "cmdline"), "\x00", " "))
+		if cmd == "" {
+			cmd = "[" + comm + "]"
+		}
+		rows = append(rows, []string{uid, strconv.Itoa(pid), ppid, strconv.Itoa(c), stime, tty, cpuTime, cmd})
+	}
+	return rows
 }
 
 // handleContainerStats implements GET /containers/{id}/stats. With

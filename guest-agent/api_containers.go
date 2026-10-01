@@ -36,7 +36,7 @@ var containerRoutes = []apiRoute{
 		// Docker streams unless told otherwise (docker-py and docker-java
 		// omit the parameter).
 		q := r.URL.Query()
-		handleContainerStats(r.Context(), w, p["id"], !q.Has("stream") || queryBool(q, "stream"))
+		handleContainerStats(r.Context(), w, p["id"], !q.Has("stream") || queryBool(q, "stream"), queryBool(q, "one-shot"))
 	}),
 	newRoute(http.MethodPost, "/containers/:id/resize", func(w http.ResponseWriter, r *http.Request, p routeParams) {
 		handleContainerResize(w, r, p["id"])
@@ -80,6 +80,11 @@ func handleContainersList(w http.ResponseWriter, r *http.Request, _ routeParams)
 	if len(filters["status"]) > 0 {
 		all = true
 	}
+	// docker ps -n N / -l: the N newest containers, running or not.
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit > 0 {
+		all = true
+	}
 	before, since := filters["before"], filters["since"]
 	delete(filters, "before")
 	delete(filters, "since")
@@ -107,6 +112,16 @@ func handleContainersList(w http.ResponseWriter, r *http.Request, _ routeParams)
 			}
 		}
 		containers = running
+	}
+	if limit > 0 && len(containers) > limit {
+		containers = containers[:limit]
+	}
+	if queryBool(r.URL.Query(), "size") {
+		images, _ := listDockerImages(r.Context())
+		for i := range containers {
+			rw, rootfs := containerSizes(r.Context(), containers[i].Id, containers[i].ImageID, images)
+			containers[i].SizeRw, containers[i].SizeRootFs = &rw, &rootfs
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(containers)
@@ -163,7 +178,7 @@ func handleContainerCreate(w http.ResponseWriter, r *http.Request, _ routeParams
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(dockerCreateResponse{
 		Id:       id,
-		Warnings: append(unsupportedHostConfigWarnings(req.HostConfig), platformWarnings...),
+		Warnings: append(append(unsupportedHostConfigWarnings(req.HostConfig), ignoredHostConfigWarnings(body)...), platformWarnings...),
 	})
 }
 
@@ -176,6 +191,7 @@ func handleContainerStart(w http.ResponseWriter, r *http.Request, p routeParams)
 	// restarts call startDockerContainer directly and must not re-arm).
 	if ns, cid, _, err := resolveDockerID(r.Context(), p["id"]); err == nil {
 		restarts.rearm(dockerID(ns, cid))
+		markUserStopped(ns, cid, false)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -187,7 +203,12 @@ func handleContainerStop(w http.ResponseWriter, r *http.Request, p routeParams) 
 			timeout = v
 		}
 	}
-	if err := stopDockerContainer(r.Context(), p["id"], timeout); err != nil {
+	signal := r.URL.Query().Get("signal")
+	if _, ok := signalValue(signal); signal != "" && !ok {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid signal: %s", signal))
+		return
+	}
+	if err := stopDockerContainer(r.Context(), p["id"], timeout, signal); err != nil {
 		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
@@ -213,7 +234,12 @@ func handleContainerRestart(w http.ResponseWriter, r *http.Request, p routeParam
 			timeout = v
 		}
 	}
-	if err := restartDockerContainer(r.Context(), p["id"], timeout); err != nil {
+	signal := r.URL.Query().Get("signal")
+	if _, ok := signalValue(signal); signal != "" && !ok {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid signal: %s", signal))
+		return
+	}
+	if err := restartDockerContainer(r.Context(), p["id"], timeout, signal); err != nil {
 		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
@@ -303,6 +329,11 @@ func handleContainerInspect(w http.ResponseWriter, r *http.Request, p routeParam
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
+	}
+	if queryBool(r.URL.Query(), "size") {
+		images, _ := listDockerImages(r.Context())
+		rw, rootfs := containerSizes(r.Context(), inspect.Id, inspect.Image, images)
+		inspect.SizeRw, inspect.SizeRootFs = &rw, &rootfs
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(inspect)

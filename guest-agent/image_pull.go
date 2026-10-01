@@ -308,8 +308,21 @@ func pullImageIntoNamespace(ctx context.Context, canonicalRef, ns, platform stri
 	if platform != "" {
 		opts = append(opts, client.WithPlatformMatcher(platformMatcher(platform)))
 	}
+	prog := pullProgressFrom(ctx)
+	if prog != nil {
+		opts = append(opts, client.WithImageHandler(prog.handler()))
+	}
 	for attempt := 1; ; attempt++ {
+		var stopPoll func()
+		if prog != nil {
+			stop, done := make(chan struct{}), make(chan struct{})
+			go func() { defer close(done); prog.poll(nsCtx, cl.ContentStore(), stop) }()
+			stopPoll = func() { close(stop); <-done }
+		}
 		img, perr := cl.Pull(nsCtx, canonicalRef, opts...)
+		if stopPoll != nil {
+			stopPoll() // nothing may write to the response after we return
+		}
 		if perr != nil {
 			return perr
 		}
@@ -334,7 +347,13 @@ func pullImageIntoNamespace(ctx context.Context, canonicalRef, ns, platform stri
 
 // pushDockerImage pushes an image to its registry through containerd's
 // remote resolver, streaming minimal Docker-style status lines to w.
-func pushDockerImage(ctx context.Context, name string, auth *registryAuth, w io.Writer) error {
+func pushDockerImage(ctx context.Context, name string, auth *registryAuth, w io.Writer) (err error) {
+	defer func() {
+		if pw, ok := w.(*pushErrorWriter); ok && err != nil && !pw.reported {
+			fmt.Fprintf(w, `{"errorDetail":{"message":%q},"error":%q}
+`, err.Error(), err.Error())
+		}
+	}()
 	ns := findImageNamespace(ctx, name)
 	if ns == "" {
 		ns = "default"
@@ -373,12 +392,18 @@ func pushDockerImage(ctx context.Context, name string, auth *registryAuth, w io.
 // and returns a status line describing which path produced the image.
 func pullDockerImage(ctx context.Context, image, platform string, auth *registryAuth) (string, error) {
 	ns := "default"
+	before := localImageDigest(ctx, ns, image)
 	if err := pullImageIntoNamespace(ctx, canonicalizeImageRef(image), ns, platform, auth); err == nil {
+		if before != "" && before == localImageDigest(ctx, ns, image) {
+			return fmt.Sprintf("Image is up to date for %s", image), nil
+		}
 		return fmt.Sprintf("Downloaded newer image for %s", image), nil
 	} else {
 		pullErr := err
 		if mErr := loadFromMirror(ctx, image, ns); mErr == nil {
-			return fmt.Sprintf("Loaded image: %s (from docker-mirror)", image), nil
+			// The wording clients check for success (docker-java).
+			log.Printf("[images] %s loaded from docker-mirror", image)
+			return fmt.Sprintf("Downloaded newer image for %s", image), nil
 		} else if !errors.Is(mErr, errMirrorNotFound) {
 			log.Printf("[images] mirror fallback for %q: %v", image, mErr)
 		}
@@ -423,4 +448,17 @@ func pushableTarget(ctx context.Context, cs content.Store, target ocispec.Descri
 		}
 	}
 	return target
+}
+
+// localImageDigest is the digest image has in ns, or "".
+func localImageDigest(ctx context.Context, ns, image string) string {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return ""
+	}
+	img, err := cl.GetImage(namespaces.WithNamespace(ctx, ns), canonicalizeImageRef(image))
+	if err != nil {
+		return ""
+	}
+	return img.Target().Digest.String()
 }

@@ -6,6 +6,22 @@ import Foundation
 
 let containerdDiskURL = stateDir.appendingPathComponent("containerd-disk.img")
 
+/// Held by `anvil disk-compact` while it rewrites the disk; no daemon may
+/// start meanwhile.
+let compactLockFile = stateDir.appendingPathComponent("disk-compact.lock")
+
+/// flock'ed by the daemon for its lifetime (and by disk-compact).
+let daemonLockFile = stateDir.appendingPathComponent("daemon.lock")
+
+/// Whether a disk compaction is running (its lock names a live process).
+func diskCompactInProgress() -> Bool {
+    guard let s = try? String(contentsOf: compactLockFile, encoding: .utf8),
+          let pid = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        return false
+    }
+    return kill(pid, 0) == 0
+}
+
 /// Run docker against anvil's socket (never the user's current context),
 /// streaming its output. Returns the exit status.
 @discardableResult
@@ -94,6 +110,22 @@ func cmdDiskCompact() {
     }
     let before = allocatedBytes(disk)
     let tmp = disk + ".new"
+    // A lock the start paths honor: an `anvil start` in this window would
+    // open the disk and then have a stale copy swapped under it.
+    // The daemon's own flock makes it atomic: a daemon holding it owns the
+    // disk, and none can start while we hold it.
+    let lockPath = compactLockFile.path
+    let daemonLock = open(daemonLockFile.path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+    guard daemonLock >= 0, flock(daemonLock, LOCK_EX | LOCK_NB) == 0,
+          FileManager.default.createFile(atPath: lockPath, contents: "\(getpid())".data(using: .utf8)) else {
+        print("[anvil] a daemon is starting or running; not touching its disk")
+        exit(1)
+    }
+    defer {
+        try? FileManager.default.removeItem(atPath: lockPath)
+        close(daemonLock)
+    }
+
     print("[anvil] compacting \(disk) (\(formatBytes(before)) allocated)...")
     let dd = Process()
     dd.executableURL = URL(fileURLWithPath: "/bin/dd")
@@ -108,6 +140,7 @@ func cmdDiskCompact() {
         chmod(disk, 0o600)
         print("[anvil] compacted: \(formatBytes(allocatedBytes(disk))) allocated")
     } else {
+        ok = false
         try? FileManager.default.removeItem(atPath: tmp)
         print("[anvil] compaction failed; disk left untouched")
     }
@@ -115,6 +148,7 @@ func cmdDiskCompact() {
         print("[anvil] the daemon was stopped for the copy; start it again with `anvil start`")
     }
     if !ok {
+        try? FileManager.default.removeItem(atPath: lockPath)
         exit(1)
     }
 }

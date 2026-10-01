@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -74,7 +73,7 @@ func handleArchiveGet(w http.ResponseWriter, r *http.Request, ns, containerdID, 
 	w.WriteHeader(http.StatusOK)
 
 	src := containerPath(srcPath)
-	prefix := filepath.Base(src)
+	prefix := cpBaseName(srcPath)
 	err = withContainerFS(r.Context(), ns, containerdID, func(root string) error {
 		return inChroot(root, func() error {
 			tw := tar.NewWriter(w)
@@ -121,7 +120,7 @@ func statContainerPath(ns, containerdID, path string) (dockerPathStat, error) {
 				return err
 			}
 			stat = dockerPathStat{
-				Name:  filepath.Base(p),
+				Name:  cpBaseName(path),
 				Size:  fi.Size(),
 				Mode:  uint32(fi.Mode()),
 				Mtime: fi.ModTime().UTC().Format(time.RFC3339),
@@ -151,7 +150,7 @@ func withContainerFS(ctx context.Context, ns, containerdID string, fn func(root 
 	if pid, ok := containerTaskRootPid(ctx, ns, containerdID); ok {
 		return fn(fmt.Sprintf("/proc/%d/root", pid))
 	}
-	return withRootfsMount(ns, containerdID, fn)
+	return withRootfsMount(ns, containerdID, true, fn)
 }
 
 // containerTaskRootPid returns the init pid of a running or paused task.
@@ -179,7 +178,9 @@ func containerTaskRootPid(ctx context.Context, ns, containerdID string) (int, bo
 // withRootfsMount mounts a stopped container's rootfs snapshot at a temporary
 // directory and calls fn with the mount root. Snapshotter mounts require the
 // container to have no live task.
-func withRootfsMount(ns, containerdID string, fn func(root string) error) error {
+// withBinds also mounts the container's volumes and bind mounts (docker cp);
+// export and volume copy-up need the bare rootfs.
+func withRootfsMount(ns, containerdID string, withBinds bool, fn func(root string) error) error {
 	cl, err := pc.get(context.Background())
 	if err != nil {
 		return err
@@ -211,6 +212,9 @@ func withRootfsMount(ns, containerdID string, fn func(root string) error) error 
 	if err := mountAll(mounts, root); err != nil {
 		return fmt.Errorf("mount rootfs: %w", err)
 	}
-	defer unmountAll(root)
+	defer unmountAll(root) // recursive: the binds below go too
+	if withBinds {
+		mountContainerBinds(ctx, c, root)
+	}
 	return fn(root)
 }

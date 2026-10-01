@@ -6,8 +6,11 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 	"time"
 
+	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
@@ -71,6 +74,8 @@ killall -9 runc 2>/dev/null && killed=1
 		time.Sleep(100 * time.Millisecond)
 	}
 
+	ensureGuestZoneinfo()
+
 	// host.docker.internal -> the Mac's localhost. Before the Docker API
 	// opens, so every container's /etc/hosts gets the redirect address.
 	setupHostLoopback()
@@ -91,6 +96,13 @@ func cleanupStaleContainers() {
 		log.Printf("[boot] stale container cleanup skipped: %v", err)
 		return
 	}
+	// Nothing runs yet: every CNI address reservation and cached result is
+	// from the previous boot. Starts allocate afresh.
+	os.RemoveAll("/var/lib/cni/networks") //nolint:errcheck
+	os.RemoveAll("/var/lib/cni/results")  //nolint:errcheck
+
+	kept := 0
+	var toStart []containerRef
 	for _, ns := range nss {
 		nsCtx := namespaces.WithNamespace(ctx, ns)
 		containers, err := cl.Containers(nsCtx)
@@ -99,19 +111,125 @@ func cleanupStaleContainers() {
 		}
 		for _, c := range containers {
 			id := c.ID()
+			// The task of a previous boot is gone with its processes.
 			if task, terr := c.Task(nsCtx, nil); terr == nil {
 				dctx, cancel := context.WithTimeout(nsCtx, 5*time.Second)
-				task.Delete(dctx) //nolint:errcheck — best effort on a stuck shim
+				task.Delete(dctx, client.WithProcessKill) //nolint:errcheck — best effort on a stuck shim
 				cancel()
 			}
-			dctx, cancel := context.WithTimeout(nsCtx, 5*time.Second)
-			if derr := c.Delete(dctx); derr != nil {
-				debugLog("[boot] stale container %s/%s: %v", ns, truncateID(id), derr)
-			}
-			cancel()
 			releaseNamedNetNS(id)
-			deleteContainerMeta(ns, id)
+			removeNetInfo(ns, id)
+
+			meta, merr := loadContainerMeta(ns, id)
+			// Containers that are not anvil's (no metadata) and --rm ones go,
+			// as Docker removes --rm containers when its daemon starts.
+			if merr != nil || meta.AutoRemove {
+				dctx, cancel := context.WithTimeout(nsCtx, 5*time.Second)
+				if derr := c.Delete(dctx, client.WithSnapshotCleanup); derr != nil {
+					debugLog("[boot] stale container %s/%s: %v", ns, truncateID(id), derr)
+				}
+				cancel()
+				if merr == nil {
+					// --rm takes its anonymous volumes along, as on removal.
+					for _, v := range removableAnonymousVolumes(ns, meta) {
+						os.RemoveAll(volumeDataDir(v.ns, v.name))
+						os.Remove(volumeMetaPath(v.ns, v.name))
+					}
+				}
+				deleteContainerMeta(ns, id)
+				continue
+			}
+			// Everything else survives the reboot, as it survives a Docker
+			// daemon restart. A container that was running is now exited.
+			wasRunning := !meta.StartedAt.IsZero() && (meta.FinishedAt.IsZero() || meta.FinishedAt.Before(meta.StartedAt))
+			if wasRunning {
+				updateContainerMeta(ns, id, func(m *containerMeta) { //nolint:errcheck
+					m.FinishedAt = time.Now().UTC()
+					m.ExitCode = 255
+				})
+			}
+			if rehydrateContainerState(ns, id, meta, wasRunning) {
+				toStart = append(toStart, containerRef{ns: ns, id: id})
+			}
+			kept++
 		}
 	}
-	log.Printf("[boot] stale container cleanup done (%d namespaces)", len(nss))
+	log.Printf("[boot] stale tasks cleared, %d containers kept, %d to restart (%d namespaces)", kept, len(toStart), len(nss))
+	if len(toStart) > 0 {
+		goSafe("boot-restart", func() {
+			<-bootFinalized // network and DHCP ready
+			// Containers that join another's namespaces (--network/--pid/
+			// --ipc container:) need it running: start them last, and give
+			// whatever failed one more pass once the rest is up.
+			sort.SliceStable(toStart, func(i, j int) bool {
+				return !joinsAnotherContainer(toStart[i]) && joinsAnotherContainer(toStart[j])
+			})
+			var failed []containerRef
+			for _, r := range toStart {
+				if err := startDockerContainer(context.Background(), dockerID(r.ns, r.id)); err != nil {
+					failed = append(failed, r)
+				}
+			}
+			for _, r := range failed {
+				if err := startDockerContainer(context.Background(), dockerID(r.ns, r.id)); err != nil {
+					log.Printf("[boot] restart %s: %v", truncateID(dockerID(r.ns, r.id)), err)
+				}
+			}
+		})
+	}
+}
+
+// rehydrateContainerState rebuilds the agent's in-memory state of a
+// container kept across a cold boot (it is set at create otherwise) and
+// reports whether its restart policy starts it now: always does,
+// unless-stopped unless a user stopped it, on-failure when the reboot cut
+// it off while running.
+func rehydrateContainerState(ns, id string, meta *containerMeta, wasRunning bool) bool {
+	did := dockerID(ns, id)
+	setContainerTTY(did, meta.TTY)
+	setContainerEntryPointInfo(did, meta.WorkingDir, meta.Entrypoint)
+	setContainerStopSignal(did, meta.StopSignal)
+	links := meta.Links
+	if len(links) == 0 && meta.HostConfig != nil {
+		links = meta.HostConfig.Links // where create keeps them
+	}
+	setContainerLinks(did, links)
+	if meta.Healthcheck != nil {
+		setHealthcheckConfig(did, meta.Healthcheck, meta.User)
+	}
+	if meta.HostConfig == nil {
+		return false
+	}
+	rp := meta.HostConfig.RestartPolicy
+	p := parseRestartPolicy(rp.Name)
+	if p.max < 0 && rp.MaximumRetryCount > 0 {
+		p.max = rp.MaximumRetryCount
+	}
+	restarts.registerAt(ns, id, p.name, p.max)
+	start := false
+	switch p.name {
+	case "always":
+		start = true
+	case "unless-stopped":
+		start = !meta.UserStopped
+	case "on-failure":
+		start = wasRunning
+	}
+	if !start {
+		restarts.clear(did) // keeps the spec for inspect; docker start re-arms
+	}
+	return start
+}
+
+// joinsAnotherContainer reports --network/--pid/--ipc container:<x>.
+func joinsAnotherContainer(r containerRef) bool {
+	meta, err := loadContainerMeta(r.ns, r.id)
+	if err != nil {
+		return false
+	}
+	if len(meta.Networks) > 0 && isContainerNetworkMode(meta.Networks[0]) {
+		return true
+	}
+	return meta.HostConfig != nil &&
+		(strings.HasPrefix(meta.HostConfig.PidMode, "container:") || strings.HasPrefix(meta.HostConfig.IpcMode, "container:"))
 }

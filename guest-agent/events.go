@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,11 @@ import (
 // Docker-compatible event. Compose subscribes to /events to track container
 // lifecycle (notably the die event's exitCode for --abort-on-container-exit).
 type dockerEvent struct {
+	// Legacy fields Docker still sends for container and image events
+	// (older docker-py, Traefik's fallback and log shippers read them).
+	Status   string           `json:"status,omitempty"`
+	ID       string           `json:"id,omitempty"`
+	From     string           `json:"from,omitempty"`
 	Type     string           `json:"Type"`
 	Action   string           `json:"Action"`
 	Actor    dockerEventActor `json:"Actor"`
@@ -93,6 +99,12 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 			return true
 		}
 		debugLog("events: send %s id=%s attrs=%v", ev.Action, truncateID(ev.Actor.ID), ev.Actor.Attributes)
+		if ev.Type == "container" || ev.Type == "image" {
+			ev.Status, ev.ID = ev.Action, ev.Actor.ID
+			if ev.Type == "container" {
+				ev.From = ev.Actor.Attributes["image"]
+			}
+		}
 		return enc.Encode(ev) == nil
 	}
 
@@ -272,11 +284,24 @@ type eventFilters struct {
 	types      []string // event type (container)
 	images     []string // image reference substring match
 	labels     []string // "key" or "key=value"
+	volumes    []string // volume name
+	scopes     []string // "local" / "swarm"
+	// daemon/plugin/node/service/secret/config: anvil emits no events of
+	// those types, so a filter on any of them matches nothing.
+	none bool
+}
+
+// eventFilterKeys are the keys Docker's /events accepts.
+var eventFilterKeys = map[string]bool{
+	"config": true, "container": true, "daemon": true, "event": true, "image": true,
+	"label": true, "network": true, "node": true, "plugin": true, "scope": true,
+	"secret": true, "service": true, "type": true, "volume": true,
 }
 
 // parseEventFilters decodes the JSON `filters` query param. The docker CLI
 // sends {"key":{"value":true}} (map[string]map[string]bool); the API docs
-// also allow {"key":["value"]}. Both are accepted. Unknown keys are ignored.
+// also allow {"key":["value"]}. Both are accepted; an unknown key is an
+// error, as in Docker (it used to be ignored and stream everything).
 func parseEventFilters(raw string) (*eventFilters, error) {
 	f := &eventFilters{}
 	if raw == "" {
@@ -285,6 +310,11 @@ func parseEventFilters(raw string) (*eventFilters, error) {
 	var decoded map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
 		return nil, err
+	}
+	for key := range decoded {
+		if !eventFilterKeys[key] {
+			return nil, fmt.Errorf("invalid filter '%s'", key)
+		}
 	}
 	pick := func(key string) []string {
 		rawVals, ok := decoded[key]
@@ -311,6 +341,13 @@ func parseEventFilters(raw string) (*eventFilters, error) {
 	f.types = pick("type")
 	f.images = pick("image")
 	f.labels = pick("label")
+	f.volumes = pick("volume")
+	f.scopes = pick("scope")
+	for _, key := range []string{"daemon", "plugin", "node", "service", "secret", "config"} {
+		if len(pick(key)) > 0 {
+			f.none = true
+		}
+	}
 	return f, nil
 }
 
@@ -325,7 +362,16 @@ func containsFold(haystack []string, needle string) bool {
 
 // match reports whether the event passes every present filter.
 func (f *eventFilters) match(ev dockerEvent) bool {
+	if f.none {
+		return false
+	}
 	if len(f.types) > 0 && !containsFold(f.types, ev.Type) {
+		return false
+	}
+	if len(f.scopes) > 0 && !containsFold(f.scopes, "local") {
+		return false
+	}
+	if len(f.volumes) > 0 && (ev.Type != "volume" || !slices.Contains(f.volumes, ev.Actor.ID)) {
 		return false
 	}
 	if len(f.events) > 0 && !containsFold(f.events, ev.Action) {

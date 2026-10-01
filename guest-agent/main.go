@@ -118,21 +118,28 @@ func main() {
 	// guest-agent is PID 1 inside the VM. Orphaned children reparent to PID 1,
 	// and containerd/runc may create short-lived hook/helper processes. Reap
 	// them so they do not accumulate as zombies and deadlock containerd-shim.
-	go reapZombies()
-	go servePortProxy()
+	// Before anything that may call pc.get (boot finalize, the scanner):
+	// assigning it inside a goroutine raced those readers.
+	pc = newPersistentClient(containerdSocket)
+
+	goLoop("reaper", reapZombies)
+	// Listeners restart after a panic (each closes its socket on the way
+	// out); a dead one would leave status/health saying OK.
+	goLoop("port-proxy", servePortProxy)
 	routeDefaultTransportThroughEgress()
-	go serveEgressProxy()
-	go serveSSHAgentForward()
-	go runRestartMonitor()
+	goLoop("egress-proxy", serveEgressProxy)
+	goSafe("ssh-agent", serveSSHAgentForward)
+	goLoop("restart-monitor", runRestartMonitor)
+	goLoop("containerd-supervisor", superviseContainerd)
 
 	// Recreate CNI conflists from the host share after a cold boot, and set
 	// the clock from the host time file. Both are file I/O + a date exec on
 	// the pre-listen critical path (~30-60 ms); nothing needs them before
 	// the first container, and subscribe_ports re-syncs the clock anyway.
-	go func() {
+	goSafe("restore-networks", func() {
 		restoreNetworkConfigs()
 		syncClockFromShare()
-	}()
+	})
 
 	// Stale anvil metadata is pruned once, in runBootFinalize, before the
 	// Docker API opens. A second, timed prune here ran after it was open and
@@ -144,31 +151,28 @@ func main() {
 	// channel is up. The Docker API server and exec'd commands wait on
 	// bootFinalized (bounded) so container/pull operations never race a boot
 	// still in flight; the status/health path does not wait.
-	go runBootFinalize()
+	goSafe("boot-finalize", runBootFinalize)
 
 	// VZ does not guarantee a sane RTC and snapshot resume leaves the clock
 	// frozen at pause time; periodic sync keeps it stepping after the
 	// initial set done above.
-	go periodicClockSync()
+	goLoop("clock-sync", periodicClockSync)
 
 	// Discard unused blocks on the containerd ext4 once a day so the sparse
 	// disk image on the host can return space after image prune.
-	go periodicFstrim()
+	goLoop("fstrim", periodicFstrim)
 
 	scanner := newPortScanner()
 	activeScanner = scanner
-	go scanner.run()
+	goLoop("port-scanner", scanner.run)
 
 	// Docker API server on a separate vsock port so the existing control
 	// channel stays untouched.
-	go func() {
-		pc = newPersistentClient(containerdSocket)
-		go startEventRecorder()
-		runDockerAPIServer(bootFinalized)
-	}()
+	goLoop("event-recorder", startEventRecorder)
+	goLoop("docker-api", func() { runDockerAPIServer(bootFinalized) })
 
 	// Buildkit bridge for the buildx remote driver (lazy buildkitd start).
-	go serveBuildkitBridge()
+	goLoop("buildkit-bridge", serveBuildkitBridge)
 
 	l, err := vsock.Listen(listenPort, nil)
 	if err != nil {
@@ -183,7 +187,7 @@ func main() {
 			time.Sleep(100 * time.Millisecond) // no spin on fd exhaustion
 			continue
 		}
-		go handle(conn, scanner)
+		goSafe("control-conn", func() { handle(conn, scanner) })
 	}
 }
 
@@ -317,6 +321,8 @@ func dispatch(req *Request) Response {
 		return runExec(req.Args)
 	case "egress":
 		return egressStatus()
+	case "df":
+		return diskUsage("/var/lib")
 	default:
 		return Response{Error: fmt.Sprintf("unknown command: %s", req.Cmd), ExitCode: 1}
 	}

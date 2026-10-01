@@ -36,7 +36,7 @@ func withContainerRootfs(ctx context.Context, ns, containerdID string, fn func(r
 			return fn(liveRootfsPath(ns, containerdID))
 		}
 	}
-	return withRootfsMount(ns, containerdID, fn)
+	return withRootfsMount(ns, containerdID, false, fn)
 }
 
 // writeTracker records whether anything reached the client, so a failure

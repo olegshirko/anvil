@@ -108,6 +108,18 @@ docker build -t myimg .         # buildx remote driver against in-VM buildkitd
 docker run -v $HOME/proj:/data alpine ls /data   # macOS bind mounts
 ```
 
+Tools that do not read the docker context — Testcontainers (Java, Go,
+Node, Python), some IDE plugins — need the socket spelled out:
+
+```sh
+export DOCKER_HOST=unix://$HOME/.anvil-vz/docker.sock
+# or, for Testcontainers only, in ~/.testcontainers.properties:
+#   docker.host=unix:///Users/<you>/.anvil-vz/docker.sock
+```
+
+Ryuk and other containers that mount that socket get the VM's own
+`/run/docker.sock`; no `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE` is needed.
+
 `anvil start` creates a buildx builder named `anvil-remote` (remote driver pointing
 at the VM's buildkitd through `~/.anvil-vz/buildkit.sock`) and selects it;
 `anvil stop` restores your previous builder. With the remote driver,
@@ -136,21 +148,27 @@ anvil disk-compact  Give space freed in the VM back to macOS (stops the daemon; 
 VM also trims its disk before every idle pause.
 
 Logs: `~/.anvil-vz/daemon.log` (host daemon), `~/.anvil-vz/console.log` (VM
-console), and with `DEBUG=1` the guest agent's
-`<share>/.anvil-run/guest-agent.log` (the project directory in a source
+console), and after a `DEBUG=1` cold boot (`make service-debug`) the guest
+agent's `<share>/.anvil-run/guest-agent.log` (the project directory in a source
 tree, `~/.anvil-vz` otherwise). `anvil logs [daemon|console|guest]` tails them.
 
 ### Configuration (environment variables)
+
+Set them in the environment or, to make them stick for `anvil start`, the
+LaunchAgent and `brew services` alike, as `KEY=VALUE` lines in
+`~/.anvil-vz/config` (the environment wins). Changing memory, CPUs or disk
+size changes the snapshot key, so the next start is a cold boot.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `ANVIL_MEMORY` | `2` | VM RAM in GiB |
 | `ANVIL_CPUS` | — | VM CPU count (unset = vz-runner default of 2) |
 | `ANVIL_DISK_GB` | `64` | containerd disk size (sparse; existing disks only grow, guest fs is resized online) |
-| `ANVIL_SHARE_USERS` | `1` | Set to `0` to disable sharing the host `/Users` tree into the VM |
+| `ANVIL_SHARE_USERS` | `1` | Shares the Mac's `/Users`, `/Volumes`, `/tmp` and `/var/folders` into the VM at the same paths (Docker Desktop's defaults), so bind mounts of them work; a missing `-v` source elsewhere is refused ("mounts denied") rather than created in VM memory; `0` disables sharing |
+| `ANVIL_SHARE_EXTRA` | `volumes,tmp,varfolders` | Which of the extra shares (`/Volumes`, `/tmp`, `/var/folders`) to set up; empty for none |
 | `ANVIL_IDLE` | `600` | Seconds without Docker clients, forwarded connections or running containers before the VM is paused into its snapshot |
 | `ANVIL_ROSETTA` | `0` | Set to `1` to run `linux/amd64` containers through Rosetta (needs `softwareupdate --install-rosetta`; changing it forces one cold boot) |
-| `DEBUG` | — | `1` enables guest-agent debug log (`guest-agent.log` on the share) |
+| `DEBUG` | — | `1` enables host-side debug logs; the guest-agent debug log (`guest-agent.log` on the share) needs a cold boot (`make service-debug`), a resumed VM keeps its old setting |
 
 ### Troubleshooting
 
@@ -169,6 +187,15 @@ Common situations:
   kernel/initrd/CPU/RAM/disk/shares, so changing `ANVIL_MEMORY` or
   `ANVIL_DISK_GB` (or updating anvil) intentionally discards the old snapshot.
   This is not an error; the next start is simply a ~0.6 s cold boot.
+  Containers, images and volumes survive it, as they survive a Docker daemon
+  restart: containers that were running show `Exited (255)`, and
+  `--restart always` (and `unless-stopped`, unless you stopped it) start
+  again; `--rm` containers are removed.
+- **A start right after the Mac was locked is a cold boot** —
+  Virtualization.framework seals the saved VM state with a Secure Enclave
+  key that is unusable while the screen is locked ("failed to restore with
+  error permission denied" in `daemon.log`). Containers, images and volumes
+  survive the cold boot.
 - **Port conflicts** — published ports are bound on `localhost`; if another
   service holds the port, the container starts but the forward fails — check
   `anvil logs`.
@@ -248,8 +275,12 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
 - HostConfig surface: `--cpus/--cpuset-cpus/--pids-limit/--ulimit/--shm-size/
   --memory-swap/--group-add (numeric)/--uts=host/--ipc=host/--cgroupns=host/
   --init/--volumes-from` are honored. Refused with a 400 naming the flag:
-  `--oom-kill-disable`, `--blkio-weight`, `--storage-opt`, `--isolation`,
-  `--runtime`, `--log-driver` other than `json-file`/`none`, AppArmor/SELinux.
+  `--oom-kill-disable`, `--blkio-weight` and the per-device blkio limits,
+  `--gpus`, `--storage-opt`, `--isolation`, `--runtime`, `--log-driver`
+  other than `json-file`/`none`. `--cgroup-parent` and
+  `--memory-swappiness` are accepted with a warning and have no effect;
+  `--security-opt apparmor=…`/`label=…` are no-ops (the VM has neither
+  AppArmor nor SELinux).
 - The Docker socket can be mounted into containers (Testcontainers' Ryuk,
   devcontainers, Traefik, Portainer): `-v /var/run/docker.sock:/var/run/docker.sock`
   and `-v ~/.anvil-vz/docker.sock:…` both reach the same API inside the VM.
@@ -264,6 +295,9 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   Mac's localhost over TCP, services bound only to `127.0.0.1` included, as
   in Docker Desktop; UDP to it goes to the Mac's NAT address.
   `gateway.docker.internal` is the NAT gateway.
+- `docker network create --internal` (compose `internal: true`) cuts the
+  network off from outside traffic; its containers still reach each other.
+  Networks are IPv4-only: `--ipv6` is accepted with a warning.
 - SSH agent forwarding as in Docker Desktop: mount
   `/run/host-services/ssh-auth.sock` and point `SSH_AUTH_SOCK` at it.
 - Docker API is emulated, not complete: it covers what `docker` CLI and

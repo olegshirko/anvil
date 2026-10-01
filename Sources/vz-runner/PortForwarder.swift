@@ -133,6 +133,11 @@ final class PortForwarder {
 
     private var listeners: [String: Listener] = [:]
     private let listenersLock = NSLock()
+    /// The mappings the guest last asked for, and the retry backoff of
+    /// listeners whose bind failed (a Mac process held the port, a race
+    /// after the port check): those are retried while still desired.
+    private var desiredMappings: [String: PortMapping] = [:]
+    private var retryDelay: [String: Double] = [:]
 
     /// Guards `running` and `subscription`. `stop()` is called from other
     /// threads while `runLoop()` occupies `queue` for good, so it cannot be
@@ -287,6 +292,8 @@ final class PortForwarder {
 
         listenersLock.lock()
         let current: [String: PortMapping] = listeners.mapValues { $0.mapping }
+        desiredMappings = desiredByKey
+        retryDelay = retryDelay.filter { desiredByKey[$0.key] != nil }
         listenersLock.unlock()
 
         let desiredKeys = Set(desiredByKey.keys)
@@ -325,13 +332,46 @@ final class PortForwarder {
         listenersLock.lock()
         listeners[mapping.listenerKey] = listener
         listenersLock.unlock()
-        listener.start { [weak self] in
-            self?.stopListener(key: mapping.listenerKey)
+        listener.start { [weak self, weak listener] in
+            self?.listenerFailed(mapping, listener)
         }
         if let target = mapping.containerIP, !target.isEmpty {
             print("[port-forwarder] forwarding \(mapping.hostIP ?? "*"):\(mapping.hostPort) -> proxy -> \(target):\(mapping.containerPort)")
         } else {
             print("[port-forwarder] forwarding localhost:\(mapping.hostPort) -> \(mapping.guestIP):\(mapping.hostPort)")
+        }
+    }
+
+    /// Drop a listener whose bind failed and try it again later (backoff up
+    /// to 30 s) for as long as the guest still wants the mapping.
+    private func listenerFailed(_ mapping: PortMapping, _ failed: Listener?) {
+        let key = mapping.listenerKey
+        listenersLock.lock()
+        // Only this listener: a replacement under the same key stays.
+        if let failed = failed, listeners[key] === failed {
+            listeners.removeValue(forKey: key)
+        }
+        listenersLock.unlock()
+        failed?.stop()
+        listenersLock.lock()
+        guard desiredMappings[key] == mapping, listeners[key] == nil else {
+            listenersLock.unlock()
+            return
+        }
+        let delay = min((retryDelay[key] ?? 1) * 2, 30)
+        retryDelay[key] = delay
+        listenersLock.unlock()
+        if delay < 30 {
+            print("[port-forwarder] host port \(mapping.hostPort) unavailable; retrying in \(Int(delay))s")
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self else { return }
+            self.listenersLock.lock()
+            let wanted = self.desiredMappings[key] == mapping && self.listeners[key] == nil
+            self.listenersLock.unlock()
+            if wanted {
+                self.startListener(mapping: mapping)
+            }
         }
     }
 

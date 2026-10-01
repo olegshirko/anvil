@@ -82,7 +82,9 @@ The decision: a minimal custom guest rootfs and a custom host runner:
 
 - **No systemd.** The init is a busybox shell; stage2 starts containerd and
   the guest-agent directly.
-- **No SSH.** Management goes over vsock, not TCP/SSH.
+- **No SSH.** Management goes over vsock, not TCP/SSH. (The Mac's
+  ssh-agent is *forwarded* to containers over vsock, §3.7; there is no SSH
+  server or client in the stack.)
 - **No gvisor-tap-vsock.** Networking is Apple's built-in
   `VZNATNetworkDeviceAttachment`.
 - **Single shared VM.** All of the user's projects live in one VM, isolated
@@ -108,8 +110,8 @@ Owns the whole VM lifecycle:
   progress and then resumes, instead of failing the client that arrived
   during it. Starting a stopped VM is left to the daemon's crash handler;
 - **snapshot invalidation** — before a restore, a hash of the kernel,
-  initrd, CPU, RAM, disk path/size is computed. If the configuration has
-  changed — cold boot and snapshot re-creation.
+  initrd, CPU, RAM, disk path/size and the virtiofs shares is computed. If
+  the configuration has changed — cold boot and snapshot re-creation.
 
 ### 3.2 ControlServer
 
@@ -125,10 +127,9 @@ accepting a docker request.
 
 ### 3.3 DockerProxyServer
 
-Unix socket `~/.anvil-vz/docker.sock`. Accepts HTTP from the Docker CLI,
-strips the `/v1.XX` prefix, forwards raw bytes to vsock:1025 where the
-guest-agent's HTTP server runs. The response is passed back without any
-protocol parsing.
+Unix socket `~/.anvil-vz/docker.sock`. Accepts HTTP from the Docker CLI and
+forwards the raw bytes, unparsed in both directions, to vsock:1025 where the
+guest-agent's HTTP server runs (the agent strips the `/v1.XX` prefix).
 
 The same class (`DockerProxyServer` parameterized by port) also serves
 `~/.anvil-vz/buildkit.sock` → vsock:1026: a raw TCP bridge to the buildkitd
@@ -156,10 +157,11 @@ mappings to `vz-runner`. `PortForwarder`:
   guests without a container IP fall back to dialing `guestIP:hostPort`;
 - for `udp` mappings opens a SOCK_DGRAM listener instead: datagrams are
   relayed to `guestIP:hostPort` with one connected socket per client
-  endpoint (60 s idle reaping). No guest-side proxy is needed: the
-  guest-agent arms the persisted port mappings at start (a reservation
-  socket plus nft DNAT hostPort→containerPort in the guest's root
-  netns), and vzNAT delivers host→guest UDP to the bound port;
+  endpoint (60 s idle reaping). No guest-side proxy is needed: the CNI
+  `portmap` plugin arms DNAT hostPort→containerPort when the container
+  attaches, and vzNAT delivers host→guest UDP to it;
+- retries a listener whose bind failed (the port was busy on the Mac) with
+  backoff for as long as the guest still wants the mapping;
 - on every push does a full-state replace: new ports are opened, gone ports
   are closed;
 - logs a conflict when it fails to open an already taken port;
@@ -225,6 +227,24 @@ the docker-mirror fallback) dial this way, and buildkitd is started with
 the same dialer (private and loopback destinations are in `NO_PROXY`). The
 traffic of containers themselves is not covered — that would need a
 userspace network stack. `anvil doctor` reports the state (`vm internet`).
+
+### 3.7 HostServicesServer
+
+Two more guest-to-host channels, both relayed on their own threads with
+per-service connection caps (`GuestConnections.swift`):
+
+- vsock 1029 — the Mac's ssh-agent (`SSH_AUTH_SOCK`, else the launchd
+  value). The guest-agent serves it as `/run/host-services/ssh-auth.sock`,
+  which containers mount (Docker Desktop's path).
+- vsock 1030 — the Mac's localhost. `host.docker.internal` resolves to a
+  guest address whose TCP traffic is redirected (nat PREROUTING/OUTPUT) to
+  a proxy in the agent, which sends `{"port":N}` here; vz-runner connects to
+  `127.0.0.1:N` on the Mac. `--internal` networks are cut off from it.
+
+The guest port proxy (`portproxy.go`, TCP 39131 in the VM) serves only the
+Mac's forwarder: it accepts connections that arrive on eth0, so a
+container cannot use it to dial arbitrary addresses through its bridge
+gateway.
 
 ## 4. Guest side: guest-agent
 
@@ -430,10 +450,17 @@ tmpfs root.
 5. Adds an iptables MASQUERADE rule for DNATed TCP (fixes asymmetric
    routing under VZ NAT);
 6. Starts containerd and immediately `exec`s the guest-agent — the
-   containerd-socket wait, the orphaned-container cleanup (low-level `ctr`,
-   not the containerd client's rm, to avoid waiting on a hung shim) and the DHCP lease
+   containerd-socket wait, the stale-task cleanup and the DHCP lease
    wait all run inside the agent (`runBootFinalize`) after its control
-   channel is up. The Docker API server on vsock:1025 and exec'd commands
+   channel is up. A cold boot keeps containers, as a Docker daemon restart
+   does: only the previous boot's tasks, netns and CNI state go; `--rm`
+   containers and records without anvil metadata are removed; a container
+   that was running becomes `Exited (255)`; the in-memory state set at
+   create (TTY, entrypoint, stop signal, links, healthcheck, restart policy)
+   is rebuilt from the metadata; and `always`, `unless-stopped` (not after a
+   user stop) and `on-failure` (if the boot cut it off) start once the boot
+   is finalized. Network conflists are on tmpfs, so a start recreates the
+   ones its container needs. The Docker API server on vsock:1025 and exec'd commands
    wait on that finalize (bounded), so container operations never race a
    boot still in flight; `status`/`health` does not wait, keeping the
    readiness gate honest but fast.
@@ -473,7 +500,8 @@ make service-debug       # stop + delete the snapshot + cold boot with DEBUG=1
 ```
 
 On a cold boot `stage2.sh` sees `/mnt/anvil/.anvil-debug` and starts the
-`guest-agent` with `ANVIL_DEBUG=1`, writing to `<share>/guest-agent.log`.
+`guest-agent` with `ANVIL_DEBUG=1`, writing to
+`<share>/.anvil-run/guest-agent.log`.
 Subsequent `make service-start`/`service-stop` will resume the VM already
 in the debug state, until a new snapshot without debug is created.
 
@@ -490,9 +518,12 @@ On shutdown:
 4. Containerd starts on the persistent disk; the guest-agent `exec`s right
    after it and brings up its vsock control channel while containerd and
    the DHCP lease are still settling (boot finalize, see §5.3).
-5. The guest-agent restores CNI conflists from `/mnt/anvil/networks/` in
-   the background and pushes the full port state (still empty).
-6. `vz-runner` saves the snapshot.
+5. The guest-agent restores CNI conflists from
+   `/mnt/anvil/.anvil-run/networks/` in the background, restarts the
+   containers whose restart policy asks for it, and pushes the full port
+   state.
+6. No snapshot is written now: the next one is saved at the idle pause or
+   on `anvil stop`.
 
 ### 6.3 Resume
 

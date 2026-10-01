@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -41,7 +42,7 @@ func detachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 	return fmt.Errorf("CNI not supported on this platform")
 }
 
-func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName string) (string, string, error) {
+func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName, staticIP string) (string, string, error) {
 	return "", "", fmt.Errorf("CNI not supported on this platform")
 }
 
@@ -52,3 +53,7 @@ func detachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName stri
 func ensureNamedNetNS(name string) error        { return nil }
 func networkUsesPluginMasq(netName string) bool { return true }
 func removeNetworkMasquerade(netName string)    {}
+
+func findConflistForNetwork(netName string) (string, error) {
+	return "", errors.New("CNI is only available on linux")
+}

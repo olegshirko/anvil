@@ -9,7 +9,9 @@ import Virtualization
 // every connection gets its own thread, relaying both directions with
 // poll(), and the number of live ones is capped.
 
-/// Upper bound on concurrent guest-initiated relays across all services.
+/// Upper bound on concurrent guest-initiated relays per service: a
+/// container holding host.docker.internal connections open must not lock
+/// out egress (pulls behind a VPN), ssh-agent or the port check.
 let maxGuestConnections = 256
 
 /// A handshake (the length-prefixed request) must arrive within this.
@@ -53,7 +55,18 @@ final class ConnectionLimiter {
     }
 }
 
-let guestConnectionLimiter = ConnectionLimiter(limit: maxGuestConnections)
+private let guestLimitersLock = NSLock()
+nonisolated(unsafe) private var guestLimiters: [String: ConnectionLimiter] = [:]
+
+/// The limiter of one guest service (by connection name).
+func guestConnectionLimiter(_ service: String) -> ConnectionLimiter {
+    guestLimitersLock.lock()
+    defer { guestLimitersLock.unlock() }
+    if let l = guestLimiters[service] { return l }
+    let l = ConnectionLimiter(limit: maxGuestConnections)
+    guestLimiters[service] = l
+    return l
+}
 
 /// Cap on concurrent Docker API / buildkit socket clients. Long-lived
 /// docker clients (logs -f, events, attach) are legitimate, hence the
@@ -103,8 +116,9 @@ func startLoopThread(name: String, _ body: @escaping () -> Void) {
 /// Run body for a guest connection on a dedicated thread, closing the
 /// connection afterwards. Over the cap the connection is closed at once.
 func runGuestConnection(_ connection: VZVirtioSocketConnection, name: String,
-                        limiter: ConnectionLimiter = guestConnectionLimiter,
+                        limiter: ConnectionLimiter? = nil,
                         _ body: @escaping () -> Void) {
+    let limiter = limiter ?? guestConnectionLimiter(name)
     guard limiter.tryAcquire() else {
         connection.close()
         return

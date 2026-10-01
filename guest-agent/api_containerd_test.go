@@ -7,6 +7,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	containerspb "github.com/containerd/containerd/api/services/containers/v1"
@@ -131,9 +132,13 @@ func TestContainerInspectAgainstFakeContainerd(t *testing.T) {
 	if insp.State.Pid != 4242 {
 		t.Errorf("Pid = %d, want 4242", insp.State.Pid)
 	}
-	// Image resolves through the image service (Get), not just info.Image.
-	if insp.Image != "docker.io/library/nginx:latest" {
-		t.Errorf("Image = %q", insp.Image)
+	// As Docker: the top-level Image is the image ID (resolved through the
+	// image service), Config.Image the name the container was created from.
+	if !strings.HasPrefix(insp.Image, "sha256:") {
+		t.Errorf("Image = %q, want the image ID", insp.Image)
+	}
+	if insp.Config.Image != "docker.io/library/nginx:latest" {
+		t.Errorf("Config.Image = %q", insp.Config.Image)
 	}
 	if len(insp.Config.Env) == 0 || insp.Config.Env[0] != "FOO=bar" {
 		t.Errorf("Config.Env = %+v", insp.Config.Env)
@@ -185,7 +190,8 @@ func TestImagesListAgainstFakeContainerd(t *testing.T) {
 			t.Errorf("image Id %q is not a full digest", img.Id)
 		}
 	}
-	if !found["docker.io/library/nginx:latest"] || !found["docker.io/library/alpine:latest"] {
+	// Familiar names, as the engine reports them.
+	if !found["nginx:latest"] || !found["alpine:latest"] {
 		t.Errorf("listed tags = %v", found)
 	}
 }

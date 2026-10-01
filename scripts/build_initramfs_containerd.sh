@@ -424,6 +424,29 @@ done
 # binfmt_misc: Rosetta for linux/amd64 containers (ANVIL_ROSETTA=1).
 putmod binfmt_misc
 
+# putmod_deps <module> — the module and everything modules.dep says it
+# needs. Not loaded at boot: the kernel autoloads them on first use
+# (iptables -m statistic, ipset, ip link add type vxlan, /dev/net/tun).
+putmod_deps() {
+    local line p
+    line=$(grep -E "/$1\.ko(\.gz)?:" "$APK_MODDIR/modules.dep" | head -1) || true
+    [[ -n "$line" ]] || return 0
+    for p in ${line%%:*} ${line#*:}; do
+        putmod "$(basename "${p%.gz}" .ko)"
+    done
+}
+# kind / k3d / minikube (kube-proxy iptables and ipvs modes, flannel
+# vxlan, ip6tables) and VPN containers (tun, wireguard).
+for extra_mod in xt_statistic xt_set xt_physdev xt_conntrack xt_NFLOG xt_CT \
+        ip_set ip_set_hash_ip ip_set_hash_net ip_set_hash_ipport \
+        ip_set_hash_ipportip ip_set_hash_ipportnet ip_set_bitmap_port \
+        iptable_mangle iptable_raw ipt_REJECT \
+        ip6_tables ip6table_filter ip6table_nat ip6table_mangle ip6table_raw ip6t_REJECT \
+        ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh nf_conntrack_netlink \
+        vxlan tun wireguard; do
+    putmod_deps "$extra_mod"
+done
+
 # Init script.
 cat > myinit <<'EOF'
 #!/bin/sh
@@ -611,6 +634,13 @@ mountpoint -q /mnt/anvil || mount -t virtiofs anvil /mnt/anvil 2>/dev/null || tr
 # host disabled it (ANVIL_SHARE_USERS=0).
 mkdir -p /Users
 mountpoint -q /Users || mount -t virtiofs macusers /Users 2>/dev/null || true
+# Also /Volumes, /tmp and /var/folders of the Mac (Docker Desktop's
+# defaults); the agent maps /tmp/... and /var/folders/... binds to them.
+for share in macvolumes:/Volumes mactmp:/private/tmp macvarfolders:/private/var/folders; do
+    tag="${share%%:*}"; dir="${share#*:}"
+    mkdir -p "$dir"
+    mountpoint -q "$dir" || mount -t virtiofs "$tag" "$dir" 2>/dev/null || rmdir "$dir" 2>/dev/null || true
+done
 
 # Rosetta for linux/amd64 containers: the share exists only when the host
 # runs with ANVIL_ROSETTA=1. binfmt_misc hands x86-64 ELF binaries to it;
@@ -761,7 +791,8 @@ bmark netfilter
 
 # Start containerd in background.
 echo "[stage2] starting containerd"
-/opt/containerd/bin/containerd > /tmp/containerd.log 2>&1 &
+# Append mode: guest-agent truncates the log in place when it grows.
+/opt/containerd/bin/containerd >> /tmp/containerd.log 2>&1 &
 bmark containerd_started
 
 # buildkitd is started lazily by guest-agent on the first build request

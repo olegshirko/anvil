@@ -138,11 +138,30 @@ func cmdDoctor(args: [String]) {
         }
     }
 
+    // The VM's /var/lib (images, containers, volumes): a full disk fails
+    // pulls and writes in confusing ways.
+    if daemonRunning, let resp = try? ControlClient.request("df"),
+       let used = (resp.stdout ?? "").split(separator: " ").first.flatMap({ Int($0) }) {
+        check("vm disk", used < 90, "/var/lib \(used)% used" + (used >= 90 ? " — anvil prune, then anvil disk-compact" : ""))
+    }
+
+    // A daemon started from an older install keeps running after an upgrade
+    // until it is restarted.
+    if daemonRunning, let pid = try? String(contentsOf: stateDir.appendingPathComponent("daemon.pid"), encoding: .utf8) {
+        let cmd = shell("ps", "-o", "command=", "-p", pid.trimmingCharacters(in: .whitespacesAndNewlines))
+        let running = cmd.split(separator: " ").first.map(String.init) ?? ""
+        let current = currentExecutablePath()
+        let same = running.isEmpty || running == current
+            || (try? FileManager.default.destinationOfSymbolicLink(atPath: current)) == running
+            || URL(fileURLWithPath: running).resolvingSymlinksInPath().path == URL(fileURLWithPath: current).resolvingSymlinksInPath().path
+        check("daemon binary", same, same ? "current" : "running \(running), installed \(current) — anvil restart to pick up the upgrade")
+    }
+
     // Host /Users share for bind mounts. Turning it off is a choice, not a
     // failure.
     if usersSharePath() != nil {
         check("/Users share", true, "/Users available in the guest")
-    } else if ProcessInfo.processInfo.environment["ANVIL_SHARE_USERS"] == "0" {
+    } else if anvilSetting("ANVIL_SHARE_USERS") == "0" {
         check("/Users share", true, "disabled by ANVIL_SHARE_USERS=0 (bind mounts from /Users will not work)")
     } else {
         check("/Users share", false, "unavailable")
@@ -236,3 +255,4 @@ func defaultRouteInterface(fromRouteOutput output: String) -> String? {
     }
     return nil
 }
+

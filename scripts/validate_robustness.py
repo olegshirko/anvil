@@ -139,6 +139,16 @@ def vz_pull(namespace: str, image: str, attempts: int = 3) -> None:
     raise last
 
 
+def remove_all_containers() -> None:
+    """Containers survive cold boots (as a Docker daemon restart keeps
+    them): every test starts from none."""
+    ids = run_host(["docker", "--host", f"unix://{DOCKER_SOCKET}", "ps", "-aq"],
+                   timeout=120.0, check=False).stdout.split()
+    if ids:
+        run_host(["docker", "--host", f"unix://{DOCKER_SOCKET}", "rm", "-f", *ids],
+                 timeout=120.0, check=False)
+
+
 def snapshot_size() -> int:
     return SNAPSHOT_FILE.stat().st_size if SNAPSHOT_FILE.exists() else 0
 
@@ -171,6 +181,7 @@ def test_repeated_resume_cycles() -> None:
     proc = start_daemon(fresh=True)
     try:
         wait_for_marker("daemon ready")
+        remove_all_containers()
         # Prepare a clean snapshot with the image cached but no container.
         if (SHARE_DIR / "nginx.tar").exists():
             docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
@@ -216,6 +227,7 @@ def test_resume_after_workload() -> None:
     proc = start_daemon(fresh=True)
     try:
         wait_for_marker("daemon ready")
+        remove_all_containers()
         if (SHARE_DIR / "nginx.tar").exists():
             docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
         docker("run", "-d", "-p", "8080:80", "--name", "nginx", "nginx", network="project-a")
@@ -258,6 +270,7 @@ def test_stateful_connection() -> None:
     proc = start_daemon(fresh=True)
     try:
         wait_for_marker("daemon ready")
+        remove_all_containers()
         if (SHARE_DIR / "nginx.tar").exists():
             docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
         docker("run", "-d", "-p", "8080:80", "--name", "nginx", "nginx", network="project-a")
@@ -318,6 +331,7 @@ def test_kill9_cleanup() -> None:
     proc = start_daemon(fresh=True)
     try:
         wait_for_marker("daemon ready")
+        remove_all_containers()
         pid = proc.pid
         os.kill(pid, signal.SIGKILL)
         proc.wait()
@@ -377,6 +391,7 @@ def test_fd_leaks() -> None:
     proc = start_daemon(fresh=True)
     try:
         wait_for_marker("daemon ready")
+        remove_all_containers()
         host_before = _count_host_fds(proc.pid)
         guest_before = _guest_agent_fd_count()
         for i in range(50):
@@ -422,6 +437,7 @@ def test_cni_cleanup() -> None:
     proc = start_daemon(fresh=True)
     try:
         wait_for_marker("daemon ready")
+        remove_all_containers()
         if (SHARE_DIR / "nginx.tar").exists():
             docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
         docker("run", "-d", "-p", "8080:80", "--name", "nginx", "nginx", network="project-a")
@@ -451,6 +467,7 @@ def test_two_projects() -> None:
     proc = start_daemon(fresh=True)
     try:
         wait_for_marker("daemon ready")
+        remove_all_containers()
         if (SHARE_DIR / "nginx.tar").exists():
             docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
             docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
@@ -510,6 +527,7 @@ def test_restart_policy_survives_resume() -> None:
     proc = start_daemon(fresh=True)
     try:
         wait_for_marker("daemon ready")
+        remove_all_containers()
         vz_pull("project-a", "alpine")
         # The container fails once (marker missing), then sleeps: the
         # restart monitor in guest-agent must bring it back up.
@@ -567,6 +585,7 @@ def test_udp_survives_resume() -> None:
     proc = start_daemon(fresh=True)
     try:
         wait_for_marker("daemon ready")
+        remove_all_containers()
         vz_pull("project-a", "alpine")
         docker("run", "-d", "-p", "25361:15361/udp",
                 "--name", "udpecho", "alpine", "sh", "-c",
@@ -602,6 +621,51 @@ def test_udp_survives_resume() -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Containers survive a cold boot; restart policies apply at boot
+# ---------------------------------------------------------------------------
+def test_containers_survive_cold_boot() -> None:
+    log("\n=== Test: containers across a cold boot ===")
+    kill_daemon()
+    proc = start_daemon(fresh=True)
+    try:
+        wait_for_marker("daemon ready")
+        remove_all_containers()
+        vz_pull("default", "alpine")
+        docker("run", "-d", "--restart", "always", "--name", "cb-always", "alpine", "sleep", "300")
+        docker("run", "-d", "--restart", "unless-stopped", "--name", "cb-unless", "alpine", "sleep", "300")
+        docker("stop", "-t", "1", "cb-unless")
+        run_host(["docker", "--host", f"unix://{DOCKER_SOCKET}", "run", "--name", "cb-exit3",
+                  "alpine", "sh", "-c", "exit 3"], check=False, timeout=60.0)
+        docker("run", "-d", "--rm", "--name", "cb-rm", "alpine", "sleep", "300")
+        stop_daemon(proc)
+        proc = start_daemon(fresh=True)  # cold boot: no snapshot
+        wait_for_marker("daemon ready")
+        deadline = time.time() + 30
+        states: dict[str, str] = {}
+        while time.time() < deadline:
+            out = docker("ps", "-a", "--format", "{{.Names}} {{.State}} {{.Status}}").stdout
+            states = {l.split()[0]: l for l in out.splitlines() if l.strip()}
+            if "cb-always" in states and " running " in states["cb-always"]:
+                break
+            time.sleep(1)
+        stop_daemon(proc)
+        problems = []
+        if " running " not in states.get("cb-always", ""):
+            problems.append(f"always not restarted: {states.get('cb-always')}")
+        if " exited " not in states.get("cb-unless", ""):
+            problems.append(f"user-stopped unless-stopped restarted: {states.get('cb-unless')}")
+        if "Exited (3)" not in states.get("cb-exit3", ""):
+            problems.append(f"exit code lost: {states.get('cb-exit3')}")
+        if "cb-rm" in states:
+            problems.append("--rm container kept")
+        record("containers across cold boot", not problems, "; ".join(problems) or
+               "always restarted, unless-stopped kept stopped, exit code kept, --rm removed")
+    except Exception as e:
+        stop_daemon(proc)
+        record("containers across cold boot", False, str(e))
+
+
 def main() -> int:
     if not VZ_RUNNER.exists():
         log(f"binary not found: {VZ_RUNNER}; run 'make sign' first")
@@ -616,6 +680,7 @@ def main() -> int:
     test_two_projects()
     test_restart_policy_survives_resume()
     test_udp_survives_resume()
+    test_containers_survive_cold_boot()
 
     log("\n=== Summary ===")
     passed = sum(1 for _, ok, _ in results if ok)

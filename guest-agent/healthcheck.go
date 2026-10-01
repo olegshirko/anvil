@@ -96,6 +96,10 @@ func startHealthCheck(dockerID, ns, containerdID string, hc *dockerHealthcheck, 
 	if retries <= 0 {
 		retries = 3
 	}
+	startInterval := time.Duration(hc.StartInterval)
+	if startInterval <= 0 {
+		startInterval = 5 * time.Second // Docker's default
+	}
 
 	var cmd []string
 	switch hc.Test[0] {
@@ -125,26 +129,21 @@ func startHealthCheck(dockerID, ns, containerdID string, hc *dockerHealthcheck, 
 	healthChecks.byID[dockerID] = h
 	healthChecks.mu.Unlock()
 
-	go func() {
-		// Wait for StartPeriod before the first check, then poll every Interval.
-		if startPeriod > 0 {
-			select {
-			case <-h.stopChan:
-				return
-			case <-time.After(startPeriod):
-			}
-		}
-
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-
+	goSafe("healthcheck", func() {
+		// As Docker: during StartPeriod probe every StartInterval; a success
+		// makes the container healthy at once, a failure does not count.
+		// Sleeping through the whole start period first kept a container
+		// with start_period: 60s from turning healthy for over a minute.
+		began := time.Now()
 		consecutiveFailures := 0
+		timer := time.NewTimer(nextHealthDelay(began, time.Now(), startPeriod, startInterval, interval, true))
+		defer timer.Stop()
 
 		for {
 			select {
 			case <-h.stopChan:
 				return
-			case <-ticker.C:
+			case <-timer.C:
 			}
 
 			start := time.Now()
@@ -164,15 +163,19 @@ func startHealthCheck(dockerID, ns, containerdID string, hc *dockerHealthcheck, 
 			}
 
 			prev := h.state.Status
-			h.state.Status, consecutiveFailures = nextHealthStatus(prev, exitCode == 0, consecutiveFailures, retries)
+			inStart := prev == "starting" && end.Sub(began) < startPeriod
+			if exitCode == 0 || !inStart {
+				h.state.Status, consecutiveFailures = nextHealthStatus(prev, exitCode == 0, consecutiveFailures, retries)
+			}
 			h.state.FailingStreak = consecutiveFailures
 			status := h.state.Status
 			h.mu.Unlock()
 			if status != prev {
 				publishHealthEvent(ns, containerdID, status)
 			}
+			timer.Reset(nextHealthDelay(began, time.Now(), startPeriod, startInterval, interval, status == "starting"))
 		}
-	}()
+	})
 }
 
 func runHealthCheckCommand(ns, containerdID, containerUser string, cmd []string, timeout time.Duration) (int, string) {
@@ -283,4 +286,13 @@ func publishHealthEvent(ns, containerdID, status string) {
 	}
 	publishAgentEvent(dockerEvent{Type: "container", Action: "health_status: " + status,
 		Actor: dockerEventActor{ID: dockerID(ns, containerdID), Attributes: attrs}})
+}
+
+// nextHealthDelay is the wait before the next probe: StartInterval while the
+// container is still starting inside its start period, Interval otherwise.
+func nextHealthDelay(began, now time.Time, startPeriod, startInterval, interval time.Duration, starting bool) time.Duration {
+	if starting && startPeriod > 0 && now.Sub(began) < startPeriod {
+		return startInterval
+	}
+	return interval
 }

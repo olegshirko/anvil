@@ -38,6 +38,7 @@ func servePortProxy() {
 		log.Printf("[port-proxy] listen %s: %v (host port forwarding unavailable)", portProxyAddr, err)
 		return
 	}
+	defer ln.Close() // a restart after a panic binds again
 	log.Printf("[port-proxy] listening on %s", portProxyAddr)
 	for {
 		conn, err := ln.Accept()
@@ -46,12 +47,21 @@ func servePortProxy() {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go handlePortProxyClient(conn)
+		goSafe("port-proxy-conn", func() { handlePortProxyClient(conn) })
 	}
 }
 
 func handlePortProxyClient(conn net.Conn) {
 	defer conn.Close()
+	// Only the Mac's forwarder, which connects to the VM's eth0 address.
+	// A container reaching the proxy through its bridge gateway could
+	// otherwise dial any address the VM can: unpublished ports of other
+	// projects, the agent's loopback services, out of an --internal
+	// network.
+	if !arrivedOnInterface(conn, "eth0") {
+		log.Printf("[port-proxy] refused %s (not from the host)", conn.RemoteAddr())
+		return
+	}
 	target, err := readPortProxyHeader(conn)
 	if err != nil {
 		log.Printf("[port-proxy] header: %v", err)
@@ -104,4 +114,27 @@ func readPortProxyHeader(conn net.Conn) (*portProxyHeader, error) {
 		return nil, fmt.Errorf("incomplete target %+v", h)
 	}
 	return &h, nil
+}
+
+// arrivedOnInterface reports whether conn's local address belongs to the
+// named interface.
+func arrivedOnInterface(conn net.Conn, name string) bool {
+	local, ok := conn.LocalAddr().(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return false
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok && ipn.IP.Equal(local.IP) {
+			return true
+		}
+	}
+	return false
 }

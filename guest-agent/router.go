@@ -118,5 +118,25 @@ func dispatchDockerAPI(w http.ResponseWriter, r *http.Request, path string) {
 			}
 		}
 	}
-	http.NotFound(w, r)
+	// Swarm-mode endpoints answer as a Docker engine that is not a swarm
+	// node; clients (docker info, compose, portainer) branch on that.
+	if len(segs) > 0 {
+		switch segs[0] {
+		case "swarm", "nodes", "services", "tasks", "secrets", "configs":
+			writeJSONError(w, http.StatusServiceUnavailable,
+				"This node is not a swarm manager. Use \"docker swarm init\" or \"docker swarm join\" to connect this node to swarm and try again.")
+			return
+		case "plugins":
+			// No managed plugins: an empty list (Portainer's create views
+			// and `docker plugin ls` query it), anything else unsupported.
+			if len(segs) == 1 && r.Method == http.MethodGet {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte("[]\n")) //nolint:errcheck
+				return
+			}
+			writeJSONError(w, http.StatusNotImplemented, "plugins are not supported by anvil")
+			return
+		}
+	}
+	writeJSONError(w, http.StatusNotFound, "page not found") // JSON, as the engine sends it
 }

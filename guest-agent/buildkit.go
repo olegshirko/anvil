@@ -5,11 +5,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -88,6 +92,10 @@ func ensureBuildkitd() error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start buildkitd: %w", err)
 	}
+	// It inherited the agent's -999 OOM score; builds may be killed.
+	if err := os.WriteFile(fmt.Sprintf("/proc/%d/oom_score_adj", cmd.Process.Pid), []byte("0"), 0o644); err != nil {
+		log.Printf("[buildkit] oom_score_adj: %v", err)
+	}
 	// No Wait(): if buildkitd dies it is collected by the orphan reaper.
 	log.Printf("[buildkit] started buildkitd (pid %d)", cmd.Process.Pid)
 	for i := 0; i < 150; i++ {
@@ -162,39 +170,118 @@ func proxyBuildkitConn(conn net.Conn) {
 // pruneBuildCache drops the whole buildkit cache and returns the reclaimed
 // bytes. It deliberately does not start buildkitd just to prune: without a
 // running daemon there is no cache to reclaim.
-func pruneBuildCache() (int64, error) {
+func pruneBuildCache(opts ...bkclient.PruneOption) (int64, []string, error) {
 	if !buildkitUp() {
-		return 0, nil
+		return 0, []string{}, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	log.Printf("[buildkit] prune: connecting")
 	c, err := bkclient.New(ctx, "unix://"+buildkitSocket)
 	if err != nil {
-		return 0, fmt.Errorf("buildkit connect: %w", err)
+		return 0, nil, fmt.Errorf("buildkit connect: %w", err)
 	}
 	defer c.Close()
 	log.Printf("[buildkit] prune: connected")
 
 	var reclaimed int64
+	deleted := []string{}
 	ch := make(chan bkclient.UsageInfo)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for u := range ch {
 			reclaimed += u.Size
+			deleted = append(deleted, u.ID)
 		}
 	}()
-	err = c.Prune(ctx, ch, bkclient.PruneAll)
+	err = c.Prune(ctx, ch, opts...)
 	// The client sends every record synchronously and never closes the
 	// channel; once Prune returns nothing else is sent, so close it here
 	// and let the reader finish (no leaked goroutine, no racy total).
 	close(ch)
 	<-done
 	if err != nil {
-		return reclaimed, fmt.Errorf("buildkit prune: %w", err)
+		return reclaimed, deleted, fmt.Errorf("buildkit prune: %w", err)
 	}
-	return reclaimed, nil
+	return reclaimed, deleted, nil
+}
+
+// buildPruneOptions translates POST /build/prune's query the way dockerd
+// does: all, the space limits (keep-storage is the old reserved-space),
+// until as the keep duration, and the cache-record filters.
+func buildPruneOptions(q url.Values) ([]bkclient.PruneOption, error) {
+	var opts []bkclient.PruneOption
+	if queryBool(q, "all") {
+		opts = append(opts, bkclient.PruneAll)
+	}
+	space := func(key string) (int64, error) {
+		v := q.Get(key)
+		if v == "" {
+			return 0, nil
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, errInvalid("invalid %s: %s", key, v)
+		}
+		return n, nil
+	}
+	reserved, err := space("reserved-space")
+	if err != nil {
+		return nil, err
+	}
+	if reserved == 0 {
+		if reserved, err = space("keep-storage"); err != nil {
+			return nil, err
+		}
+	}
+	maxUsed, err := space("max-used-space")
+	if err != nil {
+		return nil, err
+	}
+	minFree, err := space("min-free-space")
+	if err != nil {
+		return nil, err
+	}
+	var keep time.Duration
+	var filter []string
+	for key, values := range parseDockerFilters(q.Get("filters")) {
+		vals := slices.Sorted(maps.Keys(values))
+		switch key {
+		case "until":
+			if len(vals) != 1 {
+				return nil, errInvalid("filters: until takes one value")
+			}
+			now := time.Now()
+			ts, terr := parseUntil(vals[0], now)
+			if terr != nil {
+				return nil, errInvalid("filters: %v", terr)
+			}
+			keep = now.Sub(ts)
+		case "id", "parent", "type", "description", "inuse", "shared", "private":
+			switch len(vals) {
+			case 0:
+				filter = append(filter, key)
+			case 1:
+				op := "=="
+				if key == "id" {
+					op = "~="
+				}
+				filter = append(filter, key+op+vals[0])
+			default:
+				return nil, errInvalid("filters: %s takes one value", key)
+			}
+		default:
+			return nil, errInvalid("filters: %q is not a build cache filter", key)
+		}
+	}
+	if len(filter) > 0 {
+		opts = append(opts, bkclient.WithFilter(filter))
+	}
+	if keep > 0 || reserved > 0 || maxUsed > 0 || minFree > 0 {
+		opts = append(opts, bkclient.WithKeepOpt(keep, reserved, maxUsed, minFree))
+	}
+	return opts, nil
 }
 
 // handleBuildkitGRPC implements the dockerd-style gRPC hijack endpoints

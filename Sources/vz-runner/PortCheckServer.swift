@@ -67,24 +67,29 @@ final class PortCheckServer: NSObject {
     /// release it. Both address families are probed: a dual-stack IPv6
     /// wildcard bind does not conflict with an IPv4-only wildcard squatter
     /// on macOS, yet the squatter still captures 127.0.0.1 traffic.
+    /// Loopback is probed too: a Mac service bound only to 127.0.0.1 or ::1
+    /// (Homebrew redis/postgres) does not block the wildcard binds, yet it
+    /// wins localhost connections over the forwarder's wildcard listener.
     private func canBind(port: Int) -> Bool {
         canBind_INET6(port: port) && canBind_INET(port: port)
+            && canBind_INET(port: port, address: in_addr(s_addr: INADDR_LOOPBACK.bigEndian))
+            && canBind_INET6(port: port, address: in6addr_loopback, v6only: true)
     }
 
-    private func canBind_INET6(port: Int) -> Bool {
+    private func canBind_INET6(port: Int, address: in6_addr = in6addr_any, v6only: Bool = false) -> Bool {
         let fd = socket(AF_INET6, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         defer { close(fd) }
 
         var reuse: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
-        var off: Int32 = 0
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, socklen_t(MemoryLayout<Int32>.size))
+        var only: Int32 = v6only ? 1 : 0
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &only, socklen_t(MemoryLayout<Int32>.size))
 
         var addr = sockaddr_in6()
         addr.sin6_family = sa_family_t(AF_INET6)
         addr.sin6_port = in_port_t(port).bigEndian
-        addr.sin6_addr = in6addr_any
+        addr.sin6_addr = address
 
         let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -95,7 +100,7 @@ final class PortCheckServer: NSObject {
         return true
     }
 
-    private func canBind_INET(port: Int) -> Bool {
+    private func canBind_INET(port: Int, address: in_addr = in_addr(s_addr: INADDR_ANY)) -> Bool {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         defer { close(fd) }
@@ -106,7 +111,7 @@ final class PortCheckServer: NSObject {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = in_port_t(port).bigEndian
-        addr.sin_addr = in_addr(s_addr: INADDR_ANY)
+        addr.sin_addr = address
 
         let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {

@@ -287,7 +287,7 @@ final class VMLifecycleManager: NSObject {
                     cpus: self.args.cpuCount,
                     memory: self.args.memoryGiB,
                     containerdDiskPath: self.args.containerdDiskPath,
-                    usersSharePath: usersSharePath()
+                    usersSharePath: hostSharesKey()
                 )
             } else {
                 print("[anvil] keeping stored config hash (VM was restored, not booted with current assets)")
@@ -360,7 +360,7 @@ final class VMLifecycleManager: NSObject {
                 cpus: self.args.cpuCount,
                 memory: self.args.memoryGiB,
                 containerdDiskPath: self.args.containerdDiskPath,
-                usersSharePath: usersSharePath()
+                usersSharePath: hostSharesKey()
             )
             let freshBoot = self.args.fresh || self.forceFreshBoot
             print("[anvil] snapshot exists=\(self.snapshot.hasSnapshot) hashMatches=\(hashMatches) forcedFresh=\(self.forceFreshBoot)")
@@ -412,7 +412,7 @@ final class VMLifecycleManager: NSObject {
             cpus: args.cpuCount,
             memory: args.memoryGiB,
             containerdDiskPath: args.containerdDiskPath,
-            usersSharePath: usersSharePath()
+            usersSharePath: hostSharesKey()
         )
         let canRestore = args.useAgent
             && !args.fresh
@@ -429,6 +429,11 @@ final class VMLifecycleManager: NSObject {
                 let restoreDuration = Date().timeIntervalSince(restoreStart)
                 if let error = error {
                     print("[anvil] restore failed after \(String(format: "%.3f", restoreDuration))s: \(error)")
+                    if (error as NSError).domain == "VZErrorDomain", (error as NSError).code == 12 {
+                        // The saved state is sealed with a Secure Enclave key
+                        // that cannot be used while the Mac is locked.
+                        print("[anvil] note: a locked Mac cannot decrypt the saved VM state; containers survive the cold boot")
+                    }
                     print("[anvil] falling back to cold boot")
                     // Keep the machine identifier and network config: this
                     // VM was configured with them and its next save must stay

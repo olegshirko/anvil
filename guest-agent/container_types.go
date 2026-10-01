@@ -38,7 +38,14 @@ type dockerNetworkingConf struct {
 }
 
 type dockerEndpoint struct {
-	Aliases []string `json:"Aliases"`
+	Aliases    []string            `json:"Aliases"`
+	IPAMConfig *dockerEndpointIPAM `json:"IPAMConfig,omitempty"`
+}
+
+// dockerEndpointIPAM is a requested static address (`--ip`, compose
+// ipv4_address).
+type dockerEndpointIPAM struct {
+	IPv4Address string `json:"IPv4Address"`
 }
 
 type dockerHostConfig struct {
@@ -123,7 +130,8 @@ type dockerTmpfsOptions struct {
 }
 
 type dockerVolumeOptions struct {
-	NoCopy bool `json:"NoCopy"`
+	NoCopy  bool   `json:"NoCopy"`
+	Subpath string `json:"Subpath,omitempty"` // mount only this path of the volume (API 1.45)
 }
 
 type dockerDevice struct {
@@ -143,6 +151,8 @@ type dockerHealthcheck struct {
 	Timeout     int64    `json:"Timeout"`
 	Retries     int      `json:"Retries"`
 	StartPeriod int64    `json:"StartPeriod,omitempty"`
+	// StartInterval is the probe interval during StartPeriod (API 1.44).
+	StartInterval int64 `json:"StartInterval,omitempty"`
 }
 
 type dockerCreateResponse struct {
@@ -171,23 +181,39 @@ type dockerContainerSummary struct {
 	// Mounts: compose's recreate reads the old container's anonymous
 	// volumes from the list endpoint, not from inspect.
 	Mounts []dockerMountPoint `json:"Mounts"`
+	// HostConfig/NetworkSettings: compose reads the network mode and the
+	// endpoints from the list too.
+	HostConfig      dockerSummaryHostConfig      `json:"HostConfig"`
+	NetworkSettings dockerSummaryNetworkSettings `json:"NetworkSettings"`
+	// Sizes, only with ?size=1 (docker ps -s).
+	SizeRw     *int64 `json:"SizeRw,omitempty"`
+	SizeRootFs *int64 `json:"SizeRootFs,omitempty"`
 
 	// Filter inputs that are not part of the list payload.
-	exitCode int
-	created  int64 // UnixNano: before/since order containers made in the same second
-	networks []string
-	health   string
-	exposed  []string
+	exitCode   int
+	created    int64 // UnixNano: before/since order containers made in the same second
+	networks   []string
+	networkIDs map[string]string
+	health     string
+	exposed    []string
 }
 
 // dockerContainerInspect is a minimal subset of GET /containers/{id}/json.
 type dockerContainerInspect struct {
+	SizeRw          *int64                `json:"SizeRw,omitempty"`
+	SizeRootFs      *int64                `json:"SizeRootFs,omitempty"`
 	Id              string                `json:"Id"`
 	Created         string                `json:"Created"`
 	Path            string                `json:"Path"`
 	Args            []string              `json:"Args"`
 	Name            string                `json:"Name"`
-	Image           string                `json:"Image"`
+	Image           string                `json:"Image"` // the image ID; Config.Image is the name
+	ResolvConfPath  string                `json:"ResolvConfPath"`
+	HostnamePath    string                `json:"HostnamePath"`
+	HostsPath       string                `json:"HostsPath"`
+	LogPath         string                `json:"LogPath"`
+	Driver          string                `json:"Driver"`
+	Platform        string                `json:"Platform"`
 	State           dockerContainerState  `json:"State"`
 	Config          dockerContainerConfig `json:"Config"`
 	HostConfig      dockerHostConfig      `json:"HostConfig"`
@@ -255,4 +281,12 @@ type dockerPort struct {
 	PrivatePort int    `json:"PrivatePort"`
 	PublicPort  int    `json:"PublicPort,omitempty"`
 	Type        string `json:"Type"`
+}
+
+type dockerSummaryHostConfig struct {
+	NetworkMode string `json:"NetworkMode"`
+}
+
+type dockerSummaryNetworkSettings struct {
+	Networks map[string]dockerEndpointStats `json:"Networks"`
 }

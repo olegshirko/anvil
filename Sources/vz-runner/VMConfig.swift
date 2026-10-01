@@ -8,7 +8,7 @@ let usersShareTag = "macusers"
 /// so `docker run -v $HOME/...:/path` bind mounts work like on Docker
 /// Desktop / Lima. Disable with ANVIL_SHARE_USERS=0.
 func usersSharePath() -> String? {
-    if ProcessInfo.processInfo.environment["ANVIL_SHARE_USERS"] == "0" {
+    if anvilSetting("ANVIL_SHARE_USERS") == "0" {
         return nil
     }
     var isDir: ObjCBool = false
@@ -17,6 +17,32 @@ func usersSharePath() -> String? {
         return nil
     }
     return "/Users"
+}
+
+/// Further host directories shared at the same absolute path, as Docker
+/// Desktop shares them by default: external volumes, and /tmp and
+/// /var/folders ($TMPDIR) — `-v /tmp/x:/x` used to get an empty VM
+/// directory. Same switch as /Users (ANVIL_SHARE_USERS=0 turns all off).
+func extraHostShares() -> [(tag: String, path: String)] {
+    guard usersSharePath() != nil else { return [] }
+    let wanted = Set((anvilSetting("ANVIL_SHARE_EXTRA") ?? "volumes,tmp,varfolders")
+        .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+    return [("macvolumes", "/Volumes", "volumes"), ("mactmp", "/private/tmp", "tmp"),
+            ("macvarfolders", "/private/var/folders", "varfolders")]
+        .filter { wanted.contains($0.2) }
+        .map { ($0.0, $0.1) }
+        .filter { share in
+            var isDir: ObjCBool = false
+            return FileManager.default.fileExists(atPath: share.1, isDirectory: &isDir) && isDir.boolValue
+        }
+        .map { (tag: $0.0, path: $0.1) }
+}
+
+/// The host shares as one string for the snapshot config key: a restored
+/// VM must have exactly the virtiofs devices it was saved with.
+func hostSharesKey() -> String? {
+    guard let users = usersSharePath() else { return nil }
+    return ([users] + extraHostShares().map { $0.path }).joined(separator: ",")
 }
 
 /// Virtiofs tag for the Rosetta runtime share (amd64 containers).
@@ -32,8 +58,11 @@ let rosettaCacheSocketPath = "/run/rosettad/rosetta.sock"
 /// when Rosetta is installed on the Mac (softwareupdate --install-rosetta).
 /// Off by default: once registered, binfmt_misc hands every x86-64 binary in
 /// the VM to Rosetta, buildkit's amd64 builds included.
-func rosettaRequested(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
-    environment["ANVIL_ROSETTA"] == "1"
+func rosettaRequested(environment: [String: String]? = nil) -> Bool {
+    if let env = environment {
+        return env["ANVIL_ROSETTA"] == "1"
+    }
+    return anvilSetting("ANVIL_ROSETTA") == "1"
 }
 
 func rosettaEnabled() -> Bool {
@@ -152,6 +181,14 @@ func makeConfiguration(
     // so snapshot restore isn't tied to the original process's stdin/stdout.
     let serialConfig = VZVirtioConsoleDeviceSerialPortConfiguration()
     if let consolePath = args.consoleOutputPath {
+        // Keep the previous VM's console as console.log.1: after a crash
+        // the recovery boot would otherwise erase the panic trace.
+        if let size = (try? FileManager.default.attributesOfItem(atPath: consolePath))?[.size] as? NSNumber,
+           size.int64Value > 0 {
+            let previous = consolePath + ".1"
+            try? FileManager.default.removeItem(atPath: previous)
+            try? FileManager.default.moveItem(atPath: consolePath, toPath: previous)
+        }
         FileManager.default.createFile(atPath: consolePath, contents: nil, attributes: nil)
         let readHandle = FileHandle(forReadingAtPath: "/dev/null") ?? FileHandle.standardInput
         let writeHandle = FileHandle(forWritingAtPath: consolePath) ?? FileHandle.standardOutput
@@ -194,6 +231,12 @@ func makeConfiguration(
         )
         let fsConfig = VZVirtioFileSystemDeviceConfiguration(tag: usersShareTag)
         fsConfig.share = VZSingleDirectoryShare(directory: sharedDirectory)
+        sharingDevices.append(fsConfig)
+    }
+    for extra in extraHostShares() {
+        let fsConfig = VZVirtioFileSystemDeviceConfiguration(tag: extra.tag)
+        fsConfig.share = VZSingleDirectoryShare(directory: VZSharedDirectory(
+            url: URL(fileURLWithPath: extra.path), readOnly: false))
         sharingDevices.append(fsConfig)
     }
     if rosettaRequested() {

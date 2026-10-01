@@ -22,7 +22,12 @@ enum GuestCacheDropper {
         process.environment?["ANVIL_EXIT_ON_PARENT_DEATH"] = "1"
         do {
             try process.run()
-            process.waitUntilExit()
+            // Bounded: a wedged guest must not hold up the snapshot save
+            // (and the idle pause) forever.
+            guard waitForExit(process, timeout: trim ? 120 : 30) else {
+                print("[guest-cache-drop] timed out; continuing without it")
+                return
+            }
             if process.terminationStatus == 0 {
                 print("[guest-cache-drop] page cache dropped")
             } else {
@@ -41,4 +46,23 @@ enum GuestCacheDropper {
         }
         return URL(fileURLWithFileSystemRepresentation: path, isDirectory: false, relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
     }
+}
+
+/// Wait for process up to timeout seconds; on timeout it is terminated
+/// (then killed) and false is returned.
+func waitForExit(_ process: Process, timeout: TimeInterval) -> Bool {
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+        process.waitUntilExit()
+        done.signal()
+    }
+    if done.wait(timeout: .now() + timeout) == .success {
+        return true
+    }
+    process.terminate()
+    if done.wait(timeout: .now() + 2) == .timedOut {
+        kill(process.processIdentifier, SIGKILL)
+        _ = done.wait(timeout: .now() + 2)
+    }
+    return false
 }

@@ -475,8 +475,14 @@ define update_changelog
 	git diff --cached --quiet || git commit -m "docs(changelog): v$(VERSION)"
 endef
 
-release: sign
+# A tag must not ship an agent or initramfs that never booted: unit tests
+# always, and the smoke suite against the running daemon (`make
+# service-start` first; SKIP_SMOKE=1 skips it, e.g. on a machine without one).
+release: sign unit-tests
 	$(require_version)
+	@if [ "$(SKIP_SMOKE)" != "1" ]; then \
+		python3 scripts/integration_tests.py --smoke || { echo "[release] smoke tests failed (SKIP_SMOKE=1 to skip)"; exit 1; }; \
+	fi
 	@git rev-parse "v$(VERSION)" >/dev/null 2>&1 && \
 		{ echo "Error: tag v$(VERSION) already exists. Use 'make replace-release VERSION=$(VERSION)'."; exit 1; } || true
 	@echo "[release] updating CHANGELOG.md..."

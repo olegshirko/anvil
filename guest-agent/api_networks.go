@@ -5,7 +5,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 )
 
 var networkRoutes = []apiRoute{
@@ -20,11 +22,16 @@ var networkRoutes = []apiRoute{
 
 func handleNetworksList(w http.ResponseWriter, r *http.Request, _ routeParams) {
 	filters := parseDockerFilters(r.URL.Query().Get("filters"))
+	if err := validateFilterKeys(filters, networkFilterKeys); err != nil {
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
 	networks, err := listDockerNetworks(r.Context(), filters)
 	if err != nil {
 		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
+	networks = filterNetworks(r.Context(), networks, filters)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(networks)
 }
@@ -40,8 +47,16 @@ func handleNetworkCreate(w http.ResponseWriter, r *http.Request, _ routeParams) 
 		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
+	// Unsupported options are said, not silently dropped.
+	var warnings []string
+	if req.EnableIPv6 {
+		warnings = append(warnings, "IPv6 is not supported: the network is IPv4-only")
+	}
+	if req.Driver != "" && req.Driver != "bridge" {
+		warnings = append(warnings, fmt.Sprintf("driver %q is not supported: created a bridge network", req.Driver))
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"Id": nw.Id, "Warning": ""})
+	json.NewEncoder(w).Encode(map[string]interface{}{"Id": nw.Id, "Warning": strings.Join(warnings, "; ")})
 }
 
 func handleNetworkInspect(w http.ResponseWriter, r *http.Request, p routeParams) {

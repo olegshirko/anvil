@@ -188,7 +188,7 @@ type volumeMount struct {
 	nocopy   bool
 }
 
-func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mount, []string, []volumeMount, error) {
+func computeContainerMounts(ns, id string, req dockerCreateRequest) (_ []specs.Mount, _ []string, _ []volumeMount, subpaths []subpathMount, _ error) {
 	var mounts []specs.Mount
 	var anonVols []string
 	var volMounts []volumeMount
@@ -233,7 +233,10 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 				addBind(sock, dst, ro)
 				break
 			}
-			os.MkdirAll(src, 0o755) //nolint:errcheck — docker creates missing host dirs
+			src = macPathInVM(src)
+			if err := ensureBindSource(src); err != nil {
+				return err
+			}
 			addBind(src, dst, ro)
 		default:
 			if err := addNamedVolume(src, dst, ro); err != nil {
@@ -270,7 +273,7 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 
 	for _, b := range req.HostConfig.Binds {
 		if err := parseBindSpec(b); err != nil {
-			return nil, nil, nil, fmt.Errorf("bind %q: %w", b, err)
+			return nil, nil, nil, nil, fmt.Errorf("bind %q: %w", b, err)
 		}
 	}
 	for _, m := range req.HostConfig.Mounts {
@@ -285,10 +288,32 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 			continue
 		}
 		nocopy = m.VolumeOptions != nil && m.VolumeOptions.NoCopy
+		if m.Type == "volume" && m.Source != "" && m.VolumeOptions != nil && m.VolumeOptions.Subpath != "" {
+			dir, serr := volumeSubpath(volumeDataDir(ns, m.Source), m.VolumeOptions.Subpath)
+			if serr != nil {
+				return nil, nil, nil, nil, fmt.Errorf("mount %q: %w", m.Target, serr)
+			}
+			addBind(dir, m.Target, m.ReadOnly)
+			subpaths = append(subpaths, subpathMount{VolumeDir: volumeDataDir(ns, m.Source), Subpath: m.VolumeOptions.Subpath, Source: dir})
+			continue
+		}
+		if m.Type != "" && m.Type != "bind" && m.Type != "volume" {
+			// type=image (API 1.48), npipe, cluster: refused, not taken
+			// for a volume named after the image.
+			return nil, nil, nil, nil, errInvalid("mount type %q is not supported by anvil", m.Type)
+		}
+		if m.Type == "bind" {
+			// Unlike -v, --mount type=bind never creates its source.
+			if _, serr := os.Stat(macPathInVM(m.Source)); serr != nil {
+				if _, ok := dockerSocketBindSource(m.Source); !ok {
+					return nil, nil, nil, nil, errInvalid("invalid mount config for type \"bind\": bind source path does not exist: %s", m.Source)
+				}
+			}
+		}
 		err := addHostOrVolume(m.Source, m.Target, m.ReadOnly)
 		nocopy = false
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("mount %q: %w", m.Target, err)
+			return nil, nil, nil, nil, fmt.Errorf("mount %q: %w", m.Target, err)
 		}
 	}
 	// The CLI sends a bare `-v /path` as Config.Volumes, not as a bind.
@@ -302,7 +327,7 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 			continue
 		}
 		if err := addHostOrVolume("", dst, false); err != nil {
-			return nil, nil, nil, fmt.Errorf("volume %q: %w", dst, err)
+			return nil, nil, nil, nil, fmt.Errorf("volume %q: %w", dst, err)
 		}
 	}
 	for path, optsStr := range req.HostConfig.TmpFs {
@@ -331,7 +356,7 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 		specs.Mount{Type: "bind", Source: filepath.Join(containerMetaDir(ns, id), "hostname"),
 			Destination: "/etc/hostname", Options: []string{"rbind"}},
 	)
-	return mounts, anonVols, volMounts, nil
+	return mounts, anonVols, volMounts, subpaths, nil
 }
 
 // volumesFromMounts resolves --volumes-from: every volume and bind mount of
@@ -627,7 +652,10 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 		if hc.ShmSize > 0 {
 			opts = append(opts, oci.WithDevShmSize(hc.ShmSize/1024))
 		}
-		if hc.OomScoreAdj != 0 {
+		{
+			// Always set: without it the process inherits the shim's
+			// score, which follows containerd's -999 (supervise.go), and
+			// the OOM killer would prefer the agent over a container.
 			adj := hc.OomScoreAdj
 			opts = append(opts, func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
 				if s.Process == nil {
@@ -643,13 +671,19 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 				opts = append(opts, oci.WithNoNewPrivileges)
 			case strings.HasPrefix(opt, "seccomp=") || strings.HasPrefix(opt, "seccomp:"):
 				// applied last by seccompSpecOpt (it needs the final caps)
+			case strings.HasPrefix(opt, "apparmor=") || strings.HasPrefix(opt, "apparmor:") ||
+				strings.HasPrefix(opt, "label=") || strings.HasPrefix(opt, "label:"):
+				// The guest has neither AppArmor nor SELinux: like Docker on
+				// such a host (Docker Desktop too), the options are no-ops.
+				// kind, FUSE images and devcontainers pass them routinely.
+			case opt == "systempaths=unconfined" || opt == "systempaths:unconfined":
+				opts = append(opts, func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+					if s.Linux != nil {
+						s.Linux.MaskedPaths, s.Linux.ReadonlyPaths = nil, nil
+					}
+					return nil
+				})
 			default:
-				if strings.HasPrefix(opt, "apparmor=") {
-					return nil, fmt.Errorf("security-opt %q: no AppArmor in the anvil guest", opt)
-				}
-				if strings.HasPrefix(opt, "label=") {
-					return nil, fmt.Errorf("security-opt %q: no SELinux in the anvil guest", opt)
-				}
 				return nil, fmt.Errorf("security-opt %q is not supported by anvil", opt)
 			}
 		}
@@ -841,7 +875,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		return "", nil, perr
 	}
 
-	mounts, vols, volMounts, merr := computeContainerMounts(ns, id, req)
+	mounts, vols, volMounts, subpaths, merr := computeContainerMounts(ns, id, req)
 	if merr != nil {
 		return "", nil, merr
 	}
@@ -908,6 +942,8 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		Networks:         append([]string{effectiveNetworkName(req.HostConfig.NetworkMode)}, secondaryNetworksFromCreate(req)...),
 		Aliases:          requestedNetworkAliases(req),
 		NetworkAliases:   requestedNetworkAliasesByNetwork(req),
+		NetworkIPs:       requestedNetworkIPs(req),
+		SubpathMounts:    subpaths,
 		TTY:              req.Tty,
 		AutoRemove:       req.HostConfig.AutoRemove,
 		OpenStdin:        req.OpenStdin,
@@ -1129,4 +1165,131 @@ func resolvConfContent(base string, dns, search, options []string) string {
 		return ""
 	}
 	return strings.Join(out, "\n") + "\n"
+}
+
+// volumeSubpath resolves --mount type=volume,volume-subpath=<p> inside the
+// volume's directory; the path must exist and stay inside the volume, as
+// Docker requires.
+func volumeSubpath(volDir, sub string) (string, error) {
+	clean := filepath.Clean("/" + sub)
+	dir := filepath.Join(volDir, clean)
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("volume subpath %q: %w", sub, err)
+	}
+	base, err := filepath.EvalSymlinks(volDir)
+	if err != nil {
+		return "", err
+	}
+	if real != base && !strings.HasPrefix(real, base+"/") {
+		return "", fmt.Errorf("volume subpath %q escapes the volume", sub)
+	}
+	return real, nil
+}
+
+// requestedNetworkIPs collects the static addresses asked for per network
+// (`--ip`, compose ipv4_address); they used to be dropped silently.
+func requestedNetworkIPs(req dockerCreateRequest) map[string]string {
+	if req.NetworkingConfig == nil {
+		return nil
+	}
+	out := map[string]string{}
+	for name, ep := range req.NetworkingConfig.EndpointsConfig {
+		if ep.IPAMConfig != nil && ep.IPAMConfig.IPv4Address != "" {
+			out[effectiveNetworkName(name)] = ep.IPAMConfig.IPv4Address
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// staticIPFor returns the requested static address of a container on a
+// network ("" for none).
+func staticIPFor(ns, id, network string) string {
+	if meta, err := loadContainerMeta(ns, id); err == nil {
+		return meta.NetworkIPs[network]
+	}
+	return ""
+}
+
+// macPathInVM maps a bind source given as the Mac sees it to the VM path
+// of the share holding it: on macOS /tmp and /var are symlinks into
+// /private, which the VM mounts at /private/tmp and /private/var/folders.
+// A source outside those shares stays as given.
+func macPathInVM(src string) string {
+	for _, alias := range []struct{ mac, vm string }{
+		{"/tmp", "/private/tmp"},
+		{"/var/folders", "/private/var/folders"},
+	} {
+		if src != alias.mac && !strings.HasPrefix(src, alias.mac+"/") {
+			continue
+		}
+		if isMountpoint(alias.vm) {
+			return alias.vm + strings.TrimPrefix(src, alias.mac)
+		}
+	}
+	return src
+}
+
+// ensureBindSource creates a missing -v source directory the way Docker
+// does, but only on a Mac share: a path whose nearest existing ancestor is
+// the guest's RAM rootfs is a Mac directory anvil does not share, and
+// creating it would hand the container an empty directory that vanishes at
+// the next boot.
+func ensureBindSource(src string) error {
+	if _, err := os.Stat(src); err == nil {
+		return nil
+	}
+	var root syscall.Stat_t
+	if err := syscall.Stat("/", &root); err != nil {
+		return os.MkdirAll(src, 0o755)
+	}
+	for dir := filepath.Dir(src); ; dir = filepath.Dir(dir) {
+		var st syscall.Stat_t
+		if syscall.Stat(dir, &st) == nil {
+			if st.Dev == root.Dev {
+				return fmt.Errorf("mounts denied: the path %s is not shared from the Mac "+
+					"(anvil shares /Users, and /Volumes, /tmp, /var/folders unless ANVIL_SHARE_EXTRA says otherwise)", src)
+			}
+			return os.MkdirAll(src, 0o755)
+		}
+		if dir == "/" {
+			return os.MkdirAll(src, 0o755)
+		}
+	}
+}
+
+// isMountpoint reports whether path is the root of a mount (its device
+// differs from its parent's).
+func isMountpoint(path string) bool {
+	var st, parent syscall.Stat_t
+	if syscall.Stat(path, &st) != nil || syscall.Stat(filepath.Dir(path), &parent) != nil {
+		return false
+	}
+	return st.Dev != parent.Dev
+}
+
+// subpathMount is a volume-subpath mount as resolved at create; every start
+// checks the path still resolves there (a container with write access to
+// the volume could have swapped a component for a symlink meanwhile).
+type subpathMount struct {
+	VolumeDir string `json:"VolumeDir"`
+	Subpath   string `json:"Subpath"`
+	Source    string `json:"Source"`
+}
+
+// verifySubpathMounts re-resolves the container's subpath mounts.
+func verifySubpathMounts(m *containerMeta) error {
+	for _, sp := range m.SubpathMounts {
+		got, err := volumeSubpath(sp.VolumeDir, sp.Subpath)
+		if err != nil {
+			return err
+		}
+		if got != sp.Source {
+			return fmt.Errorf("volume subpath %q changed since create (now %s); refusing to start", sp.Subpath, got)
+		}
+	}
+	return nil
 }

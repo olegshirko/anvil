@@ -76,11 +76,15 @@ type containerMeta struct {
 	// --alias, compose per-network aliases). Aliases above is the legacy
 	// flat list, used for a network with no entry here.
 	NetworkAliases map[string][]string `json:"NetworkAliases,omitempty"`
-	Links          []string            `json:"Links,omitempty"`
-	TTY            bool                `json:"TTY,omitempty"`
-	AutoRemove     bool                `json:"AutoRemove,omitempty"`
-	OpenStdin      bool                `json:"OpenStdin,omitempty"`
-	StdinOnce      bool                `json:"StdinOnce,omitempty"`
+	// NetworkIPs are requested static IPv4 addresses per network.
+	NetworkIPs map[string]string `json:"NetworkIPs,omitempty"`
+	// SubpathMounts are volume-subpath mounts, re-checked at every start.
+	SubpathMounts []subpathMount `json:"SubpathMounts,omitempty"`
+	Links         []string       `json:"Links,omitempty"`
+	TTY           bool           `json:"TTY,omitempty"`
+	AutoRemove    bool           `json:"AutoRemove,omitempty"`
+	OpenStdin     bool           `json:"OpenStdin,omitempty"`
+	StdinOnce     bool           `json:"StdinOnce,omitempty"`
 	// ConfigUser is inspect's Config.User: --user, else the image's USER
 	// (devcontainers pick the remote user from it).
 	ConfigUser string `json:"ConfigUser,omitempty"`
@@ -91,8 +95,14 @@ type containerMeta struct {
 	ExposedPorts []string `json:"ExposedPorts,omitempty"`
 	// StartedAt/FinishedAt are the last run's start and exit (docker ps
 	// "Up 5 minutes", inspect State).
-	StartedAt        time.Time          `json:"StartedAt,omitzero"`
-	FinishedAt       time.Time          `json:"FinishedAt,omitzero"`
+	StartedAt  time.Time `json:"StartedAt,omitzero"`
+	FinishedAt time.Time `json:"FinishedAt,omitzero"`
+	// ExitCode is the last run's exit code (an exited container keeps it
+	// across a cold boot, when its task is gone).
+	ExitCode int `json:"ExitCode,omitempty"`
+	// UserStopped records a docker stop/kill: unless-stopped containers are
+	// not started again at boot after one.
+	UserStopped      bool               `json:"UserStopped,omitempty"`
 	StopSignal       string             `json:"StopSignal,omitempty"`
 	StopTimeout      *int               `json:"StopTimeout,omitempty"`
 	User             string             `json:"User,omitempty"` // create-time --user, for commit
@@ -184,6 +194,10 @@ func loadContainerMeta(ns, id string) (*containerMeta, error) {
 
 // deleteContainerMeta removes the whole per-container metadata directory.
 func deleteContainerMeta(ns, id string) {
+	// Under the update lock too: an update in flight (an exit recording
+	// FinishedAt) would otherwise write the file back after the removal.
+	metaUpdateMu.Lock()
+	defer metaUpdateMu.Unlock()
 	metaMu.Lock()
 	defer metaMu.Unlock()
 	os.RemoveAll(containerMetaDir(ns, id))

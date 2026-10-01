@@ -114,7 +114,7 @@ func setupHostLoopback() {
 		}
 	}
 	hostLoopbackReady.Store(true)
-	go serveHostLoopback(ln)
+	goSafe("host-loopback", func() { serveHostLoopback(ln) })
 }
 
 // hostLoopbackRules are the nat-table rules (without -A/-C) steering
@@ -156,7 +156,7 @@ func serveHostLoopback(ln net.Listener) {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go handleHostLoopbackClient(conn)
+		goSafe("host-loopback-conn", func() { handleHostLoopbackClient(conn) })
 	}
 }
 

@@ -18,11 +18,16 @@ var volumeRoutes = []apiRoute{
 
 func handleVolumesList(w http.ResponseWriter, r *http.Request, _ routeParams) {
 	filters := parseDockerFilters(r.URL.Query().Get("filters"))
+	if err := validateFilterKeys(filters, volumeFilterKeys); err != nil {
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
 	volumes, err := listDockerVolumes(r.Context(), filters)
 	if err != nil {
 		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
+	volumes = filterVolumes(r.Context(), volumes, filters)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(dockerVolumeList{Volumes: volumes})
 }

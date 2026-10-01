@@ -96,11 +96,12 @@ func updateDockerContainer(ctx context.Context, ref string, req dockerUpdateRequ
 	}
 
 	if meta != nil {
-		if meta.HostConfig == nil {
-			meta.HostConfig = &dockerHostConfig{}
-		}
-		mergeHostConfigUpdate(meta.HostConfig, req)
-		if err := saveContainerMeta(meta); err != nil {
+		if err := updateContainerMeta(ns, cid, func(m *containerMeta) {
+			if m.HostConfig == nil {
+				m.HostConfig = &dockerHostConfig{}
+			}
+			mergeHostConfigUpdate(m.HostConfig, req)
+		}); err != nil {
 			return nil, err
 		}
 	}

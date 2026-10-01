@@ -124,6 +124,10 @@ func releaseEndpoints(ctx context.Context, ns, id string, ni containerNetInfo, p
 	for _, e := range ni.Extra {
 		fast = fast && !networkUsesPluginMasq(e.Network)
 	}
+	// Containers that joined this one's netns (--network container:) keep
+	// it alive: the kernel would not remove the veth, so it must be the
+	// plugin's DEL.
+	fast = fast && !hasNetworkJoiners(ns, id)
 	if fast {
 		releaseNamedNetNS(id)
 	}
@@ -240,7 +244,7 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 		if aerr != nil {
 			return fmt.Errorf("cni attach: %w", aerr)
 		}
-		extra, xerr := attachSecondaryNetworks(ctx, id, meta.Networks[1:])
+		extra, xerr := attachSecondaryNetworks(ctx, ns, id, meta.Networks[1:])
 		if xerr != nil {
 			dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports) //nolint:errcheck
@@ -280,6 +284,18 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 	// TTY tasks need Terminal set in the IO config: the shim then allocates
 	// the pty itself (runc refuses a terminal spec with no console socket
 	// otherwise) and duplicates the console output into the log URI.
+	if meta != nil {
+		if verr := verifySubpathMounts(meta); verr != nil {
+			err = verr
+			return err
+		}
+	}
+	if meta != nil && meta.HostConfig != nil {
+		if jerr := joinContainerNamespaces(nsCtx, c, meta.HostConfig.PidMode, meta.HostConfig.IpcMode); jerr != nil {
+			err = jerr
+			return err
+		}
+	}
 	tty := getContainerTTY(dockerID(ns, id))
 	var taskIO cio.IO = &logOnlyIO{uri: uri, terminal: tty}
 	var stopLogger func()
@@ -370,14 +386,17 @@ func watchTaskExit(ctx context.Context, ns, id, netName string, ports []cniPortM
 		debugLog("[runtime] task %s/%s exited code=%d (superseded run)", ns, truncateID(id), code)
 		return
 	}
-	updateContainerMeta(ns, id, func(m *containerMeta) { //nolint:errcheck
-		m.FinishedAt = time.Now().UTC()
-	})
 	// docker kill caches the mapped 137 before the task dies; containerd
 	// often reports 0 for signal deaths, so do not overwrite it.
+	final := code
 	if cached, ok := peekContainerExitCode(did); !ok || code != 0 || cached == 0 {
 		cacheContainerExitCode(did, code)
+	} else {
+		final = cached
 	}
+	updateContainerMeta(ns, id, func(m *containerMeta) { //nolint:errcheck
+		m.FinishedAt, m.ExitCode = time.Now().UTC(), final
+	})
 	stopHealthCheck(did)
 
 	if !usesHostNetworkName(netName) {
@@ -441,7 +460,9 @@ func taskHasExited(ctx context.Context, task client.Task) (bool, int) {
 // stopNativeTask sends the configured stop signal and escalates to SIGKILL
 // after the grace timeout. The (stopped) task record is kept for status
 // reporting until the container is started again or deleted.
-func stopNativeTask(ctx context.Context, ns, id string, timeoutSec int) error {
+// stopNativeTask stops the task with signal (docker stop -s), else the
+// container's stop signal, else SIGTERM; SIGKILL after timeoutSec.
+func stopNativeTask(ctx context.Context, ns, id string, timeoutSec int, signal string) error {
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd client: %w", err)
@@ -468,6 +489,11 @@ func stopNativeTask(ctx context.Context, ns, id string, timeoutSec int) error {
 	sig := syscall.SIGTERM
 	if meta, merr := loadContainerMeta(ns, id); merr == nil && meta.StopSignal != "" {
 		if s, ok := signalValue(meta.StopSignal); ok {
+			sig = s
+		}
+	}
+	if signal != "" {
+		if s, ok := signalValue(signal); ok {
 			sig = s
 		}
 	}
@@ -704,6 +730,12 @@ func runSimpleExec(ctx context.Context, ns, id string, argv []string, user, cwd 
 // the cio copiers via IO().Wait, then close the parent write ends so the
 // pipe readers see EOF.
 func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user, cwd string, stdin []byte, timeout time.Duration) (*simpleExecResult, error) {
+	return runSimpleExecEnv(ctx, ns, id, argv, user, cwd, nil, stdin, timeout)
+}
+
+// runSimpleExecEnv is runSimpleExecStdin with extra environment entries on
+// top of the container's; a negative timeout means none (docker exec -d).
+func runSimpleExecEnv(ctx context.Context, ns, id string, argv []string, user, cwd string, extraEnv []string, stdin []byte, timeout time.Duration) (*simpleExecResult, error) {
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("containerd client: %w", err)
@@ -719,14 +751,16 @@ func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user,
 	}
 
 	u := execUserFor(nsCtx, c, user)
+	env, ctrCwd := containerProcessDefaults(nsCtx, c)
+	env = mergeEnv(env, extraEnv)
 	pspec := &specs.Process{
 		Args: argv,
-		Env:  []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+		Env:  env,
 		Cwd:  cwd,
 		User: u,
 	}
 	if pspec.Cwd == "" {
-		pspec.Cwd = "/"
+		pspec.Cwd = ctrCwd
 	}
 
 	execID := newContainerID()[:32]
@@ -753,16 +787,21 @@ func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user,
 		stderrR.Close()
 		return nil, err
 	}
-	if timeout <= 0 {
+	if timeout < 0 {
+		timeout = 100 * 365 * 24 * time.Hour // detached: runs until it exits
+	} else if timeout == 0 {
 		timeout = 30 * time.Second
 	}
 
+	detached := timeout > 30*24*time.Hour
 	var outBuf, errBuf strings.Builder
 	readAll := func(r *os.File, sb *strings.Builder, done chan struct{}) {
 		buf := make([]byte, 32*1024)
 		for {
 			n, rerr := r.Read(buf)
-			if n > 0 {
+			// A detached exec's output has no reader: buffering it grew
+			// the agent without bound (docker exec -d c yes).
+			if n > 0 && !detached {
 				sb.Write(buf[:n])
 			}
 			if rerr != nil {
@@ -906,4 +945,87 @@ func removableAnonymousVolumes(ns string, meta *containerMeta) []volumeRef {
 		}
 	}
 	return out
+}
+
+// defaultExecPath is the PATH of a container whose spec has none.
+const defaultExecPath = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+// containerProcessDefaults returns the environment and working directory
+// an exec in the container inherits, as with Docker: the container's own
+// (image ENV, -e, WORKDIR, -w). Execs and healthcheck probes used to run
+// with PATH only in "/", so `docker exec db psql -U $POSTGRES_USER` and
+// healthchecks reading the container's variables failed.
+func containerProcessDefaults(nsCtx context.Context, c client.Container) ([]string, string) {
+	env, cwd := []string{defaultExecPath}, "/"
+	spec, err := c.Spec(nsCtx)
+	if err != nil || spec == nil || spec.Process == nil {
+		return env, cwd
+	}
+	env = mergeEnv(env, spec.Process.Env)
+	if spec.Process.Cwd != "" {
+		cwd = spec.Process.Cwd
+	}
+	return env, cwd
+}
+
+// hasNetworkJoiners reports whether any container runs in this container's
+// network namespace (--network container:<it>).
+func hasNetworkJoiners(ns, id string) bool {
+	metas, err := containerMetas()
+	if err != nil {
+		return true // unknown: take the safe, slower path
+	}
+	mode := "container:" + dockerID(ns, id)
+	for _, m := range metas {
+		if len(m.Networks) > 0 && m.Networks[0] == mode {
+			return true
+		}
+	}
+	return false
+}
+
+// joinContainerNamespaces points the spec's PID/IPC namespaces at the
+// running task of the container named by --pid / --ipc container:<x>. It
+// runs at every start: the target's namespaces belong to its current run.
+func joinContainerNamespaces(ctx context.Context, c client.Container, pidMode, ipcMode string) error {
+	paths := map[specs.LinuxNamespaceType]string{}
+	for typ, mode := range map[specs.LinuxNamespaceType]string{specs.PIDNamespace: pidMode, specs.IPCNamespace: ipcMode} {
+		ref, ok := strings.CutPrefix(mode, "container:")
+		if !ok {
+			continue
+		}
+		tns, tid, _, err := resolveDockerID(ctx, ref)
+		if err != nil {
+			return errConflict("cannot join %s namespace of %s: %v", typ, ref, err)
+		}
+		pid, running := containerTaskRootPid(ctx, tns, tid)
+		if !running {
+			return errConflict("cannot join %s namespace of a non running container: %s", typ, ref)
+		}
+		name := map[specs.LinuxNamespaceType]string{specs.PIDNamespace: "pid", specs.IPCNamespace: "ipc"}[typ]
+		paths[typ] = fmt.Sprintf("/proc/%d/ns/%s", pid, name)
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	spec, err := c.Spec(ctx)
+	if err != nil {
+		return err
+	}
+	if spec.Linux == nil {
+		spec.Linux = &specs.Linux{}
+	}
+	for typ, path := range paths {
+		found := false
+		for i := range spec.Linux.Namespaces {
+			if spec.Linux.Namespaces[i].Type == typ {
+				spec.Linux.Namespaces[i].Path = path
+				found = true
+			}
+		}
+		if !found {
+			spec.Linux.Namespaces = append(spec.Linux.Namespaces, specs.LinuxNamespace{Type: typ, Path: path})
+		}
+	}
+	return c.Update(ctx, client.UpdateContainerOpts(client.WithSpec(spec)))
 }

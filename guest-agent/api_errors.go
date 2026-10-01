@@ -24,6 +24,11 @@ func errConflict(format string, args ...any) error {
 	return &apiError{status: http.StatusConflict, msg: fmt.Sprintf(format, args...)}
 }
 
+// errInvalid is a 400: the request asks for something anvil cannot do.
+func errInvalid(format string, args ...any) error {
+	return &apiError{status: http.StatusBadRequest, msg: fmt.Sprintf(format, args...)}
+}
+
 func errNotModified(format string, args ...any) error {
 	return &apiError{status: http.StatusNotModified, msg: fmt.Sprintf(format, args...)}
 }

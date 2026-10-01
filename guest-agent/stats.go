@@ -28,7 +28,7 @@ type cpuSample struct {
 // clockTicks is USER_HZ, the unit of /proc/stat (100 on Linux).
 const clockTicks = 100
 
-func handleContainerStats(ctx context.Context, w http.ResponseWriter, id string, stream bool) {
+func handleContainerStats(ctx context.Context, w http.ResponseWriter, id string, stream, oneShot bool) {
 	w.Header().Set("Content-Type", "application/json")
 	ns, containerdID, name, err := resolveDockerID(ctx, id)
 	if err != nil {
@@ -44,6 +44,12 @@ func handleContainerStats(ctx context.Context, w http.ResponseWriter, id string,
 		return containerStats(pid, did, name, prev)
 	}
 	enc := json.NewEncoder(w)
+	if !stream && oneShot {
+		// one-shot: no second sample, no precpu (dockerd's semantics).
+		reading, _ := sample(nil)
+		enc.Encode(reading)
+		return
+	}
 	if !stream {
 		// Like dockerd: a single reading still carries a precpu sample
 		// taken a moment earlier, or the CLI shows 0% CPU.

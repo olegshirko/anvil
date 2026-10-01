@@ -67,7 +67,7 @@ func copyUpVolumes(ns, id string, vms []volumeMount) error {
 	if len(todo) == 0 {
 		return nil
 	}
-	return withRootfsMount(ns, id, func(root string) error {
+	return withRootfsMount(ns, id, false, func(root string) error {
 		var errs []error
 		for _, vm := range todo {
 			if err := copyTreeBetweenRoots(root, vm.dst, vm.dir); err != nil {

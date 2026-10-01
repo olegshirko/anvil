@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 )
 
 // unsupportedHostConfig lists HostConfig fields anvil cannot honor, mapped to
@@ -16,6 +17,43 @@ var unsupportedHostConfig = map[string]string{
 	"StorageOpt":     "--storage-opt (needs project quotas on the overlay fs)",
 	"Isolation":      "--isolation (Windows containers only)",
 	"Runtime":        "--runtime (only runc exists in the guest)",
+	"DeviceRequests": "--gpus (the VM has no GPU)",
+	// The guest kernel's io controller is not set up for these.
+	"BlkioWeightDevice":    "--blkio-weight-device",
+	"BlkioDeviceReadBps":   "--device-read-bps",
+	"BlkioDeviceWriteBps":  "--device-write-bps",
+	"BlkioDeviceReadIOps":  "--device-read-iops",
+	"BlkioDeviceWriteIOps": "--device-write-iops",
+}
+
+// ignoredHostConfig are accepted but have no effect; create says so in its
+// Warnings instead of dropping them silently.
+var ignoredHostConfig = map[string]string{
+	"CgroupParent":     "--cgroup-parent is ignored: containers live under the agent's cgroup",
+	"MemorySwappiness": "--memory-swappiness is ignored (cgroup v2 has no per-container swappiness)",
+	"MaskedPaths":      "MaskedPaths is ignored: the default masked paths apply",
+	"ReadonlyPaths":    "ReadonlyPaths is ignored: the default read-only paths apply",
+	"KernelMemory":     "--kernel-memory is ignored (cgroup v2)",
+}
+
+// ignoredHostConfigWarnings lists the set fields of ignoredHostConfig.
+func ignoredHostConfigWarnings(body []byte) []string {
+	var envelope struct {
+		HostConfig map[string]json.RawMessage `json:"HostConfig"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return nil
+	}
+	var out []string
+	for field, msg := range ignoredHostConfig {
+		raw, ok := envelope.HostConfig[field]
+		if !ok || isEmptyJSON(raw) || string(trimJSONSpace(raw)) == "-1" {
+			continue
+		}
+		out = append(out, msg)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // validateHostConfig re-decodes the raw create body to spot fields the typed

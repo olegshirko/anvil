@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/config/configfile"
 	configtypes "github.com/docker/cli/cli/config/types"
 	bkclient "github.com/moby/buildkit/client"
@@ -85,7 +87,28 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 	if platform := q.Get("platform"); platform != "" {
 		frontendAttrs["platform"] = platform
 	}
-	quiet := q.Get("q") == "1" || q.Get("q") == "true"
+	if queryBool(q, "pull") {
+		frontendAttrs["image-resolve-mode"] = "pull" // docker build --pull
+	}
+	switch mode := q.Get("networkmode"); mode {
+	case "host", "none":
+		frontendAttrs["force-network-mode"] = mode
+	}
+	if hosts := buildExtraHosts(q.Get("extrahosts")); hosts != "" {
+		frontendAttrs["add-hosts"] = hosts
+	}
+	if shm := q.Get("shmsize"); shm != "" && shm != "0" {
+		frontendAttrs["shm-size"] = shm
+	}
+	var cacheImports []bkclient.CacheOptionsEntry
+	var cacheFrom []string
+	if json.Unmarshal([]byte(q.Get("cachefrom")), &cacheFrom) == nil {
+		for _, ref := range cacheFrom {
+			cacheImports = append(cacheImports, bkclient.CacheOptionsEntry{
+				Type: "registry", Attrs: map[string]string{"ref": ref}})
+		}
+	}
+	quiet := queryBool(q, "q")
 
 	// Private registries: attach the request's X-Registry-Auth credentials to
 	// the buildkit session so FROM pulls (and --push exports in the future)
@@ -118,6 +141,10 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var builtDigest string
+	// Unique per build: concurrent untagged builds must not take each
+	// other's record.
+	untaggedName := fmt.Sprintf("docker.io/anvil/untagged-build:%d", time.Now().UnixNano())
 	runBuild := func() (berr error, digestMissing bool) {
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
@@ -127,18 +154,20 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 		}
 		defer c.Close()
 
-		exports := []bkclient.ExportEntry{}
-		if len(tags) > 0 {
-			// type=image with the containerd worker writes straight into the
-			// containerd image store (namespace "default"), so `FROM` sees
-			// locally built images and no separate import step is needed.
-			exports = append(exports, bkclient.ExportEntry{
-				Type: bkclient.ExporterImage,
-				Attrs: map[string]string{
-					"name": strings.Join(tags, ","),
-				},
-			})
+		// type=image with the containerd worker writes straight into the
+		// containerd image store (namespace "default"), so `FROM` sees
+		// locally built images and no separate import step is needed. An
+		// untagged build is exported under a temporary name and renamed to
+		// its digest-only (<none>) record afterwards: Docker keeps untagged
+		// builds as dangling images, and clients use the returned ID.
+		exportNames := tags
+		if len(exportNames) == 0 {
+			exportNames = []string{untaggedName}
 		}
+		exports := []bkclient.ExportEntry{{
+			Type:  bkclient.ExporterImage,
+			Attrs: map[string]string{"name": strings.Join(exportNames, ",")},
+		}}
 
 		statusCh := make(chan *bkclient.SolveStatus)
 		done := make(chan error, 1)
@@ -176,11 +205,16 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 				"context":    ctxFS,
 				"dockerfile": dfFS,
 			},
-			Exports: exports,
-			Session: sessionAttachables,
+			Exports:      exports,
+			CacheImports: cacheImports,
+			Session:      sessionAttachables,
 		}
-		_, berr = c.Solve(ctx, nil, solveOpts, statusCh)
+		resp, serr := c.Solve(ctx, nil, solveOpts, statusCh)
+		berr = serr
 		<-done
+		if berr == nil && resp != nil {
+			builtDigest = resp.ExporterResponse["containerimage.digest"]
+		}
 
 		// Stale buildkit cache records referencing blobs removed by
 		// `docker rmi` fail with a missing-digest error; the caller prunes
@@ -212,12 +246,74 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	final, _ := json.Marshal(map[string]string{"stream": "Successfully built\r\n"})
-	w.Write(final)
-	w.Write([]byte("\n"))
-	if flusher != nil {
-		flusher.Flush()
+	if len(tags) == 0 && builtDigest != "" {
+		renameUntaggedBuild(untaggedName, builtDigest)
 	}
+	// docker-py and docker-java read the image ID from the aux message or
+	// the "Successfully built <id>" line; without it their builds failed.
+	writeJSONLine := func(v interface{}) {
+		payload, _ := json.Marshal(v)
+		w.Write(payload)
+		w.Write([]byte("\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	if builtDigest != "" {
+		writeJSONLine(map[string]interface{}{"aux": map[string]string{"ID": builtDigest}})
+		short := strings.TrimPrefix(builtDigest, "sha256:")
+		if len(short) > 12 {
+			short = short[:12]
+		}
+		writeJSONLine(map[string]string{"stream": "Successfully built " + short + "\n"})
+		for _, t := range tags {
+			writeJSONLine(map[string]string{"stream": "Successfully tagged " + t + "\n"})
+		}
+		return
+	}
+	writeJSONLine(map[string]string{"stream": "Successfully built\r\n"})
+}
+
+// renameUntaggedBuild turns the temporary record of an untagged build into
+// the digest-only <none> record (a dangling image, as Docker keeps it).
+func renameUntaggedBuild(tmpName, dgst string) {
+	ctx := namespaces.WithNamespace(context.Background(), "default")
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return
+	}
+	is := cl.ImageService()
+	tmp, err := is.Get(ctx, tmpName)
+	if err != nil {
+		return
+	}
+	defer is.Delete(ctx, tmpName) //nolint:errcheck
+	if tmp.Target.Digest.String() != dgst {
+		return // not this build's image
+	}
+	rec := tmp
+	rec.Name = "<none>@" + dgst
+	if _, err := is.Create(ctx, rec); err != nil && !errdefs.IsAlreadyExists(err) {
+		log.Printf("[build] record untagged build %s: %v", dgst, err)
+	}
+}
+
+// buildExtraHosts converts the API's extrahosts ("name:ip,…", host-gateway
+// allowed) to buildkit's add-hosts ("name=ip,…").
+func buildExtraHosts(raw string) string {
+	var out []string
+	for _, h := range strings.Split(raw, ",") {
+		h = strings.TrimSpace(h)
+		name, ip, ok := strings.Cut(h, ":")
+		if !ok || name == "" {
+			continue
+		}
+		if ip == "host-gateway" {
+			ip = desktopHostIP()
+		}
+		out = append(out, name+"="+ip)
+	}
+	return strings.Join(out, ",")
 }
 
 // buildAuthAttachable wraps request credentials in buildkit's auth session

@@ -7,6 +7,10 @@
 
 set -euo pipefail
 
+# launchd starts jobs with PATH=/usr/bin:/bin:/usr/sbin:/sbin: docker and a
+# brew-installed vz-runner live elsewhere.
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -37,6 +41,19 @@ if [[ -f "$PROJECT_ROOT/Package.swift" ]]; then
     SHARE_ROOT="${SHARE_ROOT:-$PROJECT_ROOT}"
 else
     SHARE_ROOT="${SHARE_ROOT:-$STATE_DIR}"
+fi
+# Settings from ~/.anvil-vz/config (KEY=VALUE) for whatever the environment
+# leaves unset — a LaunchAgent sees no shell variables, and `anvil start`
+# reads the same file, so both start paths boot the same VM config.
+if [[ -f "$STATE_DIR/config" ]]; then
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        key="${key#export }"
+        key="${key//[[:space:]]/}"
+        [[ "$key" =~ ^ANVIL_[A-Z_]+$ ]] || continue
+        [[ -n "${!key:-}" ]] && continue
+        value="${value%\"}"; value="${value#\"}"; value="${value%\'}"; value="${value#\'}"
+        export "$key=$value"
+    done < "$STATE_DIR/config"
 fi
 MEMORY_GB="${ANVIL_MEMORY:-2}"
 CPUS="${ANVIL_CPUS:-}"
@@ -102,6 +119,7 @@ LOG_FILE="$STATE_DIR/daemon.log"
 LAUNCHAGENT_LOG="$STATE_DIR/launchagent.log"
 
 mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"  # snapshots hold VM memory
 
 # Warn if the user's shell proxy settings will route localhost traffic away from
 # the vz-runner listeners. The service itself is unaffected, but `docker`/`curl`
@@ -125,7 +143,10 @@ is_running() {
     if [[ -f "$PID_FILE" ]]; then
         local pid
         pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        # The pid must still be a vz-runner: a stale file (the daemon died
+        # with the Mac) can name a reused pid we must not signal.
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && \
+           [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == *vz-runner ]]; then
             return 0
         fi
     fi
@@ -205,6 +226,10 @@ cmd_start() {
     else
         rm -f "$SHARE_ROOT/.anvil-debug"
     fi
+    # The log is appended across starts: keep it bounded (10 MB, one old copy).
+    if [[ -f "$LOG_FILE" ]] && (( $(stat -f %z "$LOG_FILE" 2>/dev/null || echo 0) > 10485760 )); then
+        mv -f "$LOG_FILE" "$LOG_FILE.1"
+    fi
     nohup "$VZRUNNER_BIN" daemon \
         --kernel "$KERNEL_PATH" \
         --initrd "$INITRD_PATH" \
@@ -227,7 +252,14 @@ cmd_start() {
         sleep 0.1
     done
 
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "[anvil-service] ready (pid $(cat "$PID_FILE")); docker CLI not found, context not switched"
+        return 0
+    fi
     echo "[anvil-service] switching docker context to anvil..."
+    if ! docker context inspect anvil >/dev/null 2>&1; then
+        docker context create anvil --docker "host=unix://$STATE_DIR/docker.sock" >/dev/null
+    fi
     docker context use anvil >/dev/null
 
     # Point buildx at the in-VM buildkitd via the remote driver so plain
@@ -235,7 +267,7 @@ cmd_start() {
     # builder is saved and restored on stop (same pattern as docker context).
     if command -v docker >/dev/null && docker buildx version >/dev/null 2>&1; then
         local current_builder
-        current_builder="$(docker buildx inspect 2>/dev/null | sed -n 's/^Name:\s*//p' | head -1)"
+        current_builder="$(docker buildx inspect 2>/dev/null | sed -n 's/^Name:[[:space:]]*//p' | head -1)"
         if [[ "$current_builder" != "anvil-remote" ]]; then
             echo "${current_builder:-default}" > "$STATE_DIR/previous-buildx-builder"
         fi
@@ -271,6 +303,20 @@ cmd_stop() {
         rm -f "$PID_FILE"
     fi
 
+    command -v docker >/dev/null 2>&1 || return 0
+    # Restore the previously selected buildx builder if we switched it —
+    # first: buildx keeps its selection per docker context.
+    local current_builder
+    current_builder="$(docker buildx inspect 2>/dev/null | sed -n 's/^Name:[[:space:]]*//p' | head -1)"
+    if [[ "$current_builder" == "anvil-remote" ]]; then
+        local prev_builder="default"
+        if [[ -f "$STATE_DIR/previous-buildx-builder" ]]; then
+            prev_builder="$(tr -d '[:space:]' < "$STATE_DIR/previous-buildx-builder")"
+        fi
+        docker buildx use "$prev_builder" >/dev/null 2>&1 || true
+        rm -f "$STATE_DIR/previous-buildx-builder"
+    fi
+
     local current_context
     current_context="$(docker context show 2>/dev/null || echo default)"
     if [[ "$current_context" == "anvil" ]]; then
@@ -281,18 +327,6 @@ cmd_stop() {
         echo "[anvil-service] restoring docker context to $target..."
         docker context use "$target" >/dev/null 2>&1 || true
         rm -f "$PREV_CONTEXT_FILE"
-    fi
-
-    # Restore the previously selected buildx builder if we switched it.
-    local current_builder
-    current_builder="$(docker buildx inspect 2>/dev/null | sed -n 's/^Name:\s*//p' | head -1)"
-    if [[ "$current_builder" == "anvil-remote" ]]; then
-        local prev_builder="default"
-        if [[ -f "$STATE_DIR/previous-buildx-builder" ]]; then
-            prev_builder="$(cat "$STATE_DIR/previous-buildx-builder")"
-        fi
-        docker buildx use "$prev_builder" >/dev/null 2>&1 || true
-        rm -f "$STATE_DIR/previous-buildx-builder"
     fi
 }
 

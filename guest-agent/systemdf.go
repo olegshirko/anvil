@@ -96,6 +96,13 @@ func imageSizeOf(images []dockerImageSummary, id string) int64 {
 	return 0
 }
 
+// containerSizes is docker ps -s: the writable layer, and that plus the
+// image.
+func containerSizes(ctx context.Context, did, imageID string, images []dockerImageSummary) (rw, rootfs int64) {
+	rw = containerRWSize(ctx, did)
+	return rw, rw + imageSizeOf(images, imageID)
+}
+
 // containerRWSize is the size of the container's writable layer.
 func containerRWSize(ctx context.Context, did string) int64 {
 	ns, cid, _, err := resolveDockerID(ctx, did)

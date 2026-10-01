@@ -76,6 +76,12 @@ func openContainerStdin(ns, id string, forNextRun bool) (*containerStdin, error)
 	if cs.path != "" && cs.f != nil && !(forNextRun && cs.taskOpen) {
 		return cs, nil
 	}
+	if !forNextRun && cs.taskOpen && cs.f == nil {
+		// The running task's stdin was closed (StdinOnce): a later attach
+		// gets none, as with Docker. A fresh FIFO here would be one no shim
+		// reads, and would hand its input to the next run.
+		return nil, nil
+	}
 	if cs.path == "" || cs.taskOpen {
 		if cs.f != nil {
 			cs.f.Close()

@@ -192,13 +192,14 @@ func serveEgressProxy() {
 		log.Printf("[egress] listen %s: %v (buildkit registry traffic stays direct)", egressProxyAddr, err)
 		return
 	}
+	defer ln.Close() // a restart after a panic binds again
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go handleEgressProxyClient(conn, dialOut)
+		goSafe("egress-conn", func() { handleEgressProxyClient(conn, dialOut) })
 	}
 }
 

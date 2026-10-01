@@ -216,9 +216,20 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 		}
 		opts = append(opts, cniclient.WithCapabilityPortMap(pms))
 	}
+	// A static address: host-local takes it from CNI_ARGS IP.
+	if ip := staticIPFor(ns, id, netName); ip != "" {
+		opts = append(opts, cniclient.WithArgs("IgnoreUnknown", "1"), cniclient.WithArgs("IP", ip))
+	}
 	res, err := c.Setup(ctx, id, netnsPath, opts...)
 	if err != nil {
 		return "", "", fmt.Errorf("cni setup %s: %w", netName, err)
+	}
+	// The firewall plugin may just have put its CNI-FORWARD jump (which
+	// accepts the container's traffic) above the isolation rules.
+	if cl, err := readNetworkConflist(netName); err == nil && cl.Internal {
+		if err := ensureInternalIsolation(cl); err != nil {
+			log.G(ctx).WithError(err).Warnf("[cni] isolation rules for %s", netName)
+		}
 	}
 	ip, mac := resultAddresses(res)
 	log.G(ctx).WithField("network", netName).Debugf("[cni] %s attached ip=%s", id[:12], ip)
@@ -304,7 +315,7 @@ var extraCNI = cnilibrary.NewCNIConfig([]string{cniBinDir}, &invoke.DefaultExec{
 	PluginDecoder: version.PluginDecoder{},
 })
 
-func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName string) (string, string, error) {
+func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName, staticIP string) (string, string, error) {
 	conflist, err := findConflistForNetwork(netName)
 	if err != nil {
 		return "", "", err
@@ -314,6 +325,9 @@ func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName stri
 		return "", "", fmt.Errorf("cni config %s: %w", netName, err)
 	}
 	rt := &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: ifName}
+	if staticIP != "" {
+		rt.Args = [][2]string{{"IgnoreUnknown", "1"}, {"IP", staticIP}}
+	}
 	raw, err := extraCNI.AddNetworkList(ctx, list, rt)
 	if err != nil {
 		// A failed ADD may leave a veth or an IPAM lease behind; the CNI
@@ -404,8 +418,10 @@ func ensureNamedNetNS(name string) error {
 
 // networkConflist is the part of a conflist teardown decisions need.
 type networkConflist struct {
-	Plugins []struct {
+	Internal bool `json:"anvilInternal"`
+	Plugins  []struct {
 		Type   string `json:"type"`
+		Bridge string `json:"bridge"`
 		IPMasq bool   `json:"ipMasq"`
 		IPAM   struct {
 			Ranges [][]struct {
@@ -472,6 +488,9 @@ func ensureNetworkMasquerade(netName string) error {
 	if err != nil {
 		return err
 	}
+	if cl.Internal {
+		return ensureInternalIsolation(cl)
+	}
 	for _, p := range cl.Plugins {
 		if p.Type == "bridge" && p.IPMasq {
 			return nil // the plugin masquerades itself
@@ -496,4 +515,89 @@ func removeNetworkMasquerade(netName string) {
 		args := append([]string{rule[0], rule[1], "-D"}, rule[2:]...)
 		exec.Command("iptables", args...).Run() //nolint:errcheck — best effort
 	}
+	if cl.Internal {
+		isolationMu.Lock()
+		defer isolationMu.Unlock()
+		bridge := networkBridge(cl)
+		for _, rule := range append(isolationRules(bridge), internalInputRule(bridge)) {
+			deleteIptablesRuleAll(rule)
+		}
+	}
+}
+
+// deleteIptablesRuleAll removes every copy of rule (best effort).
+func deleteIptablesRuleAll(rule []string) {
+	args := append([]string{rule[0], rule[1], "-D"}, rule[2:]...)
+	for i := 0; i < 8; i++ {
+		if exec.Command("iptables", args...).Run() != nil {
+			return
+		}
+	}
+}
+
+// isolationMu serializes isolation rule changes: two starts reordering at
+// once could leave duplicates that outlive the network.
+var isolationMu sync.Mutex
+
+// internalInputRule keeps an --internal network away from the Mac's
+// localhost (host.docker.internal is redirected to a guest-local proxy,
+// which FORWARD rules never see).
+func internalInputRule(bridge string) []string {
+	return []string{"-t", "filter", "INPUT", "-i", bridge, "-p", "tcp", "--dport", hostLoopbackProxyPt,
+		"-m", "comment", "--comment", "anvil-internal " + bridge, "-j", "DROP"}
+}
+
+func networkBridge(cl *networkConflist) string {
+	for _, p := range cl.Plugins {
+		if p.Type == "bridge" {
+			return p.Bridge
+		}
+	}
+	return ""
+}
+
+// isolationRules keep an --internal network's traffic on its bridge, as
+// Docker's DOCKER-ISOLATION chains do: nothing is forwarded in or out.
+// Containers still reach each other and the VM (DNS, the port proxy).
+func isolationRules(bridge string) [][]string {
+	comment := "anvil-internal " + bridge
+	return [][]string{
+		{"-t", "filter", "FORWARD", "-i", bridge, "!", "-o", bridge,
+			"-m", "comment", "--comment", comment, "-j", "DROP"},
+		{"-t", "filter", "FORWARD", "-o", bridge, "!", "-i", bridge,
+			"-m", "comment", "--comment", comment, "-j", "DROP"},
+	}
+}
+
+// ensureInternalIsolation keeps the isolation rules at the top of FORWARD,
+// ahead of the CNI plugins' ACCEPT rules (no change when they already are).
+func ensureInternalIsolation(cl *networkConflist) error {
+	bridge := networkBridge(cl)
+	if bridge == "" {
+		return fmt.Errorf("internal network without a bridge")
+	}
+	isolationMu.Lock()
+	defer isolationMu.Unlock()
+	if err := ensureIptablesRule(internalInputRule(bridge)); err != nil {
+		return err
+	}
+	out, err := exec.Command("iptables", "-t", "filter", "-S", "FORWARD").Output()
+	if err != nil {
+		return fmt.Errorf("iptables -S FORWARD: %w", err)
+	}
+	if isolationOnTop(string(out), "anvil-internal "+bridge+`"`) {
+		return nil
+	}
+	rules := isolationRules(bridge)
+	for _, rule := range rules {
+		deleteIptablesRuleAll(rule)
+	}
+	for i := len(rules) - 1; i >= 0; i-- {
+		rule := rules[i]
+		insert := append([]string{rule[0], rule[1], "-I", rule[2], "1"}, rule[3:]...)
+		if out, err := exec.Command("iptables", insert...).CombinedOutput(); err != nil {
+			return fmt.Errorf("iptables %s: %v: %s", strings.Join(insert, " "), err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
 }

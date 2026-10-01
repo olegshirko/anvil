@@ -82,7 +82,7 @@ func assignEphemeralPorts(ctx context.Context, ns, id string) (func(), error) {
 	}
 
 	if changed {
-		if err := saveContainerMeta(meta); err != nil {
+		if err := updateContainerMeta(ns, id, func(m *containerMeta) { m.Ports = meta.Ports }); err != nil {
 			return noop, fmt.Errorf("save port assignment: %w", err)
 		}
 		if err := setPortsLabel(ctx, ns, id, meta.Ports); err != nil {

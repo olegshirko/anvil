@@ -30,7 +30,6 @@ func TestParseEventFilters(t *testing.T) {
 		"event":     {"die", "stop"},
 		"container": {"web-1"},
 		"label":     {"com.docker.compose.service=web"},
-		"unknown":   {"whatever"},
 	})
 	f, err := parseEventFilters(string(listForm))
 	if err != nil {
@@ -38,6 +37,10 @@ func TestParseEventFilters(t *testing.T) {
 	}
 	if len(f.types) != 1 || len(f.events) != 2 || len(f.containers) != 1 || len(f.labels) != 1 {
 		t.Fatalf("unexpected filter contents: %+v", f)
+	}
+	// Unknown keys are rejected, as in Docker.
+	if _, err := parseEventFilters(`{"unknown":["x"]}`); err == nil {
+		t.Fatal("unknown filter key accepted")
 	}
 	setForm, _ := json.Marshal(map[string]map[string]bool{
 		"event": {"die": true, "start": true},
