@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"runtime"
 )
 
 var systemRoutes = []apiRoute{
@@ -57,14 +58,23 @@ func handlePing(w http.ResponseWriter, _ *http.Request, _ routeParams) {
 
 func handleVersion(w http.ResponseWriter, _ *http.Request, _ routeParams) {
 	w.Header().Set("Content-Type", "application/json")
+	kernel := kernelRelease()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"Version":       "24.0.0",
+		"Platform": map[string]string{"Name": "anvil " + anvilVersion},
+		"Components": []map[string]interface{}{
+			{"Name": "Engine", "Version": dockerEngineVersion, "Details": map[string]string{
+				"ApiVersion": dockerAPIVersion, "MinAPIVersion": dockerMinAPIVersion,
+				"Os": "linux", "Arch": runtime.GOARCH, "KernelVersion": kernel, "GitCommit": "anvil",
+			}},
+			{"Name": "anvil", "Version": anvilVersion, "Details": map[string]string{}},
+		},
+		"Version":       dockerEngineVersion,
 		"ApiVersion":    dockerAPIVersion,
 		"MinAPIVersion": dockerMinAPIVersion,
 		"GitCommit":     "anvil",
 		"Os":            "linux",
-		"Arch":          "arm64",
-		"KernelVersion": "",
+		"Arch":          runtime.GOARCH,
+		"KernelVersion": kernel,
 		"BuildTime":     "",
 	})
 }
@@ -74,14 +84,19 @@ func handleVersion(w http.ResponseWriter, _ *http.Request, _ routeParams) {
 func handleSystemPrune(w http.ResponseWriter, r *http.Request, _ routeParams) {
 	filters := parseDockerFilters(r.URL.Query().Get("filters"))
 	withVolumes := filters["volumes"]["true"]
-	stopped, _, _ := pruneDockerContainers(r.Context())
-	nets, _ := pruneDockerNetworks(r.Context())
+	pf, err := newPruneFilter(filters, "volumes", "dangling", "all")
+	if err != nil {
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
+	stopped, _, _ := pruneDockerContainers(r.Context(), pf)
+	nets, _ := pruneDockerNetworks(r.Context(), pf)
 	var vols []string
 	if withVolumes {
 		// system prune --volumes: anonymous unused volumes, as in Docker.
 		vols, _, _ = pruneDockerVolumes(r.Context(), nil)
 	}
-	_, reclaimed, _ := pruneDockerImages(r.Context(), false)
+	_, reclaimed, _ := pruneDockerImages(r.Context(), !(filters["all"]["true"] || filters["all"]["1"]), pf)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"ContainersDeleted": stopped,

@@ -211,7 +211,7 @@ cmd_start() {
         --share "$SHARE_ROOT" \
         --memory "$MEMORY_GB" \
         ${CPUS:+--cpus "$CPUS"} \
-        --idle 600 \
+        --idle "${ANVIL_IDLE:-600}" \
         $disk_arg \
         $debug_arg \
         >>"$LOG_FILE" 2>&1 &

@@ -223,6 +223,20 @@ enum DaemonCommand {
             guard !isShuttingDown else { return }
             isShuttingDown = true
             idleTimer?.invalidate()
+            // Idle-paused with the snapshot saved: there is nothing to save.
+            // The cache sync below runs `anvil exec`, whose control
+            // connection would resume the VM (deleting the snapshot) only
+            // to pause and save it again — and a kill in that window turned
+            // the next start into a cold boot.
+            if manager.isPausedWithSavedSnapshot {
+                print("[anvil] VM already paused and saved; exiting")
+                server?.stop()
+                dockerProxyServer?.stop()
+                buildkitProxyServer?.stop()
+                portForwarder?.stop()
+                releaseDaemonLock()
+                exit(0)
+            }
             // Sync the containerd cache and drop guest page caches *before*
             // pausing/saving the VM. With containerd on a block disk the sync
             // is a no-op, but dropping caches shrinks the memory snapshot.
@@ -264,9 +278,13 @@ enum DaemonCommand {
             let tracker = ClientTracker(
                 idleSeconds: idleSeconds,
                 scheduleIdle: { [weak self] in self?.scheduleIdleTimer() },
+                // Clients connect on their own threads; the timer belongs
+                // to the main run loop.
                 cancelIdle: { [weak self] in
-                    self?.idleTimer?.invalidate()
-                    self?.idleTimer = nil
+                    DispatchQueue.main.async {
+                        self?.idleTimer?.invalidate()
+                        self?.idleTimer = nil
+                    }
                 }
             )
             self.clientTracker = tracker
@@ -293,16 +311,7 @@ enum DaemonCommand {
             let dockerProxy = DockerProxyServer(
                 socketPath: dockerSocketPath,
                 deviceProvider: { [weak manager] in manager?.socketDevice },
-                resumeProvider: { [weak manager] in
-                    let sem = DispatchSemaphore(value: 0)
-                    manager?.ensureRunning { result in
-                        if case .failure(let error) = result {
-                            print("[docker-proxy] resume request failed: \(error)")
-                        }
-                        sem.signal()
-                    }
-                    _ = sem.wait(timeout: .now() + .seconds(15))
-                },
+                resumeProvider: blockingResume(manager, tag: "docker-proxy"),
                 debug: manager.args.debug
             )
             dockerProxy.onClientConnect = {
@@ -322,16 +331,7 @@ enum DaemonCommand {
                 socketPath: buildkitSocketPath,
                 port: buildkitAPIPort,
                 deviceProvider: { [weak manager] in manager?.socketDevice },
-                resumeProvider: { [weak manager] in
-                    let sem = DispatchSemaphore(value: 0)
-                    manager?.ensureRunning { result in
-                        if case .failure(let error) = result {
-                            print("[buildkit-proxy] resume request failed: \(error)")
-                        }
-                        sem.signal()
-                    }
-                    _ = sem.wait(timeout: .now() + .seconds(15))
-                },
+                resumeProvider: blockingResume(manager, tag: "buildkit-proxy"),
                 debug: manager.args.debug
             )
             buildkitProxy.onClientConnect = {
@@ -345,7 +345,27 @@ enum DaemonCommand {
             self.buildkitProxyServer = buildkitProxy
             print("[anvil] buildkit proxy socket: \(buildkitSocketPath)")
 
-            let forwarder = PortForwarder { [weak manager] in manager?.socketDevice }
+            let forwarder = PortForwarder(
+                deviceProvider: { [weak manager] in manager?.socketDevice },
+                resumeProvider: blockingResume(manager, tag: "port-forwarder")
+            )
+            forwarder.onClientConnect = {
+                tracker.connect()
+            }
+            forwarder.onClientDisconnect = {
+                tracker.disconnect()
+            }
+            forwarder.onRunningContainersChange = { [weak self] count in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    if count > 0 {
+                        self.idleTimer?.invalidate()
+                        self.idleTimer = nil
+                    } else if self.isIdleNow() {
+                        self.scheduleIdleTimer()
+                    }
+                }
+            }
             forwarder.start()
             self.portForwarder = forwarder
             phaseTimer.mark("ready_binds")
@@ -444,6 +464,23 @@ enum DaemonCommand {
             }
         }
 
+        /// A resume hook for the host-side proxies: wakes a paused VM (or
+        /// waits out a pause in progress) before the client is relayed.
+        /// Called on connection threads, never on main.
+        private func blockingResume(_ manager: VMLifecycleManager, tag: String) -> () -> Void {
+            return { [weak manager] in
+                guard let manager = manager else { return }
+                let sem = DispatchSemaphore(value: 0)
+                manager.ensureRunning { result in
+                    if case .failure(let error) = result {
+                        print("[\(tag)] resume request failed: \(error)")
+                    }
+                    sem.signal()
+                }
+                _ = sem.wait(timeout: .now() + .seconds(15))
+            }
+        }
+
         // MARK: - Idle handling
 
         private func scheduleIdleTimer() {
@@ -465,18 +502,22 @@ enum DaemonCommand {
             // they each block until their 20 s timeout and do nothing.
             DispatchQueue.global().async { [weak self] in
                 self?.cacheManager?.sync()
-                GuestCacheDropper.dropCaches()
+                GuestCacheDropper.dropCaches(trim: true)
                 DispatchQueue.main.async { [weak self] in
                     self?.pauseForIdle()
                 }
             }
         }
 
-        /// No control, Docker API or buildkit client is connected.
+        /// No control, Docker API, buildkit or forwarded-port client is
+        /// connected, and no container is running. Pausing with running
+        /// containers froze databases, web servers and workers whenever the
+        /// Docker CLI had been quiet for the idle interval.
         private func isIdleNow() -> Bool {
             !isShuttingDown
                 && (server?.clientsCount ?? 0) == 0
                 && (clientTracker?.isIdle ?? true)
+                && (portForwarder?.runningContainers ?? 0) == 0
         }
 
         private func pauseForIdle() {
@@ -484,7 +525,8 @@ enum DaemonCommand {
             // were dropped; its disconnect re-arms the idle timer. Control
             // connections are not rechecked: the exec children above may not
             // have been reaped from clientsCount yet.
-            guard !isShuttingDown, clientTracker?.isIdle ?? true else {
+            guard !isShuttingDown, clientTracker?.isIdle ?? true,
+                  (portForwarder?.runningContainers ?? 0) == 0 else {
                 clientTracker?.suppressIdleSchedule = false
                 return
             }

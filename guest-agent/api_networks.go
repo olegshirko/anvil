@@ -22,7 +22,7 @@ func handleNetworksList(w http.ResponseWriter, r *http.Request, _ routeParams) {
 	filters := parseDockerFilters(r.URL.Query().Get("filters"))
 	networks, err := listDockerNetworks(r.Context(), filters)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -37,7 +37,7 @@ func handleNetworkCreate(w http.ResponseWriter, r *http.Request, _ routeParams) 
 	}
 	nw, err := createDockerNetwork(r.Context(), req)
 	if err != nil {
-		writeJSONError(w, errorStatus(err, http.StatusInternalServerError), err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -56,16 +56,21 @@ func handleNetworkInspect(w http.ResponseWriter, r *http.Request, p routeParams)
 
 func handleNetworkDelete(w http.ResponseWriter, r *http.Request, p routeParams) {
 	if err := removeDockerNetwork(r.Context(), p["id"]); err != nil {
-		writeJSONError(w, errorStatus(err, http.StatusInternalServerError), err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func handleNetworksPrune(w http.ResponseWriter, r *http.Request, _ routeParams) {
-	deleted, err := pruneDockerNetworks(r.Context())
+	pf, err := newPruneFilter(parseDockerFilters(r.URL.Query().Get("filters")))
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
+	deleted, err := pruneDockerNetworks(r.Context(), pf)
+	if err != nil {
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

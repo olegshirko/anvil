@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -78,6 +79,34 @@ func runJSONLogger(path string, rot logRotation) error {
 			}
 			writeStream(out, name, f)
 		}(s.name, s.fd)
+	}
+	wg.Wait()
+	return nil
+}
+
+// runFifoJSONLogger is the logger for a task the shim runs in FIFO mode
+// (stdin-attached, non-TTY containers): it reads the stream FIFOs by path and
+// exits when the shim closes them at the process exit.
+func runFifoJSONLogger(path string, rot logRotation, fifos loggerFifos) error {
+	out, err := openRotatingLog(path, rot)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	startPartialFlusher(out)
+	var wg sync.WaitGroup
+	for name, p := range map[string]string{"stdout": fifos.stdout, "stderr": fifos.stderr} {
+		wg.Add(1)
+		go func(name, p string) {
+			defer wg.Done()
+			// Blocking open: returns once the shim opens the write end.
+			f, err := os.OpenFile(p, os.O_RDONLY, 0)
+			if err != nil {
+				return
+			}
+			defer f.Close()
+			writeStream(out, name, f)
+		}(name, p)
 	}
 	wg.Wait()
 	return nil
@@ -241,6 +270,9 @@ type logReadOptions struct {
 	since      time.Time   // zero = no lower bound
 	until      time.Time   // zero = no upper bound
 	stop       func() bool // polled during follow; true ends the stream
+	// stream selects which streams are emitted (1 stdout, 2 stderr); nil
+	// emits both.
+	stream func(stream byte) bool
 	// noStopWait bounds the follow when the log file never appears and no
 	// stop condition can fire (zero = 30s production default; tests shrink it).
 	noStopWait time.Duration
@@ -267,6 +299,14 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	if opts.tail == 0 && !opts.follow {
 		return nil // docker tail=0 semantics: nothing to replay
 	}
+	if opts.stream != nil {
+		inner := emit
+		emit = func(stream byte, line []byte) {
+			if opts.stream(stream) {
+				inner(stream, line)
+			}
+		}
+	}
 	emitRecord := func(rec logLine) {
 		if !opts.since.IsZero() && rec.Time.Before(opts.since) {
 			return
@@ -287,34 +327,14 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 
 	// Replay what exists — rotated files oldest first, then the live one —
 	// keeping only the last tail records when set.
-	var data []byte
-	var liveSize int64
-	for _, p := range rotatedLogFiles(logPath) {
-		b, err := os.ReadFile(p)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				return err
-			}
-			continue
-		}
-		data = append(data, b...)
-		if p == logPath {
-			liveSize = int64(len(b))
-		}
-	}
-	var lines [][]byte
-	if len(data) > 0 {
-		lines = bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
-		if opts.tail > 0 && len(lines) > opts.tail {
-			lines = lines[len(lines)-opts.tail:]
-		}
-	}
-	for _, raw := range lines {
+	liveSize, err := replayLog(logPath, opts.tail, func(raw []byte) {
 		var rec logLine
-		if json.Unmarshal(raw, &rec) != nil {
-			continue
+		if json.Unmarshal(raw, &rec) == nil {
+			emitRecord(rec)
 		}
-		emitRecord(rec)
+	})
+	if err != nil {
+		return err
 	}
 
 	if !opts.follow {
@@ -462,4 +482,149 @@ func logInode(path string) uint64 {
 		return uint64(st.Ino)
 	}
 	return 0
+}
+
+// replayLog passes the complete records of the log (rotated files oldest
+// first, then the live one) to emit — only the last tail of them when
+// tail > 0 — without loading the files into memory: up to 300 MiB of log
+// was read and split in memory on every `docker logs`, even with --tail 10.
+// It returns the offset in the live file after the last complete record,
+// where a follow continues (an unterminated record is still being written
+// and is picked up by the follow, not lost).
+func replayLog(logPath string, tail int, emit func(raw []byte)) (int64, error) {
+	if tail == 0 {
+		// Nothing to replay (`logs --tail 0 -f`, attach without logs):
+		// a follow starts at the current end.
+		return completeLogEnd(logPath)
+	}
+	files := rotatedLogFiles(logPath)
+	if tail > 0 {
+		return replayLogTail(files, logPath, tail, emit)
+	}
+	var liveOff int64
+	for _, p := range files {
+		f, err := os.Open(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return liveOff, err
+		}
+		r := bufio.NewReaderSize(f, 64<<10)
+		var off int64
+		for {
+			line, rerr := r.ReadBytes('\n')
+			if rerr != nil {
+				break // EOF; an unterminated tail is not a complete record
+			}
+			off += int64(len(line))
+			emit(line[:len(line)-1])
+		}
+		f.Close()
+		if p == logPath {
+			liveOff = off
+		}
+	}
+	return liveOff, nil
+}
+
+// completeLogEnd returns the offset after the last complete record of the
+// live log file (0 when it does not exist yet).
+func completeLogEnd(logPath string) (int64, error) {
+	f, err := os.Open(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	_, end, err := lastLogLines(f, fi.Size(), 1)
+	return end, err
+}
+
+// replayLogTail emits the last n complete records across files, reading
+// each file backwards from its end.
+func replayLogTail(files []string, logPath string, n int, emit func(raw []byte)) (int64, error) {
+	var liveOff int64
+	var newestFirst [][]byte
+	for i := len(files) - 1; i >= 0 && len(newestFirst) < n; i-- {
+		f, err := os.Open(files[i])
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return 0, err
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return 0, err
+		}
+		lines, completeEnd, err := lastLogLines(f, fi.Size(), n-len(newestFirst))
+		f.Close()
+		if err != nil {
+			return 0, err
+		}
+		if files[i] == logPath {
+			liveOff = completeEnd
+		}
+		newestFirst = append(newestFirst, lines...)
+	}
+	for i := len(newestFirst) - 1; i >= 0; i-- {
+		emit(newestFirst[i])
+	}
+	return liveOff, nil
+}
+
+// lastLogLines returns up to want complete lines (without '\n') from the end
+// of f, newest first, plus the offset after the file's last '\n'.
+func lastLogLines(f io.ReaderAt, size int64, want int) ([][]byte, int64, error) {
+	const block = 64 << 10
+	var out [][]byte
+	var carry []byte // the not yet split bytes in [pos, completeEnd)
+	pos := size
+	completeEnd := int64(-1)
+	for pos > 0 && len(out) < want {
+		n := int64(block)
+		if pos < n {
+			n = pos
+		}
+		pos -= n
+		chunk := make([]byte, n, n+int64(len(carry)))
+		if _, err := f.ReadAt(chunk, pos); err != nil && err != io.EOF {
+			return nil, 0, err
+		}
+		carry = append(chunk, carry...)
+		if completeEnd < 0 {
+			idx := bytes.LastIndexByte(carry, '\n')
+			if idx < 0 {
+				continue
+			}
+			completeEnd = pos + int64(idx) + 1
+			carry = carry[:idx+1] // drop the unterminated tail
+		}
+		// carry ends with '\n': peel whole lines off its end, keeping the
+		// first (possibly partial) line for the next block.
+		for len(out) < want {
+			body := carry[:len(carry)-1]
+			idx := bytes.LastIndexByte(body, '\n')
+			if idx < 0 {
+				break
+			}
+			out = append(out, append([]byte(nil), body[idx+1:]...))
+			carry = carry[:idx+1]
+		}
+	}
+	if pos == 0 && completeEnd >= 0 && len(out) < want && len(carry) > 0 {
+		out = append(out, append([]byte(nil), carry[:len(carry)-1]...)) // the file's first line
+	}
+	if completeEnd < 0 {
+		completeEnd = 0
+	}
+	return out, completeEnd, nil
 }

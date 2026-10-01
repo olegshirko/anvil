@@ -150,12 +150,30 @@ func rotatedLogFiles(path string) []string {
 	return append(out, path)
 }
 
+// loggerFifos names the stream FIFOs of a logger started by the agent
+// itself (stdin-attached containers, see startFifoLogger); empty when the
+// shim spawned it with fd3/fd4.
+type loggerFifos struct {
+	stdout, stderr string
+}
+
 // loggerArgs parses the logger's argv: containerd builds it from the
 // binary-v2 URI's query map, so the flag pairs come in any order.
 func loggerArgs(args []string) (path string, rot logRotation, ok bool) {
+	path, rot, _, ok = loggerArgsFifos(args)
+	return path, rot, ok
+}
+
+func loggerArgsFifos(args []string) (path string, rot logRotation, fifos loggerFifos, ok bool) {
 	rot = logRotation{maxSize: defaultLogMaxSize, maxFile: defaultLogMaxFile}
 	for i := 0; i+1 < len(args); i++ {
 		switch args[i] {
+		case "--fifo-out":
+			fifos.stdout = args[i+1]
+			i++
+		case "--fifo-err":
+			fifos.stderr = args[i+1]
+			i++
 		case "--log-json":
 			path, ok = args[i+1], true
 			i++
@@ -171,5 +189,5 @@ func loggerArgs(args []string) (path string, rot logRotation, ok bool) {
 			i++
 		}
 	}
-	return path, rot, ok
+	return path, rot, fifos, ok
 }

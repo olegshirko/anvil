@@ -57,6 +57,9 @@ type PortMapping struct {
 // PortMapState is the full snapshot pushed to vz-runner.
 type PortMapState struct {
 	Mappings []PortMapping `json:"mappings"`
+	// RunningContainers is the number of running tasks across namespaces;
+	// the host does not idle-pause the VM while it is non-zero.
+	RunningContainers int `json:"running_containers"`
 }
 
 func main() {
@@ -69,12 +72,18 @@ func main() {
 	// binary-v2 task logger (fd3/fd4 = stdout/stderr, fd5 = ready pipe).
 	// Invoked as: guest-agent --log-json <path> [--max-size N --max-file M],
 	// the pairs in any order.
-	if path, rot, ok := loggerArgs(os.Args[1:]); ok {
-		if err := runJSONLogger(path, rot); err != nil {
+	if path, rot, fifos, ok := loggerArgsFifos(os.Args[1:]); ok {
+		run := func() error { return runJSONLogger(path, rot) }
+		if fifos.stdout != "" {
+			run = func() error { return runFifoJSONLogger(path, rot, fifos) }
+		}
+		if err := run(); err != nil {
 			log.Fatalf("log-json: %v", err)
 		}
 		return
 	}
+
+	ensureVMHostname()
 
 	if len(os.Args) > 1 && os.Args[1] == "cni-gen" {
 		ns := "default"
@@ -95,6 +104,13 @@ func main() {
 			log.Fatalf("seed-entropy: %v", err)
 		}
 		return
+	}
+
+	// has-ext4 <device>: exit 0 when the device carries an ext4 superblock,
+	// 1 when it does not, 2 when it cannot be read. stage2 formats the
+	// containerd disk only on 1 — never a disk that merely failed to mount.
+	if len(os.Args) > 2 && os.Args[1] == "has-ext4" {
+		os.Exit(hasExt4Exit(os.Args[2]))
 	}
 
 	log.Printf("listening on vsock port %d", listenPort)
@@ -118,13 +134,10 @@ func main() {
 		syncClockFromShare()
 	}()
 
-	// The cold-boot metadata cleanup in stage2 removes containers directly
-	// through the containerd API, leaving anvil metadata behind; prune it
-	// once containerd is reachable.
-	go func() {
-		time.Sleep(2 * time.Second)
-		pruneStaleContainerMeta()
-	}()
+	// Stale anvil metadata is pruned once, in runBootFinalize, before the
+	// Docker API opens. A second, timed prune here ran after it was open and
+	// could delete the metadata of a container mid-create (written before
+	// its containerd record exists).
 
 	// Boot tail moved out of stage2: wait for the containerd socket, run the
 	// stale-container cleanup and wait for the DHCP lease — after the control
@@ -143,6 +156,7 @@ func main() {
 	go periodicFstrim()
 
 	scanner := newPortScanner()
+	activeScanner = scanner
 	go scanner.run()
 
 	// Docker API server on a separate vsock port so the existing control
@@ -166,6 +180,7 @@ func main() {
 		conn, err := l.Accept()
 		if err != nil {
 			log.Printf("accept error: %v", err)
+			time.Sleep(100 * time.Millisecond) // no spin on fd exhaustion
 			continue
 		}
 		go handle(conn, scanner)

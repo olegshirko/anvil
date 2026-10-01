@@ -45,10 +45,14 @@ final class PortCheckServer: NSObject {
     }
 
     private func handle(connection: VZVirtioSocketConnection) {
-        DispatchQueue.global(qos: .utility).async { [self] in
+        // Own thread and a bounded read, like the other guest-initiated
+        // services: a guest that connects and never sends must not pin a
+        // thread of GCD's shared pool forever.
+        runGuestConnection(connection, name: "port-check") { [self] in
             let fd = connection.fileDescriptor
-            defer { connection.close() }
-            guard let request = try? decodeLengthPrefixedFD(CheckRequest.self, fd: fd) else { return }
+            guard let request = try? withReceiveTimeout(fd, seconds: guestHandshakeTimeout, {
+                try decodeLengthPrefixedFD(CheckRequest.self, fd: fd)
+            }) else { return }
             var busy: [Int] = []
             for port in request.ports where port > 0 && port <= 65535 {
                 if holdsTCP(port) { continue }

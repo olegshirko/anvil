@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,10 +12,12 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	digest "github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // Getting images into a namespace: registry pull (with auth), the
@@ -346,13 +349,18 @@ func pushDockerImage(ctx context.Context, name string, auth *registryAuth, w io.
 		img, gerr = cl.GetImage(nsCtx, name)
 	}
 	if gerr != nil {
-		return fmt.Errorf("No such image: %s", name)
+		err := fmt.Errorf("No such image: %s", name)
+		fmt.Fprintf(w, `{"errorDetail":{"message":%q},"error":%q}
+`, err.Error(), err.Error())
+		return err
 	}
 	fmt.Fprintf(w, `{"status":"Pushing %s"}
 `, name)
-	if perr := cl.Push(nsCtx, canonicalizeImageRef(name), img.Target(), authResolverOpts(auth)...); perr != nil {
-		fmt.Fprintf(w, `{"errorDetail":{"message":%q}}
-`, stripANSI(perr.Error()))
+	target := pushableTarget(nsCtx, cl.ContentStore(), img.Target())
+	if perr := cl.Push(nsCtx, canonicalizeImageRef(name), target, authResolverOpts(auth)...); perr != nil {
+		msg := stripANSI(perr.Error())
+		fmt.Fprintf(w, `{"errorDetail":{"message":%q},"error":%q}
+`, msg, msg)
 		return perr
 	}
 	fmt.Fprintf(w, `{"status":"Pushed %s"}
@@ -376,4 +384,43 @@ func pullDockerImage(ctx context.Context, image, platform string, auth *registry
 		}
 		return "", fmt.Errorf("pull failed: %w", explainEgressFailure(pullErr))
 	}
+}
+
+// pushableTarget is what `docker push` sends: the image's index when every
+// manifest it lists is present locally, otherwise (a pull fetches only this
+// machine's platform of a multi-platform image) the local platform's
+// manifest — pushing the full index failed with "content digest … not
+// found" for every tagged copy of a public image.
+func pushableTarget(ctx context.Context, cs content.Store, target ocispec.Descriptor) ocispec.Descriptor {
+	if !images.IsIndexType(target.MediaType) {
+		return target
+	}
+	data, err := content.ReadBlob(ctx, cs, target)
+	if err != nil {
+		return target
+	}
+	var idx ocispec.Index
+	if json.Unmarshal(data, &idx) != nil {
+		return target
+	}
+	complete := true
+	for _, m := range idx.Manifests {
+		if _, err := cs.Info(ctx, m.Digest); err != nil {
+			complete = false
+			break
+		}
+	}
+	if complete {
+		return target
+	}
+	matcher := defaultPlatformMatcher()
+	for _, m := range idx.Manifests {
+		if m.Platform == nil || !matcher.Match(*m.Platform) {
+			continue
+		}
+		if _, err := cs.Info(ctx, m.Digest); err == nil {
+			return m
+		}
+	}
+	return target
 }

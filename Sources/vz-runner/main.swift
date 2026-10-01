@@ -503,6 +503,8 @@ func printUsage() {
       anvil doctor
       anvil logs [daemon|console|guest]
       anvil images [list|check|request] --docker <image:tag>
+      anvil prune [-f]          remove all containers, unused images, volumes, build cache
+      anvil disk-compact        give freed containerd disk space back to macOS (stops the daemon)
       anvil docker-socket-path
       anvil --version
 
@@ -572,6 +574,10 @@ case "logs":
     cmdLogs(args: Array(arguments.dropFirst()))
 case "images":
     cmdImages(args: Array(arguments.dropFirst()))
+case "prune":
+    cmdPrune(args: Array(arguments.dropFirst()))
+case "disk-compact":
+    cmdDiskCompact()
 case "docker-socket-path":
     print(dockerSocketPath)
     exit(0)

@@ -49,7 +49,16 @@ func createNamedNetNS(name string) (string, error) {
 	errCh := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
+		// Unlock only when the thread is back in the agent's netns: a locked
+		// goroutine that exits takes its thread down with it, so a thread
+		// stuck in the new netns is discarded instead of returning to the
+		// pool, where any goroutine could inherit the wrong network.
+		inOrig := true
+		defer func() {
+			if inOrig {
+				runtime.UnlockOSThread()
+			}
+		}()
 
 		tid := unix.Gettid()
 		selfPath := fmt.Sprintf("/proc/self/task/%d/ns/net", tid)
@@ -63,19 +72,26 @@ func createNamedNetNS(name string) (string, error) {
 			errCh <- fmt.Errorf("unshare netns: %w", err)
 			return
 		}
+		inOrig = false
 		newNS, err := os.Open(selfPath)
 		if err != nil {
-			unix.Setns(int(orig.Fd()), unix.CLONE_NEWNET) //nolint:errcheck
+			if unix.Setns(int(orig.Fd()), unix.CLONE_NEWNET) == nil {
+				inOrig = true
+			}
 			errCh <- fmt.Errorf("open new netns: %w", err)
 			return
 		}
 		defer newNS.Close()
 		srcRef := fmt.Sprintf("/proc/self/fd/%d", newNS.Fd())
 		mountErr := unix.Mount(srcRef, path, "none", unix.MS_BIND, "")
-		if setnsErr := unix.Setns(int(orig.Fd()), unix.CLONE_NEWNET); setnsErr != nil && mountErr == nil {
-			errCh <- fmt.Errorf("restore netns: %w", setnsErr)
+		if setnsErr := unix.Setns(int(orig.Fd()), unix.CLONE_NEWNET); setnsErr != nil {
+			if mountErr == nil {
+				mountErr = fmt.Errorf("restore netns: %w", setnsErr)
+			}
+			errCh <- mountErr
 			return
 		}
+		inOrig = true
 		errCh <- mountErr
 	}()
 	if err := <-errCh; err != nil {
@@ -184,6 +200,9 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 	if len(ports) > 0 {
 		pms := make([]cniclient.PortMapping, 0, len(ports))
 		for _, p := range ports {
+			if p.HostPort <= 0 {
+				continue // ephemeral binding not assigned yet
+			}
 			proto := strings.ToUpper(p.Protocol)
 			if proto == "" {
 				proto = "TCP"
@@ -223,6 +242,9 @@ func detachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 	if len(ports) > 0 {
 		pms := make([]cniclient.PortMapping, 0, len(ports))
 		for _, p := range ports {
+			if p.HostPort <= 0 {
+				continue // ephemeral binding not assigned yet
+			}
 			proto := strings.ToUpper(p.Protocol)
 			if proto == "" {
 				proto = "TCP"

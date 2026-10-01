@@ -127,6 +127,9 @@ func authResolverOpts(a *registryAuth) []client.RemoteOpt {
 	resolver := docker.NewResolver(docker.ResolverOptions{
 		Hosts: docker.ConfigureDefaultRegistries(
 			docker.WithClient(authHTTPClient),
+			// Loopback registries speak plain HTTP, as Docker assumes
+			// (registry:2 on localhost:5000, kind/k3d registries).
+			docker.WithPlainHTTP(docker.MatchLocalhost),
 			docker.WithAuthorizer(docker.NewDockerAuthorizer(authOpts...)),
 		),
 	})

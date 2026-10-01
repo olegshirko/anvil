@@ -6,6 +6,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -32,7 +33,10 @@ var containerRoutes = []apiRoute{
 		handleContainerTop(r.Context(), w, p["id"])
 	}),
 	newRoute(http.MethodGet, "/containers/:id/stats", func(w http.ResponseWriter, r *http.Request, p routeParams) {
-		handleContainerStats(r.Context(), w, p["id"], r.URL.Query().Get("stream") == "1")
+		// Docker streams unless told otherwise (docker-py and docker-java
+		// omit the parameter).
+		q := r.URL.Query()
+		handleContainerStats(r.Context(), w, p["id"], !q.Has("stream") || queryBool(q, "stream"))
 	}),
 	newRoute(http.MethodPost, "/containers/:id/resize", func(w http.ResponseWriter, r *http.Request, p routeParams) {
 		handleContainerResize(w, r, p["id"])
@@ -65,12 +69,35 @@ func containerArchive(w http.ResponseWriter, r *http.Request, p routeParams) {
 }
 
 func handleContainersList(w http.ResponseWriter, r *http.Request, _ routeParams) {
-	all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
+	all := queryBool(r.URL.Query(), "all")
 	filters := parseDockerFilters(r.URL.Query().Get("filters"))
+	if err := validateFilterKeys(filters, containerFilterKeys); err != nil {
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
+	// A status filter selects among all containers (docker ps -f
+	// status=exited needs no -a), as in Docker.
+	if len(filters["status"]) > 0 {
+		all = true
+	}
+	before, since := filters["before"], filters["since"]
+	delete(filters, "before")
+	delete(filters, "since")
 	containers, err := listDockerContainers(r.Context(), filters)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
+	}
+	if len(before) > 0 || len(since) > 0 {
+		everyone, err := listDockerContainers(r.Context(), nil)
+		if err != nil {
+			writeAPIError(w, err, http.StatusInternalServerError)
+			return
+		}
+		if containers, err = filterByCreatedRef(containers, everyone, before, since); err != nil {
+			writeAPIError(w, err, http.StatusBadRequest)
+			return
+		}
 	}
 	if !all {
 		running := make([]dockerContainerSummary, 0)
@@ -86,9 +113,14 @@ func handleContainersList(w http.ResponseWriter, r *http.Request, _ routeParams)
 }
 
 func handleContainersPrune(w http.ResponseWriter, r *http.Request, _ routeParams) {
-	deleted, reclaimed, err := pruneDockerContainers(r.Context())
+	pf, err := newPruneFilter(parseDockerFilters(r.URL.Query().Get("filters")))
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
+	deleted, reclaimed, err := pruneDockerContainers(r.Context(), pf)
+	if err != nil {
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -125,7 +157,7 @@ func handleContainerCreate(w http.ResponseWriter, r *http.Request, _ routeParams
 	name := r.URL.Query().Get("name")
 	id, platformWarnings, err := createDockerContainer(r.Context(), req, name, platform, parseRegistryAuth(r))
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -137,7 +169,7 @@ func handleContainerCreate(w http.ResponseWriter, r *http.Request, _ routeParams
 
 func handleContainerStart(w http.ResponseWriter, r *http.Request, p routeParams) {
 	if err := startDockerContainer(r.Context(), p["id"]); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	// A user start puts the restart policy back in force (the monitor's
@@ -149,14 +181,14 @@ func handleContainerStart(w http.ResponseWriter, r *http.Request, p routeParams)
 }
 
 func handleContainerStop(w http.ResponseWriter, r *http.Request, p routeParams) {
-	timeout := 10
+	timeout := -1 // the container's StopTimeout, else 10 s
 	if t := r.URL.Query().Get("t"); t != "" {
 		if v, err := strconv.Atoi(t); err == nil {
 			timeout = v
 		}
 	}
 	if err := stopDockerContainer(r.Context(), p["id"], timeout); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -168,21 +200,21 @@ func handleContainerKill(w http.ResponseWriter, r *http.Request, p routeParams) 
 		signal = "SIGKILL"
 	}
 	if err := killDockerContainer(r.Context(), p["id"], signal); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func handleContainerRestart(w http.ResponseWriter, r *http.Request, p routeParams) {
-	timeout := 10 // as docker stop: no -t means the default grace period
+	timeout := -1 // as docker stop: no -t means the container's grace period
 	if t := r.URL.Query().Get("t"); t != "" {
 		if v, err := strconv.Atoi(t); err == nil {
 			timeout = v
 		}
 	}
 	if err := restartDockerContainer(r.Context(), p["id"], timeout); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -191,7 +223,7 @@ func handleContainerRestart(w http.ResponseWriter, r *http.Request, p routeParam
 func handleContainerRename(w http.ResponseWriter, r *http.Request, p routeParams) {
 	newName := strings.TrimPrefix(r.URL.Query().Get("name"), "/")
 	if err := renameDockerContainer(r.Context(), p["id"], newName); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -199,7 +231,7 @@ func handleContainerRename(w http.ResponseWriter, r *http.Request, p routeParams
 
 func handleContainerPause(w http.ResponseWriter, r *http.Request, p routeParams) {
 	if err := pauseDockerContainer(r.Context(), p["id"], true); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -207,7 +239,7 @@ func handleContainerPause(w http.ResponseWriter, r *http.Request, p routeParams)
 
 func handleContainerUnpause(w http.ResponseWriter, r *http.Request, p routeParams) {
 	if err := pauseDockerContainer(r.Context(), p["id"], false); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -221,7 +253,7 @@ func handleContainerExecCreate(w http.ResponseWriter, r *http.Request, p routePa
 	}
 	id, err := createDockerExec(r.Context(), p["id"], req)
 	if err != nil {
-		writeJSONError(w, http.StatusNotFound, err.Error())
+		writeAPIError(w, err, http.StatusNotFound)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -236,7 +268,7 @@ func handleContainerExecStart(w http.ResponseWriter, r *http.Request, p routePar
 	}
 	if req.Detach {
 		if err := startDetachedExec(p["id"]); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			writeAPIError(w, err, http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -257,10 +289,10 @@ func handleContainerExecInspect(w http.ResponseWriter, _ *http.Request, p routeP
 
 func handleContainerDelete(w http.ResponseWriter, r *http.Request, p routeParams) {
 	q := r.URL.Query()
-	force := q.Get("force") == "1" || q.Get("force") == "true"
-	removeVolumes := q.Get("v") == "1" || q.Get("v") == "true"
+	force := queryBool(q, "force")
+	removeVolumes := queryBool(q, "v")
 	if err := deleteDockerContainer(r.Context(), p["id"], force, removeVolumes); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -274,4 +306,40 @@ func handleContainerInspect(w http.ResponseWriter, r *http.Request, p routeParam
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(inspect)
+}
+
+// filterByCreatedRef applies before=/since=: containers created before or
+// after the referenced one (by name or ID prefix).
+func filterByCreatedRef(list, everyone []dockerContainerSummary, before, since map[string]bool) ([]dockerContainerSummary, error) {
+	createdOf := func(ref string) (int64, error) {
+		ref = strings.TrimPrefix(ref, "/")
+		for _, c := range everyone {
+			if strings.TrimPrefix(c.Names[0], "/") == ref || strings.HasPrefix(c.Id, ref) {
+				return c.created, nil
+			}
+		}
+		return 0, fmt.Errorf("No such container: %s", ref)
+	}
+	out := list[:0]
+	for _, c := range list {
+		keep := true
+		for ref := range before {
+			t, err := createdOf(ref)
+			if err != nil {
+				return nil, err
+			}
+			keep = keep && c.created < t
+		}
+		for ref := range since {
+			t, err := createdOf(ref)
+			if err != nil {
+				return nil, err
+			}
+			keep = keep && c.created > t
+		}
+		if keep {
+			out = append(out, c)
+		}
+	}
+	return out, nil
 }

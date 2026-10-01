@@ -27,8 +27,15 @@ func newPersistentClient(address string) *persistentClient {
 	return &persistentClient{address: address}
 }
 
-// get returns the underlying containerd client, reconnecting if
-// necessary. The returned client must NOT be closed by the caller.
+// get returns the underlying containerd client, connecting first if there
+// is none yet. The returned client must NOT be closed by the caller.
+//
+// An established client is never probed or replaced: gRPC reconnects on its
+// own when containerd restarts. Probing with the caller's context used to
+// close the shared client whenever a request had been cancelled (Ctrl-C, a
+// compose sibling failing), which broke every in-flight call on it — task
+// Wait streams included, which the exit watchers then took for container
+// exits.
 func (pc *persistentClient) get(ctx context.Context) (*client.Client, error) {
 	if pc == nil {
 		return nil, fmt.Errorf("persistent client not initialized")
@@ -36,27 +43,14 @@ func (pc *persistentClient) get(ctx context.Context) (*client.Client, error) {
 	pc.mu.RLock()
 	c := pc.conn
 	pc.mu.RUnlock()
-
 	if c != nil {
-		// Verify the connection is alive with a lightweight operation.
-		if _, err := c.NamespaceService().List(ctx); err == nil {
-			return c, nil
-		}
-		// Connection lost — fall through to reconnect.
+		return c, nil
 	}
 
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
-
-	// Double-check after acquiring write lock (another goroutine may have
-	// reconnected while we waited).
 	if pc.conn != nil {
-		if _, err := pc.conn.NamespaceService().List(ctx); err == nil {
-			return pc.conn, nil
-		}
-		// Close the dead connection before reconnecting.
-		pc.conn.Close()
-		pc.conn = nil
+		return pc.conn, nil
 	}
 
 	// Connect with retry loop (mimics scanner.go pattern). Honors ctx

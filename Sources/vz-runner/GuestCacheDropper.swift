@@ -5,14 +5,19 @@ import Foundation
 /// containerd image data cached in RAM becomes unnecessary when the data is
 /// already persisted on the containerd block disk.
 enum GuestCacheDropper {
-    static func dropCaches() {
+    /// trim also discards the containerd disk's free blocks first, so the
+    /// sparse disk image gives the space back to the Mac. The guest's daily
+    /// fstrim ticker rarely fires: its clock stops while the VM is paused,
+    /// which is most of an idle VM's life.
+    static func dropCaches(trim: Bool = false) {
         guard let executableURL = Bundle.main.executableURL ?? fallbackExecutableURL() else {
             print("[guest-cache-drop] unable to locate anvil executable")
             return
         }
         let process = Process()
         process.executableURL = executableURL
-        process.arguments = ["exec", "sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches"]
+        let trimCmd = trim ? "fstrim /var/lib/containerd >/dev/null 2>&1; " : ""
+        process.arguments = ["exec", "sh", "-c", "sync; \(trimCmd)echo 3 > /proc/sys/vm/drop_caches"]
         process.environment = ProcessInfo.processInfo.environment
         process.environment?["ANVIL_EXIT_ON_PARENT_DEATH"] = "1"
         do {

@@ -40,4 +40,58 @@ final class GuestConnectionsTests: XCTestCase {
         wait(for: [done], timeout: 2)
         for fd in guest + upstream { close(fd) }
     }
+
+    // An upstream whose output grows with its input (`docker exec -i c xxd`)
+    // must not deadlock the relay once both directions' buffers fill.
+    func testRelayDoesNotDeadlockOnAmplifyingUpstream() {
+        var client: [Int32] = [0, 0], upstream: [Int32] = [0, 0]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &client), 0)
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &upstream), 0)
+        let relayDone = expectation(description: "relay ends")
+        Thread { relayBothWays(client[1], upstream[1]); relayDone.fulfill() }.start()
+
+        let input = 4 << 20
+        // Upstream: every byte read comes back twice; blocks while writing.
+        Thread {
+            var buf = [UInt8](repeating: 0, count: 16384)
+            while true {
+                let n = read(upstream[0], &buf, buf.count)
+                if n <= 0 { break }
+                for _ in 0..<2 {
+                    var off = 0
+                    while off < n {
+                        let w = buf.withUnsafeBytes { write(upstream[0], $0.baseAddress!.advanced(by: off), n - off) }
+                        if w <= 0 { return }
+                        off += w
+                    }
+                }
+            }
+            shutdown(upstream[0], SHUT_WR)
+        }.start()
+        // Client: writes its whole input while a second thread reads.
+        Thread {
+            let chunk = [UInt8](repeating: 0x61, count: 16384)
+            var sent = 0
+            while sent < input {
+                let w = chunk.withUnsafeBytes { write(client[0], $0.baseAddress!, min(chunk.count, input - sent)) }
+                if w <= 0 { return }
+                sent += w
+            }
+            shutdown(client[0], SHUT_WR)
+        }.start()
+        let got = expectation(description: "all output received")
+        Thread {
+            var buf = [UInt8](repeating: 0, count: 65536)
+            var total = 0
+            while true {
+                let n = read(client[0], &buf, buf.count)
+                if n <= 0 { break }
+                total += n
+            }
+            XCTAssertEqual(total, 2 * input)
+            got.fulfill()
+        }.start()
+        wait(for: [got, relayDone], timeout: 20)
+        for fd in client + upstream { close(fd) }
+    }
 }

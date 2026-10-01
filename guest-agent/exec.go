@@ -9,8 +9,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
@@ -39,6 +41,9 @@ type execSpec struct {
 	mu       sync.Mutex
 	running  bool
 	exitCode int
+	// finished is when the exec exited; finished execs are pruned from the
+	// store after execRetention.
+	finished time.Time
 	// proc is the containerd exec process while it runs; kept for TTY resize
 	// (POST /exec/{id}/resize) between start and exit.
 	proc client.Process
@@ -63,6 +68,14 @@ func (s *execSpec) setExit(code int) {
 	defer s.mu.Unlock()
 	s.running = false
 	s.exitCode = code
+	s.finished = time.Now()
+}
+
+// finishedBefore reports whether the exec exited before t.
+func (s *execSpec) finishedBefore(t time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.running && !s.finished.IsZero() && s.finished.Before(t)
 }
 
 func (s *execSpec) state() (bool, int) {
@@ -81,10 +94,32 @@ func newExecStore() *execStore {
 	return &execStore{byID: make(map[string]*execSpec)}
 }
 
+// execRetention is how long a finished exec stays inspectable. Every
+// `docker exec` and every healthcheck probe adds one; without pruning the
+// store grew for the agent's whole lifetime.
+const execRetention = 10 * time.Minute
+
 func (s *execStore) add(spec *execSpec) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	cutoff := time.Now().Add(-execRetention)
+	for id, e := range s.byID {
+		if e.finishedBefore(cutoff) {
+			delete(s.byID, id)
+		}
+	}
 	s.byID[spec.ID] = spec
+}
+
+// forgetContainer drops every exec of a removed container.
+func (s *execStore) forgetContainer(ns, containerdID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, e := range s.byID {
+		if e.Namespace == ns && e.ContainerdID == containerdID {
+			delete(s.byID, id)
+		}
+	}
 }
 
 func (s *execStore) get(id string) *execSpec {
@@ -169,6 +204,8 @@ func createDockerExec(ctx context.Context, containerID string, req dockerExecCre
 		Privileged:        req.Privileged,
 	}
 	execs.add(spec)
+	publishContainerEvent("exec_create: "+strings.Join(spec.Cmd, " "), spec.Namespace, spec.ContainerdID,
+		map[string]string{"execID": spec.ID})
 	return spec.ID, nil
 }
 
@@ -294,7 +331,15 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	execID := newExecID()
-	process, xerr := task.Exec(nsCtx, execID, pspec, cio.NewCreator(cio.WithStreams(stdinR, stdoutW, stderrW)))
+	// A TTY exec needs Terminal in the IO config as well as in the spec:
+	// only then does the shim hand runc a console socket and allocate the
+	// pty. With the spec flag alone runc started the process on plain pipes
+	// (`docker exec -it` shells reported "not a tty").
+	ioOpts := []cio.Opt{cio.WithStreams(stdinR, stdoutW, stderrW)}
+	if spec.Tty {
+		ioOpts = append(ioOpts, cio.WithTerminal)
+	}
+	process, xerr := task.Exec(nsCtx, execID, pspec, cio.NewCreator(ioOpts...))
 	if xerr != nil {
 		stdoutR.Close()
 		stdoutW.Close()
@@ -332,6 +377,7 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	go stream(stderrR, 2)
 
 	if serr := process.Start(nsCtx); serr != nil {
+		process.Delete(context.WithoutCancel(nsCtx)) //nolint:errcheck
 		stdoutW.Close()
 		stderrW.Close()
 		wg.Wait()
@@ -340,9 +386,13 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		failExec("start", serr)
 		return
 	}
+	publishContainerEvent("exec_start: "+strings.Join(spec.Cmd, " "), spec.Namespace, spec.ContainerdID,
+		map[string]string{"execID": spec.ID})
 
 	exitCh, werr := process.Wait(nsCtx)
 	if werr != nil {
+		process.Kill(context.WithoutCancel(nsCtx), syscall.SIGKILL)          //nolint:errcheck
+		process.Delete(context.WithoutCancel(nsCtx), client.WithProcessKill) //nolint:errcheck
 		wg.Wait()
 		spec.setExit(126)
 		return
@@ -367,10 +417,12 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		exitCode = int(st.ExitCode())
 	}
 	spec.setProcess(nil)
-	process.Delete(context.Background()) //nolint:errcheck
+	process.Delete(context.WithoutCancel(nsCtx)) //nolint:errcheck — namespaced: a bare context is rejected and leaks the record
 	stdoutR.Close()
 	stderrR.Close()
 	spec.setExit(exitCode)
+	publishContainerEvent("exec_die", spec.Namespace, spec.ContainerdID,
+		map[string]string{"execID": spec.ID, "exitCode": strconv.Itoa(exitCode)})
 
 	bufrw.Flush()
 	time.Sleep(50 * time.Millisecond)

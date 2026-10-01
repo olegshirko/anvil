@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"io"
 	"net"
 	"testing"
+	"time"
 )
 
 // readPortProxyHeader must consume a 4-byte big-endian length + JSON body and
@@ -127,5 +129,58 @@ func TestPortBindingsFromMetaMulti(t *testing.T) {
 	}
 	if _, ok := bindings["53/udp"]; !ok {
 		t.Fatalf("udp binding missing: %+v", bindings)
+	}
+}
+
+// A client that half-closes must deliver FIN to the upstream while the
+// reply still flows back.
+func TestSpliceHalfCloseForwardsFIN(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	// Upstream: read until EOF, then answer with what it got.
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		data, _ := io.ReadAll(c)
+		c.Write(append([]byte("got:"), data...)) //nolint:errcheck
+	}()
+	upstream, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxyLn.Close()
+	go func() {
+		c, err := proxyLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		defer upstream.Close()
+		spliceHalfClose(c, upstream)
+	}()
+	client, err := net.Dial("tcp", proxyLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	client.Write([]byte("ping"))                            //nolint:errcheck
+	client.(*net.TCPConn).CloseWrite()                      //nolint:errcheck
+	client.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+	reply, err := io.ReadAll(client)
+	if err != nil {
+		t.Fatalf("read reply: %v (FIN never reached the upstream?)", err)
+	}
+	if string(reply) != "got:ping" {
+		t.Fatalf("reply = %q", reply)
 	}
 }

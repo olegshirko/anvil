@@ -29,7 +29,7 @@ const noneNetwork = "none"
 
 // validateNetworkMode refuses what Docker refuses for --network none.
 func validateNetworkMode(req dockerCreateRequest) error {
-	if req.HostConfig.NetworkMode != noneNetwork {
+	if req.HostConfig.NetworkMode != noneNetwork && !isContainerNetworkMode(req.HostConfig.NetworkMode) {
 		return nil
 	}
 	if len(req.HostConfig.PortBindings) > 0 || req.HostConfig.PublishAllPorts {
@@ -153,7 +153,7 @@ func handleNetworkConnect(w http.ResponseWriter, r *http.Request, p routeParams)
 		aliases = req.EndpointConfig.Aliases
 	}
 	if err := connectContainerNetwork(r.Context(), p["id"], req.Container, aliases); err != nil {
-		writeJSONError(w, errorStatus(err, http.StatusInternalServerError), err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -166,7 +166,7 @@ func handleNetworkDisconnect(w http.ResponseWriter, r *http.Request, p routePara
 		return
 	}
 	if err := disconnectContainerNetwork(r.Context(), p["id"], req.Container); err != nil {
-		writeJSONError(w, errorStatus(err, http.StatusInternalServerError), err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -376,4 +376,21 @@ func endpointNames(eps map[string]dockerNetworkContainer) string {
 	}
 	sort.Strings(names)
 	return strings.Join(names, ", ")
+}
+
+// isContainerNetworkMode reports `--network container:<ref>` (compose
+// `network_mode: service:x` arrives in this form, resolved to the ID).
+func isContainerNetworkMode(mode string) bool {
+	return strings.HasPrefix(mode, "container:")
+}
+
+// resolveNetworkContainer resolves the target of a container network mode
+// to its namespace and containerd ID.
+func resolveNetworkContainer(ctx context.Context, mode string) (ns, containerdID string, err error) {
+	ref := strings.TrimPrefix(mode, "container:")
+	ns, containerdID, _, err = resolveDockerID(ctx, ref)
+	if err != nil {
+		return "", "", err
+	}
+	return ns, containerdID, nil
 }

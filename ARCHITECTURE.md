@@ -99,7 +99,14 @@ Owns the whole VM lifecycle:
 - **resume** — `restoreMachineStateFromURL` from
   `~/.anvil-vz/snapshots/default.vzstate`;
 - **pause + save** — on idle timeout or SIGTERM: pause the VM, drop the
-  guest page cache, save the state;
+  guest page cache, save the state. The idle timer only runs while nothing
+  is in use: no control/Docker/buildkit client, no connection through a
+  published port, and no running container (the guest pushes the count with
+  every port-state update). Pausing under running containers froze
+  databases, servers and workers whenever the CLI had been quiet;
+- **transitions** — `ensureRunning` waits out a pause or snapshot save in
+  progress and then resumes, instead of failing the client that arrived
+  during it. Starting a stopped VM is left to the daemon's crash handler;
 - **snapshot invalidation** — before a restore, a hash of the kernel,
   initrd, CPU, RAM, disk path/size is computed. If the configuration has
   changed — cold boot and snapshot re-creation.
@@ -155,7 +162,22 @@ mappings to `vz-runner`. `PortForwarder`:
   netns), and vzNAT delivers host→guest UDP to the bound port;
 - on every push does a full-state replace: new ports are opened, gone ports
   are closed;
-- logs a conflict when it fails to open an already taken port.
+- logs a conflict when it fails to open an already taken port;
+- counts every forwarded connection as a client (the VM never idle-pauses
+  under one) and resumes a paused VM before dialing the guest; the guest
+  connect runs on the connection's thread, not in the accept loop. The
+  guest proxy forwards half-closes (`CloseWrite`), so a client's FIN reaches
+  the container while the reply still flows.
+
+Bindings without a fixed host port (`-p 80`, `-P` over the image's and
+`Config.ExposedPorts`, `-p 8000-8010:80`) are stored as *ephemeral* in the
+mappings and get their host port in `startDockerContainer`
+(`ephemeral_ports.go`): a port in 32768–60999 (or the requested range) that
+no running container publishes, no concurrent start has just picked, and
+the Mac reports free (port-check, vsock 1027). The pick is persisted in the
+metadata and the `anvil/ports` label and kept across restarts while it
+stays free. Inspect shows the request in `HostConfig.PortBindings`
+(`HostPort: ""`) and the assignment in `NetworkSettings.Ports`.
 
 User host ports are deliberately never bound inside the guest at create
 time: the Docker flow expects the conflict check to belong to start —
@@ -284,7 +306,23 @@ Notable details:
   `buildctl dial-stdio` over this channel. `cmd.Wait()` also waits for the
   stdin copy, so the stdin pipe is closed on EOF of the output streams —
   otherwise a client that keeps the connection open (buildx) deadlocks
-  exec.
+  exec. A TTY exec also needs `cio.WithTerminal`, not just `Terminal` in
+  the process spec: only then does the shim pass runc a console socket.
+- Container stdin (`docker run -i`, `docker attach`, `start -ai`;
+  `container_stdin.go`). An OpenStdin container gets a stdin FIFO per run,
+  which the agent holds open read-write, so input sent before the start
+  (docker run attaches first) waits in the pipe buffer and the process does
+  not see EOF between attaches. With a TTY the shim copies the FIFO into the
+  console even with the binary logger. Without one the shim wires stdin only
+  in FIFO mode (its binary-logger IO has no stdin), so such a task runs on
+  FIFOs and the agent starts the json logger on their read ends itself
+  (`--fifo-out/--fifo-err`). The shim keeps its own writer on the stdin FIFO
+  (for the CloseIO API), so EOF (StdinOnce, `echo x | docker run -i`) is a
+  `CloseIO(WithStdinCloser)` once the task exists. A FIFO a shim has held is
+  never reused: the old shim keeps reading after its process exits, until
+  its task is deleted at the next start, and would swallow the next run's
+  input. Attach honors `logs`/`stream`/`stdout`/`stderr` (without `logs` it
+  follows from the current end of the log) and the detach keys.
 
 ### 4.3a buildkit bridge (port 1026)
 
@@ -467,7 +505,8 @@ On shutdown:
 
 ### 6.4 SIGTERM / idle timeout
 
-1. `vz-runner` receives SIGTERM or the idle timer fires.
+1. `vz-runner` receives SIGTERM or the idle timer fires (the timer is armed
+   only while no client is connected and no container runs).
 2. `ContainerdCacheManager.sync()` runs on a background queue — on the
    idle path too: run on the main queue, its `anvil exec` cannot get the
    main-queue vsock connect and times out.

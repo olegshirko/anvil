@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // Anvil's own on-disk state root. Everything the Docker API emulation needs
@@ -74,17 +75,32 @@ type containerMeta struct {
 	// NetworkAliases are the aliases per network (docker network connect
 	// --alias, compose per-network aliases). Aliases above is the legacy
 	// flat list, used for a network with no entry here.
-	NetworkAliases   map[string][]string `json:"NetworkAliases,omitempty"`
-	Links            []string            `json:"Links,omitempty"`
-	TTY              bool                `json:"TTY,omitempty"`
-	AutoRemove       bool                `json:"AutoRemove,omitempty"`
-	StopSignal       string              `json:"StopSignal,omitempty"`
-	User             string              `json:"User,omitempty"` // create-time --user, for commit
-	WorkingDir       string              `json:"WorkingDir,omitempty"`
-	Entrypoint       []string            `json:"Entrypoint,omitempty"`
-	Mounts           []dockerMount       `json:"Mounts,omitempty"`
-	AnonymousVolumes []string            `json:"AnonymousVolumes,omitempty"`
-	Healthcheck      *dockerHealthcheck  `json:"Healthcheck,omitempty"`
+	NetworkAliases map[string][]string `json:"NetworkAliases,omitempty"`
+	Links          []string            `json:"Links,omitempty"`
+	TTY            bool                `json:"TTY,omitempty"`
+	AutoRemove     bool                `json:"AutoRemove,omitempty"`
+	OpenStdin      bool                `json:"OpenStdin,omitempty"`
+	StdinOnce      bool                `json:"StdinOnce,omitempty"`
+	// ConfigUser is inspect's Config.User: --user, else the image's USER
+	// (devcontainers pick the remote user from it).
+	ConfigUser string `json:"ConfigUser,omitempty"`
+	// Domainname is the create request's domain name.
+	Domainname string `json:"Domainname,omitempty"`
+	// ExposedPorts are the container's and its image's EXPOSE entries
+	// ("80/tcp"), for inspect and -P.
+	ExposedPorts []string `json:"ExposedPorts,omitempty"`
+	// StartedAt/FinishedAt are the last run's start and exit (docker ps
+	// "Up 5 minutes", inspect State).
+	StartedAt        time.Time          `json:"StartedAt,omitzero"`
+	FinishedAt       time.Time          `json:"FinishedAt,omitzero"`
+	StopSignal       string             `json:"StopSignal,omitempty"`
+	StopTimeout      *int               `json:"StopTimeout,omitempty"`
+	User             string             `json:"User,omitempty"` // create-time --user, for commit
+	WorkingDir       string             `json:"WorkingDir,omitempty"`
+	Entrypoint       []string           `json:"Entrypoint,omitempty"`
+	Mounts           []dockerMount      `json:"Mounts,omitempty"`
+	AnonymousVolumes []string           `json:"AnonymousVolumes,omitempty"`
+	Healthcheck      *dockerHealthcheck `json:"Healthcheck,omitempty"`
 	// HostConfig snapshot of the create request, echoed back by inspect for
 	// fields owned by the spec (memory, cpus, caps, ...) that have no other
 	// persisted representation.
@@ -130,6 +146,21 @@ func saveContainerMeta(m *containerMeta) error {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(dir, "config.json"))
+}
+
+// metaUpdateMu serializes updateContainerMeta's read-modify-write.
+var metaUpdateMu sync.Mutex
+
+// updateContainerMeta applies fn to the container's metadata and saves it.
+func updateContainerMeta(ns, id string, fn func(*containerMeta)) error {
+	metaUpdateMu.Lock()
+	defer metaUpdateMu.Unlock()
+	m, err := loadContainerMeta(ns, id)
+	if err != nil {
+		return err
+	}
+	fn(m)
+	return saveContainerMeta(m)
 }
 
 // loadContainerMeta reads the metadata file for a container.

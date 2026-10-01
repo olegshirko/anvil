@@ -51,12 +51,28 @@ func pauseDockerContainer(ctx context.Context, id string, pause bool) error {
 	}
 	task, terr := c.Task(nsCtx, nil)
 	if terr != nil {
-		return fmt.Errorf("container is not running")
+		return errConflict("container %s is not running", truncateID(containerdID))
 	}
+	st, serr := task.Status(nsCtx)
+	if serr == nil {
+		switch {
+		case pause && st.Status == "paused":
+			return errConflict("container %s is already paused", truncateID(containerdID))
+		case !pause && st.Status != "paused":
+			return errConflict("container %s is not paused", truncateID(containerdID))
+		case st.Status != "running" && st.Status != "paused":
+			return errConflict("container %s is not running", truncateID(containerdID))
+		}
+	}
+	action, op := "unpause", task.Resume
 	if pause {
-		return task.Pause(nsCtx)
+		action, op = "pause", task.Pause
 	}
-	return task.Resume(nsCtx)
+	if err := op(nsCtx); err != nil {
+		return err
+	}
+	publishContainerEvent(action, ns, containerdID, nil)
+	return nil
 }
 
 // handleContainerTop implements GET /containers/{id}/top: process list of

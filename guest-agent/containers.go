@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -53,20 +54,15 @@ func waitContainerTask(ctx context.Context, ns, containerdID string) (int, error
 	if err != nil {
 		return 0, fmt.Errorf("task: %w", err)
 	}
-	exitCh, werr := task.Wait(nsCtx)
+	// The client going away (docker run -d drops its /wait right after
+	// /start) ends the wait with an error, never with containerd's 255:
+	// returning that as an exit let it be cached, and the next docker wait
+	// answered 255 at once.
+	exit, werr := waitTaskExit(nsCtx, task)
 	if werr != nil {
-		return 0, fmt.Errorf("wait: %w", werr)
+		debugLog("[docker-api] wait %s/%s: %v", ns, truncateID(containerdID), werr)
+		return 0, werr
 	}
-	st := <-exitCh
-	if serr := st.Error(); serr != nil {
-		// The client went away (docker run -d drops its /wait right after
-		// /start): containerd reports exit status 255, which is not the
-		// container's. Returning it as an exit let it be cached, and the
-		// next docker wait answered 255 at once.
-		debugLog("[docker-api] wait %s/%s: %v", ns, truncateID(containerdID), serr)
-		return 0, fmt.Errorf("wait aborted: %w", serr)
-	}
-	exit := int(st.ExitCode())
 	if cached, ok := takeContainerExitCode(did); ok && cached != 0 {
 		return cached, nil
 	}
@@ -78,6 +74,19 @@ func waitContainerTask(ctx context.Context, ns, containerdID string) (int, error
 func createDockerContainer(ctx context.Context, req dockerCreateRequest, name, platform string, auth *registryAuth) (string, []string, error) {
 	networkMode := req.HostConfig.NetworkMode
 	ns := namespaceFromNetwork(networkMode)
+	if isContainerNetworkMode(networkMode) {
+		// Join another container's network namespace: no CNI network of
+		// our own. The mode is stored with the target's Docker ID, and the
+		// container lives in the target's namespace unless compose says
+		// otherwise.
+		tns, tid, err := resolveNetworkContainer(ctx, networkMode)
+		if err != nil {
+			return "", nil, err
+		}
+		networkMode = "container:" + dockerID(tns, tid)
+		req.HostConfig.NetworkMode = networkMode
+		ns = tns
+	}
 	// Compose attaches containers to a network named <project>_<network>. The
 	// container itself carries the project label, which is the authoritative
 	// containerd namespace.
@@ -88,7 +97,7 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name, p
 
 	// Make sure the per-network CNI conflist exists before creating the
 	// container, otherwise CNI attach fails with "no such network".
-	if !usesHostNetwork(req) {
+	if !usesHostNetwork(req) && !isContainerNetworkMode(networkMode) {
 		for _, n := range append([]string{effectiveNetworkName(networkMode)}, secondaryNetworksFromCreate(req)...) {
 			if n == noneNetwork {
 				continue // no bridge: lo only (attachNetwork)
@@ -107,14 +116,21 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name, p
 		return "", nil, err
 	}
 
+	if name == "" {
+		name = generateContainerName(ctx, ns)
+		req.generatedName = true
+	}
 	// Docker refuses duplicate names; mimic that to avoid ambiguous lookups later.
 	if name != "" {
 		if existing, err := findContainerByName(ctx, ns, name); err == nil && existing != "" {
-			return "", nil, fmt.Errorf("Conflict. The container name \"/%s\" is already in use by container \"%s\". You have to remove (or rename) that container to be able to reuse that name.", name, existing)
+			return "", nil, errConflict("Conflict. The container name \"/%s\" is already in use by container \"%s\". You have to remove (or rename) that container to be able to reuse that name.", name, existing)
 		}
 	}
 
 	containerdID, warnings, err := createNativeContainer(ctx, ns, name, platform, req)
+	if err == nil {
+		defer publishContainerEvent("create", ns, containerdID, nil)
+	}
 	if err != nil {
 		return "", nil, err
 	}
@@ -267,6 +283,27 @@ func startDockerContainer(ctx context.Context, id string) error {
 		return err
 	}
 
+	if st, known := currentTaskStatus(ctx, ns, containerdID); known && st == "running" {
+		return errNotModified("container %s is already running", truncateID(containerdID))
+	}
+	if meta, merr := loadContainerMeta(ns, containerdID); merr == nil && len(meta.Networks) > 0 && isContainerNetworkMode(meta.Networks[0]) {
+		tns, tid, terr := resolveNetworkContainer(ctx, meta.Networks[0])
+		if terr != nil {
+			return errConflict("cannot join network of a non running container: %v", terr)
+		}
+		if st, known := currentTaskStatus(ctx, tns, tid); known && st != "running" {
+			return errConflict("cannot join network namespace of a non running container: %s", truncateID(dockerID(tns, tid)))
+		}
+	}
+
+	// `-p 80`, `-P` and host port ranges get their host port now, before
+	// the availability check below sees the container's ports.
+	releasePorts, err := assignEphemeralPorts(ctx, ns, containerdID)
+	if err != nil {
+		return err
+	}
+	defer releasePorts()
+
 	// Enforce host-port availability at start, like Docker does (create must
 	// NOT check: compose --force-recreate creates the replacement while the
 	// old container still holds the port). Two cases: the port is published
@@ -313,20 +350,76 @@ func startDockerContainer(ctx context.Context, id string) error {
 	// For AutoRemove containers we wait for the exit code ourselves and then
 	// delete the container. Deleting earlier would break /wait.
 	if isAutoRemove(did) {
-		go func() {
-			code, _ := waitContainerTask(context.Background(), ns, containerdID)
-			cacheContainerExitCode(did, code)
-			// Let any attach connection finish replaying the output before
-			// the container (and its logs) disappear.
-			waitForAttachDrain(did, 30*time.Second)
-			// --rm removes the anonymous volumes too, as in Docker.
-			if err := deleteDockerContainer(context.Background(), did, true, true); err != nil {
-				log.Printf("[docker-api] auto-remove %s: %v", did, err)
-			}
-			unmarkAutoRemove(did)
-		}()
+		go autoRemoveWhenExited(ns, containerdID, did)
 	}
 	return nil
+}
+
+// autoRemoveWhenExited deletes an --rm container once it has exited for
+// good. `docker restart` stops and starts the task again: Docker keeps the
+// container across it, so a stop under a restart is not the end.
+func autoRemoveWhenExited(ns, containerdID, did string) {
+	ctx := context.Background()
+	for {
+		code, err := waitContainerTask(ctx, ns, containerdID)
+		if err != nil {
+			log.Printf("[docker-api] auto-remove %s: wait: %v", truncateID(did), err)
+		}
+		if awaitRestartDone(did, time.Minute) {
+			if st, known := currentTaskStatus(ctx, ns, containerdID); known && (st == "running" || st == "paused") {
+				continue // restarted: wait for the new run
+			}
+		}
+		if err == nil {
+			cacheContainerExitCode(did, code)
+		}
+		// Let any attach connection finish replaying the output before
+		// the container (and its logs) disappear.
+		waitForAttachDrain(did, 30*time.Second)
+		// --rm removes the anonymous volumes too, as in Docker.
+		if err := deleteDockerContainer(ctx, did, true, true); err != nil {
+			log.Printf("[docker-api] auto-remove %s: %v", did, err)
+		}
+		unmarkAutoRemove(did)
+		return
+	}
+}
+
+var (
+	restartingMu sync.Mutex
+	restarting   = map[string]chan struct{}{}
+)
+
+// beginRestart marks a docker restart in progress; the returned func ends it.
+func beginRestart(did string) func() {
+	restartingMu.Lock()
+	done := make(chan struct{})
+	restarting[did] = done
+	restartingMu.Unlock()
+	return func() {
+		restartingMu.Lock()
+		if restarting[did] == done {
+			delete(restarting, did)
+		}
+		restartingMu.Unlock()
+		close(done)
+	}
+}
+
+// awaitRestartDone waits (bounded) for a docker restart in progress to
+// finish and reports whether there was one.
+func awaitRestartDone(did string, limit time.Duration) bool {
+	restartingMu.Lock()
+	done, ok := restarting[did]
+	restartingMu.Unlock()
+	if !ok {
+		return false
+	}
+	select {
+	case <-done:
+	case <-time.After(limit):
+	}
+	return true
 }
 
 // stopDockerContainer stops a container by Docker ID or name and waits until
@@ -339,12 +432,13 @@ func stopDockerContainer(ctx context.Context, id string, timeout int) error {
 		return err
 	}
 	did := dockerID(ns, containerdID)
+	wasRunning := taskRunning(ctx, ns, containerdID)
 	// A user stop wins over any restart policy: drop it before signalling
 	// so the restart monitor cannot race a restart between the exit and
 	// the cleanup below.
 	restarts.clear(did)
 	// Native stop: stop signal, then SIGKILL after the grace period.
-	if err := stopNativeTask(ctx, ns, containerdID, timeout); err != nil {
+	if err := stopNativeTask(ctx, ns, containerdID, stopTimeoutFor(ns, containerdID, timeout)); err != nil {
 		return err
 	}
 
@@ -374,7 +468,45 @@ func stopDockerContainer(ctx context.Context, id string, timeout int) error {
 
 	stopHealthCheck(did)
 	restarts.clear(did)
+	if wasRunning {
+		publishContainerEvent("stop", ns, containerdID, nil)
+	}
+	if !wasRunning {
+		// Docker answers 304 for a container that was not running; the
+		// cleanup above still ran (a pending restart is cancelled).
+		return errNotModified("container %s is not running", truncateID(containerdID))
+	}
 	return nil
+}
+
+// taskRunning reports whether the container's task is running or paused;
+// true when that cannot be determined (keeps the plain stop semantics).
+func taskRunning(ctx context.Context, ns, containerdID string) bool {
+	st, known := currentTaskStatus(ctx, ns, containerdID)
+	return !known || st == "running" || st == "paused"
+}
+
+// currentTaskStatus returns the container's task status ("stopped" when it
+// has no task); known is false when containerd could not be asked.
+func currentTaskStatus(ctx context.Context, ns, containerdID string) (status string, known bool) {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return "", false
+	}
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	c, err := cl.LoadContainer(nsCtx, containerdID)
+	if err != nil {
+		return "", false
+	}
+	task, err := c.Task(nsCtx, nil)
+	if err != nil {
+		return "stopped", true
+	}
+	st, err := task.Status(nsCtx)
+	if err != nil {
+		return "", false
+	}
+	return string(st.Status), true
 }
 
 // handleContainerWait implements POST /containers/{id}/wait.
@@ -440,11 +572,15 @@ func deleteDockerContainer(ctx context.Context, id string, force, removeVolumes 
 		return err
 	}
 	did := dockerID(ns, containerdID)
+	attrs := containerEventAttrs(ns, containerdID) // gone after the delete
 	// Native delete: task + snapshot + CNI + netns + metadata cleanup.
 	if err := deleteNativeContainer(ctx, ns, containerdID, force, removeVolumes); err != nil {
 		return err
 	}
+	publishContainerEventAttrs("destroy", did, attrs, nil)
 	forgetContainerState(did)
+	execs.forgetContainer(ns, containerdID)
+	forgetContainerStdin(ns, containerdID)
 	return nil
 }
 
@@ -458,6 +594,9 @@ func renameDockerContainer(ctx context.Context, id string, newName string) error
 	}
 	if newName == "" {
 		return fmt.Errorf("name is required")
+	}
+	if existing, ferr := findContainerByName(ctx, ns, newName); ferr == nil && existing != "" && existing != containerdID && existing != dockerID(ns, containerdID) {
+		return errConflict("Conflict. The container name \"/%s\" is already in use by container \"%s\". You have to remove (or rename) that container to be able to reuse that name.", newName, existing)
 	}
 	cl, err := pc.get(ctx)
 	if err != nil {
@@ -477,6 +616,7 @@ func renameDockerContainer(ctx context.Context, id string, newName string) error
 	if _, err := c.SetLabels(nsCtx, labels); err != nil {
 		return fmt.Errorf("rename: %w", err)
 	}
+	publishContainerEvent("rename", ns, containerdID, map[string]string{"oldName": "/" + oldName})
 	if meta, merr := loadContainerMeta(ns, containerdID); merr == nil {
 		meta.Name = newName
 		saveContainerMeta(meta)
@@ -507,7 +647,10 @@ func killDockerContainer(ctx context.Context, id string, signal string) error {
 		}
 		task, terr := c.Task(nsCtx, nil)
 		if terr != nil {
-			return fmt.Errorf("container is not running")
+			return errConflict("cannot kill container: %s: container %s is not running", id, truncateID(containerdID))
+		}
+		if st, serr := task.Status(nsCtx); serr == nil && st.Status != "running" && st.Status != "paused" {
+			return errConflict("cannot kill container: %s: container %s is not running", id, truncateID(containerdID))
 		}
 		sig := syscall.SIGKILL
 		if signal != "" {
@@ -518,6 +661,7 @@ func killDockerContainer(ctx context.Context, id string, signal string) error {
 		if kerr := task.Kill(nsCtx, sig); kerr != nil {
 			return kerr
 		}
+		publishContainerEvent("kill", ns, containerdID, map[string]string{"signal": strconv.Itoa(int(sig))})
 	}
 	// Docker reports SIGKILL'd containers with exit code 137 (128+9);
 	// compose and the CLI rely on it in events and /wait. containerd's task
@@ -540,8 +684,9 @@ func restartDockerContainer(ctx context.Context, id string, timeout int) error {
 	// Disarm during the stop so the monitor cannot race its own start in
 	// between; re-armed below, as Docker keeps the policy across restart.
 	did := dockerID(ns, containerdID)
+	defer beginRestart(did)()
 	restarts.clear(did)
-	if err := stopNativeTask(ctx, ns, containerdID, timeout); err != nil {
+	if err := stopNativeTask(ctx, ns, containerdID, stopTimeoutFor(ns, containerdID, timeout)); err != nil {
 		restarts.rearm(did)
 		return err
 	}
@@ -549,5 +694,18 @@ func restartDockerContainer(ctx context.Context, id string, timeout int) error {
 		return err
 	}
 	restarts.rearm(did)
+	publishContainerEvent("restart", ns, containerdID, nil)
 	return nil
+}
+
+// stopTimeoutFor resolves a stop grace period: an explicit -t (>= 0) wins,
+// then the container's StopTimeout (compose stop_grace_period), then 10 s.
+func stopTimeoutFor(ns, containerdID string, requested int) int {
+	if requested >= 0 {
+		return requested
+	}
+	if meta, err := loadContainerMeta(ns, containerdID); err == nil && meta.StopTimeout != nil && *meta.StopTimeout >= 0 {
+		return *meta.StopTimeout
+	}
+	return 10
 }

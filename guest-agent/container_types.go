@@ -19,12 +19,18 @@ type dockerCreateRequest struct {
 	Entrypoint       []string              `json:"Entrypoint"`
 	WorkingDir       string                `json:"WorkingDir"`
 	StopSignal       string                `json:"StopSignal"`
+	StopTimeout      *int                  `json:"StopTimeout,omitempty"`
 	Image            string                `json:"Image"`
 	Volumes          map[string]struct{}   `json:"Volumes"` // anonymous `-v /path`
+	ExposedPorts     map[string]struct{}   `json:"ExposedPorts"`
 	Labels           map[string]string     `json:"Labels"`
 	NetworkingConfig *dockerNetworkingConf `json:"NetworkingConfig,omitempty"`
 	HostConfig       dockerHostConfig      `json:"HostConfig"`
 	Healthcheck      *dockerHealthcheck    `json:"Healthcheck,omitempty"`
+
+	// generatedName marks a name the agent picked (no --name): the
+	// hostname then stays the short ID, as with Docker.
+	generatedName bool
 }
 
 type dockerNetworkingConf struct {
@@ -53,6 +59,8 @@ type dockerHostConfig struct {
 	PidMode         string                      `json:"PidMode"`
 	TmpFs           map[string]string           `json:"Tmpfs"`
 	Dns             []string                    `json:"Dns"`
+	DnsSearch       []string                    `json:"DnsSearch"`
+	DnsOptions      []string                    `json:"DnsOptions"`
 	Sysctls         map[string]string           `json:"Sysctls"`
 	Devices         []dockerDevice              `json:"Devices"`
 	Links           []string                    `json:"Links"`
@@ -104,6 +112,14 @@ type dockerMount struct {
 	Target        string               `json:"Target"`
 	ReadOnly      bool                 `json:"ReadOnly"`
 	VolumeOptions *dockerVolumeOptions `json:"VolumeOptions,omitempty"`
+	TmpfsOptions  *dockerTmpfsOptions  `json:"TmpfsOptions,omitempty"`
+}
+
+// dockerTmpfsOptions is --mount type=tmpfs,tmpfs-size=…,tmpfs-mode=….
+type dockerTmpfsOptions struct {
+	SizeBytes int64      `json:"SizeBytes,omitempty"`
+	Mode      uint32     `json:"Mode,omitempty"`
+	Options   [][]string `json:"Options,omitempty"` // [["exec"]] lifts noexec
 }
 
 type dockerVolumeOptions struct {
@@ -155,11 +171,21 @@ type dockerContainerSummary struct {
 	// Mounts: compose's recreate reads the old container's anonymous
 	// volumes from the list endpoint, not from inspect.
 	Mounts []dockerMountPoint `json:"Mounts"`
+
+	// Filter inputs that are not part of the list payload.
+	exitCode int
+	created  int64 // UnixNano: before/since order containers made in the same second
+	networks []string
+	health   string
+	exposed  []string
 }
 
 // dockerContainerInspect is a minimal subset of GET /containers/{id}/json.
 type dockerContainerInspect struct {
 	Id              string                `json:"Id"`
+	Created         string                `json:"Created"`
+	Path            string                `json:"Path"`
+	Args            []string              `json:"Args"`
 	Name            string                `json:"Name"`
 	Image           string                `json:"Image"`
 	State           dockerContainerState  `json:"State"`
@@ -172,24 +198,39 @@ type dockerContainerInspect struct {
 }
 
 type dockerContainerState struct {
-	Status   string             `json:"Status"`
-	Running  bool               `json:"Running"`
-	Pid      int                `json:"Pid"`
-	ExitCode int                `json:"ExitCode"`
-	Health   *dockerHealthState `json:"Health,omitempty"`
+	Status     string             `json:"Status"`
+	Running    bool               `json:"Running"`
+	Paused     bool               `json:"Paused"`
+	Restarting bool               `json:"Restarting"`
+	OOMKilled  bool               `json:"OOMKilled"`
+	Dead       bool               `json:"Dead"`
+	Pid        int                `json:"Pid"`
+	ExitCode   int                `json:"ExitCode"`
+	Error      string             `json:"Error"`
+	StartedAt  string             `json:"StartedAt"`
+	FinishedAt string             `json:"FinishedAt"`
+	Health     *dockerHealthState `json:"Health,omitempty"`
 }
 
 type dockerContainerConfig struct {
-	Labels      map[string]string  `json:"Labels"`
-	Image       string             `json:"Image"`
-	Healthcheck *dockerHealthcheck `json:"Healthcheck,omitempty"`
-	Tty         bool               `json:"Tty,omitempty"`
-	OpenStdin   bool               `json:"OpenStdin,omitempty"`
-	Env         []string           `json:"Env,omitempty"`
-	Cmd         []string           `json:"Cmd,omitempty"`
-	Entrypoint  []string           `json:"Entrypoint,omitempty"`
-	WorkingDir  string             `json:"WorkingDir,omitempty"`
-	StopSignal  string             `json:"StopSignal,omitempty"`
+	Hostname     string              `json:"Hostname"`
+	Domainname   string              `json:"Domainname"`
+	User         string              `json:"User"`
+	AttachStdin  bool                `json:"AttachStdin"`
+	AttachStdout bool                `json:"AttachStdout"`
+	AttachStderr bool                `json:"AttachStderr"`
+	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
+	StdinOnce    bool                `json:"StdinOnce"`
+	Labels       map[string]string   `json:"Labels"`
+	Image        string              `json:"Image"`
+	Healthcheck  *dockerHealthcheck  `json:"Healthcheck,omitempty"`
+	Tty          bool                `json:"Tty,omitempty"`
+	OpenStdin    bool                `json:"OpenStdin,omitempty"`
+	Env          []string            `json:"Env,omitempty"`
+	Cmd          []string            `json:"Cmd,omitempty"`
+	Entrypoint   []string            `json:"Entrypoint,omitempty"`
+	WorkingDir   string              `json:"WorkingDir,omitempty"`
+	StopSignal   string              `json:"StopSignal,omitempty"`
 }
 
 type dockerNetworkSettings struct {
@@ -199,9 +240,13 @@ type dockerNetworkSettings struct {
 }
 
 type dockerEndpointStats struct {
-	IPAddress   string `json:"IPAddress"`
-	IPPrefixLen int    `json:"IPPrefixLen"`
-	MacAddress  string `json:"MacAddress,omitempty"`
+	NetworkID   string   `json:"NetworkID,omitempty"`
+	Gateway     string   `json:"Gateway,omitempty"`
+	IPAddress   string   `json:"IPAddress"`
+	IPPrefixLen int      `json:"IPPrefixLen"`
+	MacAddress  string   `json:"MacAddress,omitempty"`
+	Aliases     []string `json:"Aliases,omitempty"`
+	DNSNames    []string `json:"DNSNames,omitempty"`
 }
 
 // dockerPort matches the Docker API port binding shape.

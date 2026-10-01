@@ -41,6 +41,14 @@ final class PortForwarderTests: XCTestCase {
         XCTAssertEqual(state.mappings[0].name, "api")
         XCTAssertEqual(state.mappings[0].containerIP, "10.89.1.7")
         XCTAssertNil(state.mappings[0].hostIP, "older guests send no host_ip")
+        XCTAssertNil(state.runningContainers, "older guests send no running_containers")
+    }
+
+    func testPortMapStateDecodesRunningContainers() throws {
+        let payload = #"{"mappings":[],"running_containers":3}"#
+        let state = try JSONDecoder().decode(PortMapState.self, from: payload.data(using: .utf8)!)
+        XCTAssertEqual(state.runningContainers, 3)
+        XCTAssertTrue(state.mappings.isEmpty)
     }
 
     func testPortMapStateDecodesHostIP() throws {

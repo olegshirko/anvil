@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -73,6 +74,9 @@ var (
 func dialOut(ctx context.Context, network, addr string) (net.Conn, error) {
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
 		return dialDirect(ctx, network, addr)
+	}
+	if port, ok := loopbackPort(addr); ok {
+		return dialLoopback(ctx, network, addr, port)
 	}
 	if !directEgressKnownBad(time.Now()) {
 		conn, err := dialDirect(ctx, network, addr)
@@ -319,4 +323,63 @@ var buildkitdProxyEnv = []string{
 	"https_proxy=http://" + egressProxyAddr,
 	"NO_PROXY=localhost,127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
 	"no_proxy=localhost,127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
+}
+
+// loopbackPort returns the port of a localhost / 127.0.0.0/8 / ::1 address.
+func loopbackPort(addr string) (int, bool) {
+	host, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, false
+	}
+	port, err := strconv.Atoi(p)
+	if err != nil {
+		return 0, false
+	}
+	if host == "localhost" {
+		return port, true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return port, true
+	}
+	return 0, false
+}
+
+// dialLoopback resolves a registry on "localhost:<port>" (`docker push
+// localhost:5000/app`) the way Docker Desktop users expect: the VM's own
+// loopback first (a host-network container), then the container publishing
+// that host port, then the Mac's localhost. Pulls and pushes run in the
+// agent, where localhost alone reached nothing: published ports are never
+// bound inside the VM.
+func dialLoopback(ctx context.Context, network, addr string, port int) (net.Conn, error) {
+	conn, err := dialDirect(ctx, network, addr)
+	if err == nil {
+		return conn, nil
+	}
+	if target, ok := publishedPortTarget(port); ok {
+		if c, perr := dialDirect(ctx, "tcp", target); perr == nil {
+			return c, nil
+		}
+	}
+	if c, herr := dialHostLoopback(port); herr == nil {
+		return c, nil
+	}
+	return nil, err
+}
+
+// activeScanner is the port scanner of this agent (set in main), the source
+// of the published-port map.
+var activeScanner *portScanner
+
+// publishedPortTarget returns containerIP:containerPort of the running
+// container that publishes TCP host port port.
+func publishedPortTarget(port int) (string, bool) {
+	if activeScanner == nil {
+		return "", false
+	}
+	for _, m := range activeScanner.currentState().Mappings {
+		if m.HostPort == port && (m.Protocol == "" || m.Protocol == "tcp") && m.ContainerIP != "" {
+			return net.JoinHostPort(m.ContainerIP, strconv.Itoa(m.ContainerPort)), true
+		}
+	}
+	return "", false
 }

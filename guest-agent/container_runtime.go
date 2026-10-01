@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -69,7 +70,8 @@ func signalValue(name string) (syscall.Signal, bool) {
 
 // prepareContainerRoot creates the metadata directory and the files that get
 // bind-mounted into the container: hosts, resolv.conf, hostname.
-func prepareContainerRoot(ns, id, hostname string, dns []string, extraHosts []string) error {
+func prepareContainerRoot(ns, id, hostname string, hc dockerHostConfig) error {
+	dns, extraHosts := hc.Dns, hc.ExtraHosts
 	dir := containerMetaDir(ns, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -80,14 +82,8 @@ func prepareContainerRoot(ns, id, hostname string, dns []string, extraHosts []st
 		return err
 	}
 
-	var resolv string
-	if len(dns) > 0 {
-		for _, s := range dns {
-			resolv += "nameserver " + s + "\n"
-		}
-	} else if data, err := os.ReadFile("/etc/resolv.conf"); err == nil {
-		resolv = string(data)
-	}
+	base, _ := os.ReadFile("/etc/resolv.conf")
+	resolv := resolvConfContent(string(base), dns, hc.DnsSearch, hc.DnsOptions)
 	if err := os.WriteFile(containerResolvPath(ns, id), []byte(resolv), 0o644); err != nil {
 		return err
 	}
@@ -206,6 +202,10 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 		mounts = append(mounts, specs.Mount{Type: "bind", Source: src, Destination: dst, Options: opts})
 	}
 	addNamedVolume := func(volName, dst string, ro bool) error {
+		if dev, ok := bindDeviceOption(loadVolumeOptions(volName)); ok {
+			addBind(dev, dst, ro) // a bind-backed local volume
+			return nil
+		}
 		dir := volumeDataDir(ns, volName)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
@@ -229,6 +229,10 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 			markAnonymousVolume(ns, name)
 			anonVols = append(anonVols, name)
 		case strings.HasPrefix(src, "/"):
+			if sock, ok := dockerSocketBindSource(src); ok {
+				addBind(sock, dst, ro)
+				break
+			}
 			os.MkdirAll(src, 0o755) //nolint:errcheck — docker creates missing host dirs
 			addBind(src, dst, ro)
 		default:
@@ -270,6 +274,12 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) ([]specs.Mou
 		}
 	}
 	for _, m := range req.HostConfig.Mounts {
+		if m.Type == "tmpfs" && m.Target != "" {
+			// --mount type=tmpfs (compose `tmpfs:` with options) — it was
+			// silently dropped.
+			mounts = append(mounts, tmpfsMountSpec(m))
+			continue
+		}
 		// A volume mount without a source is anonymous (compose `- /data`).
 		if m.Type == "tmpfs" || m.Target == "" || (m.Source == "" && m.Type != "volume") {
 			continue
@@ -476,7 +486,7 @@ func userProcessArgs(args []string) []string {
 const cpuPeriod = 100000
 
 // buildSpecOpts composes the OCI spec options for a create request.
-func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCreateRequest, mounts []specs.Mount, hostNet bool) ([]oci.SpecOpts, error) {
+func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCreateRequest, mounts []specs.Mount, hostNet bool, joinNetNS string) ([]oci.SpecOpts, error) {
 	entrypoint := req.Entrypoint
 	if len(entrypoint) == 0 && imgCfg != nil {
 		entrypoint = imgCfg.Entrypoint
@@ -724,9 +734,13 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 			return nil
 		})
 	} else {
+		path := netnsPathFor(id)
+		if joinNetNS != "" {
+			path = joinNetNS // --network container:<x>
+		}
 		opts = append(opts, oci.WithLinuxNamespace(specs.LinuxNamespace{
 			Type: specs.NetworkNamespace,
-			Path: netnsPathFor(id),
+			Path: path,
 		}))
 	}
 	// Last: the profile is resolved against the final capability set.
@@ -776,7 +790,25 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 	}
 
 	hostNet := usesHostNetwork(req)
-	if !hostNet {
+	// joinNetNS is the target's named netns for --network container:<x>.
+	joinNetNS := ""
+	var joinHosts, joinResolv, joinHostname string
+	if isContainerNetworkMode(req.HostConfig.NetworkMode) {
+		tns, tid, terr := resolveNetworkContainer(ctx, req.HostConfig.NetworkMode)
+		if terr != nil {
+			return "", nil, terr
+		}
+		joinNetNS = netnsPathFor(tid)
+		joinHosts, joinResolv = containerHostsPath(tns, tid), containerResolvPath(tns, tid)
+		if b, rerr := os.ReadFile(filepath.Join(containerMetaDir(tns, tid), "hostname")); rerr == nil {
+			joinHostname = strings.TrimSpace(string(b))
+		}
+		if req.Hostname == "" && joinHostname != "" {
+			req.Hostname = joinHostname // the target's UTS name, as Docker does
+		}
+	}
+	ownNetNS := !hostNet && joinNetNS == ""
+	if ownNetNS {
 		if _, nerr := createNamedNetNS(id); nerr != nil {
 			return "", nil, fmt.Errorf("create netns: %w", nerr)
 		}
@@ -793,19 +825,19 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 			os.RemoveAll(volumeDataDir(ns, v))
 		}
 		deleteContainerMeta(ns, id) // also the prepared root (hosts, resolv.conf)
-		if !hostNet {
+		if ownNetNS {
 			releaseNamedNetNS(id)
 		}
 	}()
 
 	hostname := req.Hostname
-	if hostname == "" {
+	if hostname == "" && !req.generatedName {
 		hostname = name
 	}
 	if hostname == "" {
-		hostname = id[:12]
+		hostname = truncateID(dockerID(ns, id)) // the ID docker ps shows, as Docker does
 	}
-	if perr := prepareContainerRoot(ns, id, hostname, req.HostConfig.Dns, req.HostConfig.ExtraHosts); perr != nil {
+	if perr := prepareContainerRoot(ns, id, hostname, req.HostConfig); perr != nil {
 		return "", nil, perr
 	}
 
@@ -824,6 +856,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 	}
 
 	var imgCfg *ocispecImageConfig
+	var imgExposed map[string]struct{}
 	if spec, serr := img.Spec(nsCtx); serr == nil {
 		// The image's VOLUME paths not mounted otherwise get an anonymous
 		// volume each (after --volumes-from, which takes precedence).
@@ -836,6 +869,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 			mounts = append(mounts, specs.Mount{Type: "bind", Source: vm.dir, Destination: vm.dst, Options: []string{"rbind"}})
 		}
 		volMounts = append(volMounts, imgMounts...)
+		imgExposed = spec.Config.ExposedPorts
 		imgCfg = &ocispecImageConfig{
 			Entrypoint: spec.Config.Entrypoint,
 			Cmd:        spec.Config.Cmd,
@@ -845,12 +879,26 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		}
 	}
 
-	specOpts, serr := buildSpecOpts(id, hostname, imgCfg, req, mounts, hostNet)
+	if joinNetNS != "" {
+		// The target's /etc/hosts and resolv.conf, like Docker.
+		for i := range mounts {
+			switch mounts[i].Destination {
+			case "/etc/hosts":
+				mounts[i].Source = joinHosts
+			case "/etc/resolv.conf":
+				mounts[i].Source = joinResolv
+			}
+		}
+	}
+	specOpts, serr := buildSpecOpts(id, hostname, imgCfg, req, mounts, hostNet, joinNetNS)
 	if serr != nil {
 		return "", nil, serr
 	}
 
 	portMappings := portMappingsFromCreate(req)
+	if req.HostConfig.PublishAllPorts {
+		portMappings = append(portMappings, publishAllMappings(req, imgExposed)...)
+	}
 	meta := &containerMeta{
 		ID:               id,
 		Name:             name,
@@ -862,8 +910,14 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		NetworkAliases:   requestedNetworkAliasesByNetwork(req),
 		TTY:              req.Tty,
 		AutoRemove:       req.HostConfig.AutoRemove,
+		OpenStdin:        req.OpenStdin,
+		StopTimeout:      req.StopTimeout,
+		StdinOnce:        req.StdinOnce,
 		StopSignal:       req.StopSignal,
 		User:             req.User,
+		ConfigUser:       configUser(req.User, imgCfg),
+		Domainname:       req.Domainname,
+		ExposedPorts:     exposedPortList(req, imgExposed),
 		WorkingDir:       req.WorkingDir,
 		Entrypoint:       req.Entrypoint,
 		Mounts:           req.HostConfig.Mounts,
@@ -927,13 +981,30 @@ func portMappingsFromCreate(req dockerCreateRequest) []cniPortMapping {
 			continue
 		}
 		for _, hp := range hostPorts {
-			hPorts, herr := expandPortRange(hp.HostPort)
-			if herr != nil || (len(hPorts) > 1 && len(hPorts) != len(cPorts)) {
-				continue
-			}
 			hostIP := hp.HostIp
 			if hostIP == "" {
 				hostIP = "0.0.0.0"
+			}
+			hostSpec := strings.TrimSpace(hp.HostPort)
+			if hostSpec == "" || hostSpec == "0" {
+				// `-p 80`: Docker picks a free host port at start.
+				for _, c := range cPorts {
+					out = append(out, cniPortMapping{ContainerPort: c, Protocol: proto, HostIP: hostIP, Ephemeral: true})
+				}
+				continue
+			}
+			hPorts, herr := expandPortRange(hostSpec)
+			if herr != nil {
+				continue
+			}
+			if len(hPorts) > 1 && len(cPorts) == 1 {
+				// `-p 8000-8010:80`: one free port from the range.
+				out = append(out, cniPortMapping{ContainerPort: cPorts[0], Protocol: proto, HostIP: hostIP,
+					Ephemeral: true, RangeLo: hPorts[0], RangeHi: hPorts[len(hPorts)-1]})
+				continue
+			}
+			if len(hPorts) > 1 && len(hPorts) != len(cPorts) {
+				continue
 			}
 			for i, c := range cPorts {
 				h := hPorts[0]
@@ -948,4 +1019,114 @@ func portMappingsFromCreate(req dockerCreateRequest) []cniPortMapping {
 		}
 	}
 	return out
+}
+
+// configUser is inspect's Config.User: --user wins over the image's USER.
+func configUser(requested string, img *ocispecImageConfig) string {
+	if requested != "" || img == nil {
+		return requested
+	}
+	return img.User
+}
+
+// exposedPortList is Config.ExposedPorts: the image's EXPOSE, the request's
+// ExposedPorts and every published container port, sorted.
+func exposedPortList(req dockerCreateRequest, imageExposed map[string]struct{}) []string {
+	set := map[string]bool{}
+	add := func(k string) {
+		if k == "" {
+			return
+		}
+		if !strings.Contains(k, "/") {
+			k += "/tcp"
+		}
+		set[k] = true
+	}
+	for k := range imageExposed {
+		add(k)
+	}
+	for k := range req.ExposedPorts {
+		add(k)
+	}
+	for k := range req.HostConfig.PortBindings {
+		add(k)
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// tmpfsMountSpec turns --mount type=tmpfs into an OCI mount with Docker's
+// defaults (noexec,nosuid,nodev) and the size/mode/options given.
+func tmpfsMountSpec(m dockerMount) specs.Mount {
+	opts := []string{"nosuid", "nodev"}
+	exec := false
+	if t := m.TmpfsOptions; t != nil {
+		if t.SizeBytes > 0 {
+			opts = append(opts, fmt.Sprintf("size=%d", t.SizeBytes))
+		}
+		if t.Mode != 0 {
+			opts = append(opts, fmt.Sprintf("mode=%o", t.Mode))
+		}
+		for _, o := range t.Options {
+			if len(o) == 1 && o[0] == "exec" {
+				exec = true
+			} else if len(o) > 0 {
+				opts = append(opts, strings.Join(o, "="))
+			}
+		}
+	}
+	if !exec {
+		opts = append(opts, "noexec")
+	}
+	if m.ReadOnly {
+		opts = append(opts, "ro")
+	}
+	return specs.Mount{Type: "tmpfs", Source: "tmpfs", Destination: m.Target, Options: opts}
+}
+
+// resolvConfContent builds a container's resolv.conf the way Docker does:
+// the VM's file, with its nameserver, search and options lines replaced by
+// --dns, --dns-search and --dns-option when given (each independently).
+func resolvConfContent(base string, dns, search, options []string) string {
+	var ns, srch, opts, other []string
+	for _, line := range strings.Split(base, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		switch f[0] {
+		case "nameserver":
+			ns = append(ns, line)
+		case "search", "domain":
+			srch = append(srch, line)
+		case "options":
+			opts = append(opts, line)
+		default:
+			other = append(other, line)
+		}
+	}
+	if len(dns) > 0 {
+		ns = nil
+		for _, s := range dns {
+			ns = append(ns, "nameserver "+s)
+		}
+	}
+	if len(search) > 0 {
+		srch = nil
+		if !(len(search) == 1 && search[0] == ".") { // "." clears the search list
+			srch = []string{"search " + strings.Join(search, " ")}
+		}
+	}
+	if len(options) > 0 {
+		opts = []string{"options " + strings.Join(options, " ")}
+	}
+	out := append(append(append(append([]string{}, other...), ns...), srch...), opts...)
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, "\n") + "\n"
 }

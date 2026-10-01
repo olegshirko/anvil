@@ -109,14 +109,24 @@ final class VMLifecycleManager: NSObject {
         }
     }
 
-    /// Ensure the VM is running. If it is paused, resume; if stopped, start.
+    /// How long ensureRunning waits out a transitional VM state (pausing,
+    /// saving a snapshot, resuming, restoring) before giving up.
+    static let transitionWaitLimit: TimeInterval = 60
+
+    /// Ensure the VM is running: resume it if it is paused, and wait out a
+    /// pause or snapshot save that is in progress, then resume. Starting a
+    /// stopped VM is not done here: the daemon's crash handler owns restarts
+    /// (with backoff), and a second start would open the disk twice.
     func ensureRunning(completion: @escaping (Result<Void, Error>) -> Void) {
+        ensureRunning(deadline: Date().addingTimeInterval(Self.transitionWaitLimit), completion: completion)
+    }
+
+    private func ensureRunning(deadline: Date, completion: @escaping (Result<Void, Error>) -> Void) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             guard let vm = self.vm else {
-                self.start()
-                // The delegate will report readiness asynchronously.
-                completion(.success(()))
+                completion(.failure(NSError(domain: "anvil", code: 100,
+                                            userInfo: [NSLocalizedDescriptionKey: "VM not created yet"])))
                 return
             }
 
@@ -125,15 +135,31 @@ final class VMLifecycleManager: NSObject {
                 completion(.success(()))
             case .paused:
                 self.resume(completion: completion)
-            case .stopped:
-                self.start()
-                completion(.success(()))
+            case .stopped, .error:
+                completion(.failure(NSError(domain: "anvil", code: 100,
+                                            userInfo: [NSLocalizedDescriptionKey: "VM is \(vm.state == .stopped ? "stopped" : "in error state"); restart pending"])))
             default:
-                let error = NSError(domain: "anvil", code: 100,
-                                    userInfo: [NSLocalizedDescriptionKey: "unexpected VM state: \(vm.state)"])
-                completion(.failure(error))
+                // pausing / saving / resuming / restoring / starting /
+                // stopping: an idle pause may have begun just before this
+                // client arrived. Poll until the VM settles, then resume —
+                // failing here left the client retrying vsock against a
+                // paused VM and counted as a crash strike.
+                guard Date() < deadline else {
+                    completion(.failure(NSError(domain: "anvil", code: 100,
+                                                userInfo: [NSLocalizedDescriptionKey: "VM stuck in state \(vm.state.rawValue)"])))
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
+                    self?.ensureRunning(deadline: deadline, completion: completion)
+                }
             }
         }
+    }
+
+    /// The VM is paused and its committed snapshot already holds exactly
+    /// this state (the snapshot is deleted before every resume). Main queue.
+    var isPausedWithSavedSnapshot: Bool {
+        vm?.state == .paused && snapshot.hasSnapshot
     }
 
     /// Pause the VM.
@@ -147,6 +173,9 @@ final class VMLifecycleManager: NSObject {
                 DispatchQueue.main.async {
                     switch result {
                     case .success:
+                        // A paused guest reads nothing: stop rewriting the
+                        // time and entropy files every 2 s until resume.
+                        self.stopHostTimeRefresher()
                         completion(.success(()))
                     case .failure(let error):
                         completion(.failure(error))
@@ -300,15 +329,20 @@ final class VMLifecycleManager: NSObject {
     /// every 5 s and steps its clock forward when it runs more than 1 s
     /// behind; refreshing every 2 s bounds the residual drift to ~2 s.
     private func startHostTimeRefresher() {
-        guard hostTimeTimer == nil else { return }
         DispatchQueue.main.async { [weak self] in
-            self?.hostTimeTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self = self, self.hostTimeTimer == nil else { return }
+            self.hostTimeTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
                 self?.writeHostTimeFile()
             }
         }
     }
 
     private var hostTimeTimer: Timer?
+
+    private func stopHostTimeRefresher() {
+        hostTimeTimer?.invalidate()
+        hostTimeTimer = nil
+    }
 
     private func configureAndCreateVM(completion: @escaping (Result<VZVirtualMachine, Error>) -> Void) {
         DispatchQueue.main.async { [weak self] in
@@ -465,6 +499,12 @@ final class VMLifecycleManager: NSObject {
         func attempt() {
             guard Date() < deadline else {
                 print("[anvil] guest agent did not become ready")
+                // Without this the daemon waited forever: no sockets bound,
+                // no restart. A guest that panics during boot does not fire
+                // VZ's didStop, so this is the only signal.
+                self.delegate?.vmLifecycleManager(self, didFailWithError: NSError(
+                    domain: "anvil", code: 103,
+                    userInfo: [NSLocalizedDescriptionKey: "guest agent did not become ready within 120 s"]))
                 return
             }
             device.connect(toPort: controlPort) { [weak self] result in

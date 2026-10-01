@@ -17,6 +17,7 @@ import (
 	bkclient "github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/auth/authprovider"
+	"github.com/tonistiigi/fsutil"
 )
 
 // handleBuild implements POST /build (classic Docker build API). The client
@@ -160,12 +161,20 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 			done <- nil
 		}()
 
+		ctxFS, ferr := fsutil.NewFS(ctxDir)
+		if ferr != nil {
+			return ferr, false
+		}
+		dfFS, ferr := fsutil.NewFS(filepath.Dir(filepath.Join(ctxDir, dockerfile)))
+		if ferr != nil {
+			return ferr, false
+		}
 		solveOpts := bkclient.SolveOpt{
 			Frontend:      "dockerfile.v0",
 			FrontendAttrs: frontendAttrs,
-			LocalDirs: map[string]string{
-				"context":    ctxDir,
-				"dockerfile": filepath.Dir(filepath.Join(ctxDir, dockerfile)),
+			LocalMounts: map[string]fsutil.FS{
+				"context":    ctxFS,
+				"dockerfile": dfFS,
 			},
 			Exports: exports,
 			Session: sessionAttachables,
@@ -235,7 +244,7 @@ func buildAuthAttachable(a *registryAuth) session.Attachable {
 			cf.AuthConfigs[k] = ac
 		}
 	}
-	return authprovider.NewDockerAuthProvider(authprovider.DockerAuthProviderConfig{ConfigFile: cf})
+	return authprovider.NewDockerAuthProvider(authprovider.DockerAuthProviderConfig{AuthConfigProvider: authprovider.LoadAuthConfig(cf)})
 }
 
 // parseKVParam decodes a JSON object of string→string parameters sent by the

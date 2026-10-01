@@ -239,7 +239,7 @@ func findImageNamespace(ctx context.Context, ref string) string {
 
 // tagDockerImage creates a new image record pointing at the same content —
 // containerd tags are just additional names for a target descriptor.
-func tagDockerImage(ctx context.Context, source, target string) error {
+func tagDockerImageImpl(ctx context.Context, source, target string) error {
 	// Prefer a namespace where the source's WHOLE tree is visible: records
 	// left dangling by partial GCs must not seed a dangling tag.
 	ns := ""
@@ -325,7 +325,7 @@ func tagDockerImage(ctx context.Context, source, target string) error {
 // removeDockerImage removes every image record matching the ref (canonical or
 // raw name) across namespaces. Docker semantics are "the image is gone";
 // success if at least one namespace removed a record.
-func removeDockerImage(ctx context.Context, name string, force bool) error {
+func removeDockerImageImpl(ctx context.Context, name string, force bool) error {
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd client: %w", err)
@@ -414,7 +414,7 @@ func findAllImageNamespaces(ctx context.Context, ref string) []string {
 // response shape. With dangling=true only untagged images go; with
 // dangling=false (`docker system prune -a`) every image not referenced by a
 // container goes.
-func pruneDockerImages(ctx context.Context, dangling bool) ([]map[string]string, int64, error) {
+func pruneDockerImages(ctx context.Context, dangling bool, pf pruneFilter) ([]map[string]string, int64, error) {
 	images, err := listDockerImages(ctx)
 	if err != nil {
 		return nil, 0, err
@@ -444,6 +444,9 @@ func pruneDockerImages(ctx context.Context, dangling bool) ([]map[string]string,
 			continue
 		}
 		if !dangling && used[tag] {
+			continue
+		}
+		if !pf.keep(img.Labels, time.Unix(img.Created, 0)) {
 			continue
 		}
 		ref := tag
@@ -578,4 +581,22 @@ func dockerConfigExtensions(ctx context.Context, img client.Image) map[string]js
 		}
 	}
 	return out
+}
+
+// tagDockerImage tags source as target and reports Docker's tag event.
+func tagDockerImage(ctx context.Context, source, target string) error {
+	if err := tagDockerImageImpl(ctx, source, target); err != nil {
+		return err
+	}
+	publishObjectEvent("image", "tag", canonicalizeImageRef(target), map[string]string{"name": target})
+	return nil
+}
+
+// removeDockerImage removes an image and reports Docker's delete event.
+func removeDockerImage(ctx context.Context, name string, force bool) error {
+	if err := removeDockerImageImpl(ctx, name, force); err != nil {
+		return err
+	}
+	publishObjectEvent("image", "delete", name, map[string]string{"name": name})
+	return nil
 }

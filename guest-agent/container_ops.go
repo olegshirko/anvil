@@ -9,12 +9,14 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
+	"github.com/containerd/errdefs"
 	"net/url"
 
 	"github.com/containerd/containerd/v2/pkg/cio"
@@ -144,7 +146,7 @@ func removeNetInfo(ns, id string) {
 // usesHostNetworkName reports whether a logical network name means
 // host-networking (no CNI attachment).
 func usesHostNetworkName(netName string) bool {
-	return netName == "" || netName == "host"
+	return netName == "" || netName == "host" || isContainerNetworkMode(netName)
 }
 
 // --- start ------------------------------------------------------------------
@@ -197,7 +199,7 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 	// A stopped task left over from a previous run/restart must go first.
 	if old, terr := c.Task(nsCtx, nil); terr == nil {
 		if st, serr := old.Status(nsCtx); serr == nil && st.Status == "running" {
-			return fmt.Errorf("container is already running")
+			return errNotModified("container is already running")
 		}
 		dctx, cancel := context.WithTimeout(nsCtx, 5*time.Second)
 		old.Delete(dctx, client.WithProcessKill) //nolint:errcheck
@@ -279,18 +281,55 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 	// the pty itself (runc refuses a terminal spec with no console socket
 	// otherwise) and duplicates the console output into the log URI.
 	tty := getContainerTTY(dockerID(ns, id))
+	var taskIO cio.IO = &logOnlyIO{uri: uri, terminal: tty}
+	var stopLogger func()
+	var stdin *containerStdin
+	if meta != nil && meta.OpenStdin {
+		cs, serr := openContainerStdin(ns, id, true)
+		if serr != nil {
+			err = serr
+			return err
+		}
+		stdin = cs
+		cs.taskStarting()
+		if tty {
+			// The shim copies a stdin FIFO into the console even with the
+			// binary logger.
+			taskIO = &logOnlyIO{uri: uri, terminal: true, stdin: cs.path}
+		} else {
+			// Without a console the shim wires stdin only in FIFO mode
+			// (its binary logger IO has no stdin): run the task on FIFOs
+			// and the json logger on their read ends ourselves.
+			fio, stop, ferr := startFifoLogger(ns, id, containerLogPath(ns, id), rot, cs.path)
+			if ferr != nil {
+				err = ferr
+				return err
+			}
+			taskIO, stopLogger = fio, stop
+		}
+	}
 	task, terr := c.NewTask(nsCtx, func(string) (cio.IO, error) {
-		return &logOnlyIO{uri: uri, terminal: tty}, nil
+		return taskIO, nil
 	})
 	if terr != nil {
+		if stopLogger != nil {
+			stopLogger()
+		}
 		err = fmt.Errorf("new task: %w", terr)
 		return err
 	}
+	if stdin != nil {
+		stdin.taskCreated() // the shim holds the FIFO now
+	}
+
 	if serr := task.Start(nsCtx); serr != nil {
-		task.Delete(context.Background()) //nolint:errcheck
+		task.Delete(context.WithoutCancel(nsCtx)) //nolint:errcheck — namespaced: a bare context is rejected and leaks the record
 		err = fmt.Errorf("start task: %w", serr)
 		return err
 	}
+	updateContainerMeta(ns, id, func(m *containerMeta) { //nolint:errcheck
+		m.StartedAt, m.FinishedAt = time.Now().UTC(), time.Time{}
+	})
 
 	go watchTaskExit(context.Background(), ns, id, netName, ports, run)
 	// Re-attach the health monitor on every start: docker start, docker
@@ -318,17 +357,10 @@ func watchTaskExit(ctx context.Context, ns, id, netName string, ports []cniPortM
 	if err != nil {
 		return
 	}
-	exitCh, werr := task.Wait(nsCtx)
+	code, werr := waitTaskExit(nsCtx, task)
 	if werr != nil {
+		debugLog("[runtime] wait error for %s: %v", truncateID(id), werr)
 		return
-	}
-	st := <-exitCh
-
-	code := 0
-	if serr := st.Error(); serr != nil {
-		debugLog("[runtime] wait error for %s: %v", truncateID(id), serr)
-	} else {
-		code = int(st.ExitCode())
 	}
 
 	did := dockerID(ns, id)
@@ -338,6 +370,9 @@ func watchTaskExit(ctx context.Context, ns, id, netName string, ports []cniPortM
 		debugLog("[runtime] task %s/%s exited code=%d (superseded run)", ns, truncateID(id), code)
 		return
 	}
+	updateContainerMeta(ns, id, func(m *containerMeta) { //nolint:errcheck
+		m.FinishedAt = time.Now().UTC()
+	})
 	// docker kill caches the mapped 137 before the task dies; containerd
 	// often reports 0 for signal deaths, so do not overwrite it.
 	if cached, ok := peekContainerExitCode(did); !ok || code != 0 || cached == 0 {
@@ -351,6 +386,54 @@ func watchTaskExit(ctx context.Context, ns, id, netName string, ports []cniPortM
 		}
 	}
 	debugLog("[runtime] task %s/%s exited code=%d", ns, truncateID(id), code)
+}
+
+// waitTaskExit blocks until task has really exited and returns its exit
+// code. A broken wait stream (containerd restarting, a dropped connection)
+// is not an exit: the task is re-checked and waited on again while it runs.
+// Treating it as one made a running container look exited — its network
+// torn down, its exit code cached as 0, an --rm container deleted. Only
+// ctx ending stops the wait early.
+func waitTaskExit(ctx context.Context, task client.Task) (int, error) {
+	for {
+		exitCh, werr := task.Wait(ctx)
+		if werr == nil {
+			st := <-exitCh
+			if st.Error() == nil {
+				return int(st.ExitCode()), nil
+			}
+			werr = st.Error()
+		}
+		if ctx.Err() != nil {
+			return 0, fmt.Errorf("wait aborted: %w", werr)
+		}
+		if exited, code := taskHasExited(ctx, task); exited {
+			return code, nil
+		}
+		debugLog("[runtime] wait stream for %s broke (%v); task still running, waiting again", truncateID(task.ID()), werr)
+		select {
+		case <-ctx.Done():
+			return 0, fmt.Errorf("wait aborted: %w", ctx.Err())
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// taskHasExited reports whether task is gone or stopped, with its exit code.
+// An unreachable containerd counts as not exited (the caller waits again).
+func taskHasExited(ctx context.Context, task client.Task) (bool, int) {
+	st, err := task.Status(ctx)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return true, 0
+		}
+		return false, 0
+	}
+	switch st.Status {
+	case client.Running, client.Paused, client.Pausing, client.Created:
+		return false, 0
+	}
+	return true, int(st.ExitStatus)
 }
 
 // --- stop -------------------------------------------------------------------
@@ -388,6 +471,7 @@ func stopNativeTask(ctx context.Context, ns, id string, timeoutSec int) error {
 			sig = s
 		}
 	}
+	publishContainerEvent("kill", ns, id, map[string]string{"signal": strconv.Itoa(int(sig))}) // as Docker's stop
 	if kerr := task.Kill(nsCtx, sig); kerr != nil {
 		return kerr
 	}
@@ -413,6 +497,7 @@ func stopNativeTask(ctx context.Context, ns, id string, timeoutSec int) error {
 	}
 	if stopped, serr := task.Status(nsCtx); serr == nil && stopped.Status != "stopped" {
 		kctx, cancel := context.WithTimeout(nsCtx, 5*time.Second)
+		publishContainerEvent("kill", ns, id, map[string]string{"signal": strconv.Itoa(int(syscall.SIGKILL))})
 		if kerr := task.Kill(kctx, syscall.SIGKILL); kerr != nil {
 			cancel()
 			return fmt.Errorf("force kill: %w", kerr)
@@ -460,11 +545,13 @@ func teardownNetwork(ctx context.Context, ns, id string) {
 type logOnlyIO struct {
 	uri      *url.URL
 	terminal bool
+	stdin    string // FIFO path for an OpenStdin container, else empty
 }
 
 func (l *logOnlyIO) Config() cio.Config {
 	return cio.Config{
 		Terminal: l.terminal,
+		Stdin:    l.stdin,
 		Stdout:   l.uri.String(),
 		Stderr:   l.uri.String(),
 	}
@@ -492,7 +579,7 @@ func deleteNativeContainer(ctx context.Context, ns, id string, force, removeVolu
 		if task, terr := c.Task(nsCtx, nil); terr == nil {
 			if st, serr := task.Status(nsCtx); serr == nil && st.Status == "running" {
 				if !force {
-					return fmt.Errorf("cannot remove running container without force")
+					return errConflict("cannot remove container %q: container is running: stop the container before removing or force remove", truncateID(dockerID(ns, id)))
 				}
 				kctx, kcancel := context.WithTimeout(nsCtx, 5*time.Second)
 				task.Kill(kctx, syscall.SIGKILL) //nolint:errcheck
@@ -694,7 +781,7 @@ func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user,
 		stderrW.Close()
 		<-done1
 		<-done2
-		process.Delete(context.Background()) //nolint:errcheck
+		process.Delete(context.WithoutCancel(nsCtx)) //nolint:errcheck — namespaced: a bare context is rejected and leaks the record
 		stdoutR.Close()
 		stderrR.Close()
 		return nil, fmt.Errorf("exec start: %w", serr)
@@ -706,7 +793,7 @@ func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user,
 		stderrW.Close()
 		<-done1
 		<-done2
-		process.Delete(context.Background()) //nolint:errcheck
+		process.Delete(context.WithoutCancel(nsCtx)) //nolint:errcheck — namespaced: a bare context is rejected and leaks the record
 		stdoutR.Close()
 		stderrR.Close()
 		return nil, werr
@@ -727,7 +814,7 @@ func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user,
 		stderrW.Close()
 		<-done1
 		<-done2
-		process.Delete(context.Background()) //nolint:errcheck
+		process.Delete(context.WithoutCancel(nsCtx)) //nolint:errcheck — namespaced: a bare context is rejected and leaks the record
 		stdoutR.Close()
 		stderrR.Close()
 		return &simpleExecResult{stdout: outBuf.String(), stderr: errBuf.String(), exitCode: 124},
@@ -748,7 +835,7 @@ func runSimpleExecStdin(ctx context.Context, ns, id string, argv []string, user,
 	} else {
 		exitCode = int(st.ExitCode())
 	}
-	process.Delete(context.Background()) //nolint:errcheck
+	process.Delete(context.WithoutCancel(nsCtx)) //nolint:errcheck — namespaced: a bare context is rejected and leaks the record
 	stdoutR.Close()
 	stderrR.Close()
 	return &simpleExecResult{stdout: outBuf.String(), stderr: errBuf.String(), exitCode: exitCode}, nil

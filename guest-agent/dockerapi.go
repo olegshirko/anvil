@@ -9,11 +9,14 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -115,15 +118,33 @@ func matchesLabelFilters(labels map[string]string, filters map[string]map[string
 				return false
 			}
 		}
-		return true
+	}
+	for constraint := range filters["label!"] {
+		if key, value, hasValue := strings.Cut(constraint, "="); hasValue {
+			if v, ok := labels[key]; ok && v == value {
+				return false
+			}
+		} else if _, ok := labels[constraint]; ok {
+			return false
+		}
 	}
 	return true
+}
+
+// attachStreamOptions are the attach query parameters that shape the output.
+type attachStreamOptions struct {
+	logs, stream   bool
+	stdout, stderr bool
+	detached       func() bool // true once the client typed the detach keys
 }
 
 // streamTaskLogToTTY streams the task log; with tty=true the bytes go out raw
 // (Docker sends TTY output unmultiplexed — a mux header would corrupt the
 // client terminal), otherwise in the 8-byte-header multiplexed format.
-func streamTaskLogToTTY(out io.Writer, ns, id string, follow bool, tty bool) {
+// logs replays what was written before the attach; without it the stream
+// starts at the current end (`docker start -a` of an exited container shows
+// only the new run). stream follows the log until the task exits.
+func streamTaskLogToTTY(out io.Writer, ns, id string, tty bool, ao attachStreamOptions) {
 	flusher, _ := out.(http.Flusher)
 	emit := func(stream byte, line []byte) {
 		var writeErr error
@@ -155,8 +176,19 @@ func streamTaskLogToTTY(out io.Writer, ns, id string, follow bool, tty bool) {
 	if tty {
 		quiet = stopQuietTTY
 	}
-	err := readTaskLog(logPath, logReadOptions{follow: follow, tail: -1, stop: taskExitedStopper(ns, id, follow), stopQuiet: quiet}, emitWrap)
-	debugLog("attach %s: readTaskLog done err=%v emitted=%d tty=%v follow=%v", id, err, n, tty, follow)
+	tail := -1
+	if !ao.logs {
+		tail = 0
+	}
+	baseStop := taskExitedStopper(ns, id, ao.stream)
+	stop := baseStop
+	if ao.detached != nil {
+		stop = func() bool { return ao.detached() || baseStop() }
+	}
+	opts := logReadOptions{follow: ao.stream, tail: tail, stop: stop, stopQuiet: quiet,
+		stream: func(s byte) bool { return (s == 1 && ao.stdout) || (s == 2 && ao.stderr) }}
+	err := readTaskLog(logPath, opts, emitWrap)
+	debugLog("attach %s: readTaskLog done err=%v emitted=%d tty=%v follow=%v", id, err, n, tty, ao.stream)
 }
 
 // taskExitedStopper ends a log follow stream when the container's task has
@@ -184,20 +216,51 @@ func taskExitedStopper(ns, id string, follow bool) func() bool {
 // errWriteFailed unwinds readTaskLog when the HTTP client disconnects.
 var errWriteFailed = errors.New("write failed")
 
-// handleAttach hijacks the HTTP connection and streams container output using
-// Docker's raw-stream multiplexing format. It replays the json-file task log
-// first, then follows it only if the container is still running and the
-// client asked for a stream. This avoids the race where short-lived
-// containers exit before attach is called.
+// handleAttach hijacks the HTTP connection and streams container output
+// using Docker's raw-stream multiplexing format, and feeds the client's
+// stdin to an OpenStdin container. Output is the json-file task log: with
+// logs=1 it is replayed first; with stream=1 it is followed until the task
+// exits. docker run attaches before start, so following from the current
+// end (an empty log) still shows a short-lived container's whole output.
 func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
 	ns, containerdID, _, err := resolveDockerID(r.Context(), id)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	q := r.URL.Query()
+	ao := attachStreamOptions{
+		logs:   queryBool(q, "logs"),
+		stream: queryBool(q, "stream"),
+		stdout: queryBool(q, "stdout"),
+		stderr: queryBool(q, "stderr"),
+	}
+	if !q.Has("stdout") && !q.Has("stderr") {
+		ao.stdout, ao.stderr = true, true
+	}
+	if !q.Has("stream") && !q.Has("logs") {
+		ao.logs, ao.stream = true, true // bare attach from older clients
+	}
+	did := dockerID(ns, containerdID)
+	tty := getContainerTTY(did)
+	meta, _ := loadContainerMeta(ns, containerdID)
+	var stdin *containerStdin
+	if queryBool(q, "stdin") && meta != nil && meta.OpenStdin {
+		// A stopped container is about to run again (start -ai, run):
+		// its input belongs to the next run's FIFO.
+		running, _, _ := containerTaskState(r.Context(), ns, containerdID)
+		if stdin, err = openContainerStdin(ns, containerdID, !running); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	detachKeys, err := parseDetachKeys(q.Get("detachKeys"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	// Keep AutoRemove from deleting the container (and its logs) while we
 	// are replaying output to the client.
-	did := dockerID(ns, containerdID)
 	attachBegin(did)
 	defer attachEnd(did)
 
@@ -218,20 +281,47 @@ func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
 	if err := bufrw.Flush(); err != nil {
 		return
 	}
-	// Drain any stdin the client sends so the half-duplex pipe does not block.
-	// Use the raw connection, not bufrw, because bufrw is used for writing below
-	// and bufio types are not safe for concurrent read/write.
+	// Client stdin: into the container's stdin, or drained so the client
+	// never blocks. Read from the raw connection (plus whatever the HTTP
+	// server already buffered), not bufrw's writer side, which the output
+	// goroutine below uses.
+	var detached atomic.Bool
+	in := io.MultiReader(io.LimitReader(bufrw.Reader, int64(bufrw.Reader.Buffered())), conn)
 	go func() {
-		io.Copy(io.Discard, conn)
+		if stdin == nil {
+			io.Copy(io.Discard, in) //nolint:errcheck
+			return
+		}
+		if tty {
+			if d, _ := copyStdinUntilDetach(stdin, in, detachKeys); d {
+				detached.Store(true)
+				return
+			}
+		} else {
+			io.Copy(stdin, in) //nolint:errcheck
+		}
+		// The client's stdin ended (EOF or a closed connection).
+		if meta.StdinOnce {
+			stdin.close()
+		}
 	}()
+	ao.detached = detached.Load
 
-	// Replay existing logs then follow if the container is still running.
-	// TTY containers stream raw bytes (no docker mux headers).
-	streamTaskLogToTTY(bufrw, ns, containerdID, true, getContainerTTY(did))
+	streamTaskLogToTTY(bufrw, ns, containerdID, tty, ao)
 
 	// Ensure all buffered output reaches the client before closing.
 	bufrw.Flush()
 	time.Sleep(100 * time.Millisecond)
+}
+
+// queryBool reads a boolean query parameter the way Docker's BoolValue
+// does: any value except "", 0, no, false and none is true.
+func queryBool(q url.Values, key string) bool {
+	switch strings.ToLower(strings.TrimSpace(q.Get(key))) {
+	case "", "0", "no", "false", "none":
+		return false
+	}
+	return true
 }
 
 // handleLogs streams container logs using Docker's multiplexed stream format.
@@ -263,6 +353,14 @@ func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
 			opts.tail = n
 		}
 	}
+	if q.Has("stdout") || q.Has("stderr") {
+		wantOut, wantErr := queryBool(q, "stdout"), queryBool(q, "stderr")
+		opts.stream = func(s byte) bool { return (s == 1 && wantOut) || (s == 2 && wantErr) }
+	}
+	// A TTY container's log is one raw stream, as Docker serves it: the CLI
+	// copies the body straight to the terminal, so mux headers showed up
+	// as garbage before every line.
+	tty := getContainerTTY(dockerID(ns, containerdID))
 
 	// Log driver "none" discards: there is deliberately no log file, so
 	// logs must return an empty stream (and an empty follow) instead of
@@ -284,7 +382,13 @@ func handleLogs(w http.ResponseWriter, r *http.Request, id string) {
 
 	flusher, _ := w.(http.Flusher)
 	emit := func(stream byte, line []byte) {
-		if writeDockerStream(w, stream, line) != nil {
+		var werr error
+		if tty {
+			_, werr = w.Write(line)
+		} else {
+			werr = writeDockerStream(w, stream, line)
+		}
+		if werr != nil {
 			panic(errWriteFailed) // unwind readTaskLog's follow loop
 		}
 		if flusher != nil {
@@ -356,16 +460,71 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 		log.Printf("[docker-api] boot finalize timeout, serving anyway")
 	}
 
+	srv := &http.Server{Handler: mux}
+	// The same API inside the VM, for containers that mount the Docker
+	// socket (Testcontainers' Ryuk, devcontainers, Traefik, Portainer).
+	if ul, err := listenGuestDockerSocket(); err != nil {
+		log.Printf("[docker-api] %s: %v", guestDockerSocket, err)
+	} else {
+		go func() {
+			if err := srv.Serve(ul); err != nil {
+				log.Printf("[docker-api] serve %s: %v", guestDockerSocket, err)
+			}
+		}()
+	}
+
 	l, err := vsock.Listen(dockerAPIPort, nil)
 	if err != nil {
 		log.Printf("[docker-api] listen: %v", err)
 		return
 	}
 	log.Printf("[docker-api] listening on vsock port %d", dockerAPIPort)
-	srv := &http.Server{Handler: mux}
 	if err := srv.Serve(l); err != nil {
 		log.Printf("[docker-api] serve: %v", err)
 	}
+}
+
+// guestDockerSocket is the Docker API socket inside the VM. Bind mounts of
+// any Docker socket path resolve to it (dockerSocketBindSource).
+const guestDockerSocket = "/run/docker.sock"
+
+func listenGuestDockerSocket() (net.Listener, error) {
+	if err := os.MkdirAll(filepath.Dir(guestDockerSocket), 0o755); err != nil {
+		return nil, err
+	}
+	os.Remove(guestDockerSocket) //nolint:errcheck — stale socket from a previous boot
+	l, err := net.Listen("unix", guestDockerSocket)
+	if err != nil {
+		return nil, err
+	}
+	// Only containers that mount the socket can reach it, and those are
+	// root-equivalent by design (as with Docker); non-root users inside
+	// them (devcontainers' vscode user) must be able to connect.
+	os.Chmod(guestDockerSocket, 0o666) //nolint:errcheck
+	// /var/run is a plain directory in this rootfs, not a link to /run.
+	if fi, err := os.Lstat("/var/run"); err == nil && fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
+		os.Remove("/var/run/docker.sock")                     //nolint:errcheck
+		os.Symlink(guestDockerSocket, "/var/run/docker.sock") //nolint:errcheck
+	}
+	log.Printf("[docker-api] listening on %s", guestDockerSocket)
+	return l, nil
+}
+
+// dockerSocketBindSource maps a bind-mount source naming a Docker socket to
+// the guest's own socket. Clients pass whichever path they talk to: the
+// conventional /var/run/docker.sock, Docker Desktop's docker.sock.raw, or —
+// Testcontainers with a docker context — the Mac-side ~/.anvil-vz/docker.sock,
+// which is a unix socket on the virtiofs share that nothing in the VM can
+// connect to.
+func dockerSocketBindSource(src string) (string, bool) {
+	switch filepath.Clean(src) {
+	case "/var/run/docker.sock", "/run/docker.sock", "/var/run/docker.sock.raw":
+		return guestDockerSocket, true
+	}
+	if strings.HasSuffix(filepath.Clean(src), "/.anvil-vz/docker.sock") {
+		return guestDockerSocket, true
+	}
+	return src, false
 }
 
 // parseResizeQuery extracts the h/w terminal dimensions from a resize request.
@@ -447,14 +606,17 @@ func handleExecResize(w http.ResponseWriter, r *http.Request, id string) {
 
 // pruneDockerContainers removes stopped/created containers and returns their
 // Docker IDs. It mirrors the response shape of POST /containers/prune.
-func pruneDockerContainers(ctx context.Context) ([]string, int64, error) {
+func pruneDockerContainers(ctx context.Context, pf pruneFilter) ([]string, int64, error) {
 	containers, err := listDockerContainers(ctx, nil)
 	if err != nil {
 		return nil, 0, err
 	}
 	var deleted []string
 	for _, c := range containers {
-		if c.State == "running" {
+		if c.State == "running" || c.State == "paused" {
+			continue
+		}
+		if !pf.keep(c.Labels, time.Unix(0, c.created)) {
 			continue
 		}
 		if err := deleteDockerContainer(ctx, c.Id, true, false); err != nil {
@@ -467,7 +629,7 @@ func pruneDockerContainers(ctx context.Context) ([]string, int64, error) {
 }
 
 // pruneDockerNetworks removes unused non-default networks.
-func pruneDockerNetworks(ctx context.Context) ([]string, error) {
+func pruneDockerNetworks(ctx context.Context, pf pruneFilter) ([]string, error) {
 	networks, err := listDockerNetworks(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -508,6 +670,9 @@ func pruneDockerNetworks(ctx context.Context) ([]string, error) {
 		if _, ok := inUse[nw.Name]; ok {
 			continue
 		}
+		if !pf.keep(nw.Labels, fileModTime(cniConflistPath(nw.Name))) {
+			continue
+		}
 		if err := removeDockerNetwork(ctx, nw.Name); err != nil {
 			log.Printf("[docker-api] prune network %s: %v", nw.Name, err)
 			continue
@@ -544,6 +709,12 @@ func pruneDockerVolumes(ctx context.Context, filters map[string]map[string]bool)
 		}
 		if !matchesLabelFilters(v.Labels, filters) {
 			continue
+		}
+		if len(filters["until"]) > 0 {
+			if pf, err := newPruneFilter(map[string]map[string]bool{"until": filters["until"]}); err == nil &&
+				!pf.keep(nil, parseCreatedAt(v.CreatedAt)) {
+				continue
+			}
 		}
 		size := dirSize(v.Mountpoint)
 		if err := removeDockerVolume(ctx, v.Name); err != nil {

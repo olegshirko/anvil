@@ -2777,6 +2777,469 @@ def test_build_context_symlinks() -> None:
     record("build context symlinks", "PASS", "relative and absolute links kept")
 
 
+def api_status(method: str, path: str) -> int:
+    """Raw Docker API call over the anvil socket; returns the HTTP status."""
+    proc = subprocess.run(
+        ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "60",
+         "--unix-socket", str(DOCKER_SOCKET), "-X", method, f"http://anvil{path}"],
+        capture_output=True, text=True)
+    return int(proc.stdout.strip() or 0)
+
+
+def test_ephemeral_host_ports() -> None:
+    """`-p 80`, `-P` and `-p lo-hi:80` get a free host port at start.
+
+    Regression: an empty HostPort was skipped, so testcontainers and
+    compose `ports: ["80"]` published nothing.
+    """
+    eph, pall, r1, r2 = (f"{PREFIX}-eph", f"{PREFIX}-pall", f"{PREFIX}-rng1", f"{PREFIX}-rng2")
+    lo = PORT_BASE + 60
+    try:
+        docker("run", "-d", "--name", eph, "-p", "80", "nginx")
+        port = docker("port", eph, "80/tcp").stdout.strip().splitlines()[0].rsplit(":", 1)[1]
+        if curl_status(int(port)) != "200":
+            raise RuntimeError(f"-p 80 -> localhost:{port} did not answer")
+        bindings = json.loads(docker("inspect", eph, "--format", "{{json .HostConfig.PortBindings}}").stdout)
+        if bindings["80/tcp"][0]["HostPort"] != "":
+            raise RuntimeError(f"HostConfig.PortBindings must keep the request: {bindings}")
+
+        docker("run", "-d", "--name", pall, "-P", "nginx")  # nginx EXPOSEs 80
+        pport = docker("port", pall).stdout.strip()
+        if "80/tcp ->" not in pport:
+            raise RuntimeError(f"-P published nothing: {pport!r}")
+
+        docker("run", "-d", "--name", r1, "-p", f"{lo}-{lo + 3}:80", "nginx")
+        docker("run", "-d", "--name", r2, "-p", f"{lo}-{lo + 3}:80", "nginx")
+        p1 = docker("port", r1, "80/tcp").stdout.strip().rsplit(":", 1)[1]
+        p2 = docker("port", r2, "80/tcp").stdout.strip().rsplit(":", 1)[1]
+        if p1 == p2 or not all(lo <= int(p) <= lo + 3 for p in (p1, p2)):
+            raise RuntimeError(f"range picks {p1}, {p2} not distinct within {lo}-{lo + 3}")
+        record("ephemeral host ports", "PASS", f"-p 80 -> {port}, -P -> {pport.split()[-1]}, range -> {p1}/{p2}")
+    finally:
+        cleanup(eph, pall, r1, r2)
+
+
+def test_docker_socket_in_container() -> None:
+    """Containers can mount the Docker socket (Testcontainers' Ryuk,
+    devcontainers, Traefik): /var/run/docker.sock and the Mac-side
+    ~/.anvil-vz/docker.sock both resolve to the guest's API socket."""
+    name = f"{PREFIX}-sockpeer"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sleep", "300")
+        for src in ("/var/run/docker.sock", str(DOCKER_SOCKET)):
+            out = docker("run", "--rm", "-u", "1000", "-v", f"{src}:/var/run/docker.sock",
+                         "docker:cli", "docker", "ps", "--format", "{{.Names}}", timeout=300.0)
+            if name not in out.stdout.split():
+                raise RuntimeError(f"docker ps through {src} did not list {name}: {out.stdout!r}")
+        record("docker socket in container", "PASS", "API reachable via both socket paths, as a non-root user")
+    finally:
+        cleanup(name)
+
+
+def test_api_status_codes() -> None:
+    """404 / 409 / 304 as Docker sends them; clients branch on these."""
+    run_, stopped = f"{PREFIX}-codes-run", f"{PREFIX}-codes-stopped"
+    try:
+        docker("run", "-d", "--name", run_, "alpine", "sleep", "300")
+        docker("create", "--name", stopped, "alpine", "true")
+        checks = {
+            "start running -> 304": (api_status("POST", f"/containers/{run_}/start"), 304),
+            "stop stopped -> 304": (api_status("POST", f"/containers/{stopped}/stop"), 304),
+            "kill stopped -> 409": (api_status("POST", f"/containers/{stopped}/kill"), 409),
+            "rm running -> 409": (api_status("DELETE", f"/containers/{run_}"), 409),
+            "rm missing -> 404": (api_status("DELETE", f"/containers/{PREFIX}-nope"), 404),
+            "start missing -> 404": (api_status("POST", f"/containers/{PREFIX}-nope/start"), 404),
+        }
+        bad = {k: got for k, (got, want) in checks.items() if got != want}
+        if bad:
+            raise RuntimeError(f"wrong status codes: {bad}")
+        dup = docker("create", "--name", run_, "alpine", "true", check=False)
+        if dup.returncode == 0 or "Conflict" not in dup.stderr:
+            raise RuntimeError(f"duplicate name not a conflict: {dup.stderr.strip()}")
+        if docker("rm", "-f", f"{PREFIX}-nope", check=False).returncode != 0:
+            raise RuntimeError("docker rm -f on a missing container must succeed")
+        record("API status codes", "PASS", ", ".join(checks))
+    finally:
+        cleanup(run_, stopped)
+
+
+def test_published_port_half_close() -> None:
+    """A client's shutdown(SHUT_WR) must reach the container as EOF while
+    the reply still flows back (redis/DB pools, `nc -N`)."""
+    name = f"{PREFIX}-halfclose"
+    port = PORT_BASE + 70
+    try:
+        docker("run", "-d", "--name", name, "-p", f"{port}:9000", "alpine",
+               "sh", "-c", "while true; do nc -l -p 9000 -e cat; done")
+        deadline = time.time() + 15
+        reply = b""
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+                    s.sendall(b"ping")
+                    s.shutdown(socket.SHUT_WR)
+                    s.settimeout(5)
+                    reply = b""
+                    while chunk := s.recv(64):
+                        reply += chunk
+                if reply == b"ping":
+                    break
+            except OSError:
+                pass
+            time.sleep(0.5)
+        if reply != b"ping":
+            raise RuntimeError(f"echo after half-close = {reply!r}, want b'ping' (FIN not forwarded?)")
+        record("published port half-close", "PASS", "FIN reached the container, reply came back")
+    finally:
+        cleanup(name)
+
+
+def test_exec_tty() -> None:
+    """`docker exec -t` gets a pty (regression: "not a tty")."""
+    name = f"{PREFIX}-exectty"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sleep", "300")
+        out = docker("exec", "-t", name, "tty", check=False)
+        if out.returncode != 0 or not out.stdout.strip().startswith("/dev/pts/"):
+            raise RuntimeError(f"exec -t tty -> rc={out.returncode} {out.stdout.strip()!r}")
+        plain = docker("exec", name, "tty", check=False)
+        if plain.returncode == 0:
+            raise RuntimeError("exec without -t reported a tty")
+        record("exec -t allocates a tty", "PASS", out.stdout.strip())
+    finally:
+        cleanup(name)
+
+
+def test_run_interactive_stdin() -> None:
+    """`docker run -i` pipes stdin into the container and closes it at EOF."""
+    out = docker("run", "--rm", "-i", "alpine", "sh", "-c", "wc -c; echo done",
+                 input_text="x" * 100000)
+    lines = out.stdout.split()
+    if lines[:2] != ["100000", "done"]:
+        raise RuntimeError(f"stdin not delivered or not closed: {out.stdout!r}")
+    record("run -i stdin", "PASS", "100000 bytes piped in, EOF delivered")
+
+
+def test_attach_stdin_and_detach() -> None:
+    """`docker start -ai` on an OpenStdin container: stdin flows in, output
+    of the new run only (no replay of the previous run's log)."""
+    name = f"{PREFIX}-attachin"
+    try:
+        docker("create", "-i", "--name", name, "alpine", "sh", "-c", "read l; echo got:$l")
+        first = docker("start", "-ai", name, input_text="one\n")
+        second = docker("start", "-ai", name, input_text="two\n")
+        if first.stdout.strip() != "got:one" or second.stdout.strip() != "got:two":
+            raise RuntimeError(f"start -ai output: {first.stdout!r} then {second.stdout!r}")
+        record("start -ai stdin", "PASS", "each run read its own stdin, no log replay")
+    finally:
+        cleanup(name)
+
+
+def test_tty_logs_raw() -> None:
+    """docker logs of a -t container is a raw stream (no mux headers)."""
+    name = f"{PREFIX}-ttylogs"
+    try:
+        docker("run", "-t", "--name", name, "alpine", "echo", "hello-tty")
+        out = subprocess.run(["docker", "logs", name], capture_output=True, env=DOCKER_ENV, timeout=60)
+        if out.stdout != b"hello-tty\r\n":
+            raise RuntimeError(f"logs of a tty container = {out.stdout!r}")
+        record("tty container logs are raw", "PASS", repr(out.stdout))
+    finally:
+        cleanup(name)
+
+
+def test_logs_tail_zero_follow() -> None:
+    """`logs -f --tail 0` shows only new lines."""
+    name = f"{PREFIX}-tail0"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sh", "-c",
+               "echo old; sleep 2; echo new; sleep 1")
+        time.sleep(1)
+        out = docker("logs", "-f", "--tail", "0", name, timeout=30)
+        if out.stdout.split() != ["new"]:
+            raise RuntimeError(f"logs -f --tail 0 = {out.stdout!r}, want only 'new'")
+        record("logs -f --tail 0", "PASS", "old lines skipped, new line followed")
+    finally:
+        cleanup(name)
+
+
+def test_restart_keeps_rm_container() -> None:
+    """docker restart must not remove an --rm container (Docker keeps it)."""
+    name = f"{PREFIX}-rmrestart"
+    try:
+        docker("run", "-d", "--rm", "--name", name, "alpine", "sleep", "300")
+        docker("restart", "-t", "1", name)
+        time.sleep(2)
+        state = docker("inspect", name, "--format", "{{.State.Running}}", check=False)
+        if state.stdout.strip() != "true":
+            raise RuntimeError(f"after restart: {state.stdout.strip() or state.stderr.strip()}")
+        docker("stop", "-t", "1", name)
+        deadline = time.time() + 15
+        while time.time() < deadline and docker("inspect", name, check=False).returncode == 0:
+            time.sleep(0.5)
+        if docker("inspect", name, check=False).returncode == 0:
+            raise RuntimeError("--rm container not removed after a real stop")
+        record("restart keeps --rm container", "PASS", "survived restart, removed after stop")
+    finally:
+        cleanup(name)
+
+
+def test_generated_names_and_status() -> None:
+    """Unnamed containers get Docker-style names; ps Status reads like Docker."""
+    cid = docker("run", "-d", "alpine", "sleep", "300").stdout.strip()
+    try:
+        name = docker("inspect", cid, "--format", "{{.Name}}").stdout.strip().lstrip("/")
+        if not re.fullmatch(r"[a-z]+_[a-z]+\d*", name):
+            raise RuntimeError(f"generated name {name!r}")
+        host = docker("exec", cid, "hostname").stdout.strip()
+        if host != cid[:12]:
+            raise RuntimeError(f"hostname {host!r}, want the short ID")
+        st = docker("ps", "--filter", f"id={cid}", "--format", "{{.Status}}").stdout.strip()
+        if not st.startswith("Up "):
+            raise RuntimeError(f"running status {st!r}")
+        docker("rm", "-f", cid)
+        ex = f"{PREFIX}-exit3"
+        docker("run", "--name", ex, "alpine", "sh", "-c", "exit 3", check=False)
+        st = docker("ps", "-a", "--filter", f"name={ex}", "--format", "{{.Status}}").stdout.strip()
+        cleanup(ex)
+        if not st.startswith("Exited (3) "):
+            raise RuntimeError(f"exited status {st!r}")
+        record("generated names + ps status", "PASS", f"{name}; 'Up …'; '{st}'")
+    finally:
+        docker("rm", "-f", cid, check=False)
+
+
+def test_inspect_fields() -> None:
+    """Inspect carries the fields devcontainers/testcontainers read."""
+    name = f"{PREFIX}-inspect"
+    try:
+        # sleep: nginx itself cannot bind :80 as user 101 and would exit.
+        docker("run", "-d", "--name", name, "--user", "101", "nginx", "sleep", "300")
+        info = json.loads(docker("inspect", name).stdout)[0]
+        problems = []
+        if info.get("Created", "").startswith("0001") or not info.get("Created"):
+            problems.append("Created")
+        if not info.get("Path"):
+            problems.append("Path")
+        if info["State"].get("StartedAt", "0001").startswith("0001"):
+            problems.append("State.StartedAt")
+        if info["Config"].get("User") != "101":
+            problems.append(f"Config.User={info['Config'].get('User')!r}")
+        if "80/tcp" not in (info["Config"].get("ExposedPorts") or {}):
+            problems.append("Config.ExposedPorts")
+        net = info["NetworkSettings"]["Networks"].get("bridge", {})
+        if not net.get("Gateway") or net.get("IPPrefixLen", 0) == 0:
+            problems.append(f"bridge endpoint {net}")
+        if problems:
+            raise RuntimeError(f"missing/wrong: {problems}")
+        record("inspect fields", "PASS", "Created/Path/StartedAt/User/ExposedPorts/Gateway set")
+    finally:
+        cleanup(name)
+
+
+def test_info_and_version() -> None:
+    name = f"{PREFIX}-infocount"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sleep", "300")
+        info = json.loads(docker("info", "--format", "{{json .}}").stdout)
+        if info.get("ContainersRunning", 0) < 1 or info.get("Images", 0) < 1 or info.get("MemTotal", 0) <= 0:
+            raise RuntimeError(f"info counts: running={info.get('ContainersRunning')} images={info.get('Images')} mem={info.get('MemTotal')}")
+        ver = docker("version", "--format", "{{.Server.Version}}").stdout.strip()
+        if ver.startswith("24."):
+            raise RuntimeError(f"server version still {ver}")
+        record("info/version", "PASS", f"running={info['ContainersRunning']} images={info['Images']} server={ver}")
+    finally:
+        cleanup(name)
+
+
+def test_ps_filters_extended() -> None:
+    a, b = f"{PREFIX}-flt-a", f"{PREFIX}-flt-b"
+    try:
+        docker("run", "--name", a, "alpine", "sh", "-c", "exit 2", check=False)
+        docker("run", "-d", "--name", b, "nginx")
+        def names(*flt: str) -> set[str]:
+            out = docker("ps", "-a", "--format", "{{.Names}}", *[x for f in flt for x in ("--filter", f)]).stdout
+            return set(out.split())
+        checks = {
+            "ancestor=nginx": (b in names("ancestor=nginx")) and (a not in names("ancestor=nginx")),
+            "exited=2": names("exited=2") >= {a} and b not in names("exited=2"),
+            f"since={a}": b in names(f"since={a}") and a not in names(f"since={a}"),
+            f"before={b}": a in names(f"before={b}") and b not in names(f"before={b}"),
+            "status=exited w/o -a": a in docker("ps", "--filter", "status=exited", "--format", "{{.Names}}").stdout.split(),
+        }
+        bad = [k for k, ok in checks.items() if not ok]
+        if docker("ps", "--filter", "bogus=1", check=False).returncode == 0:
+            bad.append("unknown filter accepted")
+        if bad:
+            raise RuntimeError(f"failed: {bad}")
+        record("ps filters (ancestor/exited/since/before/status)", "PASS", ", ".join(checks))
+    finally:
+        cleanup(a, b)
+
+
+def test_prune_respects_filters() -> None:
+    keep, drop = f"{PREFIX}-prune-keep", f"{PREFIX}-prune-drop"
+    try:
+        docker("create", "--name", keep, "alpine", "true")
+        docker("create", "--name", drop, "--label", "anvil-it-prune=yes", "alpine", "true")
+        docker("container", "prune", "-f", "--filter", "label=anvil-it-prune=yes")
+        left = docker("ps", "-a", "--format", "{{.Names}}").stdout.split()
+        if drop in left or keep not in left:
+            raise RuntimeError(f"after label-filtered prune: keep={keep in left} drop={drop in left}")
+        docker("container", "prune", "-f", "--filter", "until=1h")
+        if keep not in docker("ps", "-a", "--format", "{{.Names}}").stdout.split():
+            raise RuntimeError("until=1h pruned a container created just now")
+        record("prune filters", "PASS", "label and until honored")
+    finally:
+        cleanup(keep, drop)
+
+
+def test_pull_by_digest() -> None:
+    digests = docker("image", "inspect", "alpine", "--format", "{{json .RepoDigests}}").stdout
+    ds = [d for d in json.loads(digests or "[]") if "@sha256:" in d]
+    if not ds:
+        record("pull by digest", "SKIP", "alpine has no RepoDigests")
+        return
+    ref = "alpine@" + ds[0].split("@", 1)[1]
+    docker("pull", ref, timeout=300.0)
+    out = docker("run", "--rm", ref, "echo", "digest-ok").stdout.strip()
+    if out != "digest-ok":
+        raise RuntimeError(f"run {ref}: {out!r}")
+    record("pull by digest", "PASS", ref[:40])
+
+
+def test_mount_tmpfs_and_stop_timeout() -> None:
+    name = f"{PREFIX}-tmpfs"
+    try:
+        docker("run", "-d", "--name", name, "--stop-timeout", "1",
+               "--mount", "type=tmpfs,destination=/scratch,tmpfs-size=1048576",
+               "alpine", "sh", "-c", "trap '' TERM; sleep 300")
+        df = docker("exec", name, "sh", "-c", "grep ' /scratch ' /proc/mounts").stdout
+        if "tmpfs" not in df or "size=1024k" not in df:
+            raise RuntimeError(f"/scratch mount: {df.strip()!r}")
+        t0 = time.time()
+        docker("stop", name)
+        took = time.time() - t0
+        if took > 6:
+            raise RuntimeError(f"docker stop took {took:.1f}s with --stop-timeout 1")
+        record("--mount tmpfs + --stop-timeout", "PASS", f"tmpfs 1M mounted; stop in {took:.1f}s")
+    finally:
+        cleanup(name)
+
+
+def test_volume_bind_driver_opts_and_dns() -> None:
+    vol, name = f"{PREFIX}-bindvol", f"{PREFIX}-bindvol-c"
+    with tempfile.TemporaryDirectory(dir=str(HOME)) as d:
+        Path(d, "marker.txt").write_text("from-host")
+        try:
+            docker("volume", "create", "--opt", "type=none", "--opt", "o=bind", "--opt", f"device={d}", vol)
+            out = docker("run", "--rm", "--name", name, "-v", f"{vol}:/data",
+                         "--dns-search", "anvil.test", "--dns-option", "ndots:3",
+                         "alpine", "sh", "-c", "cat /data/marker.txt; cat /etc/resolv.conf").stdout
+            if "from-host" not in out:
+                raise RuntimeError(f"bind-backed volume content missing: {out!r}")
+            if "search anvil.test" not in out or "options ndots:3" not in out:
+                raise RuntimeError(f"resolv.conf: {out!r}")
+            record("volume driver_opts bind + dns-search/option", "PASS", "host dir mounted, resolv.conf set")
+        finally:
+            docker("volume", "rm", "-f", vol, check=False)
+
+
+def test_network_container_mode() -> None:
+    target = f"{PREFIX}-nettarget"
+    try:
+        docker("run", "-d", "--name", target, "nginx")
+        out = ""
+        for _ in range(20):
+            p = docker("run", "--rm", "--network", f"container:{target}", "alpine",
+                       "wget", "-qO-", "http://127.0.0.1:80/", check=False)
+            out = p.stdout
+            if "nginx" in out.lower():
+                break
+            time.sleep(0.5)
+        if "nginx" not in out.lower():
+            raise RuntimeError(f"localhost:80 from the shared netns: {out[:80]!r}")
+        mode = docker("run", "-d", "--network", f"container:{target}", "alpine", "sleep", "30").stdout.strip()
+        nm = docker("inspect", mode, "--format", "{{.HostConfig.NetworkMode}}").stdout.strip()
+        docker("rm", "-f", mode, check=False)
+        if not nm.startswith("container:"):
+            raise RuntimeError(f"NetworkMode {nm!r}")
+        record("--network container:<x>", "PASS", "target's localhost reachable; NetworkMode kept")
+    finally:
+        cleanup(target)
+
+
+def test_local_registry_push_pull() -> None:
+    """`docker push localhost:<port>/…` reaches a registry:2 container
+    published on that port (Docker Desktop semantics; plain HTTP)."""
+    reg = f"{PREFIX}-registry"
+    port = PORT_BASE + 80
+    ref = f"localhost:{port}/anvil-it/alpine:1"
+    try:
+        docker("run", "-d", "--name", reg, "-p", f"{port}:5000", "registry:2", timeout=300.0)
+        deadline = time.time() + 30
+        while time.time() < deadline and curl_status(port, "/v2/", wait=1) != "200":
+            time.sleep(0.5)
+        docker("tag", "alpine", ref)
+        docker("push", ref, timeout=300.0)
+        docker("rmi", ref)
+        docker("pull", ref, timeout=300.0)
+        out = docker("run", "--rm", ref, "echo", "from-local-registry").stdout.strip()
+        if out != "from-local-registry":
+            raise RuntimeError(f"run pulled image: {out!r}")
+        record("local registry push/pull", "PASS", ref)
+    finally:
+        docker("rmi", "-f", ref, check=False)
+        cleanup(reg)
+
+
+def test_lifecycle_events() -> None:
+    """Docker's container lifecycle events: create/destroy once per
+    container (not per restart), plus kill/stop/restart/pause/unpause/rename
+    and exec_*; image tag and volume create/destroy."""
+    name, renamed = f"{PREFIX}-evlife", f"{PREFIX}-evlife2"
+    vol = f"{PREFIX}-evvol"
+    since = str(int(time.time()) - 30)  # guest clock may trail the Mac's
+    try:
+        cid = docker("run", "-d", "--name", name, "alpine", "sleep", "300").stdout.strip()
+        docker("pause", name)
+        docker("unpause", name)
+        docker("exec", name, "true")
+        docker("rename", name, renamed)
+        docker("restart", "-t", "1", renamed)
+        docker("stop", "-t", "1", renamed)
+        docker("rm", renamed)
+        docker("tag", "alpine", "anvil-it-evtag:1")
+        docker("volume", "create", vol)
+        docker("volume", "rm", vol)
+        time.sleep(1.0)
+        out = docker("events", "--since", since, "--until", str(int(time.time()) + 1),
+                     "--format", "{{json .}}").stdout
+        evs = [json.loads(l) for l in out.splitlines() if l.strip()]
+        mine = [e["Action"] for e in evs if e.get("Type") == "container" and e.get("Actor", {}).get("ID") == cid]
+        problems = []
+        for a in ("create", "start", "pause", "unpause", "rename", "restart", "kill", "stop", "die", "destroy", "exec_die"):
+            if not any(m == a for m in mine):
+                problems.append(f"no {a}")
+        if mine.count("create") != 1 or mine.count("destroy") != 1:
+            problems.append(f"create x{mine.count('create')}, destroy x{mine.count('destroy')}")
+        if mine.count("die") != 2:  # restart + stop; an exec exit is no die
+            problems.append(f"die x{mine.count('die')}")
+        if not any(m.startswith("exec_start") for m in mine):
+            problems.append("no exec_start")
+        others = {(e.get("Type"), e.get("Action")) for e in evs}
+        for want in (("image", "tag"), ("volume", "create"), ("volume", "destroy")):
+            if want not in others:
+                problems.append(f"no {want[0]} {want[1]}")
+        if problems:
+            raise RuntimeError(f"{problems}; container actions: {mine}")
+        record("lifecycle events", "PASS", " ".join(mine))
+    finally:
+        cleanup(name, renamed)
+        docker("rmi", "anvil-it-evtag:1", check=False)
+        docker("volume", "rm", "-f", vol, check=False)
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -2877,6 +3340,27 @@ TESTS = [
     ("health status events", test_health_status_events),
     ("volume prune", test_volume_prune_semantics),
     ("run --rm latency", test_run_rm_latency),
+    ("ephemeral host ports", test_ephemeral_host_ports),
+    ("docker socket in container", test_docker_socket_in_container),
+    ("API status codes", test_api_status_codes),
+    ("published port half-close", test_published_port_half_close),
+    ("exec -t tty", test_exec_tty),
+    ("run -i stdin", test_run_interactive_stdin),
+    ("start -ai stdin", test_attach_stdin_and_detach),
+    ("tty container logs raw", test_tty_logs_raw),
+    ("logs -f --tail 0", test_logs_tail_zero_follow),
+    ("restart keeps --rm container", test_restart_keeps_rm_container),
+    ("generated names + ps status", test_generated_names_and_status),
+    ("inspect fields", test_inspect_fields),
+    ("info/version", test_info_and_version),
+    ("ps filters extended", test_ps_filters_extended),
+    ("prune filters", test_prune_respects_filters),
+    ("pull by digest", test_pull_by_digest),
+    ("mount tmpfs + stop-timeout", test_mount_tmpfs_and_stop_timeout),
+    ("volume bind opts + dns", test_volume_bind_driver_opts_and_dns),
+    ("network container mode", test_network_container_mode),
+    ("local registry push/pull", test_local_registry_push_pull),
+    ("lifecycle events", test_lifecycle_events),
 ]
 
 

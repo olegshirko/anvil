@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -116,7 +118,7 @@ func listDockerVolumes(ctx context.Context, filters map[string]map[string]bool) 
 			Mountpoint: volumeDataDir(d.ns, d.name),
 			CreatedAt:  time.Now().UTC().Format(time.RFC3339),
 			Labels:     labels,
-			Options:    map[string]string{},
+			Options:    nonNilMap(readVolumeOptions(d.ns, d.name)),
 			Scope:      "local",
 		}
 		if matchesLabelFilters(labels, filters) {
@@ -142,17 +144,24 @@ func inspectDockerVolume(ctx context.Context, name string) (*dockerVolume, error
 			Mountpoint: volumeDataDir(d.ns, d.name),
 			CreatedAt:  time.Now().UTC().Format(time.RFC3339),
 			Labels:     loadVolumeLabels(d.ns, d.name),
-			Options:    map[string]string{},
+			Options:    nonNilMap(readVolumeOptions(d.ns, d.name)),
 			Scope:      "local",
 		}, nil
 	}
 	return nil, fmt.Errorf("No such volume: %s", name)
 }
 
-// createDockerVolume creates a volume in the default namespace.
-// Driver/Options are ignored (the local driver has no alternatives).
+// createDockerVolume creates a volume in the default namespace. Of the
+// local driver's options, the bind form (type=none, o=bind, device=<path>)
+// is honored at mount time; others are recorded.
 func createDockerVolume(ctx context.Context, req dockerVolumeCreateRequest) (*dockerVolume, error) {
 	const ns = "default"
+	if dev, ok := bindDeviceOption(req.Options); ok {
+		if _, err := os.Stat(dev); err != nil {
+			return nil, &apiError{status: http.StatusBadRequest,
+				msg: fmt.Sprintf("failed to mount local volume: mount %s: no such file or directory", dev)}
+		}
+	}
 	dir := volumeDataDir(ns, req.Name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create volume %s: %w", req.Name, err)
@@ -162,15 +171,79 @@ func createDockerVolume(ctx context.Context, req dockerVolumeCreateRequest) (*do
 		labels = map[string]string{}
 	}
 	saveVolumeLabels(ns, req.Name, labels) //nolint:errcheck — cosmetic
+	if len(req.Options) > 0 {
+		saveVolumeOptions(ns, req.Name, req.Options) //nolint:errcheck
+	}
+	publishObjectEvent("volume", "create", req.Name, map[string]string{"driver": "local"})
 	return &dockerVolume{
 		Name:       req.Name,
 		Driver:     "local",
 		Mountpoint: dir,
 		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
 		Labels:     labels,
-		Options:    map[string]string{},
+		Options:    nonNilMap(req.Options),
 		Scope:      "local",
 	}, nil
+}
+
+func nonNilMap(m map[string]string) map[string]string {
+	if m == nil {
+		return map[string]string{}
+	}
+	return m
+}
+
+// volumeOptionsPath stores a volume's driver options.
+func volumeOptionsPath(ns, name string) string {
+	return filepath.Join(anvilStoreRoot, "volumes", ns, name+".opts.json")
+}
+
+func saveVolumeOptions(ns, name string, opts map[string]string) error {
+	data, err := json.Marshal(opts)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(volumeOptionsPath(ns, name), data, 0o644)
+}
+
+// readVolumeOptions reads one volume's driver options (nil when none).
+func readVolumeOptions(ns, name string) map[string]string {
+	var opts map[string]string
+	if data, err := os.ReadFile(volumeOptionsPath(ns, name)); err == nil {
+		json.Unmarshal(data, &opts) //nolint:errcheck
+	}
+	return opts
+}
+
+// loadVolumeOptions finds a volume's driver options in any namespace
+// (volumes are created in "default", mounted from project namespaces).
+func loadVolumeOptions(name string) map[string]string {
+	dirs, _ := volumeDirs()
+	for _, d := range dirs {
+		if d.name != name {
+			continue
+		}
+		var opts map[string]string
+		if data, err := os.ReadFile(volumeOptionsPath(d.ns, d.name)); err == nil && json.Unmarshal(data, &opts) == nil {
+			return opts
+		}
+	}
+	return nil
+}
+
+// bindDeviceOption recognizes the local driver's bind form — compose's
+// `driver_opts: {type: none, o: bind, device: /path}` — and returns the
+// device to bind-mount in place of the volume's own directory.
+func bindDeviceOption(opts map[string]string) (string, bool) {
+	if opts["device"] == "" || (opts["type"] != "none" && opts["type"] != "") {
+		return "", false
+	}
+	for _, o := range strings.Split(opts["o"], ",") {
+		if o == "bind" || o == "rbind" {
+			return opts["device"], true
+		}
+	}
+	return "", false
 }
 
 // removeDockerVolume removes a volume by name from any namespace.
@@ -187,6 +260,8 @@ func removeDockerVolume(ctx context.Context, name string) error {
 			return err
 		}
 		os.Remove(volumeMetaPath(d.ns, d.name))
+		os.Remove(volumeOptionsPath(d.ns, d.name))
+		publishObjectEvent("volume", "destroy", d.name, map[string]string{"driver": "local"})
 		return nil
 	}
 	return fmt.Errorf("No such volume: %s", name)

@@ -40,7 +40,7 @@ var imageRoutes = []apiRoute{
 func handleImagesList(w http.ResponseWriter, r *http.Request, _ routeParams) {
 	images, err := listDockerImages(r.Context())
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	filters := parseDockerFilters(r.URL.Query().Get("filters"))
@@ -118,7 +118,12 @@ func familiarRef(ref string) string {
 func handleImageCreate(w http.ResponseWriter, r *http.Request, _ routeParams) {
 	image := r.URL.Query().Get("fromImage")
 	if tag := r.URL.Query().Get("tag"); tag != "" {
-		image += ":" + tag
+		// The CLI sends `pull img@sha256:…` as fromImage=img&tag=sha256:…
+		if strings.Contains(tag, ":") {
+			image += "@" + tag
+		} else {
+			image += ":" + tag
+		}
 	}
 	if image == "" {
 		writeJSONError(w, http.StatusBadRequest, "missing fromImage")
@@ -128,6 +133,9 @@ func handleImageCreate(w http.ResponseWriter, r *http.Request, _ routeParams) {
 	status, err := "", perr
 	if perr == nil {
 		status, err = pullDockerImage(r.Context(), image, platform, parseRegistryAuth(r))
+		if err == nil {
+			publishObjectEvent("image", "pull", canonicalizeImageRef(image), map[string]string{"name": image})
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
@@ -155,7 +163,7 @@ func handleImageTag(w http.ResponseWriter, r *http.Request, p routeParams) {
 		return
 	}
 	if err := tagDockerImage(r.Context(), p["name"], target); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
@@ -163,10 +171,19 @@ func handleImageTag(w http.ResponseWriter, r *http.Request, p routeParams) {
 
 func handleImagePush(w http.ResponseWriter, r *http.Request, p routeParams) {
 	w.Header().Set("Content-Type", "application/json")
-	if err := pushDockerImage(r.Context(), p["name"], parseRegistryAuth(r), w); err != nil {
-		fmt.Fprintf(w, "{\"status\":\"error pushing %s: %s\"}\n", p["name"], err.Error())
-		return
+	name := p["name"]
+	// The CLI sends the tag separately: POST /images/<repo>/push?tag=<tag>.
+	// Ignoring it pushed (or failed to find) <repo>:latest.
+	if tag := r.URL.Query().Get("tag"); tag != "" {
+		if strings.Contains(tag, ":") {
+			name += "@" + tag
+		} else {
+			name += ":" + tag
+		}
 	}
+	// pushDockerImage reports failures as errorDetail lines, which make the
+	// CLI exit non-zero (a plain status line looked like success).
+	pushDockerImage(r.Context(), name, parseRegistryAuth(r), w) //nolint:errcheck
 }
 
 // handleImageDelete implements docker rmi; force=1 is `rmi -f` (compose down
@@ -179,8 +196,8 @@ func handleImageDelete(w http.ResponseWriter, r *http.Request, p routeParams) {
 		http.NotFound(w, r)
 		return
 	}
-	if err := removeDockerImage(r.Context(), name, r.URL.Query().Get("force") == "1"); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+	if err := removeDockerImage(r.Context(), name, queryBool(r.URL.Query(), "force")); err != nil {
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -190,12 +207,17 @@ func handleImageDelete(w http.ResponseWriter, r *http.Request, p routeParams) {
 func handleImagesPrune(w http.ResponseWriter, r *http.Request, _ routeParams) {
 	filters := parseDockerFilters(r.URL.Query().Get("filters"))
 	dangling := true
-	if filters["dangling"]["false"] {
+	if filters["dangling"]["false"] || filters["dangling"]["0"] {
 		dangling = false
 	}
-	deleted, reclaimed, err := pruneDockerImages(r.Context(), dangling)
+	pf, err := newPruneFilter(filters, "dangling")
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusBadRequest)
+		return
+	}
+	deleted, reclaimed, err := pruneDockerImages(r.Context(), dangling, pf)
+	if err != nil {
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -208,7 +230,7 @@ func handleImagesPrune(w http.ResponseWriter, r *http.Request, _ routeParams) {
 func handleBuildPrune(w http.ResponseWriter, _ *http.Request, _ routeParams) {
 	reclaimed, err := pruneBuildCache()
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

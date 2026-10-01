@@ -88,6 +88,7 @@ final class DockerProxyServer {
                     continue
                 }
                 setSocketNoSigPipe(client)
+                setLargeSocketBuffers(client)
                 runOnConnectionThread(name: "docker-proxy-client", limiter: hostConnectionLimiter,
                                       onReject: { close(client) }) { [weak self] in
                     guard let self = self else {
@@ -131,14 +132,13 @@ final class DockerProxyServer {
     // MARK: - Private
 
     private func handleClient(fd clientFd: Int32) {
-        DispatchQueue.main.async { [weak self] in
-            self?.onClientConnect?()
-        }
+        // Synchronous, not posted to main: the daemon's idle pause checks
+        // the client count on main, and an async increment let it pause the
+        // VM under a client that had already been accepted.
+        onClientConnect?()
         defer {
             close(clientFd)
-            DispatchQueue.main.async { [weak self] in
-                self?.onClientDisconnect?()
-            }
+            onClientDisconnect?()
         }
 
         // Ask the daemon to resume the VM if it is paused. The ControlServer

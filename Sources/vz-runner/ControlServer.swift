@@ -87,8 +87,11 @@ final class ControlServer {
             return
         }
 
+        // Dedicated threads, not GCD's shared pool: every client blocks on
+        // vsock and guest I/O (an `anvil exec` for as long as its command
+        // runs), and the shutdown and idle paths need that pool themselves.
         let listenFD = fd
-        DispatchQueue.global().async { [weak self] in
+        startLoopThread(name: "control-accept") { [weak self] in
             while let self = self, self.isListening(on: listenFD) {
                 let client = accept(listenFD, nil, nil)
                 guard client >= 0 else {
@@ -96,8 +99,13 @@ final class ControlServer {
                     continue
                 }
                 setSocketNoSigPipe(client)
-                DispatchQueue.global().async { [weak self] in
-                    self?.handleClient(fd: client)
+                runOnConnectionThread(name: "control-client", limiter: hostConnectionLimiter,
+                                      onReject: { close(client) }) { [weak self] in
+                    guard let self = self else {
+                        close(client)
+                        return
+                    }
+                    self.handleClient(fd: client)
                 }
             }
         }

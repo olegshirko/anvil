@@ -253,6 +253,9 @@ func formatHealthStatus(dockerID, baseStatus string) string {
 	if state == nil {
 		return baseStatus
 	}
+	if state.Status == "starting" {
+		return baseStatus + " (health: starting)" // as Docker words it
+	}
 	return fmt.Sprintf("%s (%s)", baseStatus, state.Status)
 }
 

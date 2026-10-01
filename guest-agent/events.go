@@ -89,10 +89,10 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	send := func(ev dockerEvent) bool {
 		if !filter.match(ev) {
-			debugLog("events: filtered out %s id=%s", ev.Action, ev.Actor.ID[:12])
+			debugLog("events: filtered out %s id=%s", ev.Action, truncateID(ev.Actor.ID))
 			return true
 		}
-		debugLog("events: send %s id=%s attrs=%v", ev.Action, ev.Actor.ID[:12], ev.Actor.Attributes)
+		debugLog("events: send %s id=%s attrs=%v", ev.Action, truncateID(ev.Actor.ID), ev.Actor.Attributes)
 		return enc.Encode(ev) == nil
 	}
 
@@ -433,16 +433,17 @@ func parseEventTimestamp(raw string) *time.Time {
 // the same way, and compose's monitor matches events to services by the
 // com.docker.compose.service label.
 func translateDockerEvent(ctx context.Context, cl *client.Client, env *events.Envelope) (dockerEvent, bool) {
+	// Task create/delete happen on every start/restart: Docker's create
+	// and destroy (once per container) are published by the agent itself
+	// (publishContainerEvent), as are kill/stop/restart/pause/rename/exec.
 	var action string
 	switch env.Topic {
-	case "/tasks/create":
-		action = "create"
 	case "/tasks/start":
 		action = "start"
 	case "/tasks/exit":
 		action = "die"
-	case "/tasks/delete":
-		action = "destroy"
+	case "/tasks/oom":
+		action = "oom"
 	default:
 		return dockerEvent{}, false
 	}
@@ -458,6 +459,9 @@ func translateDockerEvent(ctx context.Context, cl *client.Client, env *events.En
 	case *eventsapi.TaskStart:
 		containerdID = e.ContainerID
 	case *eventsapi.TaskExit:
+		if e.ID != "" && e.ID != e.ContainerID {
+			return dockerEvent{}, false // an exec process: exec_die is the agent's
+		}
 		containerdID = e.ContainerID
 		exitCode = strconv.Itoa(int(e.ExitStatus))
 		// containerd reports 0 for signal deaths; docker kill caches the
@@ -467,7 +471,7 @@ func translateDockerEvent(ctx context.Context, cl *client.Client, env *events.En
 				exitCode = strconv.Itoa(code)
 			}
 		}
-	case *eventsapi.TaskDelete:
+	case *eventsapi.TaskOOM:
 		containerdID = e.ContainerID
 	default:
 		return dockerEvent{}, false
@@ -585,4 +589,64 @@ func publishEndpointEvents(action, ns, id, primary string, extra []netEndpoint) 
 	for _, e := range extra {
 		publishNetworkEvent(action, e.Network, networkIDFor(ctx, e.Network), did)
 	}
+}
+
+// containerEventAttrs are a container's event attributes as Docker sends
+// them: its labels plus name and image (compose matches events to services
+// by label). Empty when the container is gone.
+func containerEventAttrs(ns, containerdID string) map[string]string {
+	attrs := map[string]string{}
+	ctx := namespaces.WithNamespace(context.Background(), ns)
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return attrs
+	}
+	ctr, err := cl.LoadContainer(ctx, containerdID)
+	if err != nil {
+		return attrs
+	}
+	info, err := ctr.Info(ctx, client.WithoutRefreshedMetadata)
+	if err != nil {
+		return attrs
+	}
+	for k, v := range info.Labels {
+		attrs[k] = v
+	}
+	if info.Image != "" {
+		attrs["image"] = info.Image
+	}
+	if name, ok := attrs[labelName]; ok {
+		attrs["name"] = name
+	}
+	return attrs
+}
+
+// publishContainerEvent emits a container event the agent originates; extra
+// attributes (signal, oldName, execID, exitCode) are added to the labels.
+func publishContainerEvent(action, ns, containerdID string, extra map[string]string) {
+	publishContainerEventAttrs(action, dockerID(ns, containerdID), containerEventAttrs(ns, containerdID), extra)
+}
+
+// publishContainerEventAttrs publishes with attributes captured earlier (a
+// destroy event is sent after the container, and its labels, are gone).
+func publishContainerEventAttrs(action, did string, attrs, extra map[string]string) {
+	merged := make(map[string]string, len(attrs)+len(extra))
+	for k, v := range attrs {
+		merged[k] = v
+	}
+	for k, v := range extra {
+		merged[k] = v
+	}
+	publishAgentEvent(dockerEvent{Type: "container", Action: action,
+		Actor: dockerEventActor{ID: did, Attributes: merged}})
+}
+
+// publishObjectEvent emits an image or volume event (pull/tag/delete,
+// create/destroy) the way the Docker daemon reports them.
+func publishObjectEvent(typ, action, id string, attrs map[string]string) {
+	if attrs == nil {
+		attrs = map[string]string{}
+	}
+	publishAgentEvent(dockerEvent{Type: typ, Action: action,
+		Actor: dockerEventActor{ID: id, Attributes: attrs}})
 }

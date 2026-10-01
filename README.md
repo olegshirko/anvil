@@ -128,12 +128,17 @@ anvil doctor     Diagnose install: hypervisor, signing, assets, API, shares (--j
 anvil logs       Tail daemon/console/guest logs
 anvil exec ...   Run a command inside the VM (debugging)
 anvil images     Manage the image-mirror fallback (list / check / request)
+anvil prune      Remove all containers, unused images/volumes/networks and the build cache (-f skips the prompt)
+anvil disk-compact  Give space freed in the VM back to macOS (stops the daemon; snapshot stays valid)
 ```
 
-Housekeeping lives in the Makefile: `make prune` (remove containers/volumes/
-images inside the VM), `make disk-compact` (reclaim host space from the
-sparse containerd disk after a prune — logical size and snapshot stay
-intact).
+`make prune` / `make disk-compact` do the same from a source checkout. The
+VM also trims its disk before every idle pause.
+
+Logs: `~/.anvil-vz/daemon.log` (host daemon), `~/.anvil-vz/console.log` (VM
+console), and with `DEBUG=1` the guest agent's
+`<share>/.anvil-run/guest-agent.log` (the project directory in a source
+tree, `~/.anvil-vz` otherwise). `anvil logs [daemon|console|guest]` tails them.
 
 ### Configuration (environment variables)
 
@@ -143,6 +148,7 @@ intact).
 | `ANVIL_CPUS` | — | VM CPU count (unset = vz-runner default of 2) |
 | `ANVIL_DISK_GB` | `64` | containerd disk size (sparse; existing disks only grow, guest fs is resized online) |
 | `ANVIL_SHARE_USERS` | `1` | Set to `0` to disable sharing the host `/Users` tree into the VM |
+| `ANVIL_IDLE` | `600` | Seconds without Docker clients, forwarded connections or running containers before the VM is paused into its snapshot |
 | `ANVIL_ROSETTA` | `0` | Set to `1` to run `linux/amd64` containers through Rosetta (needs `softwareupdate --install-rosetta`; changing it forces one cold boot) |
 | `DEBUG` | — | `1` enables guest-agent debug log (`guest-agent.log` on the share) |
 
@@ -244,6 +250,16 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   --init/--volumes-from` are honored. Refused with a 400 naming the flag:
   `--oom-kill-disable`, `--blkio-weight`, `--storage-opt`, `--isolation`,
   `--runtime`, `--log-driver` other than `json-file`/`none`, AppArmor/SELinux.
+- The Docker socket can be mounted into containers (Testcontainers' Ryuk,
+  devcontainers, Traefik, Portainer): `-v /var/run/docker.sock:/var/run/docker.sock`
+  and `-v ~/.anvil-vz/docker.sock:…` both reach the same API inside the VM.
+  `-p 80`, `-P` and `-p 8000-8010:80` get a free host port at start.
+- `docker run -i`, `docker attach` (with ctrl-p ctrl-q detach), `start -ai`
+  and `docker exec -it` behave as in Docker. `--network container:<x>`
+  (compose `network_mode: service:x`) shares the target's network namespace.
+  Prune endpoints honor `until`/`label`/`label!`, and `docker ps` takes
+  Docker's filters (ancestor, network, health, exited, before/since, volume,
+  publish/expose); an unknown filter is an error, not ignored.
 - `host.docker.internal` (and `--add-host name:host-gateway`) reaches the
   Mac's localhost over TCP, services bound only to `127.0.0.1` included, as
   in Docker Desktop; UDP to it goes to the Mac's NAT address.
@@ -252,7 +268,7 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   `/run/host-services/ssh-auth.sock` and point `SSH_AUTH_SOCK` at it.
 - Docker API is emulated, not complete: it covers what `docker` CLI and
   `docker compose` actually use. Not implemented: Swarm and its whole CLI
-  surface, plugins and some prune endpoints. `docker update` covers
+  surface and plugins. `docker update` covers
   memory/swap/reservation, CPU (cpus, shares, quota/period, cpuset), pids and
   the restart policy; blkio and device limits are not updatable. `docker search` queries Docker Hub only. `docker diff` does not
   report files hidden by an opaque directory (`rm -rf dir && mkdir dir`).

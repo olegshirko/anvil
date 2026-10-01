@@ -20,7 +20,7 @@ func handleVolumesList(w http.ResponseWriter, r *http.Request, _ routeParams) {
 	filters := parseDockerFilters(r.URL.Query().Get("filters"))
 	volumes, err := listDockerVolumes(r.Context(), filters)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -35,7 +35,7 @@ func handleVolumeCreate(w http.ResponseWriter, r *http.Request, _ routeParams) {
 	}
 	vol, err := createDockerVolume(r.Context(), req)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -54,7 +54,7 @@ func handleVolumeInspect(w http.ResponseWriter, r *http.Request, p routeParams) 
 
 func handleVolumeDelete(w http.ResponseWriter, r *http.Request, p routeParams) {
 	if err := removeDockerVolume(r.Context(), p["name"]); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -63,7 +63,7 @@ func handleVolumeDelete(w http.ResponseWriter, r *http.Request, p routeParams) {
 func handleVolumesPrune(w http.ResponseWriter, r *http.Request, _ routeParams) {
 	deleted, reclaimed, err := pruneDockerVolumes(r.Context(), parseDockerFilters(r.URL.Query().Get("filters")))
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeAPIError(w, err, http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

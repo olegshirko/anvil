@@ -65,10 +65,19 @@ func handlePortProxyClient(conn net.Conn) {
 	}
 	defer upstream.Close()
 
+	spliceHalfClose(conn, upstream)
+}
+
+// spliceHalfClose copies both directions and forwards a half-close: when one
+// side finishes sending, the other gets FIN while the reverse direction keeps
+// flowing. Without it the host relay's shutdown(SHUT_WR) never reached the
+// container, so a client that closed its end left the server side (redis,
+// DB pools, keep-alive HTTP) and both relays open forever.
+func spliceHalfClose(a, b net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); _, _ = io.Copy(upstream, conn) }()
-	go func() { defer wg.Done(); _, _ = io.Copy(conn, upstream) }()
+	go func() { defer wg.Done(); _, _ = io.Copy(b, a); closeWrite(b) }()
+	go func() { defer wg.Done(); _, _ = io.Copy(a, b); closeWrite(a) }()
 	wg.Wait()
 }
 

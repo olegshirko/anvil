@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	tasks "github.com/containerd/containerd/api/services/tasks/v1"
+	tasktype "github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
@@ -32,6 +34,14 @@ type cniPortMapping struct {
 	ContainerPort int    `json:"containerPort"`
 	Protocol      string `json:"protocol"`
 	HostIP        string `json:"hostIP"`
+	// Ephemeral marks a binding without a fixed host port (`-p 80`, `-P`,
+	// `-p 8000-8010:80`): startDockerContainer picks a free port and
+	// stores it in HostPort, which stays 0 until the first start.
+	Ephemeral bool `json:"ephemeral,omitempty"`
+	// RangeLo/RangeHi bound the pick for a host port range; zero means
+	// the ephemeral range.
+	RangeLo int `json:"rangeLo,omitempty"`
+	RangeHi int `json:"rangeHi,omitempty"`
 }
 
 // portsLabel returns the container's port mappings as JSON (the shape of the
@@ -45,8 +55,12 @@ func portsLabel(c client.Container, nsCtx context.Context) string {
 }
 
 type portScanner struct {
-	mu          sync.Mutex
-	current     []PortMapping
+	mu      sync.Mutex
+	current []PortMapping
+	// running counts running containers in every namespace. The host keeps
+	// the VM awake while it is non-zero: an idle pause would freeze
+	// databases, servers and workers between CLI calls.
+	running     int
 	subscribers map[chan PortMapState]struct{}
 	guestIP     string
 	// containerIPs caches (namespace, containerd id) -> {task pid, CNI IP}
@@ -138,28 +152,37 @@ func (s *portScanner) scanAndNotify(cl *client.Client) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if stateEqual(s.current, state.Mappings) {
+	if stateEqual(s.current, state.Mappings) && s.running == state.RunningContainers {
 		return false
 	}
 	s.current = state.Mappings
+	s.running = state.RunningContainers
 	return true
 }
 
+// pushCurrentState hands the latest state to every subscriber. It sends
+// under s.mu so unsubscribe cannot close a channel mid-send (a send on a
+// closed channel panics PID 1), and it never blocks: a subscriber that has
+// not taken the previous state gets it replaced, so the host always ends up
+// with the newest full state rather than a stale one.
 func (s *portScanner) pushCurrentState() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	state := s.currentStateLocked()
-	chans := make([]chan PortMapState, 0, len(s.subscribers))
 	for ch := range s.subscribers {
-		chans = append(chans, ch)
+		offerLatest(ch, state)
 	}
-	s.mu.Unlock()
+}
 
-	for _, ch := range chans {
-		select {
-		case ch <- state:
-		default:
-			// Drop to slow subscribers; they will get the next update.
-		}
+// offerLatest puts state into a 1-slot channel, replacing an unread value.
+func offerLatest(ch chan PortMapState, state PortMapState) {
+	select {
+	case <-ch:
+	default:
+	}
+	select {
+	case ch <- state:
+	default:
 	}
 }
 
@@ -172,7 +195,7 @@ func (s *portScanner) currentState() PortMapState {
 func (s *portScanner) currentStateLocked() PortMapState {
 	mappings := make([]PortMapping, len(s.current))
 	copy(mappings, s.current)
-	return PortMapState{Mappings: mappings}
+	return PortMapState{Mappings: mappings, RunningContainers: s.running}
 }
 
 func (s *portScanner) subscribe() chan PortMapState {
@@ -213,9 +236,17 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 
 	var mappings []PortMapping
 	seen := make(map[string]bool)
+	running := 0
 
 	for _, ns := range nss {
 		nsCtx := namespaces.WithNamespace(ctx, ns)
+		// One task listing per namespace instead of a Task+Status
+		// round-trip per container.
+		live := namespaceRunningTasks(nsCtx, cl)
+		running += len(live)
+		if len(live) == 0 {
+			continue
+		}
 		containers, err := cl.Containers(nsCtx)
 		if err != nil {
 			log.Printf("[scanner] list containers in %s: %v", ns, err)
@@ -237,12 +268,8 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 			}
 
 			// Skip containers that are not running.
-			task, err := c.Task(nsCtx, nil)
-			if err != nil {
-				continue
-			}
-			status, err := task.Status(nsCtx)
-			if err != nil || status.Status != "running" {
+			pid, ok := live[c.ID()]
+			if !ok {
 				continue
 			}
 
@@ -256,10 +283,13 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 			// port proxy, so it needs the CNI address (10.10.x.y), not the
 			// guest NAT IP. Address lookups cost ~ms, so cache per
 			// (namespace, id) keyed by task pid — a restart gets a new pid.
-			containerIP := s.containerIPFor(ns, c.ID(), task.Pid(), labels[labelName])
+			containerIP := s.containerIPFor(ns, c.ID(), pid, labels[labelName])
 			seen[ns+"/"+c.ID()] = true
 
 			for _, p := range ports {
+				if p.HostPort <= 0 {
+					continue // ephemeral binding not assigned yet
+				}
 				proto := p.Protocol
 				if proto == "" {
 					proto = "tcp"
@@ -287,7 +317,23 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 	}
 
 	sortPortMappings(mappings)
-	return PortMapState{Mappings: mappings}, nil
+	return PortMapState{Mappings: mappings, RunningContainers: running}, nil
+}
+
+// namespaceRunningTasks maps containerd container ID -> task pid for every
+// running task in one namespace.
+func namespaceRunningTasks(nsCtx context.Context, cl *client.Client) map[string]uint32 {
+	out := map[string]uint32{}
+	resp, err := cl.TaskService().List(nsCtx, &tasks.ListTasksRequest{})
+	if err != nil {
+		return out
+	}
+	for _, p := range resp.Tasks {
+		if p.Status == tasktype.Status_RUNNING {
+			out[p.ID] = p.Pid
+		}
+	}
+	return out
 }
 
 func stateEqual(a, b []PortMapping) bool {

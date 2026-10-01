@@ -93,6 +93,27 @@ struct ListenerBindAddress {
 
 struct PortMapState: Codable {
     let mappings: [PortMapping]
+    /// Running containers across every namespace; nil from guests that
+    /// predate the field. The daemon does not idle-pause while it is > 0.
+    var runningContainers: Int? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case mappings
+        case runningContainers = "running_containers"
+    }
+}
+
+/// Callbacks a listener runs around every forwarded TCP connection.
+final class PortConnectionHooks {
+    let resume: () -> Void
+    let connect: () -> Void
+    let disconnect: () -> Void
+
+    init(resume: @escaping () -> Void, connect: @escaping () -> Void, disconnect: @escaping () -> Void) {
+        self.resume = resume
+        self.connect = connect
+        self.disconnect = disconnect
+    }
 }
 
 /// Subscribes to guest-agent port-mapping pushes and exposes localhost TCP listeners
@@ -100,6 +121,14 @@ struct PortMapState: Codable {
 /// control plane.
 final class PortForwarder {
     private let deviceProvider: () -> VZVirtioSocketDevice?
+    private let resumeProvider: () -> Void
+    /// A forwarded connection opened / closed. Called synchronously on the
+    /// connection's thread, so the daemon's idle check sees it at once.
+    var onClientConnect: (() -> Void)?
+    var onClientDisconnect: (() -> Void)?
+    /// The guest reported a different number of running containers.
+    var onRunningContainersChange: ((Int) -> Void)?
+    private var runningContainersCount = 0
     private let queue = DispatchQueue(label: "com.olegshirko.anvil.port-forwarder", qos: .utility)
 
     private var listeners: [String: Listener] = [:]
@@ -120,9 +149,24 @@ final class PortForwarder {
         return running
     }
 
-    init(deviceProvider: @escaping () -> VZVirtioSocketDevice?) {
+    init(deviceProvider: @escaping () -> VZVirtioSocketDevice?,
+         resumeProvider: @escaping () -> Void = {}) {
         self.deviceProvider = deviceProvider
+        self.resumeProvider = resumeProvider
     }
+
+    /// Running containers per the guest's last push.
+    var runningContainers: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return runningContainersCount
+    }
+
+    private lazy var hooks = PortConnectionHooks(
+        resume: { [weak self] in self?.resumeProvider() },
+        connect: { [weak self] in self?.onClientConnect?() },
+        disconnect: { [weak self] in self?.onClientDisconnect?() }
+    )
 
     func start() {
         stateLock.lock()
@@ -179,6 +223,7 @@ final class PortForwarder {
             while isRunning {
                 do {
                     let state = try decodeLengthPrefixedFD(PortMapState.self, fd: fd)
+                    self.updateRunningContainers(state.runningContainers)
                     self.apply(state: state)
                 } catch {
                     print("[port-forwarder] subscription read failed: \(error)")
@@ -209,6 +254,17 @@ final class PortForwarder {
         }
 
         return connectVsockOnce(device: device, port: controlPort, timeout: 5)
+    }
+
+    private func updateRunningContainers(_ count: Int?) {
+        guard let count = count else { return }
+        stateLock.lock()
+        let changed = runningContainersCount != count
+        runningContainersCount = count
+        stateLock.unlock()
+        if changed {
+            onRunningContainersChange?(count)
+        }
     }
 
     // MARK: - Listener management
@@ -265,7 +321,7 @@ final class PortForwarder {
             return
         }
 
-        let listener = Listener(mapping: mapping)
+        let listener = Listener(mapping: mapping, hooks: hooks)
         listenersLock.lock()
         listeners[mapping.listenerKey] = listener
         listenersLock.unlock()
@@ -316,11 +372,13 @@ final class PortForwarder {
 
 private final class Listener {
     let mapping: PortMapping
+    private let hooks: PortConnectionHooks
     private var fd: Int32 = -1
     private let lock = NSLock()
 
-    init(mapping: PortMapping) {
+    init(mapping: PortMapping, hooks: PortConnectionHooks) {
         self.mapping = mapping
+        self.hooks = hooks
     }
 
     deinit {
@@ -454,6 +512,9 @@ private final class Listener {
     private var udpClients: [String: UDPClient] = [:]
     private let udpClientsLock = NSLock()
     private let udpIdleTimeout: TimeInterval = 60
+    /// Per-port cap on client endpoints. Each costs a socket; without a
+    /// bound, a LAN host spraying source ports exhausted the daemon's fds.
+    private let udpMaxClients = 512
 
     /// Stable dictionary key for a client address: the raw socket bytes.
     private func udpKey(_ addr: sockaddr_in6) -> String {
@@ -614,6 +675,11 @@ private final class Listener {
             return -1
         }
         udpClientsLock.lock()
+        if udpClients.count >= udpMaxClients,
+           let oldest = udpClients.min(by: { $0.value.lastUsed < $1.value.lastUsed }) {
+            close(oldest.value.fd)
+            udpClients.removeValue(forKey: oldest.key)
+        }
         udpClients[key] = UDPClient(fd: fd, lastUsed: Date())
         udpClientsLock.unlock()
         return fd
@@ -641,18 +707,27 @@ private final class Listener {
         var nodelay: Int32 = 1
         setsockopt(clientFd, IPPROTO_TCP, TCP_NODELAY, &nodelay, socklen_t(MemoryLayout<Int32>.size))
 
-        let targetFd = connectToGuest()
-        guard targetFd >= 0 else {
-            close(clientFd)
-            return
-        }
-        setsockopt(targetFd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
-        setsockopt(targetFd, IPPROTO_TCP, TCP_NODELAY, &nodelay, socklen_t(MemoryLayout<Int32>.size))
-
-        runOnConnectionThread(name: "port-\(mapping.hostPort)", limiter: hostConnectionLimiter,
-                              onReject: { close(clientFd); close(targetFd) }) {
+        // Everything that can block — waking a paused VM, the guest
+        // connect (up to 5 s) — runs on the connection's own thread: inline
+        // in the accept loop one slow connect stalled every new connection
+        // on the port.
+        let hooks = self.hooks
+        runOnConnectionThread(name: "port-\(mapping.hostPort)", limiter: portConnectionLimiter,
+                              onReject: { close(clientFd) }) { [weak self] in
+            // A live forwarded connection (a browser tab, a DB pool) is
+            // activity: the VM must not idle-pause under it.
+            hooks.connect()
+            defer {
+                close(clientFd)
+                hooks.disconnect()
+            }
+            hooks.resume()
+            guard let self = self else { return }
+            let targetFd = self.connectToGuest()
+            guard targetFd >= 0 else { return }
+            setsockopt(targetFd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+            setsockopt(targetFd, IPPROTO_TCP, TCP_NODELAY, &nodelay, socklen_t(MemoryLayout<Int32>.size))
             relayBothWays(clientFd, targetFd)
-            close(clientFd)
             close(targetFd)
         }
     }

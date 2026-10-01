@@ -55,11 +55,24 @@ final class ConnectionLimiter {
 
 let guestConnectionLimiter = ConnectionLimiter(limit: maxGuestConnections)
 
-/// Cap on concurrent host-side client connections (docker.sock, buildkit
-/// sock, published ports). Published ports listen on all interfaces by
-/// default, so LAN peers can open these; long-lived docker clients (logs -f,
-/// events, attach) are legitimate, hence the higher bound.
+/// Cap on concurrent Docker API / buildkit socket clients. Long-lived
+/// docker clients (logs -f, events, attach) are legitimate, hence the
+/// higher bound.
 let hostConnectionLimiter = ConnectionLimiter(limit: 1024)
+
+/// Separate cap for published-port connections: those listen on every
+/// interface by default, and a LAN peer holding them open must not lock the
+/// Docker CLI out of docker.sock.
+let portConnectionLimiter = ConnectionLimiter(limit: 1024)
+
+/// Larger socket buffers for the local Docker/buildkit sockets: macOS
+/// AF_UNIX defaults to 8 KiB, so build contexts, `docker load` and
+/// `docker cp` moved in 8 KiB reads whatever the relay buffer size.
+func setLargeSocketBuffers(_ fd: Int32) {
+    var size: Int32 = 1 << 20
+    _ = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, socklen_t(MemoryLayout<Int32>.size))
+    _ = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, socklen_t(MemoryLayout<Int32>.size))
+}
 
 /// Run body on a dedicated thread (never GCD's shared pool: blocking relays
 /// there starve the whole daemon). Over the limiter's cap, onReject runs
@@ -119,38 +132,47 @@ func withReceiveTimeout<T>(_ fd: Int32, seconds: Int, _ body: () throws -> T) th
     return try body()
 }
 
-/// Copy bytes in both directions on the calling thread until both sides
-/// are done, half-closing the peer when one direction ends.
+/// Copy bytes in both directions until both sides are done, half-closing
+/// the peer when one direction ends. Each direction gets its own thread
+/// with blocking I/O: a single thread that blocks writing to one side stops
+/// draining the other, and a stream whose output grows with its input
+/// (`docker exec -i c xxd` fed a large file) deadlocked once both socket
+/// buffers filled. The calling thread pumps a -> b.
 func relayBothWays(_ a: Int32, _ b: Int32) {
+    let reverseDone = DispatchSemaphore(value: 0)
+    let reverse = Thread {
+        pumpOneWay(from: b, to: a)
+        reverseDone.signal()
+    }
+    reverse.name = "relay-reverse"
+    reverse.stackSize = 256 * 1024
+    reverse.start()
+    pumpOneWay(from: a, to: b)
+    reverseDone.wait()
+}
+
+/// Copy `from` to `to` until EOF, then half-close `to`. When `to` is gone
+/// both sockets are shut down, which also ends the opposite pump.
+func pumpOneWay(from: Int32, to: Int32) {
     var buf = [UInt8](repeating: 0, count: 65536)
-    var aOpen = true // a -> b still flowing
-    var bOpen = true // b -> a still flowing
-    while aOpen || bOpen {
-        var fds: [pollfd] = []
-        if aOpen { fds.append(pollfd(fd: a, events: Int16(POLLIN), revents: 0)) }
-        if bOpen { fds.append(pollfd(fd: b, events: Int16(POLLIN), revents: 0)) }
-        let ready = poll(&fds, nfds_t(fds.count), -1)
-        if ready < 0 {
-            if errno == EINTR { continue }
+    while true {
+        let n = read(from, &buf, buf.count)
+        if n < 0 && errno == EINTR { continue }
+        if n <= 0 {
+            _ = shutdown(to, Int32(SHUT_WR))
             return
         }
-        for p in fds where p.revents != 0 {
-            let from = p.fd
-            let to = from == a ? b : a
-            let n = read(from, &buf, buf.count)
-            if n < 0 && (errno == EINTR || errno == EAGAIN) { continue }
-            if n <= 0 {
-                _ = shutdown(to, Int32(SHUT_WR))
-                if from == a { aOpen = false } else { bOpen = false }
-                continue
+        var off = 0
+        while off < n {
+            let w = buf.withUnsafeBytes { write(to, $0.baseAddress!.advanced(by: off), n - off) }
+            if w < 0 && errno == EINTR { continue }
+            if w <= 0 {
+                // The peer is gone: unblock the other direction too.
+                _ = shutdown(to, Int32(SHUT_RDWR))
+                _ = shutdown(from, Int32(SHUT_RDWR))
+                return
             }
-            var off = 0
-            while off < n {
-                let w = buf.withUnsafeBytes { write(to, $0.baseAddress!.advanced(by: off), n - off) }
-                if w < 0 && errno == EINTR { continue }
-                if w <= 0 { return } // the peer is gone: stop both directions
-                off += w
-            }
+            off += w
         }
     }
 }

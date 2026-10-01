@@ -129,7 +129,9 @@ func serveBuildkitBridge() {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
+			// Back off: a persistent failure (fd exhaustion) spun here.
 			log.Printf("[buildkit] accept error: %v", err)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		go proxyBuildkitConn(conn)
@@ -184,12 +186,11 @@ func pruneBuildCache() (int64, error) {
 		}
 	}()
 	err = c.Prune(ctx, ch, bkclient.PruneAll)
-	// The client does not close the usage channel when the RPC completes;
-	// drain briefly for pending records instead of blocking forever.
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-	}
+	// The client sends every record synchronously and never closes the
+	// channel; once Prune returns nothing else is sent, so close it here
+	// and let the reader finish (no leaked goroutine, no racy total).
+	close(ch)
+	<-done
 	if err != nil {
 		return reclaimed, fmt.Errorf("buildkit prune: %w", err)
 	}

@@ -246,7 +246,7 @@ ubuntu-modules: $(UBUNTU_DIR)
 # No `go mod tidy` here: a build must not rewrite go.mod/go.sum (CI checks
 # tidiness with `go mod tidy -diff`).
 guest-agent:
-	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o ../$(AGENT_BIN) .
+	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.anvilVersion=$(BUILD_VERSION)" -o ../$(AGENT_BIN) .
 
 initramfs-agent: extract-alpine-kernel guest-agent
 	scripts/build_initramfs.sh

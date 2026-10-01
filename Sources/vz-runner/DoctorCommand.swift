@@ -59,6 +59,14 @@ func cmdDoctor(args: [String]) {
     } else {
         check("containerd disk", true, "not created yet (created on first start)")
     }
+    // stage2 leaves this marker when the disk holds a filesystem that would
+    // not mount: it is kept (never reformatted) and /var/lib is ephemeral.
+    let shareRoot = findProjectRoot() ?? stateDir.path
+    let mountFailed = "\(shareRoot)/.anvil-run/disk-mount-failed"
+    if daemonRunning, FileManager.default.fileExists(atPath: mountFailed) {
+        check("containerd disk mounted", false,
+              "the VM could not mount it this boot (data kept, not reformatted); stop anvil and run `e2fsck` on \(diskPath) from a Linux VM, or see console.log")
+    }
     if let sysAttrs = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory()),
        let free = sysAttrs[.systemFreeSize] as? NSNumber {
         let freeGiB = free.int64Value / (1024*1024*1024)
@@ -196,9 +204,10 @@ func cmdLogs(args: [String]) {
     let logs: [(String, String)] = [
         ("daemon", stateDir.appendingPathComponent("daemon.log").path),
         ("console", stateDir.appendingPathComponent("console.log").path),
-        // guest-agent.log is written to the virtiofs share (debug mode only).
-        ("guest", findProjectRoot().map { "\($0)/guest-agent.log" }
-            ?? stateDir.appendingPathComponent("guest-agent.log").path),
+        // guest-agent.log is written to <share>/.anvil-run (debug mode only);
+        // the share is the project dir in a source tree, else ~/.anvil-vz.
+        ("guest", findProjectRoot().map { "\($0)/.anvil-run/guest-agent.log" }
+            ?? stateDir.appendingPathComponent(".anvil-run/guest-agent.log").path),
     ]
     let which = args.first
     for (name, path) in logs where which == nil || which == name {

@@ -632,6 +632,7 @@ fi
 # so both containerd root (/var/lib/containerd) and anvil state (/var/lib/anvil)
 # survive reboots and resume, instead of filling tmpfs root.
 mkdir -p /var/lib
+rm -f /mnt/anvil/.anvil-run/disk-mount-failed 2>/dev/null
 mountpoint -q /var/lib || {
     # Load virtio-blk and ext4 for the optional persistent block disk.
     modprobe virtio_blk 2>/dev/null || true
@@ -648,9 +649,30 @@ mountpoint -q /var/lib || {
                 /usr/sbin/resize2fs "$blk" >/dev/null 2>&1 || true
                 break
             fi
+            # The mount failed. Format ONLY a disk that carries no
+            # filesystem (first boot): a disk that holds one but did not
+            # mount (journal left dirty by a host crash, ext4 module not
+            # loaded) still has every image and volume on it. Formatting it
+            # here used to wipe them silently.
+            /bin/guest-agent has-ext4 "$blk"
+            sig=$?
+            if [ "$sig" -ne 1 ]; then
+                echo "[stage2] $blk holds a filesystem (or is unreadable) but did not mount; checking it"
+                if command -v e2fsck >/dev/null 2>&1; then
+                    e2fsck -p "$blk" >/dev/null 2>&1 || e2fsck -y "$blk" >/dev/null 2>&1
+                fi
+                if mount -t ext4 -o noatime,nobarrier,data=writeback,commit=60 "$blk" /var/lib 2>/dev/null; then
+                    echo "[stage2] mounted $blk as /var/lib after fsck"
+                    break
+                fi
+                echo "[stage2] ERROR: $blk does not mount; NOT formatting it (data kept). /var/lib is not persistent this boot."
+                mkdir -p /mnt/anvil/.anvil-run
+                echo "$blk" > /mnt/anvil/.anvil-run/disk-mount-failed 2>/dev/null || true
+                break
+            fi
             # First boot: format the raw disk as ext4.
             if command -v mkfs.ext4 >/dev/null 2>&1; then
-                echo "[stage2] formatting $blk as ext4"
+                echo "[stage2] formatting $blk as ext4 (no filesystem on it)"
                 mkfs.ext4 -F -q "$blk" 2>/dev/null && \
                 mount -t ext4 -o noatime,nobarrier,data=writeback,commit=60 "$blk" /var/lib 2>/dev/null && \
                 echo "[stage2] mounted $blk as /var/lib (fresh ext4)" && break

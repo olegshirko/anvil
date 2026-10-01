@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -430,23 +429,6 @@ func responsePool(subnet string, pool *ipamPool) dockerIPAMConfig {
 	}
 	c := dockerIPAMConfig{Subnet: pool.Subnet, Gateway: pool.Gateway}
 	return c
-}
-
-// apiError carries the HTTP status a handler should answer with.
-type apiError struct {
-	status int
-	msg    string
-}
-
-func (e *apiError) Error() string { return e.msg }
-
-// errorStatus maps an error to its HTTP status, fallback when untyped.
-func errorStatus(err error, fallback int) int {
-	var ae *apiError
-	if errors.As(err, &ae) {
-		return ae.status
-	}
-	return fallback
 }
 
 // removeStaleBridge deletes the Linux bridge of a removed network when no
