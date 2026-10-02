@@ -44,6 +44,9 @@ var containerRoutes = []apiRoute{
 	newRoute(http.MethodPost, "/containers/:id/attach", func(w http.ResponseWriter, r *http.Request, p routeParams) {
 		handleAttach(w, r, p["id"])
 	}),
+	newRoute(http.MethodGet, "/containers/:id/attach/ws", func(w http.ResponseWriter, r *http.Request, p routeParams) {
+		handleAttachWS(w, r, p["id"])
+	}),
 	newRoute(http.MethodGet, "/containers/:id/logs", func(w http.ResponseWriter, r *http.Request, p routeParams) {
 		handleLogs(w, r, p["id"])
 	}),

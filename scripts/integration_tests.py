@@ -3724,6 +3724,68 @@ def test_k3s_cluster() -> None:
         cleanup(name)
 
 
+def ws_attach(cid: str, query: str) -> socket.socket:
+    """Open /containers/{id}/attach/ws on docker.sock (client side of RFC 6455)."""
+    import base64
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(10)
+    sock.connect(str(DOCKER_SOCKET))
+    key = base64.b64encode(os.urandom(16)).decode()
+    sock.sendall((f"GET /v1.51/containers/{cid}/attach/ws?{query} HTTP/1.1\r\nHost: docker\r\n"
+                  "Upgrade: websocket\r\nConnection: Upgrade\r\nOrigin: http://localhost\r\n"
+                  f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        head += sock.recv(1)
+    if b" 101 " not in head.split(b"\r\n")[0]:
+        raise RuntimeError(f"attach/ws handshake: {head!r}")
+    return sock
+
+
+def ws_read(sock: socket.socket, want: bytes, timeout: float = 10.0) -> bytes:
+    got = b""
+    deadline = time.time() + timeout
+    while want not in got and time.time() < deadline:
+        hdr = sock.recv(2)
+        if len(hdr) < 2:
+            break
+        n = hdr[1] & 0x7F
+        if n == 126:
+            n = int.from_bytes(sock.recv(2), "big")
+        elif n == 127:
+            n = int.from_bytes(sock.recv(8), "big")
+        payload = b""
+        while len(payload) < n:
+            payload += sock.recv(n - len(payload))
+        got += payload
+    return got
+
+
+def ws_send(sock: socket.socket, data: bytes) -> None:
+    mask = os.urandom(4)
+    frame = bytes([0x82, 0x80 | len(data)]) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+    sock.sendall(frame)
+
+
+def test_attach_websocket() -> None:
+    name = f"{PREFIX}-attachws"
+    try:
+        docker("run", "-d", "-i", "--name", name, "alpine", "sh", "-c", "echo ready; cat")
+        cid = docker("inspect", "-f", "{{.Id}}", name).stdout.strip()
+        sock = ws_attach(cid, "logs=1&stream=1&stdin=1&stdout=1&stderr=1")
+        try:
+            if b"ready" not in ws_read(sock, b"ready"):
+                raise RuntimeError("no output over attach/ws")
+            ws_send(sock, b"over-websocket\n")
+            if b"over-websocket" not in ws_read(sock, b"over-websocket"):
+                raise RuntimeError("stdin over attach/ws did not come back")
+        finally:
+            sock.close()
+        record("attach over websocket", "PASS", "output and stdin over /attach/ws")
+    finally:
+        cleanup(name)
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -3862,6 +3924,7 @@ TESTS = [
     ("bind mount file events", test_bind_mount_file_events),
     ("host network ports", test_host_network_ports),
     ("k3s cluster", test_k3s_cluster),
+    ("attach over websocket", test_attach_websocket),
 ]
 
 

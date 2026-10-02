@@ -289,7 +289,8 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   and `-v ~/.anvil-vz/docker.sock:…` both reach the same API inside the VM.
   `-p 80`, `-P` and `-p 8000-8010:80` get a free host port at start.
 - `docker run -i`, `docker attach` (with ctrl-p ctrl-q detach), `start -ai`
-  and `docker exec -it` behave as in Docker. `--network container:<x>`
+  and `docker exec -it` behave as in Docker; web consoles can attach over
+  `GET /containers/{id}/attach/ws`. `--network container:<x>`
   (compose `network_mode: service:x`) shares the target's network namespace.
   Prune endpoints honor `until`/`label`/`label!`, and `docker ps` takes
   Docker's filters (ancestor, network, health, exited, before/since, volume,
