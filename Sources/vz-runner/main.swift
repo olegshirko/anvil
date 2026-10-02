@@ -71,10 +71,10 @@ func saveDockerContext() {
     proc.waitUntilExit()
     let ctx = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? "default"
+    // Already on anvil (a daemon that died without a stop left it there):
+    // keep the context saved back then, or stop would fall back to default.
     if ctx != "anvil" {
         try? ctx.write(toFile: prevContextFile.path, atomically: true, encoding: .utf8)
-    } else {
-        try? FileManager.default.removeItem(at: prevContextFile)
     }
 }
 

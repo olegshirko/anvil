@@ -8,18 +8,21 @@
     <array>
         <string>/bin/bash</string>
         <string>@REPO_ROOT@/scripts/anvil-service.sh</string>
-        <string>start</string>
+        <string>run</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
-    <!-- No KeepAlive: launchd would supervise the anvil-service.sh wrapper,
-         which nohup's the daemon and always exits 0 — SuccessfulExit=false
-         can never trigger, it only fakes protection. VM crash recovery lives
-         inside the daemon (guestDidStop / vsock-unreachable restart). -->
+    <!-- `run` keeps the daemon in the foreground as the job's own process,
+         so launchd supervises it: a daemon that crashes (non-zero exit or
+         a signal) is started again; `anvil-service.sh stop` / SIGTERM end
+         it with exit 0 and it stays stopped. -->
     <key>KeepAlive</key>
-    <false/>
-    <!-- The wrapper exits once the daemon is up; without this launchd kills
-         the rest of the job's process group, the daemon included. -->
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <!-- The docker-context setup runs beside the daemon and may outlive a
+         short-lived job. -->
     <key>AbandonProcessGroup</key>
     <true/>
     <key>StandardOutPath</key>

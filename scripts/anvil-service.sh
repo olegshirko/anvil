@@ -157,6 +157,16 @@ is_running() {
     return 1
 }
 
+save_docker_context() {
+    local current_context
+    current_context="$(docker context show 2>/dev/null || echo default)"
+    # Already on anvil (a daemon that died without a stop left it there):
+    # keep the context saved back then, or stop would fall back to default.
+    if [[ "$current_context" != "anvil" ]]; then
+        echo "$current_context" > "$PREV_CONTEXT_FILE"
+    fi
+}
+
 cmd_start() {
     if is_running; then
         local pid running_bin
@@ -184,16 +194,42 @@ cmd_start() {
         return 1
     fi
 
-    local current_context
-    current_context="$(docker context show 2>/dev/null || echo default)"
-    if [[ "$current_context" != "anvil" ]]; then
-        echo "$current_context" > "$PREV_CONTEXT_FILE"
-    else
-        rm -f "$PREV_CONTEXT_FILE"
-    fi
-
+    save_docker_context
     check_proxy
 
+    echo "[anvil-service] starting vz-runner daemon..."
+    rm -f "$PID_FILE"
+    prepare_daemon
+    nohup "$VZRUNNER_BIN" "${DAEMON_ARGS[@]}" >>"$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    setup_docker_context
+}
+
+# cmd_run runs the daemon in the foreground, for a supervisor (launchd,
+# brew services) that restarts it if it crashes: start's nohup'd daemon
+# outlived its job, so launchd could neither watch nor restart it (and
+# without AbandonProcessGroup killed it with the wrapper). The docker
+# context is switched alongside once the daemon is ready.
+cmd_run() {
+    if is_running; then
+        echo "[anvil-service] daemon already running (pid $(cat "$PID_FILE")); not starting another"
+        return 0
+    fi
+    if [[ ! -x "$VZRUNNER_BIN" ]]; then
+        echo "[anvil-service] error: vz-runner binary not found at $VZRUNNER_BIN" >&2
+        return 1
+    fi
+    save_docker_context
+    check_proxy
+    prepare_daemon
+    ( setup_docker_context ) &
+    echo "[anvil-service] running vz-runner daemon in the foreground (pid $$)..."
+    exec "$VZRUNNER_BIN" "${DAEMON_ARGS[@]}" >>"$LOG_FILE" 2>&1
+}
+
+# prepare_daemon creates or grows the containerd disk, rotates the log and
+# fills DAEMON_ARGS.
+prepare_daemon() {
     # Create the containerd persistent disk if it doesn't exist, or grow it
     # when ANVIL_DISK_GB (default 64) exceeds the current size. Sparse either
     # way. Growing changes the file size, which is part of the snapshot config
@@ -217,15 +253,16 @@ cmd_start() {
         fi
     fi
 
-    echo "[anvil-service] starting vz-runner daemon..."
-    rm -f "$PID_FILE"
-    local disk_arg=""
-    if [[ -f "$CONTAINERD_DISK" ]]; then
-        disk_arg="--containerd-disk $CONTAINERD_DISK"
+    DAEMON_ARGS=(daemon --kernel "$KERNEL_PATH" --initrd "$INITRD_PATH" --share "$SHARE_ROOT"
+                 --memory "$MEMORY_GB" --idle "${ANVIL_IDLE:-600}")
+    if [[ -n "$CPUS" ]]; then
+        DAEMON_ARGS+=(--cpus "$CPUS")
     fi
-    local debug_arg=""
+    if [[ -f "$CONTAINERD_DISK" ]]; then
+        DAEMON_ARGS+=(--containerd-disk "$CONTAINERD_DISK")
+    fi
     if [[ "${DEBUG:-}" == "1" || "${DEBUG:-}" == "true" ]]; then
-        debug_arg="--debug"
+        DAEMON_ARGS+=(--debug)
         touch "$SHARE_ROOT/.anvil-debug"
     else
         rm -f "$SHARE_ROOT/.anvil-debug"
@@ -234,18 +271,11 @@ cmd_start() {
     if [[ -f "$LOG_FILE" ]] && (( $(stat -f %z "$LOG_FILE" 2>/dev/null || echo 0) > 10485760 )); then
         mv -f "$LOG_FILE" "$LOG_FILE.1"
     fi
-    nohup "$VZRUNNER_BIN" daemon \
-        --kernel "$KERNEL_PATH" \
-        --initrd "$INITRD_PATH" \
-        --share "$SHARE_ROOT" \
-        --memory "$MEMORY_GB" \
-        ${CPUS:+--cpus "$CPUS"} \
-        --idle "${ANVIL_IDLE:-600}" \
-        $disk_arg \
-        $debug_arg \
-        >>"$LOG_FILE" 2>&1 &
-    echo $! > "$PID_FILE"
+}
 
+# setup_docker_context waits for the daemon's control socket, then points
+# the docker CLI and buildx at anvil.
+setup_docker_context() {
     local start_sec=$SECONDS
     local control_sock="$STATE_DIR/control.sock"
     until [[ -S "$control_sock" ]]; do
@@ -352,6 +382,9 @@ case "${1:-}" in
     start)
         cmd_start
         ;;
+    run)
+        cmd_run
+        ;;
     stop)
         cmd_stop
         ;;
@@ -362,7 +395,7 @@ case "${1:-}" in
         cmd_status
         ;;
     *)
-        echo "Usage: $(basename "$0") {start|stop|restart|status}"
+        echo "Usage: $(basename "$0") {start|run|stop|restart|status}"
         exit 1
         ;;
 esac

@@ -79,7 +79,9 @@ make rebuild-all      # vz-runner (signed) + guest-agent + initramfs
 make service-start    # background daemon + docker context
 ```
 
-`make service-install` registers a LaunchAgent so anvil starts at login.
+`make service-install` registers a LaunchAgent so anvil starts at login. It
+runs `anvil-service.sh run`, which keeps the daemon in the foreground so
+launchd restarts it if it crashes (a stop or SIGTERM ends it for good).
 
 ### Uninstall
 
