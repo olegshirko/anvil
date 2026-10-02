@@ -63,6 +63,12 @@ type PortMapState struct {
 	// WatchPaths are the Mac directories running containers bind-mount;
 	// the host forwards file changes under them (fsevents.go).
 	WatchPaths []string `json:"watch_paths,omitempty"`
+	// Domains name the running containers for the host's
+	// <name>.anvil.localhost proxy (domains.go).
+	Domains []DomainEntry `json:"domains,omitempty"`
+	// GuestIP is the VM's eth0 address (the port proxy's), also when no
+	// mapping carries it.
+	GuestIP string `json:"guest_ip,omitempty"`
 }
 
 func main() {

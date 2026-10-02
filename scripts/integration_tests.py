@@ -3786,6 +3786,33 @@ def test_attach_websocket() -> None:
         cleanup(name)
 
 
+def test_container_domains() -> None:
+    # http://<name>.anvil.localhost (ANVIL_DOMAINS=1; skipped when off).
+    port = int(os.environ.get("ANVIL_DOMAINS_PORT", "80"))
+    probe = subprocess.run(["curl", "--noproxy", "*", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "8",
+                            f"http://probe.anvil.localhost:{port}/"], capture_output=True, text=True)
+    if probe.stdout.strip() in ("", "000"):
+        record("container domains", "SKIP", f"ANVIL_DOMAINS is off (nothing on :{port})")
+        return
+    name = f"{PREFIX}-domain"
+    try:
+        docker("run", "-d", "--name", name, "busybox", "sh", "-c",
+               "mkdir -p /w && echo domain-ok > /w/index.html && httpd -f -p 80 -h /w")
+        deadline = time.time() + 15
+        body = ""
+        while time.time() < deadline:
+            body = subprocess.run(["curl", "--noproxy", "*", "-s", "-m", "3", f"http://{name}.anvil.localhost:{port}/"],
+                                  capture_output=True, text=True).stdout.strip()
+            if body == "domain-ok":
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError(f"{name}.anvil.localhost:{port}: {body!r}")
+        record("container domains", "PASS", f"http://{name}.anvil.localhost:{port}")
+    finally:
+        cleanup(name)
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -3925,6 +3952,7 @@ TESTS = [
     ("host network ports", test_host_network_ports),
     ("k3s cluster", test_k3s_cluster),
     ("attach over websocket", test_attach_websocket),
+    ("container domains", test_container_domains),
 ]
 
 

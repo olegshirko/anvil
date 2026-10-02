@@ -170,6 +170,9 @@ enum DaemonCommand {
         private var buildkitProxyServer: DockerProxyServer?
         private var portForwarder: PortForwarder?
         private var fsEventsForwarder: FSEventsForwarder?
+        /// <name>.anvil.localhost (ANVIL_DOMAINS=1); its listener outlives
+        /// VM restarts.
+        private var domainProxy: DomainProxy?
         private var idleTimer: Timer?
         /// Fires after the VM has stayed idle-paused for `idleReleaseSeconds`
         /// and stops it to give its memory back (VMLifecycleManager.releaseMemory).
@@ -409,6 +412,18 @@ enum DaemonCommand {
                 fsEvents.update(paths: paths)
             }
             self.fsEventsForwarder = fsEvents
+            if self.domainProxy == nil, let domainsPort = DomainProxy.configuredPort() {
+                let proxy = DomainProxy(port: domainsPort, hooks: PortConnectionHooks(
+                    resume: blockingResume(manager, tag: "domains"),
+                    // The current tracker: a crash restart replaces it.
+                    connect: { [weak self] in self?.clientTracker?.connect() },
+                    disconnect: { [weak self] in self?.clientTracker?.disconnect() }))
+                proxy.start()
+                self.domainProxy = proxy
+            }
+            if let proxy = self.domainProxy {
+                forwarder.onDomainsChange = { domains, ip in proxy.update(domains: domains, guestIP: ip) }
+            }
             forwarder.start()
             self.portForwarder = forwarder
             phaseTimer.mark("ready_binds")

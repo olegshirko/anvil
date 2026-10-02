@@ -98,11 +98,16 @@ struct PortMapState: Codable {
     var runningContainers: Int? = nil
     /// Mac directories running containers bind-mount (FSEventsForwarder).
     var watchPaths: [String]? = nil
+    /// Running containers by name (DomainProxy), and the VM's address.
+    var domains: [DomainEntry]? = nil
+    var guestIP: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case mappings
         case runningContainers = "running_containers"
         case watchPaths = "watch_paths"
+        case domains
+        case guestIP = "guest_ip"
     }
 }
 
@@ -133,6 +138,8 @@ final class PortForwarder {
     var onRunningContainersChange: ((Int) -> Void)?
     /// The bind-mounted Mac directories to watch ([] when disconnected).
     var onWatchPathsChange: (([String]) -> Void)?
+    /// The guest's domain table and address, on every push.
+    var onDomainsChange: (([DomainEntry], String) -> Void)?
     private var runningContainersCount = 0
     private let queue = DispatchQueue(label: "com.olegshirko.anvil.port-forwarder", qos: .utility)
 
@@ -238,6 +245,7 @@ final class PortForwarder {
                     let state = try decodeLengthPrefixedFD(PortMapState.self, fd: fd)
                     self.updateRunningContainers(state.runningContainers)
                     self.onWatchPathsChange?(state.watchPaths ?? [])
+                    self.onDomainsChange?(state.domains ?? [], state.guestIP ?? "")
                     self.apply(state: state)
                 } catch {
                     print("[port-forwarder] subscription read failed: \(error)")
@@ -854,34 +862,8 @@ private final class Listener {
         return (ip, mapping.containerPort)
     }
 
-    /// Sends the port-proxy handshake: 4-byte big-endian body length + JSON.
     private func sendPortProxyHeader(_ fd: Int32, target: (ip: String, port: Int)) -> Bool {
-        let header = "{\"container_ip\":\"\(target.ip)\",\"container_port\":\(target.port)}"
-        let body = Array(header.utf8)
-
-        var length = UInt32(body.count).bigEndian
-        let lengthSent = withUnsafeBytes(of: &length) { ptr -> Int in
-            var total = 0
-            while total < 4 {
-                let n = write(fd, ptr.baseAddress!.advanced(by: total), 4 - total)
-                if n <= 0 { return -1 }
-                total += n
-            }
-            return total
-        }
-        guard lengthSent == 4 else { return false }
-
-        var mutableBody = body
-        let bodySent = mutableBody.withUnsafeMutableBufferPointer { ptr -> Int in
-            var total = 0
-            while total < body.count {
-                let n = write(fd, ptr.baseAddress!.advanced(by: total), body.count - total)
-                if n <= 0 { return -1 }
-                total += n
-            }
-            return total
-        }
-        return bodySent == body.count
+        sendGuestPortProxyHeader(fd, ip: target.ip, port: target.port)
     }
 }
 
@@ -891,7 +873,20 @@ private final class Listener {
 /// connect to an unreachable guest address stalls for the full TCP SYN
 /// timeout (~75 s), and since it runs inline in the listener's accept loop
 /// it takes the whole published port down with it.
-private func connectWithTimeout(_ fd: Int32, _ addr: sockaddr_in, timeout: TimeInterval) -> Bool {
+/// Sends the guest port-proxy handshake: 4-byte big-endian body length +
+/// JSON naming the target inside the VM.
+func sendGuestPortProxyHeader(_ fd: Int32, ip: String, port: Int) -> Bool {
+    guard let body = try? JSONSerialization.data(withJSONObject: ["container_ip": ip, "container_port": port]) else {
+        return false
+    }
+    var frame = Data()
+    var length = UInt32(body.count).bigEndian
+    frame.append(Data(bytes: &length, count: 4))
+    frame.append(body)
+    return (try? writeExactlyFD(fd, data: frame)) != nil
+}
+
+func connectWithTimeout(_ fd: Int32, _ addr: sockaddr_in, timeout: TimeInterval) -> Bool {
     let flags = fcntl(fd, F_GETFL, 0)
     guard flags >= 0 else { return false }
     _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)

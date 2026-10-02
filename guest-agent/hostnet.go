@@ -21,9 +21,11 @@ type containerScanInfo struct {
 	name       string
 	hostNet    bool
 	watchPaths []string
+	domains    []string // host names (without the suffix)
+	httpPort   int
 }
 
-func loadContainerScanInfo(ns, id string, pid uint32) containerScanInfo {
+func loadContainerScanInfo(ns, id string, pid uint32, labels map[string]string) containerScanInfo {
 	info := containerScanInfo{pid: pid}
 	meta, err := loadContainerMeta(ns, id)
 	if err != nil {
@@ -32,6 +34,8 @@ func loadContainerScanInfo(ns, id string, pid uint32) containerScanInfo {
 	info.name = meta.Name
 	info.hostNet = meta.HostConfig != nil && meta.HostConfig.NetworkMode == "host"
 	info.watchPaths = containerWatchPaths(ns, id)
+	info.domains = containerDomains(meta.Name, labels)
+	info.httpPort = containerHTTPPort(meta.ExposedPorts, labels)
 	return info
 }
 

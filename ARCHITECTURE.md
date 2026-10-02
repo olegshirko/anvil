@@ -274,6 +274,20 @@ Nothing changes on the Mac. The touch comes back through FSEvents (its
 flags are cumulative, so it still reads "modified"); a path whose mtime
 equals what was last forwarded is dropped, which breaks the loop.
 
+### 3.9 DomainProxy
+
+Opt-in (`ANVIL_DOMAINS=1`). The guest adds a domain table to the port
+state: per running bridged container its names (the container name, and
+`<service>.<project>` for compose), its CNI address and an HTTP port (label
+`dev.anvil.http.port`, else 80 if exposed, else the lowest exposed TCP
+port), plus the VM's own address. The daemon listens on the loopback
+(127.0.0.1 and ::1, port 80 or `ANVIL_DOMAINS_PORT`); macOS resolves every
+`*.localhost` name there. It reads the request head, picks the container
+from `Host: <name>.anvil.localhost`, wakes a paused or released VM, and
+relays the connection unchanged — head included — through the guest port
+proxy, so keep-alive and WebSocket upgrades work. Connections count as
+clients for the idle timer, like forwarded ports.
+
 ## 4. Guest side: guest-agent
 
 ### 4.1 Startup and the PID 1 role
