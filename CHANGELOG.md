@@ -1,3 +1,11 @@
+## v1.6.0 (2026-10-02)
+
+### Added
+- f1ee160 feat: containers survive cold boots; exec env, healthchecks, static IPs and API fixes
+
+### Fixed
+- 3eae886 fix: subpath mounts pinned at start, cp -a, static IPs outside ip_range; review fixes
+- 4ead2c7 fix: idle pause froze running containers; Testcontainers, stdin, exec -it and Docker API parity
 ## v1.5.0 (2026-09-26)
 
 ### Added
