@@ -1,3 +1,10 @@
+## v1.8.0 (2026-10-02)
+
+### Added
+- 2b1db8b feat: container domains, http://<name>.anvil.localhost (ANVIL_DOMAINS=1)
+
+### Fixed
+- a16d2fc fix: review of the 1.7 features
 ## v1.7.0 (2026-10-02)
 
 ### Added
