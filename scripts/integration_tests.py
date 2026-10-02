@@ -3691,6 +3691,39 @@ def test_host_network_ports() -> None:
         cleanup(name)
 
 
+def test_k3s_cluster() -> None:
+    # Kubernetes in a container (what k3d/kind do): privileged devices
+    # (/dev/kmsg), kube-proxy's kernel modules, pod DNS and Service routing.
+    name = f"{PREFIX}-k3s"
+    try:
+        if "/dev/kmsg" not in docker("run", "--rm", "--privileged", "alpine", "ls", "/dev/kmsg").stdout:
+            raise RuntimeError("--privileged container has no /dev/kmsg")
+        docker("run", "-d", "--name", name, "--privileged", "rancher/k3s:v1.31.4-k3s1", "server",
+               "--disable=traefik", "--disable=metrics-server", timeout=600.0)
+        def kubectl(*args: str, check: bool = False) -> subprocess.CompletedProcess:
+            return docker("exec", name, "kubectl", *args, check=check, timeout=60.0)
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            pods = kubectl("get", "pods", "-n", "kube-system", "--no-headers").stdout
+            if "coredns" in pods and all(" Running " in l for l in pods.splitlines() if "coredns" in l):
+                break
+            if docker("inspect", "-f", "{{.State.Running}}", name).stdout.strip() != "true":
+                raise RuntimeError("k3s exited: " + docker("logs", "--tail", "20", name).stderr[-800:])
+            time.sleep(3)
+        else:
+            raise RuntimeError(f"coredns not running: {pods!r}")
+        kubectl("create", "deployment", "web", "--image=nginx:alpine", check=True)
+        kubectl("expose", "deployment", "web", "--port", "80", check=True)
+        kubectl("wait", "--for=condition=available", "deployment/web", "--timeout=120s", check=True)
+        out = kubectl("run", "probe", "--rm", "-i", "--restart=Never", "--image=busybox", "--",
+                      "wget", "-qO-", "-T", "10", "http://web.default.svc.cluster.local").stdout
+        if "Welcome to nginx" not in out:
+            raise RuntimeError(f"service not reachable from a pod: {out[-300:]!r}")
+        record("k3s cluster", "PASS", "node ready, coredns running, pod -> Service by DNS name")
+    finally:
+        cleanup(name)
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -3828,6 +3861,7 @@ TESTS = [
     ("volume subpath", test_volume_subpath),
     ("bind mount file events", test_bind_mount_file_events),
     ("host network ports", test_host_network_ports),
+    ("k3s cluster", test_k3s_cluster),
 ]
 
 

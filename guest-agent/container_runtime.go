@@ -619,7 +619,9 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 		opts = append(opts, oci.WithRootFSReadonly())
 	}
 	if req.HostConfig.Privileged {
-		opts = append(opts, oci.WithPrivileged)
+		// As Docker: every device of the VM and access to all of them —
+		// kubelet in k3s/kind nodes needs /dev/kmsg, DinD loop devices.
+		opts = append(opts, oci.WithPrivileged, oci.WithHostDevices, oci.WithAllDevicesAllowed)
 	} else {
 		if len(req.HostConfig.CapAdd) > 0 {
 			opts = append(opts, oci.WithAddedCapabilities(req.HostConfig.CapAdd))

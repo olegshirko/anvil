@@ -296,6 +296,10 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   Mac's localhost over TCP, services bound only to `127.0.0.1` included, as
   in Docker Desktop; UDP to it goes to the Mac's NAT address.
   `gateway.docker.internal` is the NAT gateway.
+- Kubernetes in containers works (k3s/k3d; `--privileged` containers get
+  the VM's devices, and the kernel carries the modules kube-proxy, flannel
+  and VPN containers load): `docker run --privileged -p 6443:6443
+  rancher/k3s server` gives a cluster `kubectl` on the Mac can reach.
 - `--network host` containers share the VM's network; the TCP ports they
   listen on are forwarded to the Mac's `127.0.0.1` automatically (no `-p`),
   as with Docker Desktop's host networking.
