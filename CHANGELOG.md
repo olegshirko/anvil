@@ -1,3 +1,10 @@
+## v1.7.0 (2026-10-02)
+
+### Added
+- 59d83ca feat: GET /containers/{id}/attach/ws
+- a9f0a5d feat: launchd supervises the daemon (anvil-service.sh run)
+- 1fa07c2 feat: privileged containers get the VM's devices; k3s runs in a container
+- b8d1a5b feat: file change events in bind mounts, idle memory release, host-network ports
 ## v1.6.0 (2026-10-02)
 
 ### Added
