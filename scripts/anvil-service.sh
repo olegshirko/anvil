@@ -329,6 +329,13 @@ cmd_stop() {
         while kill -0 "$pid" 2>/dev/null; do
             if (( SECONDS - start_sec > 90 )); then
                 echo "[anvil-service] warning: daemon did not stop gracefully, sending SIGKILL" >&2
+                # launchd would restart a killed supervised daemon at once:
+                # unload its job first (brew services start / login loads it again).
+                local label
+                if label="$(supervised_label)"; then
+                    echo "[anvil-service] unloading launchd job $label" >&2
+                    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+                fi
                 kill -KILL "$pid" 2>/dev/null || true
                 break
             fi
@@ -364,7 +371,30 @@ cmd_stop() {
     fi
 }
 
+# supervised_label prints the launchd job (our LaunchAgent or brew services)
+# that runs the daemon in `run` mode, if any.
+supervised_label() {
+    local label pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    [[ -n "$pid" ]] || return 1
+    for label in com.olegshirko.anvil homebrew.mxcl.anvil; do
+        if launchctl print "gui/$(id -u)/$label" 2>/dev/null | grep -q "pid = $pid\$"; then
+            echo "$label"
+            return 0
+        fi
+    done
+    return 1
+}
+
 cmd_restart() {
+    # Under launchd, restart the job itself: stop + start would leave an
+    # unsupervised daemon behind.
+    local label
+    if label="$(supervised_label)"; then
+        echo "[anvil-service] restarting launchd job $label..."
+        launchctl kickstart -k "gui/$(id -u)/$label"
+        return 0
+    fi
     cmd_stop || true
     cmd_start
 }

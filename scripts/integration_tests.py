@@ -3645,6 +3645,7 @@ def test_bind_mount_file_events() -> None:
             time.sleep(4)  # the guest pushes the watch set with the port state
             with open(Path(d, "a.txt"), "a") as f:
                 f.write("v2")
+            mtime = Path(d, "a.txt").stat().st_mtime_ns
             Path(d, "new.txt").write_text("x")
             deadline = time.time() + 10
             logs = ""
@@ -3655,6 +3656,9 @@ def test_bind_mount_file_events() -> None:
                 time.sleep(0.5)
             else:
                 raise RuntimeError(f"no inotify events for Mac-side changes: {logs!r}")
+            # Forwarding must leave the Mac's file exactly as it was.
+            if Path(d, "a.txt").stat().st_mtime_ns != mtime:
+                raise RuntimeError("forwarding changed the Mac file's mtime")
             # The guest's touch must not echo back into another event.
             time.sleep(3)
             before = len(docker("logs", name).stdout.splitlines())
@@ -3808,7 +3812,24 @@ def test_container_domains() -> None:
             time.sleep(0.5)
         else:
             raise RuntimeError(f"{name}.anvil.localhost:{port}: {body!r}")
-        record("container domains", "PASS", f"http://{name}.anvil.localhost:{port}")
+        # A container published on the proxy's own port answers the
+        # requests that are not for a container domain.
+        pub = f"{PREFIX}-domain-pub"
+        try:
+            docker("run", "-d", "--name", pub, "-p", f"{port}:80", "busybox", "sh", "-c",
+                   "mkdir -p /w && echo published-ok > /w/index.html && httpd -f -p 80 -h /w")
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                body = subprocess.run(["curl", "--noproxy", "*", "-s", "-m", "3", f"http://localhost:{port}/"],
+                                      capture_output=True, text=True).stdout.strip()
+                if body == "published-ok":
+                    break
+                time.sleep(0.5)
+            else:
+                raise RuntimeError(f"-p {port}:80 beside the domains proxy: {body!r}")
+        finally:
+            cleanup(pub)
+        record("container domains", "PASS", f"http://{name}.anvil.localhost:{port}, -p {port} still served")
     finally:
         cleanup(name)
 

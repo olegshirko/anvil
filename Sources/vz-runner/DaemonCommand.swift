@@ -206,7 +206,10 @@ enum DaemonCommand {
             self.cacheManager = ContainerdCacheManager(sharePath: manager.args.sharePath)
             manager.delegate = self
             manager.portCheckServer = PortCheckServer { [weak self] port in
-                self?.portForwarder?.holdsTCP(port: port) ?? false
+                // The domains proxy holds its loopback port too; a
+                // container published there shares it (DomainProxy relays
+                // the requests that are not for a container domain).
+                (self?.portForwarder?.holdsTCP(port: port) ?? false) || self?.domainProxy?.port == port
             }
         }
 
@@ -269,7 +272,10 @@ enum DaemonCommand {
             // connection would resume the VM (deleting the snapshot) only
             // to pause and save it again — and a kill in that window turned
             // the next start into a cold boot.
-            if manager.isPausedWithSavedSnapshot {
+            // Released (or being released) to free memory: the snapshot is
+            // saved too, and waking it to save again could, on a locked Mac,
+            // lose it to the cold-boot fallback.
+            if manager.isPausedWithSavedSnapshot || manager.released || manager.releasing {
                 print("[anvil] VM already paused and saved; exiting")
                 server?.stop()
                 dockerProxyServer?.stop()
@@ -413,11 +419,17 @@ enum DaemonCommand {
             }
             self.fsEventsForwarder = fsEvents
             if self.domainProxy == nil, let domainsPort = DomainProxy.configuredPort() {
-                let proxy = DomainProxy(port: domainsPort, hooks: PortConnectionHooks(
+                let proxy = DomainProxy(
+                    port: domainsPort,
                     resume: blockingResume(manager, tag: "domains"),
-                    // The current tracker: a crash restart replaces it.
-                    connect: { [weak self] in self?.clientTracker?.connect() },
-                    disconnect: { [weak self] in self?.clientTracker?.disconnect() }))
+                    // The tracker of the moment, released on the same one:
+                    // a crash restart replaces it under live connections.
+                    acquireClient: { [weak self] in
+                        let tracker = self?.clientTracker
+                        tracker?.connect()
+                        return { tracker?.disconnect() }
+                    },
+                    publishedTarget: { [weak self] port in self?.portForwarder?.tcpTarget(hostPort: port) })
                 proxy.start()
                 self.domainProxy = proxy
             }

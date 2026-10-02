@@ -422,6 +422,19 @@ final class PortForwarder {
         return nil
     }
 
+    /// The container target of a published TCP host port (DomainProxy hands
+    /// it requests that are not for a container domain).
+    func tcpTarget(hostPort: Int) -> (guestIP: String, ip: String, port: Int)? {
+        listenersLock.lock()
+        defer { listenersLock.unlock() }
+        for l in listeners.values where l.mapping.hostPort == hostPort && (l.mapping.protocol ?? "tcp") == "tcp" {
+            if let ip = l.mapping.containerIP, !ip.isEmpty {
+                return (l.mapping.guestIP, ip, l.mapping.containerPort)
+            }
+        }
+        return nil
+    }
+
     /// Whether a host TCP port is currently bound by one of our own listeners.
     func holdsTCP(port: Int) -> Bool {
         listenersLock.lock()

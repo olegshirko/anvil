@@ -88,6 +88,8 @@ final class VMLifecycleManager: NSObject {
     /// boot. Pass `fresh: true` to skip the snapshot entirely (crash-loop
     /// recovery invalidates a possibly poisoned snapshot).
     func start(fresh: Bool = false) {
+        dropWakeWaiters(NSError(domain: "anvil", code: 105,
+                                userInfo: [NSLocalizedDescriptionKey: "VM restarted"]))
         forceFreshBoot = fresh
         writeHostTimeFile()
         startHostTimeRefresher()
@@ -171,6 +173,8 @@ final class VMLifecycleManager: NSObject {
     /// The VM was stopped to give its memory back; the committed snapshot
     /// holds it. Main queue.
     private(set) var released = false
+    /// A release stop is in flight (main queue).
+    private(set) var releasing = false
     /// Clients waiting for a released VM to come back (nil: no wake).
     private var wakeWaiters: [(Result<Void, Error>) -> Void]?
 
@@ -181,18 +185,21 @@ final class VMLifecycleManager: NSObject {
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let vm = self.vm, self.isPausedWithSavedSnapshot, vm.canStop else { return }
             vm.delegate = nil // intentional: not a crash
+            self.releasing = true
             vm.stop { [weak self] error in
-                DispatchQueue.main.async {
-                    guard let self = self else { return }
-                    if let error = error {
-                        print("[anvil] stopping the idle VM failed: \(error)")
-                        return
-                    }
-                    self.vm = nil
-                    self.released = true
-                    self.stopHostTimeRefresher()
-                    print("[anvil] idle VM stopped to free its memory; the next client restores it")
+                // Runs on the main queue, VZ's own: no extra hop, which left
+                // a window where the VM looked stopped but not released.
+                guard let self = self else { return }
+                self.releasing = false
+                if let error = error {
+                    print("[anvil] stopping the idle VM failed: \(error)")
+                    vm.delegate = self // still the live VM: watch it again
+                    return
                 }
+                self.vm = nil
+                self.released = true
+                self.stopHostTimeRefresher()
+                print("[anvil] idle VM stopped to free its memory; the next client restores it")
             }
         }
     }
@@ -206,6 +213,7 @@ final class VMLifecycleManager: NSObject {
             return
         }
         wakeWaiters = [completion]
+        forceFreshBoot = false // a crash-loop's fresh boot is not this wake's
         print("[anvil] restoring the released VM...")
         writeHostTimeFile()
         startHostTimeRefresher()
@@ -231,6 +239,16 @@ final class VMLifecycleManager: NSObject {
             return
         }
         delegate?.vmLifecycleManagerDidBecomeReady(self)
+    }
+
+    /// Fail clients still waiting for a wake (the VM stopped or the daemon
+    /// restarts it): a crash restart's readiness must reach the daemon.
+    private func dropWakeWaiters(_ error: Error) {
+        released = false
+        if let waiters = wakeWaiters {
+            wakeWaiters = nil
+            waiters.forEach { $0(.failure(error)) }
+        }
     }
 
     /// A failed wake fails its clients and is then a crash like any other.
@@ -667,11 +685,13 @@ final class VMLifecycleManager: NSObject {
 extension VMLifecycleManager: VZVirtualMachineDelegate {
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         print("\n[anvil] guest stopped")
+        dropWakeWaiters(NSError(domain: "anvil", code: 106, userInfo: [NSLocalizedDescriptionKey: "guest stopped"]))
         delegate?.vmLifecycleManagerDidStop(self)
     }
 
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
         print("\n[anvil] VM stopped with error: \(error)")
+        dropWakeWaiters(error)
         delegate?.vmLifecycleManager(self, didFailWithError: error)
     }
 }

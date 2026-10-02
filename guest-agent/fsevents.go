@@ -7,22 +7,20 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-
-	"golang.org/x/sys/unix"
 )
 
 // File changes made on the Mac reach the VM through virtiofs, but the guest
 // kernel never sees them happen, so inotify inside containers stays silent:
 // hot reload (Vite, webpack, nodemon, air, uvicorn --reload) missed every
 // edit. The host watches the bind-mounted Mac directories with FSEvents and
-// streams the changed paths here with their current times; re-applying
-// those exact times (utimensat) raises IN_ATTRIB on the inode, which every
-// watcher of the file or of its directory receives. Nothing changes on the
-// Mac: the values are the ones the file already has.
+// streams the changed paths here; a chmod to the file's current mode
+// raises IN_ATTRIB on the inode, which every watcher of the file or of its
+// directory receives. Nothing changes on the Mac. (Re-applying the file's
+// times instead could roll a newer file's mtime back to the one the host
+// had read a moment earlier.)
 
 // macShareRoots are where Mac paths live in the VM (same absolute paths).
 var macShareRoots = []string{"/Users/", "/Volumes/", "/private/tmp/", "/private/var/folders/"}
@@ -94,17 +92,6 @@ func handleFSEvents(conn net.Conn) {
 		for _, ev := range batch.Events {
 			applyFSEvent(ev)
 		}
-	}
-}
-
-func applyFSEvent(ev fsEvent) {
-	p := filepath.Clean(ev.Path)
-	if !onMacShare(p) || ev.Mtime <= 0 {
-		return
-	}
-	ts := []unix.Timespec{unix.NsecToTimespec(ev.Atime), unix.NsecToTimespec(ev.Mtime)}
-	if err := unix.UtimesNanoAt(unix.AT_FDCWD, p, ts, unix.AT_SYMLINK_NOFOLLOW); err != nil && !os.IsNotExist(err) {
-		debugLog("[fsevents] %s: %v", p, err)
 	}
 }
 

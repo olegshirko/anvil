@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"net/http"
+	"sync/atomic"
 
 	"golang.org/x/net/websocket"
 )
@@ -47,7 +48,12 @@ func handleAttachWS(w http.ResponseWriter, r *http.Request, id string) {
 			ws.PayloadType = websocket.BinaryFrame
 			attachBegin(did)
 			defer attachEnd(did)
+			// A WebSocket has no half-close: the read side ending means the
+			// client left, and the output stream stops following too.
+			var gone atomic.Bool
+			ao.detached = gone.Load
 			go func() {
+				defer gone.Store(true)
 				if stdin == nil {
 					io.Copy(io.Discard, ws) //nolint:errcheck
 					return

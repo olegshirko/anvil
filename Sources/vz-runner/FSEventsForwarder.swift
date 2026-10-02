@@ -9,10 +9,10 @@ import Virtualization
 ///
 /// The guest pushes the directories running containers bind-mount (the port
 /// state's `watch_paths`); they are watched here with one FSEvents stream.
-/// Changed paths go to the guest over a control connection (`fs_events`)
-/// with their current times, and the guest re-applies those times, which
-/// raises IN_ATTRIB there. The touch comes back as a metadata-only event,
-/// which is ignored.
+/// Changed paths go to the guest over a control connection (`fs_events`);
+/// the guest chmods each to its current mode, which raises IN_ATTRIB there
+/// and changes nothing on the Mac. The touch comes back through FSEvents
+/// and is recognised by its unchanged mtime.
 final class FSEventsForwarder {
     private let deviceProvider: () -> VZVirtioSocketDevice?
     private let queue = DispatchQueue(label: "com.olegshirko.anvil.fsevents", qos: .utility)
@@ -31,6 +31,21 @@ final class FSEventsForwarder {
     /// a recently changed file, so the echo of the guest's touch still says
     /// "modified"; an unchanged mtime is what tells it apart.
     private var lastSent: [String: (mtime: Int64, at: Date)] = [:]
+    /// At most one forward per path per second: a container writing into a
+    /// bind mount (logs, builds, a database) shows up here too, and each of
+    /// its writes need not become a guest round trip. The latest change of
+    /// a held-back path still goes out when its second is over.
+    private static let perPathInterval: TimeInterval = 1
+    private var deferred: [String: FSEventStreamEventFlags] = [:]
+
+    /// Trees no watcher needs and that churn constantly.
+    private static func ignored(_ path: String) -> Bool {
+        if path.contains("/node_modules/") || path.contains("/.git/objects/") {
+            return true
+        }
+        let parts = path.split(separator: "/", maxSplits: 3)
+        return parts.count >= 3 && parts[0] == "Users" && parts[2] == "Library"
+    }
 
     init(deviceProvider: @escaping () -> VZVirtioSocketDevice?) {
         self.deviceProvider = deviceProvider
@@ -63,6 +78,7 @@ final class FSEventsForwarder {
             stream = nil
         }
         pending.removeAll()
+        deferred.removeAll()
         dirRoots = []
         fileRoots = []
         var watched = Set<String>()
@@ -112,7 +128,8 @@ final class FSEventsForwarder {
         // Metadata-only events are the echo of the guest's own touch (and
         // chmods/xattrs, which watchers do not need).
         guard flags & content != 0 else { return }
-        guard fileRoots.contains(path) || dirRoots.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) else {
+        guard fileRoots.contains(path) || dirRoots.contains(where: { path == $0 || path.hasPrefix($0 + "/") }),
+              !Self.ignored(path) else {
             return
         }
         pending[path, default: 0] |= flags
@@ -134,29 +151,45 @@ final class FSEventsForwarder {
 
     private func flush() {
         flushScheduled = false
-        let changes = pending
+        var changes = pending
         pending.removeAll()
+        for (p, f) in deferred { changes[p, default: 0] |= f }
+        deferred.removeAll()
         var events: [Event] = []
         var seen = Set<String>()
         let structural = FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated
             | kFSEventStreamEventFlagItemRemoved | kFSEventStreamEventFlagItemRenamed)
         let now = Date()
         lastSent = lastSent.filter { now.timeIntervalSince($0.value.at) < 30 }
-        func add(_ p: String) {
+        var nextDue: TimeInterval?
+        func add(_ p: String, flags: FSEventStreamEventFlags) {
             guard seen.insert(p).inserted, let ev = Self.timesEvent(p) else { return }
-            if let last = lastSent[p], last.mtime == ev.m {
-                return // our own touch coming back, or no real change
+            if let last = lastSent[p] {
+                if last.mtime == ev.m {
+                    return // our own touch coming back, or no real change
+                }
+                let wait = Self.perPathInterval - now.timeIntervalSince(last.at)
+                if wait > 0 {
+                    deferred[p, default: 0] |= flags
+                    nextDue = min(nextDue ?? wait, wait)
+                    return
+                }
             }
             lastSent[p] = (ev.m, now)
             events.append(ev)
         }
         for (path, flags) in changes {
-            add(path)
+            add(path, flags: flags)
             // A watcher of the directory learns of new, gone and renamed
-            // entries through the directory itself.
-            if flags & structural != 0 {
-                add((path as NSString).deletingLastPathComponent)
+            // entries through the directory itself — only a watched one.
+            let parent = (path as NSString).deletingLastPathComponent
+            if flags & structural != 0, dirRoots.contains(where: { parent == $0 || parent.hasPrefix($0 + "/") }) {
+                add(parent, flags: 0)
             }
+        }
+        if let due = nextDue, !flushScheduled {
+            flushScheduled = true
+            queue.asyncAfter(deadline: .now() + due) { [self] in flush() }
         }
         guard !events.isEmpty else { return }
         // Bounded frames: a checkout touching thousands of files goes in parts.

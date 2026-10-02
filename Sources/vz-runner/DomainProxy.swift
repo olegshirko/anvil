@@ -18,8 +18,14 @@ struct DomainEntry: Codable, Equatable {
 final class DomainProxy {
     static let suffix = ".anvil.localhost"
 
-    private let port: Int
-    private let hooks: PortConnectionHooks
+    let port: Int
+    private let resume: () -> Void
+    /// Counts the connection as a client; returns its matching release (the
+    /// daemon's client tracker can be replaced while a connection lives).
+    private let acquireClient: () -> () -> Void
+    /// A container published on this same host port (-p 80:80): requests
+    /// for other hosts (http://localhost) go to it.
+    private let publishedTarget: (Int) -> (guestIP: String, ip: String, port: Int)?
     private let lock = NSLock()
     private var table: [String: DomainEntry] = [:]
     private var guestIP = ""
@@ -28,9 +34,12 @@ final class DomainProxy {
     private var tableReceived = false
     private var fds: [Int32] = []
 
-    init(port: Int, hooks: PortConnectionHooks) {
+    init(port: Int, resume: @escaping () -> Void, acquireClient: @escaping () -> () -> Void,
+         publishedTarget: @escaping (Int) -> (guestIP: String, ip: String, port: Int)?) {
         self.port = port
-        self.hooks = hooks
+        self.resume = resume
+        self.acquireClient = acquireClient
+        self.publishedTarget = publishedTarget
     }
 
     /// ANVIL_DOMAINS / ANVIL_DOMAINS_PORT; nil when the feature is off.
@@ -129,17 +138,30 @@ final class DomainProxy {
         var zero = timeval(tv_sec: 0, tv_usec: 0)
         setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &zero, socklen_t(MemoryLayout<timeval>.size))
 
-        guard let host = Self.hostHeader(head) else {
-            respond(client, status: "400 Bad Request", body: "anvil: request without a Host header\n")
+        let host = Self.hostHeader(head)
+        let name = host.flatMap(Self.containerName)
+        let release = acquireClient()
+        defer { release() }
+
+        guard let name = name else {
+            // Not a container domain: a container published on this port
+            // (-p 80:80) answers, as it would without the proxy.
+            if let published = publishedTarget(port) {
+                resume()
+                relay(client, head: head, guestIP: published.guestIP, ip: published.ip, port: published.port)
+            } else {
+                respond(client, status: "404 Not Found",
+                        body: "anvil: \(host ?? "this request") is not a <name>\(Self.suffix) address\n")
+            }
             return
         }
-        hooks.connect()
-        defer { hooks.disconnect() }
-        hooks.resume() // a paused or released VM comes back first
-
-        guard let name = Self.containerName(host) else {
-            respond(client, status: "404 Not Found", body: "anvil: \(host) is not a <name>\(Self.suffix) address\n")
-            return
+        // Wake a paused or released VM only for a name it may serve: the
+        // table survives a release; empty or unknown, ask the guest.
+        lock.lock()
+        let mayServe = table[name] != nil || !tableReceived || table.isEmpty
+        lock.unlock()
+        if mayServe {
+            resume()
         }
         // Right after a wake the guest may not have pushed its table yet.
         var entry: DomainEntry?
@@ -163,7 +185,11 @@ final class DomainProxy {
                     body: "anvil: no running container named \(name)\n\(known.isEmpty ? "" : "running:\n\(known)\n")")
             return
         }
+        relay(client, head: head, guestIP: vmIP, ip: target.ip, port: target.port)
+    }
 
+    /// Relay the connection, head first, to ip:port in the VM.
+    private func relay(_ client: Int32, head: Data, guestIP vmIP: String, ip: String, port targetPort: Int) {
         let upstream = socket(AF_INET, SOCK_STREAM, 0)
         guard upstream >= 0 else { return }
         defer { close(upstream) }
@@ -173,9 +199,9 @@ final class DomainProxy {
         addr.sin_port = in_port_t(guestPortProxyPort).bigEndian
         guard vmIP.withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1,
               connectWithTimeout(upstream, addr, timeout: 5),
-              sendGuestPortProxyHeader(upstream, ip: target.ip, port: target.port),
+              sendGuestPortProxyHeader(upstream, ip: ip, port: targetPort),
               (try? writeExactlyFD(upstream, data: head)) != nil else {
-            respond(client, status: "502 Bad Gateway", body: "anvil: cannot reach \(name) on port \(target.port)\n")
+            respond(client, status: "502 Bad Gateway", body: "anvil: cannot reach \(ip):\(targetPort) in the VM\n")
             return
         }
         relayBothWays(client, upstream)

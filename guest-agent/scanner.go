@@ -74,6 +74,8 @@ type portScanner struct {
 	containerIPs map[string]containerIPEntry
 	// scanInfo caches per-task metadata (bind paths, host networking).
 	scanInfo map[string]containerScanInfo
+	// hostNetCache holds host-network containers' discovered ports.
+	hostNetCache map[string]*hostNetCacheEntry
 }
 
 type containerIPEntry struct {
@@ -251,6 +253,7 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 	var mappings []PortMapping
 	var watch []string
 	var listeners map[string]tcpListener
+	var listenSig string
 	var domains []DomainEntry
 	infoSeen := map[string]bool{}
 	seen := make(map[string]bool)
@@ -294,8 +297,17 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 			}
 			if listeners == nil {
 				listeners = rootNetnsListeners()
+				listenSig = listenersSignature(listeners)
 			}
-			for port, target := range hostNetworkPorts(pid, listeners) {
+			if s.hostNetCache == nil {
+				s.hostNetCache = map[string]*hostNetCacheEntry{}
+			}
+			entry := s.hostNetCache[key]
+			if entry == nil {
+				entry = &hostNetCacheEntry{}
+				s.hostNetCache[key] = entry
+			}
+			for port, target := range hostNetworkPorts(pid, listeners, listenSig, entry) {
 				mappings = append(mappings, PortMapping{
 					Namespace:     ns,
 					ContainerID:   id,
@@ -374,6 +386,7 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 	for key := range s.scanInfo {
 		if !infoSeen[key] {
 			delete(s.scanInfo, key)
+			delete(s.hostNetCache, key)
 		}
 	}
 	// Removed and stopped containers leave the address cache.

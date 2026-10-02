@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -112,14 +113,48 @@ func processSocketInodes(pids []int) map[string]bool {
 	return out
 }
 
+// hostNetCacheEntry remembers a container's ports for one combination of
+// the VM's listening sockets and the container's processes.
+type hostNetCacheEntry struct {
+	sig   string
+	ports map[int]string
+}
+
+// listenersSignature identifies the set of listening sockets.
+func listenersSignature(listeners map[string]tcpListener) string {
+	inodes := make([]string, 0, len(listeners))
+	for inode := range listeners {
+		inodes = append(inodes, inode)
+	}
+	slices.Sort(inodes)
+	return strings.Join(inodes, ",")
+}
+
 // hostNetworkPorts returns the ports a host-network container listens on,
-// with the address the port proxy must dial for each.
-func hostNetworkPorts(taskPid uint32, listeners map[string]tcpListener) map[int]string {
+// with the address the port proxy must dial for each. Reading every fd of
+// every process is the costly part (k3s runs hundreds): it is redone only
+// when the listening sockets or the container's processes changed.
+func hostNetworkPorts(taskPid uint32, listeners map[string]tcpListener, listenSig string, cache *hostNetCacheEntry) map[int]string {
 	pids := cgroupPids(cgroupDir(int(taskPid)))
 	if len(pids) == 0 {
 		pids = []int{int(taskPid)}
 	}
+	var sig strings.Builder
+	sig.WriteString(listenSig)
+	sig.WriteByte('|')
+	for _, p := range pids {
+		sig.WriteString(strconv.Itoa(p))
+		sig.WriteByte(',')
+	}
+	if cache != nil && cache.ports != nil && cache.sig == sig.String() {
+		return cache.ports
+	}
 	out := map[int]string{}
+	defer func() {
+		if cache != nil {
+			cache.sig, cache.ports = sig.String(), out
+		}
+	}()
 	for inode := range processSocketInodes(pids) {
 		l, ok := listeners[inode]
 		if !ok {
