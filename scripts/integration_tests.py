@@ -3635,6 +3635,62 @@ def test_volume_subpath() -> None:
         docker("volume", "rm", "-f", vol, check=False)
 
 
+def test_bind_mount_file_events() -> None:
+    # Changes made on the Mac raise inotify events in containers (hot reload).
+    name = f"{PREFIX}-fsevents"
+    with tempfile.TemporaryDirectory(dir=str(Path.home())) as d:
+        Path(d, "a.txt").write_text("v1")
+        try:
+            docker("run", "-d", "--name", name, "-v", f"{d}:/w", "busybox", "inotifyd", "-", "/w")
+            time.sleep(4)  # the guest pushes the watch set with the port state
+            with open(Path(d, "a.txt"), "a") as f:
+                f.write("v2")
+            Path(d, "new.txt").write_text("x")
+            deadline = time.time() + 10
+            logs = ""
+            while time.time() < deadline:
+                logs = docker("logs", name).stdout
+                if "a.txt" in logs and "new.txt" in logs:
+                    break
+                time.sleep(0.5)
+            else:
+                raise RuntimeError(f"no inotify events for Mac-side changes: {logs!r}")
+            # The guest's touch must not echo back into another event.
+            time.sleep(3)
+            before = len(docker("logs", name).stdout.splitlines())
+            time.sleep(3)
+            after = len(docker("logs", name).stdout.splitlines())
+            if after != before:
+                raise RuntimeError(f"events keep coming without changes ({before} -> {after} lines)")
+            record("bind mount file events", "PASS", f"{after} events, no echo loop")
+        finally:
+            cleanup(name)
+
+
+def test_host_network_ports() -> None:
+    # A --network host container's listeners are reachable on the Mac's
+    # loopback without -p.
+    name = f"{PREFIX}-hostnet"
+    port = PORT_BASE + 77
+    try:
+        docker("run", "-d", "--name", name, "--network", "host", "busybox",
+               "sh", "-c", f"mkdir -p /www && echo hostnet-ok > /www/index.html && httpd -f -p {port} -h /www")
+        deadline = time.time() + 15
+        body = ""
+        while time.time() < deadline:
+            p = subprocess.run(["curl", "--noproxy", "*", "-s", "-m", "2", f"http://127.0.0.1:{port}/"],
+                               capture_output=True, text=True)
+            body = p.stdout.strip()
+            if body == "hostnet-ok":
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError(f"host-network port {port} not reachable from the Mac: {body!r}")
+        record("host network ports", "PASS", f"127.0.0.1:{port} -> host-network container")
+    finally:
+        cleanup(name)
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -3770,6 +3826,8 @@ TESTS = [
     ("api parity (audit fixes)", test_api_parity_audit),
     ("static IP outside ip_range", test_static_ip_outside_ip_range),
     ("volume subpath", test_volume_subpath),
+    ("bind mount file events", test_bind_mount_file_events),
+    ("host network ports", test_host_network_ports),
 ]
 
 

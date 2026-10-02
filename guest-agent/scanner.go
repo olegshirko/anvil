@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -61,11 +62,14 @@ type portScanner struct {
 	// the VM awake while it is non-zero: an idle pause would freeze
 	// databases, servers and workers between CLI calls.
 	running     int
+	watchPaths  []string
 	subscribers map[chan PortMapState]struct{}
 	guestIP     string
 	// containerIPs caches (namespace, containerd id) -> {task pid, CNI IP}
 	// so per-scan address lookups only run for new or restarted containers.
 	containerIPs map[string]containerIPEntry
+	// scanInfo caches per-task metadata (bind paths, host networking).
+	scanInfo map[string]containerScanInfo
 }
 
 type containerIPEntry struct {
@@ -152,11 +156,13 @@ func (s *portScanner) scanAndNotify(cl *client.Client) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if stateEqual(s.current, state.Mappings) && s.running == state.RunningContainers {
+	if stateEqual(s.current, state.Mappings) && s.running == state.RunningContainers &&
+		slices.Equal(s.watchPaths, state.WatchPaths) {
 		return false
 	}
 	s.current = state.Mappings
 	s.running = state.RunningContainers
+	s.watchPaths = state.WatchPaths
 	return true
 }
 
@@ -195,7 +201,8 @@ func (s *portScanner) currentState() PortMapState {
 func (s *portScanner) currentStateLocked() PortMapState {
 	mappings := make([]PortMapping, len(s.current))
 	copy(mappings, s.current)
-	return PortMapState{Mappings: mappings, RunningContainers: s.running}
+	return PortMapState{Mappings: mappings, RunningContainers: s.running,
+		WatchPaths: slices.Clone(s.watchPaths)}
 }
 
 func (s *portScanner) subscribe() chan PortMapState {
@@ -235,6 +242,9 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 	s.guestIP = guestIP
 
 	var mappings []PortMapping
+	var watch []string
+	var listeners map[string]tcpListener
+	infoSeen := map[string]bool{}
 	seen := make(map[string]bool)
 	running := 0
 
@@ -246,6 +256,38 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 		running += len(live)
 		if len(live) == 0 {
 			continue
+		}
+		for id, pid := range live {
+			key := ns + "/" + id
+			info, ok := s.scanInfo[key]
+			if !ok || info.pid != pid {
+				info = loadContainerScanInfo(ns, id, pid)
+				if s.scanInfo == nil {
+					s.scanInfo = map[string]containerScanInfo{}
+				}
+				s.scanInfo[key] = info
+			}
+			infoSeen[key] = true
+			watch = append(watch, info.watchPaths...)
+			if !info.hostNet {
+				continue
+			}
+			if listeners == nil {
+				listeners = rootNetnsListeners()
+			}
+			for port, target := range hostNetworkPorts(pid, listeners) {
+				mappings = append(mappings, PortMapping{
+					Namespace:     ns,
+					ContainerID:   id,
+					Name:          info.name,
+					HostPort:      port,
+					ContainerPort: port,
+					Protocol:      "tcp",
+					GuestIP:       guestIP,
+					ContainerIP:   target,
+					HostIP:        "127.0.0.1", // the Mac's loopback, as Docker Desktop does
+				})
+			}
 		}
 		containers, err := cl.Containers(nsCtx)
 		if err != nil {
@@ -309,6 +351,11 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 		}
 	}
 
+	for key := range s.scanInfo {
+		if !infoSeen[key] {
+			delete(s.scanInfo, key)
+		}
+	}
 	// Removed and stopped containers leave the address cache.
 	for key := range s.containerIPs {
 		if !seen[key] {
@@ -317,7 +364,7 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 	}
 
 	sortPortMappings(mappings)
-	return PortMapState{Mappings: mappings, RunningContainers: running}, nil
+	return PortMapState{Mappings: mappings, RunningContainers: running, WatchPaths: minimalWatchPaths(watch)}, nil
 }
 
 // namespaceRunningTasks maps containerd container ID -> task pid for every

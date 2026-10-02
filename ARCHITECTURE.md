@@ -106,6 +106,14 @@ Owns the whole VM lifecycle:
   published port, and no running container (the guest pushes the count with
   every port-state update). Pausing under running containers froze
   databases, servers and workers whenever the CLI had been quiet;
+- **memory release** — a paused VM keeps all of its memory allocated on
+  the Mac. After it has stayed idle-paused for `ANVIL_IDLE_RELEASE`
+  (900 s; 0 keeps it paused) with a saved snapshot, the VM is stopped
+  (`releaseMemory`). The next client re-creates it and restores the
+  snapshot (`wake`, ~0.5 s; a cold boot if the restore fails, e.g. on a
+  locked Mac). The daemon's servers stay up: they reach the new VM through
+  `socketDevice`, and readiness goes to the waiting clients, not to the
+  daemon's first-boot path;
 - **transitions** — `ensureRunning` waits out a pause or snapshot save in
   progress and then resumes, instead of failing the client that arrived
   during it. Starting a stopped VM is left to the daemon's crash handler;
@@ -162,6 +170,11 @@ mappings to `vz-runner`. `PortForwarder`:
   attaches, and vzNAT delivers host→guest UDP to it;
 - retries a listener whose bind failed (the port was busy on the Mac) with
   backoff for as long as the guest still wants the mapping;
+- forwards `--network host` containers too: the scanner matches the
+  socket inodes of the container's processes (its cgroup) against the LISTEN
+  entries of the VM's `/proc/net/tcp{,6}` and pushes each port as a
+  `127.0.0.1` mapping whose target is the VM's loopback (or the one address
+  the socket is bound to), reached through the same port proxy;
 - on every push does a full-state replace: new ports are opened, gone ports
   are closed;
 - logs a conflict when it fails to open an already taken port;
@@ -245,6 +258,21 @@ The guest port proxy (`portproxy.go`, TCP 39131 in the VM) serves only the
 Mac's forwarder: it accepts connections that arrive on eth0, so a
 container cannot use it to dial arbitrary addresses through its bridge
 gateway.
+
+### 3.8 FSEventsForwarder
+
+virtiofs shows the guest new file contents, but the guest kernel never sees
+a change made on the Mac happen, so inotify in containers stayed silent. The
+guest adds the Mac paths running containers bind-mount to its port-state
+push (`watch_paths`); the daemon watches them with one FSEvents stream
+(a single-file bind watches its directory but forwards only that file) and
+sends batches of changed paths with their current atime/mtime over a
+control connection (`fs_events`). The guest re-applies exactly those times
+with `utimensat`, which raises `IN_ATTRIB` for watchers of the file and of
+its directory; created, removed and renamed entries also touch the parent.
+Nothing changes on the Mac. The touch comes back through FSEvents (its
+flags are cumulative, so it still reads "modified"); a path whose mtime
+equals what was last forwarded is dropped, which breaks the loop.
 
 ## 4. Guest side: guest-agent
 
@@ -543,7 +571,8 @@ On shutdown:
    main-queue vsock connect and times out.
 3. `GuestCacheDropper` drops the page cache in the guest.
 4. VM pause + `saveMachineStateToURL`.
-5. The process exits.
+5. On SIGTERM the process exits. On the idle path the VM stays paused;
+   `ANVIL_IDLE_RELEASE` later stops it to free its memory (§3.1).
 
 ### 6.5 Daemon restart
 

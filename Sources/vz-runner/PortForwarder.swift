@@ -96,10 +96,13 @@ struct PortMapState: Codable {
     /// Running containers across every namespace; nil from guests that
     /// predate the field. The daemon does not idle-pause while it is > 0.
     var runningContainers: Int? = nil
+    /// Mac directories running containers bind-mount (FSEventsForwarder).
+    var watchPaths: [String]? = nil
 
     enum CodingKeys: String, CodingKey {
         case mappings
         case runningContainers = "running_containers"
+        case watchPaths = "watch_paths"
     }
 }
 
@@ -128,6 +131,8 @@ final class PortForwarder {
     var onClientDisconnect: (() -> Void)?
     /// The guest reported a different number of running containers.
     var onRunningContainersChange: ((Int) -> Void)?
+    /// The bind-mounted Mac directories to watch ([] when disconnected).
+    var onWatchPathsChange: (([String]) -> Void)?
     private var runningContainersCount = 0
     private let queue = DispatchQueue(label: "com.olegshirko.anvil.port-forwarder", qos: .utility)
 
@@ -139,6 +144,7 @@ final class PortForwarder {
     private var desiredMappings: [String: PortMapping] = [:]
     private var retryDelay: [String: Double] = [:]
     private var lastFailure: [String: Date] = [:]
+    private var deviceMissingLogged = false
 
     /// Guards `running` and `subscription`. `stop()` is called from other
     /// threads while `runLoop()` occupies `queue` for good, so it cannot be
@@ -195,6 +201,7 @@ final class PortForwarder {
             shutdown(subscription.fileDescriptor, SHUT_RDWR)
         }
         stateLock.unlock()
+        onWatchPathsChange?([])
         apply(state: PortMapState(mappings: []))
     }
 
@@ -230,6 +237,7 @@ final class PortForwarder {
                 do {
                     let state = try decodeLengthPrefixedFD(PortMapState.self, fd: fd)
                     self.updateRunningContainers(state.runningContainers)
+                    self.onWatchPathsChange?(state.watchPaths ?? [])
                     self.apply(state: state)
                 } catch {
                     print("[port-forwarder] subscription read failed: \(error)")
@@ -239,6 +247,7 @@ final class PortForwarder {
 
             closeSubscription(connection)
             // Clear stale listeners while disconnected; guest-agent will send a full state on reconnect.
+            self.onWatchPathsChange?([])
             self.apply(state: PortMapState(mappings: []))
             if isRunning {
                 Thread.sleep(forTimeInterval: 1.0)
@@ -255,9 +264,15 @@ final class PortForwarder {
 
     private func connectToGuestAgent() -> VZVirtioSocketConnection? {
         guard let device = deviceProvider() else {
-            print("[port-forwarder] VM socket device not ready")
+            // Also the steady state of a VM stopped to free its memory: say
+            // it once, not every second.
+            if !deviceMissingLogged {
+                deviceMissingLogged = true
+                print("[port-forwarder] VM socket device not ready")
+            }
             return nil
         }
+        deviceMissingLogged = false
 
         return connectVsockOnce(device: device, port: controlPort, timeout: 5)
     }

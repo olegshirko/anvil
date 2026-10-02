@@ -66,7 +66,8 @@ def remove_snapshots() -> None:
         shutil.rmtree(SNAPSHOT_DIR)
 
 
-def start_daemon(fresh: bool = False) -> subprocess.Popen:
+def start_daemon(fresh: bool = False, extra_args: list[str] | None = None,
+                 env: dict[str, str] | None = None) -> subprocess.Popen:
     LOG_FILE.unlink(missing_ok=True)
     SHARE_DIR.mkdir(parents=True, exist_ok=True)
     # The persistent containerd disk is required for container starts: the
@@ -82,7 +83,7 @@ def start_daemon(fresh: bool = False) -> subprocess.Popen:
                         "count=0", "seek=10g"], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     cmd = [str(VZ_RUNNER), "daemon", "--share", str(SHARE_DIR),
-           "--containerd-disk", disk]
+           "--containerd-disk", disk, *(extra_args or [])]
     if fresh:
         remove_snapshots()
     return subprocess.Popen(
@@ -90,6 +91,7 @@ def start_daemon(fresh: bool = False) -> subprocess.Popen:
         stdout=open(LOG_FILE, "w"),
         stderr=subprocess.STDOUT,
         cwd=PROJECT_ROOT,
+        env={**os.environ, **(env or {})},
     )
 
 
@@ -666,6 +668,27 @@ def test_containers_survive_cold_boot() -> None:
         record("containers across cold boot", False, str(e))
 
 
+def test_idle_memory_release() -> None:
+    log("\n=== Test: idle memory release ===")
+    kill_daemon()
+    proc = start_daemon(fresh=True, extra_args=["--idle", "3"], env={"ANVIL_IDLE_RELEASE": "3"})
+    try:
+        wait_for_marker("daemon ready")
+        remove_all_containers()
+        vz_pull("default", "alpine")
+        wait_for_marker("idle VM stopped to free its memory", timeout=60.0)
+        t0 = time.time()
+        out = docker("run", "--rm", "alpine", "echo", "woke").stdout.strip()
+        took = time.time() - t0
+        stop_daemon(proc)
+        if out != "woke":
+            raise RuntimeError(f"run after release: {out!r}")
+        record("idle memory release", True, f"VM stopped while idle, restored for docker run in {took:.2f}s")
+    except Exception as e:
+        stop_daemon(proc)
+        record("idle memory release", False, str(e))
+
+
 def main() -> int:
     if not VZ_RUNNER.exists():
         log(f"binary not found: {VZ_RUNNER}; run 'make sign' first")
@@ -681,6 +704,7 @@ def main() -> int:
     test_restart_policy_survives_resume()
     test_udp_survives_resume()
     test_containers_survive_cold_boot()
+    test_idle_memory_release()
 
     log("\n=== Summary ===")
     passed = sum(1 for _, ok, _ in results if ok)

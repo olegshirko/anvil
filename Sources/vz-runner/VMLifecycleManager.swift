@@ -95,7 +95,7 @@ final class VMLifecycleManager: NSObject {
             guard let self = self else { return }
             switch result {
             case .failure(let error):
-                self.delegate?.vmLifecycleManager(self, didFailWithError: error)
+                self.notifyFailure(error)
             case .success(let vm):
                 self.vm = vm
                 self.phaseTimer.mark("config")
@@ -125,6 +125,10 @@ final class VMLifecycleManager: NSObject {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             guard let vm = self.vm else {
+                if self.released || self.wakeWaiters != nil {
+                    self.wake(completion: completion)
+                    return
+                }
                 completion(.failure(NSError(domain: "anvil", code: 100,
                                             userInfo: [NSLocalizedDescriptionKey: "VM not created yet"])))
                 return
@@ -160,6 +164,83 @@ final class VMLifecycleManager: NSObject {
     /// this state (the snapshot is deleted before every resume). Main queue.
     var isPausedWithSavedSnapshot: Bool {
         vm?.state == .paused && snapshot.hasSnapshot
+    }
+
+    // MARK: - Memory release
+
+    /// The VM was stopped to give its memory back; the committed snapshot
+    /// holds it. Main queue.
+    private(set) var released = false
+    /// Clients waiting for a released VM to come back (nil: no wake).
+    private var wakeWaiters: [(Result<Void, Error>) -> Void]?
+
+    /// Stop an idle-paused VM whose snapshot is saved: a paused VM keeps all
+    /// of its memory (2 GiB and more) allocated on the Mac for as long as it
+    /// stays paused. The next client restores it from the snapshot.
+    func releaseMemory() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let vm = self.vm, self.isPausedWithSavedSnapshot, vm.canStop else { return }
+            vm.delegate = nil // intentional: not a crash
+            vm.stop { [weak self] error in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    if let error = error {
+                        print("[anvil] stopping the idle VM failed: \(error)")
+                        return
+                    }
+                    self.vm = nil
+                    self.released = true
+                    self.stopHostTimeRefresher()
+                    print("[anvil] idle VM stopped to free its memory; the next client restores it")
+                }
+            }
+        }
+    }
+
+    /// Bring a released VM back from its snapshot (cold boot if the restore
+    /// fails, e.g. while the Mac is locked). The daemon's servers stay as
+    /// they are: they reach the new VM through socketDevice.
+    private func wake(completion: @escaping (Result<Void, Error>) -> Void) {
+        if wakeWaiters != nil {
+            wakeWaiters?.append(completion)
+            return
+        }
+        wakeWaiters = [completion]
+        print("[anvil] restoring the released VM...")
+        writeHostTimeFile()
+        startHostTimeRefresher()
+        configureAndCreateVM { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .failure(let error):
+                self.notifyFailure(error)
+            case .success(let vm):
+                self.vm = vm
+                self.attachPortCheckServer()
+                self.attemptRestoreOrColdBoot(vm: vm)
+            }
+        }
+    }
+
+    /// Readiness goes to the clients waiting for a wake, or to the daemon.
+    private func notifyReady() {
+        if let waiters = wakeWaiters {
+            wakeWaiters = nil
+            released = false
+            waiters.forEach { $0(.success(())) }
+            return
+        }
+        delegate?.vmLifecycleManagerDidBecomeReady(self)
+    }
+
+    /// A failed wake fails its clients and is then a crash like any other.
+    private func notifyFailure(_ error: Error) {
+        if let waiters = wakeWaiters {
+            wakeWaiters = nil
+            released = false
+            waiters.forEach { $0(.failure(error)) }
+        }
+        delegate?.vmLifecycleManager(self, didFailWithError: error)
     }
 
     /// Pause the VM.
@@ -454,9 +535,9 @@ final class VMLifecycleManager: NSObject {
                             case .success:
                                 print("[anvil] VM resumed in \(String(format: "%.3f", resumeDuration))s, streaming console:\n---")
                                 self.phaseTimer.mark("vm_resume")
-                                self.delegate?.vmLifecycleManagerDidBecomeReady(self)
+                                self.notifyReady()
                             case .failure(let error):
-                                self.delegate?.vmLifecycleManager(self, didFailWithError: error)
+                                self.notifyFailure(error)
                             }
                         }
                     }
@@ -487,7 +568,7 @@ final class VMLifecycleManager: NSObject {
                     }
                 case .failure(let error):
                     print("[anvil] failed to start: \(error)")
-                    self.delegate?.vmLifecycleManager(self, didFailWithError: error)
+                    self.notifyFailure(error)
                 }
             }
         }
@@ -495,7 +576,7 @@ final class VMLifecycleManager: NSObject {
 
     private func waitForGuestAgent(vm: VZVirtualMachine) {
         guard let device = vm.socketDevices.first as? VZVirtioSocketDevice else {
-            delegate?.vmLifecycleManager(self, didFailWithError: NSError(domain: "anvil", code: 102,
+            notifyFailure(NSError(domain: "anvil", code: 102,
                                                                          userInfo: [NSLocalizedDescriptionKey: "virtio socket device not found"]))
             return
         }
@@ -507,7 +588,7 @@ final class VMLifecycleManager: NSObject {
                 // Without this the daemon waited forever: no sockets bound,
                 // no restart. A guest that panics during boot does not fire
                 // VZ's didStop, so this is the only signal.
-                self.delegate?.vmLifecycleManager(self, didFailWithError: NSError(
+                self.notifyFailure(NSError(
                     domain: "anvil", code: 103,
                     userInfo: [NSLocalizedDescriptionKey: "guest agent did not become ready within 120 s"]))
                 return
@@ -527,7 +608,7 @@ final class VMLifecycleManager: NSObject {
                     // to block here for ~2.4s (pause -> save -> resume); the
                     // daemon already saves on idle timeout and on shutdown,
                     // so an inline save only delayed first use.
-                    self.delegate?.vmLifecycleManagerDidBecomeReady(self)
+                    self.notifyReady()
                 case .failure:
                     // Fine-grained: the agent is typically up within a second
                     // of vm.start completing, so a coarse poll interval adds

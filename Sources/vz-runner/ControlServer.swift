@@ -143,7 +143,15 @@ final class ControlServer {
             decrementClients()
         }
 
-        guard let device = deviceProvider() else {
+        // A VM stopped to free memory is being restored (the connect hook
+        // asked for it): wait for its socket device, bounded.
+        var device = deviceProvider()
+        let deviceDeadline = Date().addingTimeInterval(20)
+        while device == nil && Date() < deviceDeadline {
+            Thread.sleep(forTimeInterval: 0.1)
+            device = deviceProvider()
+        }
+        guard let device = device else {
             let data = (try? encodeLengthPrefixed(ControlResponse(stdout: nil, stderr: nil, exitCode: 1, error: "vm not ready", status: nil))) ?? Data()
             _ = data.withUnsafeBytes { write(clientFd, $0.baseAddress, $0.count) }
             return

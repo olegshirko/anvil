@@ -167,6 +167,7 @@ size changes the snapshot key, so the next start is a cold boot.
 | `ANVIL_SHARE_USERS` | `1` | Shares the Mac's `/Users`, `/Volumes`, `/tmp` and `/var/folders` into the VM at the same paths (Docker Desktop's defaults), so bind mounts of them work; a missing `-v` source elsewhere is refused ("mounts denied") rather than created in VM memory; `0` disables sharing |
 | `ANVIL_SHARE_EXTRA` | `volumes,tmp,varfolders` | Which of the extra shares (`/Volumes`, `/tmp`, `/var/folders`) to set up; empty for none |
 | `ANVIL_IDLE` | `600` | Seconds without Docker clients, forwarded connections or running containers before the VM is paused into its snapshot |
+| `ANVIL_IDLE_RELEASE` | `900` | Seconds the VM stays idle-paused before it is stopped to give its memory back to macOS (the next Docker command restores it from the snapshot in ~0.5 s); `0` keeps it paused |
 | `ANVIL_ROSETTA` | `0` | Set to `1` to run `linux/amd64` containers through Rosetta (needs `softwareupdate --install-rosetta`; changing it forces one cold boot) |
 | `DEBUG` | — | `1` enables host-side debug logs; the guest-agent debug log (`guest-agent.log` on the share) needs a cold boot (`make service-debug`), a resumed VM keeps its old setting |
 
@@ -295,6 +296,14 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   Mac's localhost over TCP, services bound only to `127.0.0.1` included, as
   in Docker Desktop; UDP to it goes to the Mac's NAT address.
   `gateway.docker.internal` is the NAT gateway.
+- `--network host` containers share the VM's network; the TCP ports they
+  listen on are forwarded to the Mac's `127.0.0.1` automatically (no `-p`),
+  as with Docker Desktop's host networking.
+- File changes made on the Mac under a bind mount raise inotify events in
+  the containers using it, so hot reload (Vite, webpack, nodemon, air,
+  `uvicorn --reload`) reacts to edits. The guest learns of them as a
+  metadata change (`IN_ATTRIB`) of the file and, for created/removed
+  entries, of its directory.
 - `docker network create --internal` (compose `internal: true`) cuts the
   network off from outside traffic; its containers still reach each other.
   Networks are IPv4-only: `--ipv6` is accepted with a warning.

@@ -60,6 +60,9 @@ type PortMapState struct {
 	// RunningContainers is the number of running tasks across namespaces;
 	// the host does not idle-pause the VM while it is non-zero.
 	RunningContainers int `json:"running_containers"`
+	// WatchPaths are the Mac directories running containers bind-mount;
+	// the host forwards file changes under them (fsevents.go).
+	WatchPaths []string `json:"watch_paths,omitempty"`
 }
 
 func main() {
@@ -205,6 +208,10 @@ func handle(conn net.Conn, scanner *portScanner) {
 
 		if req.Cmd == "subscribe_ports" {
 			handleSubscribe(conn, scanner)
+			return
+		}
+		if req.Cmd == "fs_events" {
+			handleFSEvents(conn)
 			return
 		}
 

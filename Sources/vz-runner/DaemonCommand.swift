@@ -169,7 +169,18 @@ enum DaemonCommand {
         private var dockerProxyServer: DockerProxyServer?
         private var buildkitProxyServer: DockerProxyServer?
         private var portForwarder: PortForwarder?
+        private var fsEventsForwarder: FSEventsForwarder?
         private var idleTimer: Timer?
+        /// Fires after the VM has stayed idle-paused for `idleReleaseSeconds`
+        /// and stops it to give its memory back (VMLifecycleManager.releaseMemory).
+        private var releaseTimer: Timer?
+        /// ANVIL_IDLE_RELEASE (seconds, default 15 min, 0 = keep the paused VM).
+        private let idleReleaseSeconds: TimeInterval = {
+            if let v = anvilSetting("ANVIL_IDLE_RELEASE"), let n = TimeInterval(v.trimmingCharacters(in: .whitespaces)) {
+                return max(n, 0)
+            }
+            return 900
+        }()
         private var isShuttingDown = false
         private var restartAttempts = 0
         private var isRestartingVM = false
@@ -393,6 +404,11 @@ enum DaemonCommand {
                     }
                 }
             }
+            let fsEvents = FSEventsForwarder(deviceProvider: { [weak manager] in manager?.socketDevice })
+            forwarder.onWatchPathsChange = { paths in
+                fsEvents.update(paths: paths)
+            }
+            self.fsEventsForwarder = fsEvents
             forwarder.start()
             self.portForwarder = forwarder
             phaseTimer.mark("ready_binds")
@@ -536,6 +552,20 @@ enum DaemonCommand {
             }
         }
 
+        /// Stop the idle-paused VM after a while: paused, it still holds all
+        /// of its memory. Only if nothing woke it in between.
+        private func scheduleMemoryRelease() {
+            releaseTimer?.invalidate()
+            releaseTimer = nil
+            guard idleReleaseSeconds > 0 else { return }
+            releaseTimer = Timer.scheduledTimer(withTimeInterval: idleReleaseSeconds, repeats: false) { [weak self] _ in
+                guard let self = self else { return }
+                self.releaseTimer = nil
+                guard !self.isShuttingDown, self.isIdleNow(), self.manager.isPausedWithSavedSnapshot else { return }
+                self.manager.releaseMemory()
+            }
+        }
+
         /// No control, Docker API, buildkit or forwarded-port client is
         /// connected, and no container is running. Pausing with running
         /// containers froze databases, web servers and workers whenever the
@@ -563,8 +593,12 @@ enum DaemonCommand {
                 switch result {
                 case .success:
                     print("[anvil] VM paused")
-                    self.manager.saveSnapshot { [weak self] _ in
-                        self?.clientTracker?.suppressIdleSchedule = false
+                    self.manager.saveSnapshot { [weak self] error in
+                        guard let self = self else { return }
+                        self.clientTracker?.suppressIdleSchedule = false
+                        if error == nil {
+                            self.scheduleMemoryRelease()
+                        }
                     }
                 case .failure(let error):
                     print("[anvil] idle pause failed: \(error)")
