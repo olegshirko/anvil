@@ -459,13 +459,7 @@ func periodicFstrim() {
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 	for range ticker.C {
-		out, err := exec.Command("fstrim", "-v", "/var/lib/containerd").CombinedOutput()
-		msg := strings.TrimSpace(string(out))
-		if err != nil {
-			log.Printf("fstrim failed: %v (%s)", err, msg)
-		} else {
-			log.Printf("fstrim: %s", msg)
-		}
+		runDiskTrim()
 	}
 }
 
