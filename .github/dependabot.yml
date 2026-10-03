@@ -4,6 +4,22 @@ updates:
     directory: /guest-agent
     schedule:
       interval: weekly
+    ignore:
+      # Upgraded by hand together with the containerd and buildkitd the VM
+      # ships (Makefile CONTAINERD_URL / BUILDKIT_URL): the clients must
+      # match them. Patch releases still come.
+      - dependency-name: "github.com/containerd/containerd/v2"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "github.com/containerd/containerd/api"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "github.com/moby/buildkit"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # Pseudo-versions that follow buildkit.
+      - dependency-name: "github.com/tonistiigi/fsutil"
+      # GO-2026-6443 (server panic reachable through the vsock gRPC bridge)
+      # is in 1.84.0; take 1.85 once it is released.
+      - dependency-name: "google.golang.org/grpc"
+        versions: [">= 1.84.0, < 1.85.0"]
     groups:
       go-deps:
         patterns: ["*"]
