@@ -30,6 +30,7 @@ enum DaemonCommand {
         phaseTimer.mark("lock")
 
         let manager = VMLifecycleManager(args: cliArgs.bootArgs, phaseTimer: phaseTimer)
+        publishGuestSettings(sharePath: cliArgs.bootArgs.sharePath)
         let daemon = Daemon(manager: manager, idleSeconds: cliArgs.idleSeconds, phaseTimer: phaseTimer)
         globalDaemon = daemon
 
@@ -664,4 +665,16 @@ func raiseOpenFileLimit() {
     if setrlimit(RLIMIT_NOFILE, &rl) != 0 {
         print("[daemon] cannot raise the open file limit: \(String(cString: strerror(errno)))")
     }
+}
+
+/// Hands settings the guest reads lazily to it through the share:
+/// <share>/.anvil-run/build-cache-gb caps the buildkit cache (default 20,
+/// Docker Desktop's builder default; 0 leaves buildkit's own policy).
+func publishGuestSettings(sharePath: String?) {
+    guard let share = sharePath else { return }
+    let dir = URL(fileURLWithPath: share).appendingPathComponent(".anvil-run", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let raw = anvilSetting("ANVIL_BUILD_CACHE_GB")?.trimmingCharacters(in: .whitespaces) ?? ""
+    let gb = UInt(raw) ?? 20
+    try? "\(gb)\n".write(to: dir.appendingPathComponent("build-cache-gb"), atomically: true, encoding: .utf8)
 }

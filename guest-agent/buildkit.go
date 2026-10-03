@@ -81,6 +81,11 @@ func ensureBuildkitd() error {
 	}
 	defer logFile.Close()
 	cmd := exec.Command(buildkitdBin)
+	if conf, err := writeBuildkitdConfig(); err != nil {
+		log.Printf("[buildkit] config: %v (using the default)", err)
+	} else {
+		cmd.Args = append(cmd.Args, "--config", conf)
+	}
 	// guest-agent (PID 1) runs with an almost empty environment; a child
 	// with no PATH/HOME misbehaves subtly (registry credential lookup,
 	// helper resolution). Give buildkitd a sane minimal env.
@@ -353,4 +358,43 @@ func handleBuildkitGRPC(w http.ResponseWriter, r *http.Request) {
 	if err := serveBuildkitGRPC(conn, bufrw.Reader); err != nil {
 		log.Printf("[buildkit] grpc bridge: %v", err)
 	}
+}
+
+const buildkitdBaseConfig = "/etc/buildkit/buildkitd.toml"
+
+// writeBuildkitdConfig derives buildkitd's config from the baked one plus
+// the cache cap the host published (ANVIL_BUILD_CACHE_GB, see
+// publishGuestSettings): GC trims the build cache to it after builds.
+func writeBuildkitdConfig() (string, error) {
+	base, err := os.ReadFile(buildkitdBaseConfig)
+	if err != nil {
+		return "", err
+	}
+	gb := 20
+	if raw, err := os.ReadFile(filepath.Join(anvilRunDir, "build-cache-gb")); err == nil {
+		if n, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && n >= 0 {
+			gb = n
+		}
+	}
+	conf := buildkitdConfigWithCacheCap(string(base), gb)
+	path := "/run/buildkit/buildkitd.toml"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	return path, os.WriteFile(path, []byte(conf), 0o644)
+}
+
+// buildkitdConfigWithCacheCap adds GC with a used-space cap to the
+// containerd worker section; gb 0 keeps buildkit's own policy.
+func buildkitdConfigWithCacheCap(base string, gb int) string {
+	if gb == 0 {
+		return base
+	}
+	const section = "[worker.containerd]\n"
+	i := strings.Index(base, section)
+	if i < 0 {
+		return base
+	}
+	i += len(section)
+	return base[:i] + fmt.Sprintf("  gc = true\n  maxUsedSpace = \"%dGB\"\n", gb) + base[i:]
 }

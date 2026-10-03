@@ -166,6 +166,7 @@ size changes the snapshot key, so the next start is a cold boot.
 | `ANVIL_MEMORY` | `2` | VM RAM in GiB |
 | `ANVIL_CPUS` | — | VM CPU count (unset = vz-runner default of 2) |
 | `ANVIL_DISK_GB` | `64` | containerd disk size (sparse; existing disks only grow, guest fs is resized online) |
+| `ANVIL_BUILD_CACHE_GB` | `20` | Cap on the build cache: buildkit garbage-collects it down to this size after builds (as Docker Desktop's builder does); `0` leaves buildkit's own policy. Takes effect when buildkitd next starts (cold boot) |
 | `ANVIL_SHARE_USERS` | `1` | Shares the Mac's `/Users`, `/Volumes`, `/tmp` and `/var/folders` into the VM at the same paths (Docker Desktop's defaults), so bind mounts of them work; a missing `-v` source elsewhere is refused ("mounts denied") rather than created in VM memory; `0` disables sharing |
 | `ANVIL_SHARE_EXTRA` | `volumes,tmp,varfolders` | Which of the extra shares (`/Volumes`, `/tmp`, `/var/folders`) to set up; empty for none |
 | `ANVIL_IDLE` | `600` | Seconds without Docker clients, forwarded connections or running containers before the VM is paused into its snapshot |
@@ -339,9 +340,9 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   build cache — add `--load` to import it into the image store (compose does
   this automatically). The buildx `docker-container` driver (which pulls a
   moby/buildkit image) does not work.
-- `docker events --since` replays only what the in-memory event log kept
-  (last 1024 events since first boot — the buffer survives snapshot pauses);
-  live events, `--until` and filters are unaffected.
+- `docker events --since` replays the last 1024 events; the log is kept on
+  the VM disk, so it survives snapshot pauses and cold boots. Live events,
+  `--until` and filters are unaffected.
 - `FROM` in a Dockerfile resolves through the registry; if Docker Hub is
   fully unreachable, a build with a brand-new base image fails (local
   fallback only works for tags already pulled).
