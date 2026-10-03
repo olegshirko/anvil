@@ -1,3 +1,21 @@
+## v1.9.0 (2026-10-03)
+
+### Added
+- ae5b32e feat: IPv6 on user-defined networks (dual-stack, ULA by default, NAT egress, internal isolation)
+- 9994a02 feat: freed disk space goes back to macOS (FITRIM after deletes; virtio-blk passes discards)
+- 1e658ef feat: build cache capped at ANVIL_BUILD_CACHE_GB (default 20) through buildkit GC
+- ece93ac feat: docker events --since survives cold boots (event log kept on the VM disk)
+
+### Fixed
+- 81fb0e3 fix: a short-lived container saw no peers in /etc/hosts (own hosts block written before the task starts)
+
+### Changed
+- 057af57 refactor: the daily trim uses the same FITRIM path as the post-delete trim
+
+### Internal
+- c00db59 test(validate): host ports picked free instead of fixed 8080/8081
+- 46c0901 test: IPv6 network, hosts populated before start
+- 2e4ac9b build(release): bottle uploads retry; make bottle-resume finishes a failed run
 ## v1.8.1 (2026-10-03)
 
 ### Fixed
