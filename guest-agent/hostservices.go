@@ -135,15 +135,20 @@ func hostLoopbackRules(gateway string) [][]string {
 // ensureIptablesRule appends rule unless an identical one exists (a
 // snapshot-resumed guest keeps its rules).
 func ensureIptablesRule(rule []string) error {
+	return ensureXtablesRule("iptables", rule)
+}
+
+// ensureXtablesRule is ensureIptablesRule for iptables or ip6tables.
+func ensureXtablesRule(bin string, rule []string) error {
 	withOp := func(op string) []string {
 		// rule = -t nat CHAIN ...: the operation goes before the chain.
 		return append([]string{rule[0], rule[1], op}, rule[2:]...)
 	}
-	if exec.Command("iptables", withOp("-C")...).Run() == nil {
+	if exec.Command(bin, withOp("-C")...).Run() == nil {
 		return nil
 	}
-	if out, err := exec.Command("iptables", withOp("-A")...).CombinedOutput(); err != nil {
-		return fmt.Errorf("iptables %s: %v: %s", strings.Join(withOp("-A"), " "), err, strings.TrimSpace(string(out)))
+	if out, err := exec.Command(bin, withOp("-A")...).CombinedOutput(); err != nil {
+		return fmt.Errorf("%s %s: %v: %s", bin, strings.Join(withOp("-A"), " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

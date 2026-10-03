@@ -198,14 +198,14 @@ func findConflistForNetwork(netName string) (string, error) {
 }
 
 // attachNetwork attaches a container's netns to the given logical network
-// with port mappings and returns the assigned IPv4 address.
-func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports []cniPortMapping) (string, string, error) {
+// with port mappings and returns the assigned addresses.
+func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports []cniPortMapping) (cniAddrs, error) {
 	if netName == noneNetwork {
-		return "", "", attachLoopbackOnly(ctx, id, netnsPath)
+		return cniAddrs{}, attachLoopbackOnly(ctx, id, netnsPath)
 	}
 	conflist, err := findConflistForNetwork(netName)
 	if err != nil {
-		return "", "", err
+		return cniAddrs{}, err
 	}
 	if err := ensureNetworkMasquerade(netName); err != nil {
 		log.G(ctx).WithError(err).Warnf("[cni] masquerade rule for %s", netName)
@@ -218,7 +218,7 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 		c, err = cnim.forConflist(conflist)
 	}
 	if err != nil {
-		return "", "", err
+		return cniAddrs{}, err
 	}
 	var opts []cniclient.NamespaceOpts
 	if len(ports) > 0 {
@@ -246,7 +246,7 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 	}
 	res, err := c.Setup(ctx, id, netnsPath, opts...)
 	if err != nil {
-		return "", "", fmt.Errorf("cni setup %s: %w", netName, err)
+		return cniAddrs{}, fmt.Errorf("cni setup %s: %w", netName, err)
 	}
 	// The firewall plugin may just have put its CNI-FORWARD jump (which
 	// accepts the container's traffic) above the isolation rules.
@@ -255,9 +255,9 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 			log.G(ctx).WithError(err).Warnf("[cni] isolation rules for %s", netName)
 		}
 	}
-	ip, mac := resultAddresses(res)
-	log.G(ctx).WithField("network", netName).Debugf("[cni] %s attached ip=%s", id[:12], ip)
-	return ip, mac, nil
+	addrs := resultAddresses(res)
+	log.G(ctx).WithField("network", netName).Debugf("[cni] %s attached ip=%s ipv6=%s", id[:12], addrs.IP, addrs.IPv6)
+	return addrs, nil
 }
 
 // detachNetwork tears down a container endpoint on a logical network.
@@ -296,31 +296,6 @@ func detachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 	return c.Remove(ctx, id, netnsPath, opts...)
 }
 
-// resultAddresses extracts the primary IPv4 address and MAC from a CNI
-// result. The address arrives as a plain net.IP.
-func resultAddresses(res *cniclient.Result) (ip, mac string) {
-	if res == nil {
-		return "", ""
-	}
-	for _, iface := range res.Interfaces {
-		if iface == nil {
-			continue
-		}
-		if mac == "" {
-			mac = iface.Mac
-		}
-		for _, cfg := range iface.IPConfigs {
-			if cfg.IP != nil && cfg.IP.To4() != nil {
-				return cfg.IP.String(), mac
-			}
-			if ip == "" && cfg.IP != nil {
-				ip = cfg.IP.String()
-			}
-		}
-	}
-	return ip, mac
-}
-
 // jsonUnmarshal is a thin alias keeping runtime.go free of a second direct
 // encoding/json import at call sites above.
 func jsonUnmarshal(data []byte, v interface{}) error {
@@ -339,21 +314,29 @@ var extraCNI = cnilibrary.NewCNIConfig([]string{cniBinDir}, &invoke.DefaultExec{
 	PluginDecoder: version.PluginDecoder{},
 })
 
-func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName, staticIP string) (string, string, error) {
+func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName, staticIP string) (cniAddrs, error) {
 	conflist, err := findConflistForNetwork(netName)
 	if err != nil {
-		return "", "", err
+		return cniAddrs{}, err
+	}
+	// A dual-stack network needs IPv6 forwarding (eth0 keeping its router
+	// advertisements) and its IPv6 masquerade or isolation before the
+	// bridge plugin runs, on a secondary endpoint too.
+	if cl, cerr := readNetworkConflist(netName); cerr == nil && anyIPv6(networkSubnets(cl)) {
+		if err := ensureNetworkMasquerade(netName); err != nil {
+			log.G(ctx).WithError(err).Warnf("[cni] masquerade rule for %s", netName)
+		}
 	}
 	data, err := os.ReadFile(conflist)
 	if err == nil && staticIP != "" {
 		data, err = staticConflistBytes(data)
 	}
 	if err != nil {
-		return "", "", fmt.Errorf("cni config %s: %w", netName, err)
+		return cniAddrs{}, fmt.Errorf("cni config %s: %w", netName, err)
 	}
 	list, err := cnilibrary.ConfListFromBytes(data)
 	if err != nil {
-		return "", "", fmt.Errorf("cni config %s: %w", netName, err)
+		return cniAddrs{}, fmt.Errorf("cni config %s: %w", netName, err)
 	}
 	rt := &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: ifName}
 	if staticIP != "" {
@@ -364,15 +347,15 @@ func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName, sta
 		// A failed ADD may leave a veth or an IPAM lease behind; the CNI
 		// spec has the runtime issue DEL for it.
 		extraCNI.DelNetworkList(context.WithoutCancel(ctx), list, rt) //nolint:errcheck
-		return "", "", fmt.Errorf("cni setup %s (%s): %w", netName, ifName, err)
+		return cniAddrs{}, fmt.Errorf("cni setup %s (%s): %w", netName, ifName, err)
 	}
 	res, err := types100.NewResultFromResult(raw)
 	if err != nil {
-		return "", "", fmt.Errorf("cni result %s: %w", netName, err)
+		return cniAddrs{}, fmt.Errorf("cni result %s: %w", netName, err)
 	}
-	ip, mac := extraResultAddresses(res, ifName)
-	log.G(ctx).WithField("network", netName).Debugf("[cni] %s attached %s ip=%s", id[:12], ifName, ip)
-	return ip, mac, nil
+	addrs := extraResultAddresses(res, ifName)
+	log.G(ctx).WithField("network", netName).Debugf("[cni] %s attached %s ip=%s ipv6=%s", id[:12], ifName, addrs.IP, addrs.IPv6)
+	return addrs, nil
 }
 
 func detachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName string) error {
@@ -385,28 +368,6 @@ func detachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName stri
 		return err
 	}
 	return extraCNI.DelNetworkList(ctx, list, &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: ifName})
-}
-
-// extraResultAddresses picks the IPv4 address and MAC of ifName.
-func extraResultAddresses(res *types100.Result, ifName string) (ip, mac string) {
-	idx := -1
-	for i, iface := range res.Interfaces {
-		if iface != nil && iface.Name == ifName && iface.Sandbox != "" {
-			idx, mac = i, iface.Mac
-		}
-	}
-	for _, cfg := range res.IPs {
-		if cfg == nil || (cfg.Interface != nil && idx >= 0 && *cfg.Interface != idx) {
-			continue
-		}
-		if v4 := cfg.Address.IP.To4(); v4 != nil {
-			return v4.String(), mac
-		}
-		if ip == "" {
-			ip = cfg.Address.IP.String()
-		}
-	}
-	return ip, mac
 }
 
 // --- --network none -----------------------------------------------------------
@@ -507,63 +468,114 @@ func networkSubnets(cl *networkConflist) []string {
 	return out
 }
 
-func masqueradeRule(netName, subnet string) []string {
-	return []string{"-t", "nat", "POSTROUTING", "-s", subnet, "!", "-d", subnet,
-		"-m", "comment", "--comment", "anvil-masq " + netName, "-j", "MASQUERADE"}
-}
-
-// ensureNetworkMasquerade installs the network's outbound masquerade rule
-// (idempotent: one iptables -C when present).
+// ensureNetworkMasquerade installs the network's outbound masquerade rules,
+// one per subnet in its family's table (idempotent: one -C when present).
+// A dual-stack network first gets IPv6 forwarding; an --internal one gets
+// isolation instead of NAT, in both families.
 func ensureNetworkMasquerade(netName string) error {
 	cl, err := readNetworkConflist(netName)
 	if err != nil {
 		return err
 	}
+	subnets := networkSubnets(cl)
+	// A forwarding failure is reported, but must not cost the network
+	// its IPv4 NAT or its isolation.
+	var fwdErr error
+	if anyIPv6(subnets) {
+		fwdErr = ensureIPv6Forwarding()
+	}
 	if cl.Internal {
-		return ensureInternalIsolation(cl)
+		if err := ensureInternalIsolation(cl); err != nil {
+			return err
+		}
+		return fwdErr
 	}
 	for _, p := range cl.Plugins {
 		if p.Type == "bridge" && p.IPMasq {
-			return nil // the plugin masquerades itself
+			return fwdErr // the plugin masquerades itself
 		}
 	}
-	for _, subnet := range networkSubnets(cl) {
-		if err := ensureIptablesRule(masqueradeRule(netName, subnet)); err != nil {
+	for _, subnet := range subnets {
+		if err := ensureXtablesRule(xtablesFor(subnet), masqueradeRule(netName, subnet)); err != nil {
 			return err
 		}
 	}
-	return nil
+	return fwdErr
 }
 
-// removeNetworkMasquerade drops the rule when the network goes away.
+// removeNetworkMasquerade drops the rules when the network goes away.
 func removeNetworkMasquerade(netName string) {
 	cl, err := readNetworkConflist(netName)
 	if err != nil {
 		return
 	}
-	for _, subnet := range networkSubnets(cl) {
+	subnets := networkSubnets(cl)
+	for _, subnet := range subnets {
 		rule := masqueradeRule(netName, subnet)
 		args := append([]string{rule[0], rule[1], "-D"}, rule[2:]...)
-		exec.Command("iptables", args...).Run() //nolint:errcheck — best effort
+		exec.Command(xtablesFor(subnet), args...).Run() //nolint:errcheck — best effort
 	}
 	if cl.Internal {
 		isolationMu.Lock()
 		defer isolationMu.Unlock()
 		bridge := networkBridge(cl)
-		for _, rule := range append(isolationRules(bridge), internalInputRule(bridge)) {
-			deleteIptablesRuleAll(rule)
+		for _, bin := range isolationTables(subnets) {
+			for _, rule := range append(isolationRules(bridge), internalInputRule(bridge)) {
+				deleteXtablesRuleAll(bin, rule)
+			}
 		}
 	}
 }
 
-// deleteIptablesRuleAll removes every copy of rule (best effort).
-func deleteIptablesRuleAll(rule []string) {
+// deleteXtablesRuleAll removes every copy of rule (best effort).
+func deleteXtablesRuleAll(bin string, rule []string) {
 	args := append([]string{rule[0], rule[1], "-D"}, rule[2:]...)
 	for i := 0; i < 8; i++ {
-		if exec.Command("iptables", args...).Run() != nil {
+		if exec.Command(bin, args...).Run() != nil {
 			return
 		}
 	}
+}
+
+// isolationTables are the tables an --internal network's isolation goes
+// into: ip6tables too once it is dual-stack (IPv6 forwarding is on then).
+func isolationTables(subnets []string) []string {
+	if anyIPv6(subnets) {
+		return []string{"iptables", "ip6tables"}
+	}
+	return []string{"iptables"}
+}
+
+// ipv6Forwarding guards the one-time switch to IPv6 forwarding (a resumed
+// snapshot keeps it, a cold boot starts over with the flag).
+var ipv6Forwarding struct {
+	sync.Mutex
+	on bool
+}
+
+// ensureIPv6Forwarding turns IPv6 forwarding on for dual-stack networks.
+// With forwarding on, the kernel ignores router advertisements and purges
+// the routes it learned from them — eth0 would lose the default route (and,
+// on expiry, the SLAAC address) the macOS NAT advertises — unless the
+// interface's accept_ra is 2, so that is set first. The bridge plugin
+// turns forwarding on by itself for an IPv6 gateway, which is why this
+// runs before every CNI ADD on a dual-stack network.
+func ensureIPv6Forwarding() error {
+	ipv6Forwarding.Lock()
+	defer ipv6Forwarding.Unlock()
+	if ipv6Forwarding.on {
+		return nil
+	}
+	for _, s := range []struct{ path, value string }{
+		{"/proc/sys/net/ipv6/conf/eth0/accept_ra", "2"},
+		{"/proc/sys/net/ipv6/conf/all/forwarding", "1"},
+	} {
+		if err := os.WriteFile(s.path, []byte(s.value), 0o644); err != nil {
+			return fmt.Errorf("ipv6 forwarding: %w", err)
+		}
+	}
+	ipv6Forwarding.on = true
+	return nil
 }
 
 // isolationMu serializes isolation rule changes: two starts reordering at
@@ -601,7 +613,9 @@ func isolationRules(bridge string) [][]string {
 }
 
 // ensureInternalIsolation keeps the isolation rules at the top of FORWARD,
-// ahead of the CNI plugins' ACCEPT rules (no change when they already are).
+// ahead of the CNI plugins' ACCEPT rules (no change when they already are),
+// in ip6tables as well for a dual-stack network: an internal network must
+// not leak out over IPv6 either.
 func ensureInternalIsolation(cl *networkConflist) error {
 	bridge := networkBridge(cl)
 	if bridge == "" {
@@ -609,25 +623,36 @@ func ensureInternalIsolation(cl *networkConflist) error {
 	}
 	isolationMu.Lock()
 	defer isolationMu.Unlock()
-	if err := ensureIptablesRule(internalInputRule(bridge)); err != nil {
+	for _, bin := range isolationTables(networkSubnets(cl)) {
+		if err := ensureIsolationRules(bin, bridge); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureIsolationRules installs one table's isolation rules; the caller
+// holds isolationMu.
+func ensureIsolationRules(bin, bridge string) error {
+	if err := ensureXtablesRule(bin, internalInputRule(bridge)); err != nil {
 		return err
 	}
-	out, err := exec.Command("iptables", "-t", "filter", "-S", "FORWARD").Output()
+	out, err := exec.Command(bin, "-t", "filter", "-S", "FORWARD").Output()
 	if err != nil {
-		return fmt.Errorf("iptables -S FORWARD: %w", err)
+		return fmt.Errorf("%s -S FORWARD: %w", bin, err)
 	}
 	if isolationOnTop(string(out), "anvil-internal "+bridge+`"`) {
 		return nil
 	}
 	rules := isolationRules(bridge)
 	for _, rule := range rules {
-		deleteIptablesRuleAll(rule)
+		deleteXtablesRuleAll(bin, rule)
 	}
 	for i := len(rules) - 1; i >= 0; i-- {
 		rule := rules[i]
 		insert := append([]string{rule[0], rule[1], "-I", rule[2], "1"}, rule[3:]...)
-		if out, err := exec.Command("iptables", insert...).CombinedOutput(); err != nil {
-			return fmt.Errorf("iptables %s: %v: %s", strings.Join(insert, " "), err, strings.TrimSpace(string(out)))
+		if out, err := exec.Command(bin, insert...).CombinedOutput(); err != nil {
+			return fmt.Errorf("%s %s: %v: %s", bin, strings.Join(insert, " "), err, strings.TrimSpace(string(out)))
 		}
 	}
 	return nil

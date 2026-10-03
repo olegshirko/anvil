@@ -505,6 +505,28 @@ func generateCNIConfigLocked(ns string, extraLabels map[string]string) error {
 		ipRange["rangeEnd"] = fmt.Sprintf("10.10.%d.254", alloc.octet)
 	}
 
+	// A dual-stack network gets a second range set: host-local then hands
+	// out one address per family, and the bridge plugin puts both gateways
+	// on the bridge. IPv4-only networks keep the exact conflist they had.
+	ranges := []interface{}{[]interface{}{ipRange}}
+	v6 := loadNetworkIPv6(netName)
+	logSubnets := subnet
+	if v6 != nil {
+		subnet6 := pickIPv6Subnet(netName, alloc.octet, existing, v6)
+		ipRange6 := map[string]interface{}{"subnet": subnet6}
+		if v6.Subnet != "" {
+			ipRange6["gateway"] = v6.Gateway
+			if v6.RangeStart != "" {
+				ipRange6["rangeStart"] = v6.RangeStart
+				ipRange6["rangeEnd"] = v6.RangeEnd
+			}
+		} else if _, n, err := net.ParseCIDR(subnet6); err == nil {
+			ipRange6["gateway"] = offsetIP6(n.IP, 1).String()
+		}
+		ranges = append(ranges, []interface{}{ipRange6})
+		logSubnets += " " + subnet6
+	}
+
 	labels := map[string]string{}
 	if ns == "default" {
 		labels[labelDefaultNetwork] = "true"
@@ -529,6 +551,9 @@ func generateCNIConfigLocked(ns string, extraLabels map[string]string) error {
 	var routes []interface{}
 	if !internal {
 		routes = []interface{}{map[string]interface{}{"dst": "0.0.0.0/0"}}
+		if v6 != nil {
+			routes = append(routes, map[string]interface{}{"dst": "::/0"})
+		}
 	}
 
 	conf := map[string]interface{}{
@@ -554,10 +579,8 @@ func generateCNIConfigLocked(ns string, extraLabels map[string]string) error {
 				"ipMasq":      false,
 				"hairpinMode": true,
 				"ipam": map[string]interface{}{
-					"type": "host-local",
-					"ranges": []interface{}{
-						[]interface{}{ipRange},
-					},
+					"type":   "host-local",
+					"ranges": ranges,
 					"routes": routes,
 				},
 			},
@@ -586,7 +609,7 @@ func generateCNIConfigLocked(ns string, extraLabels map[string]string) error {
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("write cni config %s: %w", path, err)
 	}
-	log.Printf("[cni-gen] created CNI config for namespace %s: %s", ns, subnet)
+	log.Printf("[cni-gen] created CNI config for namespace %s: %s", ns, logSubnets)
 	return nil
 }
 

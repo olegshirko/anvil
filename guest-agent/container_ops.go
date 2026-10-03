@@ -35,6 +35,8 @@ type containerNetInfo struct {
 	IP      string `json:"IP"`
 	Mac     string `json:"Mac,omitempty"`
 	Network string `json:"Network"`
+	// The primary endpoint's IPv6 side on a dual-stack network.
+	ipv6Addr
 	// Extra holds the secondary endpoints (eth1...), see container_networks.go.
 	Extra []netEndpoint `json:"Extra,omitempty"`
 }
@@ -232,14 +234,14 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 		// iptables chain ("No chain/target/match by that name"). On any
 		// attach failure, run the matching DEL to clear the stale endpoint
 		// state and attach again.
-		ip, mac, aerr := attachNetwork(ctx, netName, ns, id, netnsPathFor(id), ports)
+		addrs, aerr := attachNetwork(ctx, netName, ns, id, netnsPathFor(id), ports)
 		if aerr != nil {
 			time.Sleep(200 * time.Millisecond)
 			dctx, dcancel := context.WithTimeout(ctx, 10*time.Second)
 			detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports) //nolint:errcheck
 			dcancel()
 			time.Sleep(100 * time.Millisecond)
-			ip, mac, aerr = attachNetwork(ctx, netName, ns, id, netnsPathFor(id), ports)
+			addrs, aerr = attachNetwork(ctx, netName, ns, id, netnsPathFor(id), ports)
 		}
 		if aerr != nil {
 			return fmt.Errorf("cni attach: %w", aerr)
@@ -251,7 +253,7 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 			cancel()
 			return fmt.Errorf("cni attach: %w", xerr)
 		}
-		saveNetInfo(ns, id, containerNetInfo{IP: ip, Mac: mac, Network: netName, Extra: extra})
+		saveNetInfo(ns, id, containerNetInfo{IP: addrs.IP, Mac: addrs.Mac, Network: netName, ipv6Addr: addrs.ipv6Addr, Extra: extra})
 		publishEndpointEvents("connect", ns, id, netName, extra)
 		defer func() {
 			if err != nil {

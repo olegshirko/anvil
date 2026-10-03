@@ -102,7 +102,9 @@ func refreshNetworkHosts(network string) {
 	log.Printf("[net-alias] network %s refreshed: %d entries across %d members", network, len(entries[network]), len(members))
 }
 
-// networkHostsEntries maps each network to its "ip\tnames" lines.
+// networkHostsEntries maps each network to its "ip\tnames" lines. On a
+// dual-stack network a peer gets a second line with its IPv6 address, so
+// its names resolve to both (resolvers still prefer IPv4 over a ULA).
 func networkHostsEntries(metas []*containerMeta, netInfo func(ns, id string) (containerNetInfo, bool)) map[string][]string {
 	out := map[string][]string{}
 	for _, m := range metas {
@@ -114,6 +116,9 @@ func networkHostsEntries(metas []*containerMeta, netInfo func(ns, id string) (co
 			if ip := ni.ipOn(n); ip != "" {
 				names := strings.Join(dedupeStrings(append([]string{m.Name}, m.aliasesOn(n)...)), " ")
 				out[n] = append(out[n], ip+"\t"+names)
+				if ip6 := ni.ipv6On(n); ip6 != "" {
+					out[n] = append(out[n], ip6+"\t"+names)
+				}
 			}
 		}
 	}

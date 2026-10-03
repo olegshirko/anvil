@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,6 +32,7 @@ type dockerNetwork struct {
 	Driver     string            `json:"Driver"`
 	Scope      string            `json:"Scope"`
 	Created    string            `json:"Created"`
+	EnableIPv6 bool              `json:"EnableIPv6"`
 	Internal   bool              `json:"Internal"`
 	Attachable bool              `json:"Attachable"`
 	Ingress    bool              `json:"Ingress"`
@@ -142,6 +144,7 @@ func conflistToDockerNetwork(cl cniConflist) dockerNetwork {
 			}
 		}
 	}
+	subnet6, _ := ipv6RangeOf(cl)
 	labels := cl.Labels
 	if labels == nil {
 		labels = mergeNetworkLabels(map[string]string{}, loadNetworkLabels(cl.Name))
@@ -154,6 +157,7 @@ func conflistToDockerNetwork(cl cniConflist) dockerNetwork {
 		Driver:     "bridge",
 		Scope:      "local",
 		Created:    time.Now().UTC().Format(time.RFC3339),
+		EnableIPv6: subnet6 != "",
 		Internal:   cl.Internal,
 		IPAM:       ipam,
 		Options:    map[string]string{},
@@ -352,6 +356,10 @@ func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*
 	if perr != nil {
 		return nil, &apiError{status: http.StatusBadRequest, msg: perr.Error()}
 	}
+	pool6, perr := ipv6PoolFromIPAM(req.IPAM.Config, req.ipv6Enabled())
+	if perr != nil {
+		return nil, &apiError{status: http.StatusBadRequest, msg: perr.Error()}
+	}
 
 	// Pre-create the CNI config so the new network uses our deterministic subnet
 	// and bridge name instead of an auto-generated one. Include any labels sent
@@ -370,6 +378,16 @@ func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*
 				return fmt.Errorf("save ipam pool for %s: %w", req.Name, err)
 			}
 		}
+		if pool6 != nil {
+			existing, _ := loadCNIConflists()
+			if other := ipv6PoolOverlap(req.Name, pool6, existing); other != "" {
+				return &apiError{status: http.StatusForbidden,
+					msg: fmt.Sprintf("invalid pool request: Pool overlaps with other one on this address space (network %s)", other)}
+			}
+			if err := saveNetworkIPv6(req.Name, pool6); err != nil {
+				return fmt.Errorf("save ipv6 pool for %s: %w", req.Name, err)
+			}
+		}
 		if req.Internal {
 			if err := markNetworkInternal(req.Name); err != nil {
 				return fmt.Errorf("mark %s internal: %w", req.Name, err)
@@ -386,6 +404,13 @@ func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*
 	// Build the response manually: Compose relies on the labels being
 	// present in the create response.
 	subnet := networkSubnet(req.Name)
+	ipamConfig := []dockerIPAMConfig{responsePool(subnet, pool)}
+	subnet6, gateway6 := "", ""
+	if pool6 != nil {
+		if subnet6, gateway6 = networkSubnet6(req.Name); subnet6 != "" {
+			ipamConfig = append(ipamConfig, dockerIPAMConfig{Subnet: subnet6, Gateway: gateway6})
+		}
+	}
 	labels := req.Labels
 	if labels == nil {
 		labels = map[string]string{}
@@ -395,15 +420,16 @@ func createDockerNetwork(ctx context.Context, req dockerNetworkCreateRequest) (*
 	}
 	publishNetworkEvent("create", req.Name, networkID(req.Name), "")
 	return &dockerNetwork{
-		Id:       networkID(req.Name),
-		Name:     req.Name,
-		Driver:   defaultString(req.Driver, "bridge"),
-		Scope:    "local",
-		Created:  time.Now().UTC().Format(time.RFC3339),
-		Internal: req.Internal,
-		IPAM:     dockerIPAM{Driver: defaultString(req.IPAM.Driver, "default"), Config: []dockerIPAMConfig{responsePool(subnet, pool)}},
-		Labels:   labels,
-		Options:  req.Options,
+		Id:         networkID(req.Name),
+		Name:       req.Name,
+		Driver:     defaultString(req.Driver, "bridge"),
+		Scope:      "local",
+		Created:    time.Now().UTC().Format(time.RFC3339),
+		EnableIPv6: subnet6 != "",
+		Internal:   req.Internal,
+		IPAM:       dockerIPAM{Driver: defaultString(req.IPAM.Driver, "default"), Config: ipamConfig},
+		Labels:     labels,
+		Options:    req.Options,
 	}, nil
 }
 
@@ -445,6 +471,16 @@ func removeDockerNetwork(ctx context.Context, name string) error {
 	}
 	publishNetworkEvent("destroy", fileName, networkID(fileName), "")
 	return nil
+}
+
+// ipv6Enabled is EnableIPv6, or the com.docker.network.enable_ipv6 driver
+// option Docker also accepts for it.
+func (req dockerNetworkCreateRequest) ipv6Enabled() bool {
+	if req.EnableIPv6 {
+		return true
+	}
+	on, _ := strconv.ParseBool(req.Options["com.docker.network.enable_ipv6"])
+	return on
 }
 
 // responsePool is the IPAM config reported for a created network.

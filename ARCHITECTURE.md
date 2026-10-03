@@ -422,6 +422,15 @@ Every Docker Compose project gets its own namespace and bridge network:
   `/mnt/anvil/.anvil-run/networks/<name>.ipam`, so config rewrites and the
   cold-boot restore keep it, and a pool overlapping another network is
   refused like in Docker;
+- a dual-stack network (`--ipv6`, compose `enable_ipv6`) is marked by
+  `<name>.ipv6` (holding the requested IPv6 subnet, if any) and gets a
+  second host-local range: the requested subnet or the ULA
+  `fd61:6e76:696c:<octet in hex>::/64` paired with its IPv4 slot (user IPv4
+  pools take a hashed ID from 0x100 up). IPv6 egress is an ip6tables
+  masquerade like the IPv4 one; the first dual-stack attach sets eth0's
+  `accept_ra=2` before turning on IPv6 forwarding, which would otherwise
+  drop the RA-learned default route of the macOS NAT. `--internal`
+  isolation is mirrored in ip6tables;
 - the bridge is `br-<sanitized-project>` when that fits the 15-character
   interface-name limit and is free, otherwise `br-<5 chars>-<hash>` — plain
   truncation made every `compose-test-*` project share one bridge;

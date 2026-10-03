@@ -49,8 +49,8 @@ func handleNetworkCreate(w http.ResponseWriter, r *http.Request, _ routeParams) 
 	}
 	// Unsupported options are said, not silently dropped.
 	var warnings []string
-	if req.EnableIPv6 {
-		warnings = append(warnings, "IPv6 is not supported: the network is IPv4-only")
+	if !req.ipv6Enabled() && hasIPv6Subnet(req.IPAM.Config) {
+		warnings = append(warnings, "IPv6 subnet ignored: IPv6 is not enabled on the network (--ipv6)")
 	}
 	if req.Driver != "" && req.Driver != "bridge" {
 		warnings = append(warnings, fmt.Sprintf("driver %q is not supported: created a bridge network", req.Driver))

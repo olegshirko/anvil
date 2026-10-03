@@ -469,7 +469,7 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 			endpoint := dockerEndpointStats{}
 			ni, niOK := loadNetInfo(ns, c.ID())
 			if niOK {
-				endpoint = dockerEndpointStats{IPAddress: ni.IP, MacAddress: ni.Mac}
+				endpoint = endpointStats(ni.IP, ni.Mac, ni.ipv6Addr)
 			} else if usesHostNetworkName(networkName) && !isContainerNetworkMode(networkName) {
 				endpoint = dockerEndpointStats{IPAddress: detectGuestIP()}
 			}
@@ -538,9 +538,12 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 					RestartPolicy: restarts.policySpecFor(did),
 				}),
 				NetworkSettings: dockerNetworkSettings{
-					IPAddress: containerIP,
-					Ports:     portBindings,
-					Networks:  endpoints,
+					IPAddress:           containerIP,
+					GlobalIPv6Address:   endpoint.GlobalIPv6Address,
+					GlobalIPv6PrefixLen: endpoint.GlobalIPv6PrefixLen,
+					IPv6Gateway:         endpoint.IPv6Gateway,
+					Ports:               portBindings,
+					Networks:            endpoints,
 				},
 			}, nil
 		}
@@ -561,7 +564,7 @@ func containerNetworkInfo(ns, containerdID, name string) (map[string]dockerEndpo
 	}
 	ni, niOK := loadNetInfo(ns, containerdID)
 	if niOK {
-		primary = dockerEndpointStats{IPAddress: ni.IP, MacAddress: ni.Mac}
+		primary = endpointStats(ni.IP, ni.Mac, ni.ipv6Addr)
 	} else if usesHostNetworkName(networkName) && !isContainerNetworkMode(networkName) {
 		primary.IPAddress = detectGuestIP()
 	}

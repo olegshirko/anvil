@@ -260,19 +260,27 @@ type dockerContainerConfig struct {
 }
 
 type dockerNetworkSettings struct {
-	IPAddress string                         `json:"IPAddress"`
-	Ports     map[string][]dockerHostPort    `json:"Ports,omitempty"`
-	Networks  map[string]dockerEndpointStats `json:"Networks,omitempty"`
+	IPAddress string `json:"IPAddress"`
+	// The primary network's IPv6 address (the legacy top-level fields,
+	// as Docker fills them).
+	GlobalIPv6Address   string                         `json:"GlobalIPv6Address,omitempty"`
+	GlobalIPv6PrefixLen int                            `json:"GlobalIPv6PrefixLen,omitempty"`
+	IPv6Gateway         string                         `json:"IPv6Gateway,omitempty"`
+	Ports               map[string][]dockerHostPort    `json:"Ports,omitempty"`
+	Networks            map[string]dockerEndpointStats `json:"Networks,omitempty"`
 }
 
 type dockerEndpointStats struct {
-	NetworkID   string   `json:"NetworkID,omitempty"`
-	Gateway     string   `json:"Gateway,omitempty"`
-	IPAddress   string   `json:"IPAddress"`
-	IPPrefixLen int      `json:"IPPrefixLen"`
-	MacAddress  string   `json:"MacAddress,omitempty"`
-	Aliases     []string `json:"Aliases,omitempty"`
-	DNSNames    []string `json:"DNSNames,omitempty"`
+	NetworkID           string   `json:"NetworkID,omitempty"`
+	Gateway             string   `json:"Gateway,omitempty"`
+	IPAddress           string   `json:"IPAddress"`
+	IPPrefixLen         int      `json:"IPPrefixLen"`
+	IPv6Gateway         string   `json:"IPv6Gateway,omitempty"`
+	GlobalIPv6Address   string   `json:"GlobalIPv6Address,omitempty"`
+	GlobalIPv6PrefixLen int      `json:"GlobalIPv6PrefixLen,omitempty"`
+	MacAddress          string   `json:"MacAddress,omitempty"`
+	Aliases             []string `json:"Aliases,omitempty"`
+	DNSNames            []string `json:"DNSNames,omitempty"`
 }
 
 // dockerPort matches the Docker API port binding shape.

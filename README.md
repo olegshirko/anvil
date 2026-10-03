@@ -147,7 +147,9 @@ anvil disk-compact  Give space freed in the VM back to macOS (stops the daemon; 
 ```
 
 `make prune` / `make disk-compact` do the same from a source checkout. The
-VM also trims its disk before every idle pause.
+VM also trims its disk ~30 s after deletes (`rm`, `rmi`, `volume rm`,
+prunes) and before every idle pause, so freed space normally returns to
+macOS without `disk-compact`.
 
 Logs: `~/.anvil-vz/daemon.log` (host daemon), `~/.anvil-vz/console.log` (VM
 console), and after a `DEBUG=1` cold boot (`make service-debug`) the guest
@@ -322,7 +324,11 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   entries, of its directory.
 - `docker network create --internal` (compose `internal: true`) cuts the
   network off from outside traffic; its containers still reach each other.
-  Networks are IPv4-only: `--ipv6` is accepted with a warning.
+  `--ipv6` (compose `enable_ipv6: true`) makes a user network dual-stack:
+  without an IPv6 subnet it gets a ULA /64 (`fd61:6e76:696c:<slot>::/64`),
+  egress is NATed through the VM, names resolve to both addresses.
+  Published ports stay IPv4 to the container; the default `bridge` is
+  IPv4-only.
 - SSH agent forwarding as in Docker Desktop: mount
   `/run/host-services/ssh-auth.sock` and point `SSH_AUTH_SOCK` at it.
 - Docker API is emulated, not complete: it covers what `docker` CLI and

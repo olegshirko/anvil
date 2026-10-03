@@ -47,6 +47,29 @@ type netEndpoint struct {
 	IfName  string `json:"IfName"`
 	IP      string `json:"IP"`
 	Mac     string `json:"Mac,omitempty"`
+	ipv6Addr
+}
+
+// ipv6Addr is an endpoint's address on a dual-stack network, empty on an
+// IPv4-only one. Embedded in the net.json records (flat, omitempty), so
+// files written before IPv6 load unchanged.
+type ipv6Addr struct {
+	IPv6          string `json:"IPv6,omitempty"`
+	IPv6PrefixLen int    `json:"IPv6PrefixLen,omitempty"`
+	IPv6Gateway   string `json:"IPv6Gateway,omitempty"`
+}
+
+// cniAddrs is what a CNI attach assigned to the container's interface.
+type cniAddrs struct {
+	IP  string
+	Mac string
+	ipv6Addr
+}
+
+// endpointStats renders an endpoint's addresses in the inspect shape.
+func endpointStats(ip, mac string, v6 ipv6Addr) dockerEndpointStats {
+	return dockerEndpointStats{IPAddress: ip, MacAddress: mac,
+		GlobalIPv6Address: v6.IPv6, GlobalIPv6PrefixLen: v6.IPv6PrefixLen, IPv6Gateway: v6.IPv6Gateway}
 }
 
 // ipOn returns the container's address on network ("" when not attached).
@@ -62,14 +85,28 @@ func (ni containerNetInfo) ipOn(network string) string {
 	return ""
 }
 
-// endpointOn returns the endpoint stats on network.
-func (ni containerNetInfo) endpointOn(network string) (dockerEndpointStats, bool) {
+// ipv6On returns the container's IPv6 address on network ("" when not
+// attached or the network is IPv4-only).
+func (ni containerNetInfo) ipv6On(network string) string {
 	if ni.Network == network {
-		return dockerEndpointStats{IPAddress: ni.IP, MacAddress: ni.Mac}, true
+		return ni.IPv6
 	}
 	for _, e := range ni.Extra {
 		if e.Network == network {
-			return dockerEndpointStats{IPAddress: e.IP, MacAddress: e.Mac}, true
+			return e.IPv6
+		}
+	}
+	return ""
+}
+
+// endpointOn returns the endpoint stats on network.
+func (ni containerNetInfo) endpointOn(network string) (dockerEndpointStats, bool) {
+	if ni.Network == network {
+		return endpointStats(ni.IP, ni.Mac, ni.ipv6Addr), true
+	}
+	for _, e := range ni.Extra {
+		if e.Network == network {
+			return endpointStats(e.IP, e.Mac, e.ipv6Addr), true
 		}
 	}
 	return dockerEndpointStats{}, false
@@ -114,12 +151,12 @@ func attachSecondaryNetworks(ctx context.Context, ns, id string, networks []stri
 	var eps []netEndpoint
 	for _, n := range networks {
 		ifName := nextIfName(eps)
-		ip, mac, err := attachExtraNetwork(ctx, n, id, netnsPathFor(id), ifName, staticIPFor(ns, id, n))
+		addrs, err := attachExtraNetwork(ctx, n, id, netnsPathFor(id), ifName, staticIPFor(ns, id, n))
 		if err != nil {
 			detachSecondaryNetworks(ctx, id, eps)
 			return nil, err
 		}
-		eps = append(eps, netEndpoint{Network: n, IfName: ifName, IP: ip, Mac: mac})
+		eps = append(eps, netEndpoint{Network: n, IfName: ifName, IP: addrs.IP, Mac: addrs.Mac, ipv6Addr: addrs.ipv6Addr})
 	}
 	return eps, nil
 }
@@ -213,11 +250,11 @@ func connectContainerNetwork(ctx context.Context, networkRef, container string, 
 	if running, _, _ := containerTaskState(ctx, ns, id); running {
 		ni, _ := loadNetInfo(ns, id)
 		ifName := nextIfName(ni.Extra)
-		ip, mac, err := attachExtraNetwork(ctx, network, id, netnsPathFor(id), ifName, staticIP)
+		addrs, err := attachExtraNetwork(ctx, network, id, netnsPathFor(id), ifName, staticIP)
 		if err != nil {
 			return err
 		}
-		ni.Extra = append(ni.Extra, netEndpoint{Network: network, IfName: ifName, IP: ip, Mac: mac})
+		ni.Extra = append(ni.Extra, netEndpoint{Network: network, IfName: ifName, IP: addrs.IP, Mac: addrs.Mac, ipv6Addr: addrs.ipv6Addr})
 		if err := saveNetInfo(ns, id, ni); err != nil {
 			detachSecondaryNetworks(ctx, id, ni.Extra[len(ni.Extra)-1:])
 			return err
@@ -372,11 +409,16 @@ func endpointsOn(network string, prefixLen int, metas []*containerMeta, netInfo 
 		if prefixLen > 0 {
 			addr += "/" + strconv.Itoa(prefixLen)
 		}
+		addr6 := ep.GlobalIPv6Address
+		if addr6 != "" && ep.GlobalIPv6PrefixLen > 0 {
+			addr6 += "/" + strconv.Itoa(ep.GlobalIPv6PrefixLen)
+		}
 		out[did] = dockerNetworkContainer{
 			Name:        strings.TrimPrefix(m.Name, "/"),
 			EndpointID:  dockerID(did, network),
 			MacAddress:  ep.MacAddress,
 			IPv4Address: addr,
+			IPv6Address: addr6,
 		}
 	}
 	return out

@@ -34,16 +34,16 @@ func createNamedNetNS(name string) (string, error) {
 
 func releaseNamedNetNS(name string) {}
 
-func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports []cniPortMapping) (string, string, error) {
-	return "", "", fmt.Errorf("CNI not supported on this platform")
+func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports []cniPortMapping) (cniAddrs, error) {
+	return cniAddrs{}, fmt.Errorf("CNI not supported on this platform")
 }
 
 func detachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports []cniPortMapping) error {
 	return fmt.Errorf("CNI not supported on this platform")
 }
 
-func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName, staticIP string) (string, string, error) {
-	return "", "", fmt.Errorf("CNI not supported on this platform")
+func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName, staticIP string) (cniAddrs, error) {
+	return cniAddrs{}, fmt.Errorf("CNI not supported on this platform")
 }
 
 func detachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName string) error {
