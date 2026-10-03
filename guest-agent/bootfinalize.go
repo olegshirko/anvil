@@ -30,6 +30,8 @@ var bootFinalized = make(chan struct{})
 // exec'd commands.
 func runBootFinalize() {
 	defer close(bootFinalized)
+	// Deletes of the previous session may predate this boot's timer.
+	defer scheduleDiskTrim()
 
 	// Kill unreachable shims from a crashed previous session first — trying
 	// to delete their tasks through containerd would hang.

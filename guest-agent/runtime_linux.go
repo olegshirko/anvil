@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"unsafe"
 
 	cniclient "github.com/containerd/go-cni"
 	"github.com/containerd/log"
@@ -630,4 +631,22 @@ func ensureInternalIsolation(cl *networkConflist) error {
 		}
 	}
 	return nil
+}
+
+// fitrim is FITRIM, _IOWR('X', 121, struct fstrim_range).
+const fitrim = 0xc0185879
+
+// trimFilesystem discards the unused blocks of the file system at path
+// (FITRIM, what fstrim does) and returns how many bytes it trimmed.
+func trimFilesystem(path string) (uint64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	r := struct{ start, length, minLen uint64 }{0, ^uint64(0), 0}
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), fitrim, uintptr(unsafe.Pointer(&r))); errno != 0 {
+		return 0, errno
+	}
+	return r.length, nil
 }

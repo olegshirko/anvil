@@ -58,5 +58,6 @@ func findConflistForNetwork(netName string) (string, error) {
 	return "", errors.New("CNI is only available on linux")
 }
 
-func armSubpathMounts(m *containerMeta) error { return verifySubpathMounts(m) }
-func releaseSubpathMounts(ns, id string)      {}
+func armSubpathMounts(m *containerMeta) error    { return verifySubpathMounts(m) }
+func releaseSubpathMounts(ns, id string)         {}
+func trimFilesystem(path string) (uint64, error) { return 0, nil }

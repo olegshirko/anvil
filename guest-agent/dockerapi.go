@@ -439,6 +439,9 @@ func newDockerAPIHandler() http.Handler {
 		w.Header().Set("Connection", "close")
 
 		dispatchDockerAPI(w, r, path)
+		if freesDiskSpace(r.Method, path) {
+			scheduleDiskTrim()
+		}
 	})
 	return mux
 }
