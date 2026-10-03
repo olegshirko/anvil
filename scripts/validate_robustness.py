@@ -25,6 +25,26 @@ import sys
 import time
 from pathlib import Path
 
+
+def _free_port(start: int) -> int:
+    """A host port nothing listens on (any address), from start upwards:
+    fixed 8080/8081 collided with whatever the Mac already runs there."""
+    import socket
+    for port in range(start, start + 200):
+        for host in ("0.0.0.0", "127.0.0.1"):
+            with socket.socket() as s:
+                try:
+                    s.bind((host, port))
+                except OSError:
+                    break
+        else:
+            return port
+    raise RuntimeError(f"no free host port near {start}")
+
+
+PORT_A = _free_port(18080)
+PORT_B = _free_port(PORT_A + 1)
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VZ_RUNNER = PROJECT_ROOT / ".build" / "release" / "vz-runner"
 SHARE_DIR = Path("/tmp/anvil-share")
@@ -232,10 +252,10 @@ def test_resume_after_workload() -> None:
         remove_all_containers()
         if (SHARE_DIR / "nginx.tar").exists():
             docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
-        docker("run", "-d", "-p", "8080:80", "--name", "nginx", "nginx", network="project-a")
+        docker("run", "-d", "-p", f"{PORT_A}:80", "--name", "nginx", "nginx", network="project-a")
         # Let it serve for a few seconds before saving.
         for _ in range(30):
-            p = run_host(["curl", "--noproxy", "*", "-s", "-o", "/dev/null", "-w", "%{http_code}", "http://localhost:8080"], check=False)
+            p = run_host(["curl", "--noproxy", "*", "-s", "-o", "/dev/null", "-w", "%{http_code}", f"http://localhost:{PORT_A}"], check=False)
             if p.stdout.strip() == "200":
                 break
             time.sleep(0.2)
@@ -249,7 +269,7 @@ def test_resume_after_workload() -> None:
         proc = start_daemon(fresh=False)
         resume_time = wait_for_marker("daemon ready", timeout=60.0)
         for _ in range(30):
-            p = run_host(["curl", "--noproxy", "*", "-s", "-o", "/dev/null", "-w", "%{http_code}", "http://localhost:8080"], check=False)
+            p = run_host(["curl", "--noproxy", "*", "-s", "-o", "/dev/null", "-w", "%{http_code}", f"http://localhost:{PORT_A}"], check=False)
             if p.stdout.strip() == "200":
                 break
             time.sleep(0.2)
@@ -275,9 +295,9 @@ def test_stateful_connection() -> None:
         remove_all_containers()
         if (SHARE_DIR / "nginx.tar").exists():
             docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
-        docker("run", "-d", "-p", "8080:80", "--name", "nginx", "nginx", network="project-a")
+        docker("run", "-d", "-p", f"{PORT_A}:80", "--name", "nginx", "nginx", network="project-a")
         for _ in range(30):
-            p = run_host(["curl", "--noproxy", "*", "-s", "-o", "/dev/null", "-w", "%{http_code}", "http://localhost:8080"], check=False)
+            p = run_host(["curl", "--noproxy", "*", "-s", "-o", "/dev/null", "-w", "%{http_code}", f"http://localhost:{PORT_A}"], check=False)
             if p.stdout.strip() == "200":
                 break
             time.sleep(0.2)
@@ -286,7 +306,7 @@ def test_stateful_connection() -> None:
 
         # Open a keep-alive HTTP connection from the host.
         import socket
-        sock = socket.create_connection(("localhost", 8080), timeout=5.0)
+        sock = socket.create_connection(("localhost", PORT_A), timeout=5.0)
         sock.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
         # Read first response.
         sock.settimeout(2.0)
@@ -442,7 +462,7 @@ def test_cni_cleanup() -> None:
         remove_all_containers()
         if (SHARE_DIR / "nginx.tar").exists():
             docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
-        docker("run", "-d", "-p", "8080:80", "--name", "nginx", "nginx", network="project-a")
+        docker("run", "-d", "-p", f"{PORT_A}:80", "--name", "nginx", "nginx", network="project-a")
         rules_with_container = _iptables_nat_rules()
         bridges_with_container = _bridge_interfaces()
         docker("rm", "-f", "nginx", timeout=30.0)
@@ -473,8 +493,8 @@ def test_two_projects() -> None:
         if (SHARE_DIR / "nginx.tar").exists():
             docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
             docker("load", "-i", str(SHARE_DIR / "nginx.tar"), timeout=120)
-        docker("run", "-d", "-p", "8080:80", "--name", "nginx-a", "nginx", network="project-a")
-        docker("run", "-d", "-p", "8081:80", "--name", "nginx-b", "nginx", network="project-b")
+        docker("run", "-d", "-p", f"{PORT_A}:80", "--name", "nginx-a", "nginx", network="project-a")
+        docker("run", "-d", "-p", f"{PORT_B}:80", "--name", "nginx-b", "nginx", network="project-b")
 
         def wait_http(url: str) -> str:
             for _ in range(50):
@@ -484,8 +504,8 @@ def test_two_projects() -> None:
                 time.sleep(0.2)
             return "000"
 
-        a_code = wait_http("http://localhost:8080")
-        b_code = wait_http("http://localhost:8081")
+        a_code = wait_http(f"http://localhost:{PORT_A}")
+        b_code = wait_http(f"http://localhost:{PORT_B}")
         both_reachable = a_code == "200" and b_code == "200"
 
         # Try to bind the same host port in project-b. With the host-port
@@ -493,7 +513,7 @@ def test_two_projects() -> None:
         # created, with a clear error message.
         conflict = run_host(
             ["docker", "--host", f"unix://{DOCKER_SOCKET}", "run", "--network", "project-b",
-             "-d", "-p", "8080:80", "--name", "nginx-b-conflict", "nginx"],
+             "-d", "-p", f"{PORT_A}:80", "--name", "nginx-b-conflict", "nginx"],
             timeout=30.0,
             check=False,
         )
@@ -501,8 +521,8 @@ def test_two_projects() -> None:
         if not conflict_rejected:
             docker("rm", "-f", "nginx-b-conflict", timeout=30.0)
 
-        # After the rejected conflict attempt, project-a:8080 must still work.
-        a_after = wait_http("http://localhost:8080")
+        # After the rejected conflict attempt, project-a's port must still work.
+        a_after = wait_http(f"http://localhost:{PORT_A}")
 
         docker("rm", "-f", "nginx-a", timeout=30.0)
         docker("rm", "-f", "nginx-b", timeout=30.0)
@@ -510,9 +530,9 @@ def test_two_projects() -> None:
 
         ok = both_reachable and conflict_rejected and a_after == "200"
         detail = (
-            f"project-a:8080={a_code} project-b:8081={b_code}, "
+            f"project-a:{PORT_A}={a_code} project-b:{PORT_B}={b_code}, "
             f"duplicate host port rejected={conflict_rejected}, "
-            f"project-a:8080 after conflict attempt={a_after}"
+            f"project-a:{PORT_A} after conflict attempt={a_after}"
         )
         record("two-project isolation", ok, detail)
     except Exception as e:
