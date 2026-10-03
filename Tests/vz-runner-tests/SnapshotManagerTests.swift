@@ -132,6 +132,37 @@ final class SnapshotManagerTests: XCTestCase {
             containerdDiskPath: disk.path, usersSharePath: "/Users"))
     }
 
+    func testRosettaToggleInvalidates() {
+        let m = makeManager()
+        XCTAssertTrue(m.writeConfigHash(
+            kernel: kernel.path, initrd: initrd.path, cpus: 4, memory: 2,
+            containerdDiskPath: disk.path, usersSharePath: "/Users", rosetta: false))
+        XCTAssertFalse(m.configHashMatches(
+            kernel: kernel.path, initrd: initrd.path, cpus: 4, memory: 2,
+            containerdDiskPath: disk.path, usersSharePath: "/Users", rosetta: true))
+        XCTAssertTrue(m.configHashMatches(
+            kernel: kernel.path, initrd: initrd.path, cpus: 4, memory: 2,
+            containerdDiskPath: disk.path, usersSharePath: "/Users", rosetta: false))
+    }
+
+    // The hash stamped at save is the one taken when the VM was configured:
+    // an initramfs rebuilt (or ANVIL_ROSETTA toggled) while the VM runs must
+    // not make the old VM's snapshot look like the new configuration's.
+    func testPinnedHashDoesNotFollowLaterChanges() throws {
+        let m = makeManager()
+        let pinned = m.configHash(
+            kernel: kernel.path, initrd: initrd.path, cpus: 4, memory: 2,
+            containerdDiskPath: disk.path, usersSharePath: "/Users", rosetta: false)
+        try Data("initrd-v2-longer".utf8).write(to: initrd)
+        XCTAssertTrue(m.writeConfigHash(pinned))
+        XCTAssertFalse(m.configHashMatches(
+            kernel: kernel.path, initrd: initrd.path, cpus: 4, memory: 2,
+            containerdDiskPath: disk.path, usersSharePath: "/Users", rosetta: false))
+        XCTAssertFalse(m.configHashMatches(
+            kernel: kernel.path, initrd: initrd.path, cpus: 4, memory: 2,
+            containerdDiskPath: disk.path, usersSharePath: "/Users", rosetta: true))
+    }
+
     func testDiskSizeChangeInvalidates() throws {
         let m = makeManager()
         writeHash(m)

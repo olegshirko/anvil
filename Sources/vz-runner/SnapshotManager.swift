@@ -21,31 +21,46 @@ struct SnapshotManager {
             && FileManager.default.fileExists(atPath: configHashURL.path)
     }
 
-    func configHashMatches(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?, usersSharePath: String?) -> Bool {
+    /// The configuration hash of a VM built from these inputs. Computed once
+    /// when the VM is configured and kept for its whole run: recomputing it
+    /// at save time read whatever the disk and ~/.anvil-vz/config said by
+    /// then — a rebuilt initramfs or a toggled ANVIL_ROSETTA — and stamped a
+    /// snapshot of the old VM as matching the new configuration.
+    func configHash(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?, usersSharePath: String?, rosetta: Bool = rosettaEnabled()) -> String {
+        let components = configHashComponents(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory, containerdDiskPath: containerdDiskPath, usersSharePath: usersSharePath, rosetta: rosetta)
+        print("[anvil] hash inputs -> kernel:\(components.kernelSHA) initrd:\(components.initrdSHA) cpus:\(components.cpus) memory:\(components.memory) disk:\(components.diskToken) shares:\(components.sharesToken)")
+        return components.hash
+    }
+
+    func configHashMatches(_ current: String) -> Bool {
         guard let stored = try? String(contentsOf: configHashURL, encoding: .utf8) else {
             return false
         }
-        let components = configHashComponents(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory, containerdDiskPath: containerdDiskPath, usersSharePath: usersSharePath)
-        let current = components.hash
         let storedClean = stored.trimmingCharacters(in: .whitespacesAndNewlines)
         print("[anvil] stored config hash: \(storedClean)")
         print("[anvil] current config hash: \(current)")
-        print("[anvil] hash inputs -> kernel:\(components.kernelSHA) initrd:\(components.initrdSHA) cpus:\(components.cpus) memory:\(components.memory) disk:\(components.diskToken)")
         return storedClean == current
     }
 
+    func configHashMatches(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?, usersSharePath: String?, rosetta: Bool = rosettaEnabled()) -> Bool {
+        configHashMatches(configHash(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory, containerdDiskPath: containerdDiskPath, usersSharePath: usersSharePath, rosetta: rosetta))
+    }
+
     @discardableResult
-    func writeConfigHash(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?, usersSharePath: String?) -> Bool {
-        let components = configHashComponents(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory, containerdDiskPath: containerdDiskPath, usersSharePath: usersSharePath)
-        print("[anvil] writing config hash: \(components.hash)")
-        print("[anvil] hash inputs -> kernel:\(components.kernelSHA) initrd:\(components.initrdSHA) cpus:\(components.cpus) memory:\(components.memory) disk:\(components.diskToken)")
+    func writeConfigHash(_ hash: String) -> Bool {
+        print("[anvil] writing config hash: \(hash)")
         do {
-            try components.hash.write(to: configHashURL, atomically: true, encoding: .utf8)
+            try hash.write(to: configHashURL, atomically: true, encoding: .utf8)
             return true
         } catch {
             print("[anvil] failed to write config hash: \(error)")
             return false
         }
+    }
+
+    @discardableResult
+    func writeConfigHash(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?, usersSharePath: String?, rosetta: Bool = rosettaEnabled()) -> Bool {
+        writeConfigHash(configHash(kernel: kernel, initrd: initrd, cpus: cpus, memory: memory, containerdDiskPath: containerdDiskPath, usersSharePath: usersSharePath, rosetta: rosetta))
     }
 
     private struct HashComponents {
@@ -54,10 +69,11 @@ struct SnapshotManager {
         let cpus: Int
         let memory: UInt64
         let diskToken: String
+        let sharesToken: String
         let hash: String
     }
 
-    private func configHashComponents(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?, usersSharePath: String?) -> HashComponents {
+    private func configHashComponents(kernel: String, initrd: String, cpus: Int, memory: UInt64, containerdDiskPath: String?, usersSharePath: String?, rosetta: Bool) -> HashComponents {
         let kernelSHA = sha256OfFile(kernel) ?? "missing"
         let initrdSHA = sha256OfFile(initrd) ?? "missing"
         let diskToken = diskToken(for: containerdDiskPath)
@@ -65,10 +81,10 @@ struct SnapshotManager {
         // with a different virtiofs device list fails, so invalidate on change.
         // The Rosetta share is appended only when on, so the hash (and the
         // snapshot) of a default configuration is unchanged.
-        let sharesToken = (usersSharePath ?? "nousers") + (rosettaEnabled() ? ":rosetta-aot" : "")
+        let sharesToken = (usersSharePath ?? "nousers") + (rosetta ? ":rosetta-aot" : "")
         let input = "\(kernelSHA):\(initrdSHA):\(cpus):\(memory):\(diskToken):\(sharesToken)"
         let hash = SHA256.hash(data: Data(input.utf8)).compactMap { String(format: "%02x", $0) }.joined()
-        return HashComponents(kernelSHA: kernelSHA, initrdSHA: initrdSHA, cpus: cpus, memory: memory, diskToken: diskToken, hash: hash)
+        return HashComponents(kernelSHA: kernelSHA, initrdSHA: initrdSHA, cpus: cpus, memory: memory, diskToken: diskToken, sharesToken: sharesToken, hash: hash)
     }
 
     private func diskToken(for path: String?) -> String {
