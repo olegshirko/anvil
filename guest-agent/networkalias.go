@@ -78,6 +78,25 @@ func refreshHostsForContainer(ns, containerdID string) {
 	}
 }
 
+// writeOwnHosts fills the managed hosts section of one container from the
+// current mesh. Start calls it before the task runs: the peers' files are
+// refreshed in the background afterwards, and a short-lived
+// `docker run --network n alpine ping peer` otherwise raced that refresh
+// for its own file and found no peers.
+func writeOwnHosts(ns, id string) {
+	metas, err := containerMetas()
+	if err != nil {
+		return
+	}
+	entries := networkHostsEntries(metas, func(ns, id string) (containerNetInfo, bool) { return loadNetInfo(ns, id) })
+	for _, m := range metas {
+		if m.Namespace == ns && m.ID == id {
+			rewriteHostsManagedSection(containerHostsPath(ns, id), hostsBlockFor(m, entries))
+			return
+		}
+	}
+}
+
 // refreshNetworkHosts regenerates the managed hosts section of every
 // container on the network. A container on several networks gets the union
 // of all its networks' entries (one managed block per hosts file), each peer

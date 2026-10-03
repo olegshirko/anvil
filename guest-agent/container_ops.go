@@ -254,6 +254,7 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 			return fmt.Errorf("cni attach: %w", xerr)
 		}
 		saveNetInfo(ns, id, containerNetInfo{IP: addrs.IP, Mac: addrs.Mac, Network: netName, ipv6Addr: addrs.ipv6Addr, Extra: extra})
+		writeOwnHosts(ns, id)
 		publishEndpointEvents("connect", ns, id, netName, extra)
 		defer func() {
 			if err != nil {
