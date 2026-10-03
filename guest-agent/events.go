@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -189,14 +192,20 @@ func eventKey(ev dockerEvent) string {
 	return fmt.Sprintf("%s/%s/%d", ev.Action, ev.Actor.ID, ev.TimeNano)
 }
 
-// eventBufferSize is how many recent events the in-memory log keeps. Events
-// survive VM pauses inside the memory snapshot, so the replay covers the
-// whole uptime (not just since the last resume) at no persistence cost.
+// eventBufferSize is how many recent events the log keeps. Events survive
+// VM pauses inside the memory snapshot and cold boots through eventLogPath,
+// so `docker events --since` replays across restarts of the VM too.
 const eventBufferSize = 1024
+
+// eventLogPath is the on-disk copy of the ring: JSON lines appended per
+// event, compacted to the ring once it holds twice the ring's size.
+var eventLogPath = filepath.Join(anvilStoreRoot, "events.jsonl")
 
 var eventLog struct {
 	sync.Mutex
-	ring []dockerEvent
+	ring  []dockerEvent
+	f     *os.File
+	lines int
 }
 
 // eventLogSnapshot returns buffered events with TimeNano after `since`, in
@@ -223,6 +232,79 @@ func eventLogRecord(ev dockerEvent) {
 	} else {
 		eventLog.ring = append(eventLog.ring, ev)
 	}
+	if eventLog.f == nil {
+		return
+	}
+	line, err := json.Marshal(ev)
+	if err != nil {
+		return
+	}
+	if _, err := eventLog.f.Write(append(line, '\n')); err != nil {
+		log.Printf("[events] persist: %v", err)
+		return
+	}
+	eventLog.lines++
+	if eventLog.lines >= 2*eventBufferSize {
+		compactEventLogLocked()
+	}
+}
+
+// loadEventLog fills the ring from eventLogPath and opens it for appending.
+// Called once at startup, before the recorder runs.
+func loadEventLog() {
+	eventLog.Lock()
+	defer eventLog.Unlock()
+	if data, err := os.ReadFile(eventLogPath); err == nil {
+		var ring []dockerEvent
+		for _, line := range bytes.Split(data, []byte("\n")) {
+			var ev dockerEvent
+			if len(line) == 0 || json.Unmarshal(line, &ev) != nil {
+				continue // a line torn by a crash mid-write
+			}
+			ring = append(ring, ev)
+		}
+		if len(ring) > eventBufferSize {
+			ring = ring[len(ring)-eventBufferSize:]
+		}
+		eventLog.ring = append(ring, eventLog.ring...)
+	}
+	compactEventLogLocked()
+}
+
+// compactEventLogLocked rewrites eventLogPath to the ring and reopens it for
+// appending. eventLog must be locked.
+func compactEventLogLocked() {
+	if eventLog.f != nil {
+		eventLog.f.Close()
+		eventLog.f = nil
+	}
+	var buf bytes.Buffer
+	for _, ev := range eventLog.ring {
+		if line, err := json.Marshal(ev); err == nil {
+			buf.Write(line)
+			buf.WriteByte('\n')
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(eventLogPath), 0o755); err != nil {
+		log.Printf("[events] persist: %v", err)
+		return
+	}
+	tmp := eventLogPath + ".tmp"
+	if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil {
+		log.Printf("[events] persist: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, eventLogPath); err != nil {
+		log.Printf("[events] persist: %v", err)
+		return
+	}
+	f, err := os.OpenFile(eventLogPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Printf("[events] persist: %v", err)
+		return
+	}
+	eventLog.f = f
+	eventLog.lines = len(eventLog.ring)
 }
 
 // startEventRecorder translates containerd events once, centrally, into the

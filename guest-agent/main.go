@@ -177,6 +177,7 @@ func main() {
 
 	// Docker API server on a separate vsock port so the existing control
 	// channel stays untouched.
+	loadEventLog()
 	goLoop("event-recorder", startEventRecorder)
 	goLoop("docker-api", func() { runDockerAPIServer(bootFinalized) })
 

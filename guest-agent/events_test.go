@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -246,5 +249,46 @@ func TestHealthStatusTransitions(t *testing.T) {
 		if fl.match(ev) != want {
 			t.Errorf("%s: match != %v", flt, want)
 		}
+	}
+}
+
+func TestEventLogPersistsAcrossRestart(t *testing.T) {
+	oldRing, oldPath := eventLog.ring, eventLogPath
+	defer func() {
+		eventLog.Lock()
+		if eventLog.f != nil {
+			eventLog.f.Close()
+			eventLog.f = nil
+		}
+		eventLog.Unlock()
+		eventLog.ring, eventLogPath = oldRing, oldPath
+	}()
+	eventLogPath = filepath.Join(t.TempDir(), "events.jsonl")
+	eventLog.ring = nil
+	loadEventLog() // empty file, opened for appending
+
+	base := time.Now()
+	n := 2*eventBufferSize + 10 // crosses a compaction
+	for i := 0; i < n; i++ {
+		eventLogRecord(dockerEvent{Action: "start", Actor: dockerEventActor{ID: fmt.Sprintf("id%d", i)},
+			TimeNano: base.Add(time.Duration(i) * time.Millisecond).UnixNano()})
+	}
+	// A crash mid-write leaves a torn last line.
+	eventLog.f.WriteString(`{"Action":"sta`)
+
+	// "Reboot": drop the in-memory state and load from disk.
+	eventLog.f.Close()
+	eventLog.f, eventLog.ring = nil, nil
+	loadEventLog()
+	got := eventLogSnapshot(time.Time{})
+	if len(got) != eventBufferSize {
+		t.Fatalf("after reload: want %d events, got %d", eventBufferSize, len(got))
+	}
+	if want := fmt.Sprintf("id%d", n-1); got[len(got)-1].Actor.ID != want {
+		t.Errorf("newest event: want %s, got %s", want, got[len(got)-1].Actor.ID)
+	}
+	data, _ := os.ReadFile(eventLogPath)
+	if lines := bytes.Count(data, []byte("\n")); lines != eventBufferSize {
+		t.Errorf("file not compacted on load: %d lines", lines)
 	}
 }
