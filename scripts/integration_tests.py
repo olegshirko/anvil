@@ -3834,6 +3834,70 @@ def test_container_domains() -> None:
         cleanup(name)
 
 
+def test_hosts_before_start() -> None:
+    """A container's own /etc/hosts lists its network peers before its
+    process runs: a short-lived `run --rm ... ping peer` used to race the
+    background mesh refresh and find nobody."""
+    net = f"{PREFIX}-hostsrace"
+    peer = f"{PREFIX}-hrpeer"
+    try:
+        docker("network", "create", net)
+        docker("run", "-d", "--name", peer, "--network", net, "alpine", "sleep", "120")
+        misses = 0
+        for _ in range(6):
+            out = docker("run", "--rm", "--network", net, "alpine", "grep", "-c", peer, "/etc/hosts", check=False)
+            if out.stdout.strip() in ("", "0"):
+                misses += 1
+        if misses:
+            raise RuntimeError(f"peer missing from /etc/hosts at start in {misses}/6 runs")
+    finally:
+        docker("rm", "-f", peer, check=False, timeout=60.0)
+        docker("network", "rm", net, check=False, timeout=60.0)
+    record("hosts populated before start", "PASS", "6/6 short-lived runs saw the peer")
+
+
+def test_ipv6_network() -> None:
+    """docker network create --ipv6: dual-stack addresses, a v6 default route,
+    names resolving to v6, inspect fields, v6 egress through the VM's NAT,
+    and no v6 escape from an --internal network or into another network."""
+    net, other, internal = f"{PREFIX}-v6", f"{PREFIX}-v6b", f"{PREFIX}-v6i"
+    srv = f"{PREFIX}-v6srv"
+    try:
+        docker("network", "create", "--ipv6", net)
+        docker("network", "create", "--ipv6", other)
+        docker("network", "create", "--ipv6", "--internal", internal)
+        cfg = json.loads(docker("network", "inspect", net, "--format", "{{json .IPAM.Config}}").stdout)
+        v6 = [c for c in cfg if ":" in c.get("Subnet", "")]
+        if docker("network", "inspect", net, "--format", "{{.EnableIPv6}}").stdout.strip() != "true" or not v6:
+            raise RuntimeError(f"network not dual-stack: {cfg}")
+        docker("run", "-d", "--name", srv, "--network", net, "nginx:alpine")
+        ep = json.loads(docker("inspect", srv, "--format", "{{json .NetworkSettings.Networks}}").stdout)[net]
+        addr6 = ep.get("GlobalIPv6Address", "")
+        if not addr6 or ep.get("GlobalIPv6PrefixLen") != 64 or not ep.get("IPv6Gateway"):
+            raise RuntimeError(f"inspect lacks IPv6 fields: {ep}")
+        out = docker("run", "--rm", "--network", net, "alpine", "sh", "-c",
+                     f"ip -6 route | grep -q '^default' && ping -6 -c1 -W3 {srv} >/dev/null && echo OK",
+                     check=False, timeout=60.0)
+        if "OK" not in out.stdout:
+            raise RuntimeError(f"no v6 route or name over v6: {out.stdout!r} {out.stderr!r}")
+        out = docker("run", "--rm", "--network", other, "alpine", "ping", "-6", "-c1", "-W2", addr6,
+                     check=False, timeout=60.0)
+        if out.returncode == 0:
+            raise RuntimeError("another network reaches the container over IPv6")
+        out = docker("run", "--rm", "--network", internal, "alpine", "ping", "-6", "-c1", "-W2",
+                     "2606:4700:4700::1111", check=False, timeout=60.0)
+        if out.returncode == 0:
+            raise RuntimeError("an --internal network reaches the outside over IPv6")
+        egress = docker("run", "--rm", "--network", net, "alpine", "ping", "-6", "-c1", "-W3",
+                        "2606:4700:4700::1111", check=False, timeout=60.0).returncode == 0
+    finally:
+        docker("rm", "-f", srv, check=False, timeout=60.0)
+        for n in (net, other, internal):
+            docker("network", "rm", n, check=False, timeout=60.0)
+    record("IPv6 network", "PASS", f"{v6[0]['Subnet']}, inspect + name + isolation ok, "
+           f"egress {'ok' if egress else 'unavailable on this host network'}")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -3857,6 +3921,8 @@ TESTS = [
     ("compose 15 services", test_compose_many_services),
     ("build context symlinks", test_build_context_symlinks),
     ("network connect/disconnect", test_network_connect),
+    ("hosts populated before start", test_hosts_before_start),
+    ("IPv6 network", test_ipv6_network),
     ("logs", test_logs),
     ("logs --tail/-t", test_logs_tail_timestamps),
     ("exec", test_exec),
