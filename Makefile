@@ -11,7 +11,7 @@
     container-tools time-boot time-service validate doctor unit-tests integration smoke \
     harness harness-prepull harness-tests harness-all bench-all \
     prune clean-containers disk-compact \
-    release replace-release update-brew release-notes bottle
+    release replace-release update-brew release-notes bottle bottle-resume
 
 BINARY := .build/release/vz-runner
 ENTITLEMENTS := entitlements.plist
@@ -533,3 +533,8 @@ update-brew:
 bottle:
 	$(require_version)
 	scripts/make_bottle.sh "$(VERSION)" "$(HOMEBREW_TAP_DIR)"
+
+# Finish a bottle run that failed after the primary upload (aliases, formula).
+bottle-resume:
+	$(require_version)
+	scripts/make_bottle.sh --resume "$(VERSION)" "$(HOMEBREW_TAP_DIR)"
