@@ -1,3 +1,11 @@
+## v1.8.1 (2026-10-03)
+
+### Fixed
+- 0cb1acd fix: snapshot config hash is taken when the VM is configured, not at save
+
+### Internal
+- ff41d58 build(deps): Dependabot skips the VM-coupled modules and grpc 1.84
+- 85d525e build(deps): GitHub Actions and Go dependency updates
 ## v1.8.0 (2026-10-02)
 
 ### Added
