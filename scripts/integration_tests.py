@@ -3898,6 +3898,70 @@ def test_ipv6_network() -> None:
            f"egress {'ok' if egress else 'unavailable on this host network'}")
 
 
+def _api_json(method: str, path: str, body: dict | None = None, query: dict | None = None):
+    """Raw Docker API call over the anvil socket; returns parsed JSON."""
+    args = ["curl", "-s", "--max-time", "60", "--unix-socket", str(DOCKER_SOCKET), "-X", method]
+    if query:
+        args += ["-G"]
+        for k, v in query.items():
+            args += ["--data-urlencode", f"{k}={v}"]
+    if body is not None:
+        args += ["-H", "Content-Type: application/json", "-d", json.dumps(body)]
+    out = subprocess.run(args + [f"http://anvil{path}"], capture_output=True, text=True, timeout=90)
+    return json.loads(out.stdout or "null")
+
+
+def test_exec_stdin_eof() -> None:
+    """docker exec -i passes stdin EOF on to the process: `echo x | docker
+    exec -i c cat` returns (it used to hang — the shim kept the FIFO open)."""
+    name = f"{PREFIX}-execeof"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sleep", "120")
+        out = docker("exec", "-i", name, "sh", "-c", "wc -c; echo eof-seen",
+                     input_text="hello stdin\n", timeout=30.0)
+        if "eof-seen" not in out.stdout or "12" not in out.stdout:
+            raise RuntimeError(f"exec -i output: {out.stdout!r}")
+    finally:
+        cleanup(name)
+    record("exec -i stdin EOF", "PASS", "12 bytes read, EOF reached the process")
+
+
+def test_k3d_style_create() -> None:
+    """What k3d does: list networks/containers by id=^/?<id>$ (Docker filters
+    are regular expressions) and create nodes with NetworkMode "bridge" plus
+    the cluster network in EndpointsConfig — Docker then joins only that
+    network (one default route)."""
+    net, name = f"{PREFIX}-k3dnet", f"{PREFIX}-k3dnode"
+    try:
+        docker("network", "create", net)
+        nid = docker("network", "inspect", net, "-f", "{{.ID}}").stdout.strip()
+        found = _api_json("GET", "/networks", query={"filters": json.dumps({"id": {f"^/?{nid}$": True}, "name": {f"^/?{net}$": True}})})
+        if [n["Name"] for n in found or []] != [net]:
+            raise RuntimeError(f"network id regex filter: {found}")
+        created = _api_json("POST", f"/containers/create?name={name}", {
+            "Image": "alpine", "Cmd": ["sleep", "120"],
+            "HostConfig": {"NetworkMode": "bridge"},
+            "NetworkingConfig": {"EndpointsConfig": {net: {}}},
+        })
+        cid = created.get("Id", "")
+        if not cid:
+            raise RuntimeError(f"create: {created}")
+        docker("start", name)
+        nets = docker("inspect", name, "-f", "{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}").stdout.split()
+        if nets != [net]:
+            raise RuntimeError(f"node joined {nets}, want only {net}")
+        routes = docker("exec", name, "ip", "route").stdout
+        if routes.count("default") != 1:
+            raise RuntimeError(f"want one default route: {routes!r}")
+        listed = _api_json("GET", "/containers/json", query={"filters": json.dumps({"id": {f"^/?{cid}$": True}})})
+        if len(listed or []) != 1:
+            raise RuntimeError(f"container id regex filter: {listed}")
+    finally:
+        cleanup(name)
+        docker("network", "rm", net, check=False, timeout=60.0)
+    record("k3d-style create", "PASS", "id regex filters, EndpointsConfig-only network, one default route")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -3926,6 +3990,8 @@ TESTS = [
     ("logs", test_logs),
     ("logs --tail/-t", test_logs_tail_timestamps),
     ("exec", test_exec),
+    ("exec -i stdin EOF", test_exec_stdin_eof),
+    ("k3d-style create", test_k3d_style_create),
     ("exec -d/-w", test_exec_detached_and_flags),
     ("cp", test_cp),
     ("cp directories", test_cp_directory),
