@@ -3998,6 +3998,29 @@ def test_mount_order() -> None:
     record("mount order (parents first)", "PASS", "bind inside a tmpfs stays visible")
 
 
+def test_network_rm_frees_bridge() -> None:
+    """network rm deletes the network's bridge: a leaked bridge kept its
+    subnet's route, so the next network on that subnet had no egress."""
+    a, b, c = f"{PREFIX}-brA", f"{PREFIX}-brB", f"{PREFIX}-brC"
+    subnet = "10.10.247.0/24"
+    try:
+        docker("network", "create", "--subnet", subnet, a)
+        docker("run", "--rm", "--network", a, "alpine", "true")
+        docker("network", "rm", a)
+        docker("network", "create", "--subnet", subnet, b)
+        out = docker("run", "--rm", "--network", b, "alpine", "ping", "-c1", "-W3", "1.1.1.1",
+                     check=False, timeout=60.0)
+        if out.returncode != 0:
+            raise RuntimeError(f"no egress on a reused subnet: {out.stdout!r}")
+        routes = docker("run", "--rm", "--net=host", "alpine", "ip", "route").stdout
+        if routes.count("10.10.247.0/24") != 1:
+            raise RuntimeError(f"stale route for the subnet: {routes!r}")
+    finally:
+        for n in (a, b, c):
+            docker("network", "rm", n, check=False, timeout=60.0)
+    record("network rm frees its bridge", "PASS", "reused subnet has one route and egress")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -4030,6 +4053,7 @@ TESTS = [
     ("k3d-style create", test_k3d_style_create),
     ("/etc files writable", test_etc_files_writable),
     ("mount order (parents first)", test_mount_order),
+    ("network rm frees its bridge", test_network_rm_frees_bridge),
     ("exec -d/-w", test_exec_detached_and_flags),
     ("cp", test_cp),
     ("cp directories", test_cp_directory),

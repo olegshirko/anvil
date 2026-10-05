@@ -492,21 +492,81 @@ func responsePool(subnet string, pool *ipamPool) dockerIPAMConfig {
 	return c
 }
 
-// removeStaleBridge deletes the Linux bridge of a removed network when no
-// interfaces remain attached to it (best effort).
+// conflistBridge is the bridge plugin's interface name. It is not the first
+// plugin (loopback is): reading Plugins[0] found no bridge, so removed
+// networks leaked their bridges, and a later network on the same subnet
+// lost its outbound traffic to the dead bridge's route.
+func conflistBridge(cl cniConflist) string {
+	for _, p := range cl.Plugins {
+		if p.Type == "bridge" {
+			return p.Bridge
+		}
+	}
+	return ""
+}
+
+// removeStaleBridge deletes the Linux bridge of a removed network.
 func removeStaleBridge(conflistPath string) {
 	data, err := os.ReadFile(conflistPath)
 	if err != nil {
 		return
 	}
 	var cl cniConflist
-	if json.Unmarshal(data, &cl) != nil || len(cl.Plugins) == 0 || cl.Plugins[0].Bridge == "" {
+	if json.Unmarshal(data, &cl) != nil {
 		return
 	}
-	out, err := exec.Command("sh", "-c",
-		fmt.Sprintf("if [ -d /sys/class/net/%s/brif ] && [ -z \"$(ls /sys/class/net/%s/brif)\" ]; then ip link delete %s; fi",
-			cl.Plugins[0].Bridge, cl.Plugins[0].Bridge, cl.Plugins[0].Bridge)).CombinedOutput()
+	if br := conflistBridge(cl); br != "" {
+		deleteBridgeLink(br)
+	}
+}
+
+// deleteBridgeLink removes a bridge whose network has no endpoints left
+// (removeDockerNetwork refuses one in use). The veths of containers that
+// just stopped may still be going away with their netns: wait briefly,
+// then delete regardless — deleting a bridge releases its ports.
+func deleteBridgeLink(br string) {
+	sys := "/sys/class/net/" + br
+	if _, err := os.Stat(sys); err != nil {
+		return
+	}
+	for i := 0; i < 20; i++ {
+		if ports, _ := os.ReadDir(sys + "/brif"); len(ports) == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if out, err := exec.Command("ip", "link", "delete", br).CombinedOutput(); err != nil {
+		debugLog("[docker-api] bridge cleanup %s: %v: %s", br, err, out)
+	}
+}
+
+// sweepOrphanBridges deletes anvil bridges no conflist names and no port
+// uses: leaks of the removal bug above (or of a crash mid-removal). Run
+// before a new network is allocated, since an orphan holding the same
+// subnet captures its traffic.
+func sweepOrphanBridges(existing map[string]cniConflist) {
+	links, err := os.ReadDir("/sys/class/net")
 	if err != nil {
-		debugLog("[docker-api] bridge cleanup %s: %v: %s", cl.Plugins[0].Bridge, err, out)
+		return
+	}
+	named := map[string]bool{}
+	for _, cl := range existing {
+		named[conflistBridge(cl)] = true
+	}
+	for _, l := range links {
+		br := l.Name()
+		if !strings.HasPrefix(br, "br-") || named[br] {
+			continue
+		}
+		if _, err := os.Stat("/sys/class/net/" + br + "/bridge"); err != nil {
+			continue // not a bridge
+		}
+		if ports, _ := os.ReadDir("/sys/class/net/" + br + "/brif"); len(ports) > 0 {
+			continue
+		}
+		log.Printf("[docker-api] removing orphan bridge %s", br)
+		if out, err := exec.Command("ip", "link", "delete", br).CombinedOutput(); err != nil {
+			debugLog("[docker-api] orphan bridge %s: %v: %s", br, err, out)
+		}
 	}
 }

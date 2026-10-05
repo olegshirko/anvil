@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -159,5 +160,17 @@ func TestSortMountsByDepth(t *testing.T) {
 	want := []string{"/run", "/data/", "/var/run", "/etc/hosts", "/var/run/docker.sock"}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("order = %v, want %v", got, want)
+	}
+}
+
+// The bridge plugin is not the first one (loopback is); reading Plugins[0]
+// leaked every removed network's bridge.
+func TestConflistBridge(t *testing.T) {
+	var cl cniConflist
+	if err := json.Unmarshal([]byte(`{"name":"n","plugins":[{"type":"loopback"},{"type":"bridge","bridge":"br-n"},{"type":"portmap"}]}`), &cl); err != nil {
+		t.Fatal(err)
+	}
+	if got := conflistBridge(cl); got != "br-n" {
+		t.Errorf("conflistBridge = %q, want br-n", got)
 	}
 }

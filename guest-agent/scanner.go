@@ -488,6 +488,9 @@ func generateCNIConfigLocked(ns string, extraLabels map[string]string) error {
 	path := filepath.Join(cniConfDir, "anvil-"+base+".conflist")
 
 	existing, _ := loadCNIConflists()
+	if _, ok := existing[netName]; !ok {
+		sweepOrphanBridges(existing)
+	}
 	pool := loadNetworkPool(netName)
 	alloc := pickNetAlloc(netName, projectSubnetOctet(ns), existing, pool)
 	bridge := alloc.bridge
