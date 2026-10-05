@@ -3986,6 +3986,18 @@ def test_etc_files_writable() -> None:
     record("/etc files writable", "PASS", "own edits kept beside the peer block; ro under --read-only")
 
 
+def test_mount_order() -> None:
+    """Mounts go parents first, as in Docker: k3d's tools container has
+    --tmpfs /run --tmpfs /var/run plus the Docker socket bound inside, and
+    the tmpfs used to cover the socket."""
+    out = docker("run", "--rm", "--tmpfs", "/run", "--tmpfs", "/var/run",
+                 "-v", "/var/run/docker.sock:/var/run/docker.sock", "alpine",
+                 "sh", "-c", "test -S /var/run/docker.sock && echo SOCK", check=False, timeout=60.0)
+    if "SOCK" not in out.stdout:
+        raise RuntimeError(f"socket covered by the tmpfs: {out.stdout!r} {out.stderr!r}")
+    record("mount order (parents first)", "PASS", "bind inside a tmpfs stays visible")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -4017,6 +4029,7 @@ TESTS = [
     ("exec -i stdin EOF", test_exec_stdin_eof),
     ("k3d-style create", test_k3d_style_create),
     ("/etc files writable", test_etc_files_writable),
+    ("mount order (parents first)", test_mount_order),
     ("exec -d/-w", test_exec_detached_and_flags),
     ("cp", test_cp),
     ("cp directories", test_cp_directory),

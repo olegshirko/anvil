@@ -41,6 +41,20 @@ func effectiveNetworkName(networkMode string) string {
 	return networkMode
 }
 
+// sortMountsByDepth orders mounts parents first, as Docker does
+// (daemon sortMounts): a tmpfs on /run listed after a bind on
+// /run/docker.sock otherwise covered it — k3d's tools container has exactly
+// that (--tmpfs /run --tmpfs /var/run -v /var/run/docker.sock:...).
+// Stable, so mounts of equal depth keep the requested order.
+func sortMountsByDepth(mounts []specs.Mount) []specs.Mount {
+	out := slices.Clone(mounts)
+	depth := func(m specs.Mount) int {
+		return strings.Count(filepath.Clean("/"+m.Destination), "/")
+	}
+	sort.SliceStable(out, func(i, j int) bool { return depth(out[i]) < depth(out[j]) })
+	return out
+}
+
 // primaryNetworkMode is the network a create request really asks for.
 // Docker (updateContainerNetworkSettings) joins the NetworkMode network only
 // when EndpointsConfig is empty: k3d sends NetworkMode "bridge" with its
@@ -813,7 +827,7 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 		opts = append(opts, oci.WithLinuxDeviceFollowSymlinks(d.PathOnHost, "rwm"))
 	}
 	if len(mounts) > 0 {
-		opts = append(opts, oci.WithMounts(mounts))
+		opts = append(opts, oci.WithMounts(sortMountsByDepth(mounts)))
 	}
 	if hostNet {
 		// Drop the default (fresh, empty) network namespace so the task

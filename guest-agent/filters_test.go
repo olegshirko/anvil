@@ -1,8 +1,11 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
+
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 func TestMatchesContainerFiltersExtended(t *testing.T) {
@@ -136,5 +139,25 @@ func TestPrimaryNetworkMode(t *testing.T) {
 		if got := primaryNetworkMode(tc.r); got != tc.want {
 			t.Errorf("primaryNetworkMode(%q, %v) = %q, want %q", tc.r.HostConfig.NetworkMode, tc.r.NetworkingConfig, got, tc.want)
 		}
+	}
+}
+
+// Docker mounts parents first: a tmpfs on /run must not cover a bind on
+// /var/run/docker.sock requested before it.
+func TestSortMountsByDepth(t *testing.T) {
+	in := []specs.Mount{
+		{Destination: "/var/run/docker.sock"},
+		{Destination: "/run"},
+		{Destination: "/var/run"},
+		{Destination: "/etc/hosts"},
+		{Destination: "/data/"},
+	}
+	var got []string
+	for _, m := range sortMountsByDepth(in) {
+		got = append(got, m.Destination)
+	}
+	want := []string{"/run", "/data/", "/var/run", "/etc/hosts", "/var/run/docker.sock"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("order = %v, want %v", got, want)
 	}
 }
