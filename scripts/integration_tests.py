@@ -4021,6 +4021,30 @@ def test_network_rm_frees_bridge() -> None:
     record("network rm frees its bridge", "PASS", "reused subnet has one route and egress")
 
 
+def test_restart_keeps_ip() -> None:
+    """A restarted container gets its previous address back when it is free
+    (Docker asks IPAM for it): k3s nodes that came back on new IPs lost
+    their node IP and crash-looped."""
+    net, name = f"{PREFIX}-keepip", f"{PREFIX}-keepipc"
+    fmt = "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"
+    try:
+        docker("network", "create", net)
+        docker("run", "-d", "--name", name, "--network", net, "alpine", "sleep", "300")
+        # A second container started meanwhile must not take the address.
+        first = docker("inspect", name, "-f", fmt).stdout.strip()
+        docker("restart", "-t", "0", name)
+        after_restart = docker("inspect", name, "-f", fmt).stdout.strip()
+        docker("stop", "-t", "0", name)
+        docker("start", name)
+        after_start = docker("inspect", name, "-f", fmt).stdout.strip()
+        if not first or first != after_restart or first != after_start:
+            raise RuntimeError(f"address changed: {first} -> {after_restart} -> {after_start}")
+    finally:
+        cleanup(name)
+        docker("network", "rm", net, check=False, timeout=60.0)
+    record("restart keeps IP", "PASS", f"{first} kept across restart and stop/start")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -4054,6 +4078,7 @@ TESTS = [
     ("/etc files writable", test_etc_files_writable),
     ("mount order (parents first)", test_mount_order),
     ("network rm frees its bridge", test_network_rm_frees_bridge),
+    ("restart keeps IP", test_restart_keeps_ip),
     ("exec -d/-w", test_exec_detached_and_flags),
     ("cp", test_cp),
     ("cp directories", test_cp_directory),

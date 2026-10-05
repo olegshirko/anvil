@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 
 	cniclient "github.com/containerd/go-cni"
@@ -61,3 +62,5 @@ func findConflistForNetwork(netName string) (string, error) {
 func armSubpathMounts(m *containerMeta) error    { return verifySubpathMounts(m) }
 func releaseSubpathMounts(ns, id string)         {}
 func trimFilesystem(path string) (uint64, error) { return 0, nil }
+
+func ipInNetworkSubnet(network string, ip net.IP) bool { return false }

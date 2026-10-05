@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -210,7 +211,11 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 	if err := ensureNetworkMasquerade(netName); err != nil {
 		log.G(ctx).WithError(err).Warnf("[cni] masquerade rule for %s", netName)
 	}
-	staticIP := staticIPFor(ns, id, netName)
+	staticIP, preferred := staticIPFor(ns, id, netName), false
+	if staticIP == "" {
+		staticIP = preferredIP(ns, id, netName)
+		preferred = staticIP != ""
+	}
 	var c cniclient.CNI
 	if staticIP != "" {
 		c, err = staticCNI(conflist)
@@ -245,6 +250,15 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 		opts = append(opts, cniclient.WithArgs("IgnoreUnknown", "1"), cniclient.WithArgs("IP", staticIP))
 	}
 	res, err := c.Setup(ctx, id, netnsPath, opts...)
+	if err != nil && preferred {
+		// The previous address is only a preference: undo the attempt and
+		// let IPAM pick any free one.
+		log.G(ctx).WithError(err).Debugf("[cni] previous address %s on %s unavailable", staticIP, netName)
+		c.Remove(ctx, id, netnsPath, opts...) //nolint:errcheck
+		if c, err = cnim.forConflist(conflist); err == nil {
+			res, err = c.Setup(ctx, id, netnsPath, opts[:len(opts)-2]...)
+		}
+	}
 	if err != nil {
 		return cniAddrs{}, fmt.Errorf("cni setup %s: %w", netName, err)
 	}
@@ -256,6 +270,7 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 		}
 	}
 	addrs := resultAddresses(res)
+	rememberIP(ns, id, netName, addrs.IP)
 	log.G(ctx).WithField("network", netName).Debugf("[cni] %s attached ip=%s ipv6=%s", id[:12], addrs.IP, addrs.IPv6)
 	return addrs, nil
 }
@@ -674,4 +689,18 @@ func trimFilesystem(path string) (uint64, error) {
 		return 0, errno
 	}
 	return r.length, nil
+}
+
+// ipInNetworkSubnet reports whether ip lies in one of network's subnets.
+func ipInNetworkSubnet(network string, ip net.IP) bool {
+	cl, err := readNetworkConflist(network)
+	if err != nil {
+		return false
+	}
+	for _, s := range networkSubnets(cl) {
+		if _, n, err := net.ParseCIDR(s); err == nil && n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }

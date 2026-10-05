@@ -7,6 +7,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -151,7 +153,21 @@ func attachSecondaryNetworks(ctx context.Context, ns, id string, networks []stri
 	var eps []netEndpoint
 	for _, n := range networks {
 		ifName := nextIfName(eps)
-		addrs, err := attachExtraNetwork(ctx, n, id, netnsPathFor(id), ifName, staticIPFor(ns, id, n))
+		ip, preferred := staticIPFor(ns, id, n), false
+		if ip == "" {
+			ip = preferredIP(ns, id, n)
+			preferred = ip != ""
+		}
+		addrs, err := attachExtraNetwork(ctx, n, id, netnsPathFor(id), ifName, ip)
+		if err != nil && preferred {
+			// The previous address is only a preference: undo the attempt
+			// and take any free one.
+			detachExtraNetwork(ctx, n, id, netnsPathFor(id), ifName) //nolint:errcheck
+			addrs, err = attachExtraNetwork(ctx, n, id, netnsPathFor(id), ifName, "")
+		}
+		if err == nil {
+			rememberIP(ns, id, n, addrs.IP)
+		}
 		if err != nil {
 			detachSecondaryNetworks(ctx, id, eps)
 			return nil, err
@@ -459,4 +475,44 @@ func resolveNetworkContainer(ctx context.Context, mode string) (ns, containerdID
 		return "", "", err
 	}
 	return ns, containerdID, nil
+}
+
+// hostLocalDir is where the host-local IPAM plugin records allocations,
+// one file per address under the network's name (cleared at boot).
+const hostLocalDir = "/var/lib/cni/networks"
+
+// preferredIP is the address the container had on network before, when
+// it is still inside the network's subnet and free — what Docker does
+// (libnetwork asks IPAM for the previous address): a restarted container
+// keeps its IP. k3s agents that came back on new addresses kept their old
+// node IP and failed "failed to find interface with specified node ip".
+func preferredIP(ns, id, network string) string {
+	meta, err := loadContainerMeta(ns, id)
+	if err != nil || meta.LastIPs[network] == "" {
+		return ""
+	}
+	ip := net.ParseIP(meta.LastIPs[network])
+	if ip == nil || ip.To4() == nil {
+		return ""
+	}
+	if !ipInNetworkSubnet(network, ip) {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(hostLocalDir, network, ip.String())); err == nil {
+		return "" // taken by another container meanwhile
+	}
+	return ip.String()
+}
+
+// rememberIP records the address the container got on network.
+func rememberIP(ns, id, network, ip string) {
+	if ip == "" {
+		return
+	}
+	updateContainerMeta(ns, id, func(m *containerMeta) { //nolint:errcheck — best effort
+		if m.LastIPs == nil {
+			m.LastIPs = map[string]string{}
+		}
+		m.LastIPs[network] = ip
+	})
 }

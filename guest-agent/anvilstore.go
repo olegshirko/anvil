@@ -78,6 +78,9 @@ type containerMeta struct {
 	NetworkAliases map[string][]string `json:"NetworkAliases,omitempty"`
 	// NetworkIPs are requested static IPv4 addresses per network.
 	NetworkIPs map[string]string `json:"NetworkIPs,omitempty"`
+	// LastIPs are the IPv4 addresses the container last had per network,
+	// asked for again at the next start (preferredIP).
+	LastIPs map[string]string `json:"LastIPs,omitempty"`
 	// SubpathMounts are volume-subpath mounts, re-checked at every start.
 	SubpathMounts []subpathMount `json:"SubpathMounts,omitempty"`
 	Links         []string       `json:"Links,omitempty"`
