@@ -3962,6 +3962,30 @@ def test_k3d_style_create() -> None:
     record("k3d-style create", "PASS", "id regex filters, EndpointsConfig-only network, one default route")
 
 
+def test_etc_files_writable() -> None:
+    """/etc/hosts, resolv.conf and hostname are writable as in Docker (k3d
+    rewrites a node's /etc/hosts), read-only under --read-only, and the peer
+    block keeps working next to a container's own edits."""
+    net, name, peer = f"{PREFIX}-etcnet", f"{PREFIX}-etc", f"{PREFIX}-etcpeer"
+    try:
+        docker("network", "create", net)
+        docker("run", "-d", "--name", name, "--network", net, "alpine", "sleep", "120")
+        docker("exec", name, "sh", "-c",
+               "echo '10.9.9.9 custom.k3d.internal' >> /etc/hosts && echo 'options ndots:1' >> /etc/resolv.conf")
+        docker("run", "-d", "--name", peer, "--network", net, "alpine", "sleep", "120")
+        time.sleep(1.0)
+        hosts = docker("exec", name, "cat", "/etc/hosts").stdout
+        if "custom.k3d.internal" not in hosts or peer not in hosts:
+            raise RuntimeError(f"own edit or peer entry missing: {hosts!r}")
+        ro = docker("run", "--rm", "--read-only", "alpine", "sh", "-c", "echo x >> /etc/hosts", check=False)
+        if ro.returncode == 0:
+            raise RuntimeError("/etc/hosts writable under --read-only")
+    finally:
+        cleanup(name, peer)
+        docker("network", "rm", net, check=False, timeout=60.0)
+    record("/etc files writable", "PASS", "own edits kept beside the peer block; ro under --read-only")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -3992,6 +4016,7 @@ TESTS = [
     ("exec", test_exec),
     ("exec -i stdin EOF", test_exec_stdin_eof),
     ("k3d-style create", test_k3d_style_create),
+    ("/etc files writable", test_etc_files_writable),
     ("exec -d/-w", test_exec_detached_and_flags),
     ("cp", test_cp),
     ("cp directories", test_cp_directory),

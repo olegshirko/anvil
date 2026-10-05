@@ -372,14 +372,21 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) (_ []specs.M
 		})
 	}
 
-	// Standard /etc files as bind mounts (like nerdctl/docker).
+	// Standard /etc files as bind mounts, writable unless --read-only, as
+	// Docker's NetworkMounts: k3d rewrites a node's /etc/hosts, and images
+	// append to it at startup. The peer block is rewritten in place (same
+	// inode, other lines kept), so it coexists with such edits.
+	etcOpts := []string{"rbind"}
+	if req.HostConfig.ReadonlyRootfs {
+		etcOpts = []string{"rbind", "ro"}
+	}
 	mounts = append(mounts,
 		specs.Mount{Type: "bind", Source: containerHostsPath(ns, id), Destination: "/etc/hosts",
-			Options: []string{"rbind", "ro"}},
+			Options: etcOpts},
 		specs.Mount{Type: "bind", Source: containerResolvPath(ns, id), Destination: "/etc/resolv.conf",
-			Options: []string{"rbind", "ro"}},
+			Options: etcOpts},
 		specs.Mount{Type: "bind", Source: filepath.Join(containerMetaDir(ns, id), "hostname"),
-			Destination: "/etc/hostname", Options: []string{"rbind"}},
+			Destination: "/etc/hostname", Options: etcOpts},
 	)
 	return mounts, anonVols, volMounts, subpaths, nil
 }
