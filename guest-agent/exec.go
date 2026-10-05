@@ -335,13 +335,34 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 
 	var stdinR io.Reader
 	var stdinWriteCloser io.WriteCloser
+	// started is closed once the process runs, finished when this handler
+	// returns: the stdin copier needs the process for CloseIO.
+	started, finished := make(chan struct{}), make(chan struct{})
+	defer close(finished)
+	var proc client.Process
 	if spec.AttachStdin || spec.Tty {
 		pr, pw := io.Pipe()
 		stdinR = pr
 		stdinWriteCloser = pw
 		go func() {
-			io.Copy(pw, conn)
+			// bufrw, not conn: bytes the client sent right behind the
+			// request are already in its buffer.
+			io.Copy(pw, bufrw.Reader)
 			pw.Close()
+			// The client half-closed (stdin EOF). Closing our pipe ends the
+			// FIFO copy, but the shim keeps its own writer on the FIFO, so
+			// the process sees EOF only after CloseIO — what dockerd does.
+			// Without it `echo x | docker exec -i c cat` never returned.
+			select {
+			case <-started:
+			case <-finished:
+				return
+			}
+			ctx, cancel := context.WithTimeout(nsCtx, 10*time.Second)
+			defer cancel()
+			if err := proc.CloseIO(ctx, client.WithStdinCloser); err != nil {
+				debugLog("[exec] close stdin of %s: %v", truncateID(id), err)
+			}
 		}()
 	}
 
@@ -411,6 +432,8 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	spec.setProcess(process) // again: the pid exists only now
+	proc = process
+	close(started)
 	publishContainerEvent("exec_start: "+strings.Join(spec.Cmd, " "), spec.Namespace, spec.ContainerdID,
 		map[string]string{"execID": spec.ID})
 
