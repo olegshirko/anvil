@@ -41,6 +41,27 @@ func effectiveNetworkName(networkMode string) string {
 	return networkMode
 }
 
+// primaryNetworkMode is the network a create request really asks for.
+// Docker (updateContainerNetworkSettings) joins the NetworkMode network only
+// when EndpointsConfig is empty: k3d sends NetworkMode "bridge" with its
+// cluster network in EndpointsConfig and gets that network alone. Joining
+// both gave the nodes two default routes.
+func primaryNetworkMode(req dockerCreateRequest) string {
+	mode := req.HostConfig.NetworkMode
+	if effectiveNetworkName(mode) != "bridge" || req.NetworkingConfig == nil || len(req.NetworkingConfig.EndpointsConfig) == 0 {
+		return mode
+	}
+	var names []string
+	for name := range req.NetworkingConfig.EndpointsConfig {
+		if effectiveNetworkName(name) == "bridge" {
+			return mode // the default network is among the requested ones
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names[0]
+}
+
 func usesHostNetwork(req dockerCreateRequest) bool {
 	return req.HostConfig.NetworkMode == "host"
 }

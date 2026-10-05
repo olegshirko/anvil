@@ -80,3 +80,61 @@ func TestResolvConfContent(t *testing.T) {
 		t.Errorf("--dns-search . should clear search: %q", got)
 	}
 }
+
+// k3d looks networks and containers up with id=^/?<id>$ (Docker matches
+// filter values as regular expressions); a plain prefix must still work.
+func TestIDFilterMatch(t *testing.T) {
+	id := "3f1c9a0b7d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a"
+	for _, tc := range []struct {
+		pattern string
+		want    bool
+	}{
+		{id, true},
+		{id[:12], true},
+		{"^/?" + id + "$", true},
+		{"^" + id[:12] + "$", false},
+		{"^/?deadbeef$", false},
+		{"[", false}, // invalid expression: prefix fallback
+		{"", false},
+	} {
+		if got := idFilterMatch(tc.pattern, id); got != tc.want {
+			t.Errorf("idFilterMatch(%q) = %v, want %v", tc.pattern, got, tc.want)
+		}
+	}
+	s := dockerContainerSummary{Id: id, Names: []string{"/c"}}
+	if !matchesContainerFilters(s, map[string]map[string]bool{"id": {"^/?" + id + "$": true}}) {
+		t.Error("container id filter does not take a regular expression")
+	}
+}
+
+// Docker joins the NetworkMode network only when EndpointsConfig is empty
+// (k3d: NetworkMode "bridge" + its cluster network in EndpointsConfig).
+func TestPrimaryNetworkMode(t *testing.T) {
+	req := func(mode string, eps ...string) dockerCreateRequest {
+		var r dockerCreateRequest
+		r.HostConfig.NetworkMode = mode
+		if len(eps) > 0 {
+			r.NetworkingConfig = &dockerNetworkingConf{EndpointsConfig: map[string]dockerEndpoint{}}
+			for _, e := range eps {
+				r.NetworkingConfig.EndpointsConfig[e] = dockerEndpoint{}
+			}
+		}
+		return r
+	}
+	for _, tc := range []struct {
+		r    dockerCreateRequest
+		want string
+	}{
+		{req("bridge", "k3d-x"), "k3d-x"},
+		{req("", "k3d-x"), "k3d-x"},
+		{req("default", "b", "a"), "a"},
+		{req("bridge"), "bridge"},
+		{req("bridge", "bridge", "k3d-x"), "bridge"},
+		{req("app_default", "app_default", "other"), "app_default"},
+		{req("host", "k3d-x"), "host"},
+	} {
+		if got := primaryNetworkMode(tc.r); got != tc.want {
+			t.Errorf("primaryNetworkMode(%q, %v) = %q, want %q", tc.r.HostConfig.NetworkMode, tc.r.NetworkingConfig, got, tc.want)
+		}
+	}
+}

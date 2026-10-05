@@ -68,7 +68,7 @@ func matchesContainerFilters(s dockerContainerSummary, filters map[string]map[st
 	name := strings.TrimPrefix(s.Names[0], "/")
 	checks := []bool{
 		anyMatch(filters["name"], func(v string) bool { return v != "" && (nameFilterMatch(v, name) || nameFilterMatch(v, "/"+name)) }),
-		anyMatch(filters["id"], func(v string) bool { return strings.HasPrefix(s.Id, v) }),
+		anyMatch(filters["id"], func(v string) bool { return idFilterMatch(v, s.Id) }),
 		anyMatch(filters["status"], func(v string) bool { return v == s.State }),
 		anyMatch(filters["ancestor"], func(v string) bool { return imageMatchesAncestor(s.Image, s.ImageID, v) }),
 		anyMatch(filters["network"], func(v string) bool {

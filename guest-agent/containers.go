@@ -95,6 +95,7 @@ func waitContainerTaskCond(ctx context.Context, ns, containerdID string, nextExi
 // createDockerContainer creates a container natively via containerd and
 // returns its Docker ID.
 func createDockerContainer(ctx context.Context, req dockerCreateRequest, name, platform string, auth *registryAuth) (string, []string, error) {
+	req.HostConfig.NetworkMode = primaryNetworkMode(req)
 	networkMode := req.HostConfig.NetworkMode
 	ns := namespaceFromNetwork(networkMode)
 	if isContainerNetworkMode(networkMode) {

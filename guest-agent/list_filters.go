@@ -32,7 +32,7 @@ func filterNetworks(ctx context.Context, list []dockerNetwork, filters map[strin
 	for _, n := range list {
 		builtin := n.Name == "bridge" || n.Name == "host" || n.Name == "none"
 		ok := anyMatch(filters["name"], func(v string) bool { return nameFilterMatch(v, n.Name) }) &&
-			anyMatch(filters["id"], func(v string) bool { return strings.HasPrefix(n.Id, v) }) &&
+			anyMatch(filters["id"], func(v string) bool { return idFilterMatch(v, n.Id) }) &&
 			anyMatch(filters["driver"], func(v string) bool { return v == n.Driver }) &&
 			anyMatch(filters["scope"], func(v string) bool { return v == n.Scope || (n.Scope == "" && v == "local") }) &&
 			anyMatch(filters["type"], func(v string) bool { return (v == "builtin") == builtin && (v == "builtin" || v == "custom") }) &&
@@ -109,6 +109,21 @@ func nameFilterMatch(pattern, name string) bool {
 		return strings.Contains(name, pattern)
 	}
 	return re.MatchString(name)
+}
+
+// idFilterMatch is Docker's id filter (filters.Args.Match): a regular
+// expression, unanchored, so a plain ID prefix still matches and k3d's
+// `id=^/?<id>$` does too. A pattern that is not a valid expression falls
+// back to the prefix match it most likely meant.
+func idFilterMatch(pattern, id string) bool {
+	if pattern == "" {
+		return false
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return strings.HasPrefix(id, pattern)
+	}
+	return re.MatchString(id)
 }
 
 // volumeInUse reports whether a mounted source is the volume's directory or
