@@ -446,6 +446,20 @@ for extra_mod in xt_statistic xt_set xt_physdev xt_conntrack xt_NFLOG xt_CT \
         vxlan tun wireguard; do
     putmod_deps "$extra_mod"
 done
+# Native nftables expressions and the xt matches iptables-nft cannot
+# translate. In a container's netns iptables-nft turns -m limit, -j NFLOG,
+# -m pkttype... into these; a missing one fails the whole iptables-restore
+# with ENOENT — kube-router (k3s NetworkPolicy) then applied no policy at
+# all. Also kube-proxy's nftables mode (fib, counter, quota, numgen).
+for nft_expr in nft_limit nft_log nft_counter nft_quota nft_numgen nft_hash \
+        nft_fib nft_fib_inet nft_fib_ipv4 nft_fib_ipv6 nft_redir nft_objref \
+        nft_connlimit nft_socket nft_tproxy nft_reject_inet nft_reject_ipv4 \
+        nft_reject_ipv6 nft_dup_ipv4 nft_dup_ipv6 nft_chain_route_ipv4 \
+        nft_chain_route_ipv6 nfnetlink_log xt_pkttype xt_LOG xt_owner \
+        xt_iprange xt_length xt_recent xt_hashlimit xt_connmark xt_CONNMARK \
+        xt_TCPMSS xt_ipvs xt_bpf xt_u32; do
+    putmod_deps "$nft_expr"
+done
 
 # Init script.
 cat > myinit <<'EOF'
