@@ -115,27 +115,31 @@ def test_port_forward() -> None:
 
 
 def test_port_restart_new_ip() -> None:
-    """A restarted container gets a new CNI IP; the host listener must follow.
+    """A container that restarts on a different IP keeps its published port:
+    the host listener must follow the new address.
 
     Regression: the forwarder diffed state by listener key only, so a restart
     (same container ID) left the listener dialing the dead pre-restart IP.
+    A restart keeps the previous address when it is free, so a squatter
+    takes it while the container is stopped.
     """
-    filler = f"{PREFIX}-ipfill"
+    net = f"{PREFIX}-ipnet2"
+    squatter = f"{PREFIX}-ipsquat"
     name = f"{PREFIX}-web-restart"
     port = PORT_BASE + 5
-    ip = lambda c: docker("inspect", "--format", "{{.NetworkSettings.IPAddress}}", c).stdout.strip()
+    ip = lambda c: docker("inspect", "--format",
+                          "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", c).stdout.strip()
     try:
-        # Filler holds the lowest CNI address so the web container starts on a
-        # higher one; freeing the filler before the restart forces a new IP.
-        docker("run", "-d", "--name", filler, "nginx")
-        docker("run", "-d", "--name", name, "-p", f"{port}:80", "nginx")
+        docker("network", "create", net)
+        docker("run", "-d", "--name", name, "--network", net, "-p", f"{port}:80", "nginx")
         code = curl_status(port)
         if code != "200":
             raise RuntimeError(f"nginx on :{port} -> {code}, want 200")
         ip_before = ip(name)
 
-        docker("rm", "-f", filler)
-        docker("restart", name)
+        docker("stop", "-t", "0", name)
+        docker("run", "-d", "--name", squatter, "--network", net, "--ip", ip_before, "alpine", "sleep", "120")
+        docker("start", name)
         ip_after = ip(name)
         if ip_before == ip_after:
             raise RuntimeError(f"test is vacuous: container IP did not change ({ip_before})")
@@ -146,7 +150,8 @@ def test_port_restart_new_ip() -> None:
         record("published port survives restart with new container IP", "PASS",
                f"listener followed {ip_before} -> {ip_after}, still 200")
     finally:
-        cleanup(filler, name)
+        cleanup(squatter, name)
+        docker("network", "rm", net, check=False, timeout=60.0)
 
 
 def test_foreign_port_conflict() -> None:
