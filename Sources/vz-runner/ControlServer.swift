@@ -120,12 +120,18 @@ final class ControlServer {
     /// Close the listening socket and remove the path.
     func stop() {
         lock.lock()
-        if fd >= 0 {
+        let wasListening = fd >= 0
+        if wasListening {
             close(fd)
             fd = -1
         }
         lock.unlock()
-        try? FileManager.default.removeItem(atPath: socketPath)
+        // Only while this instance owns the listener: a stopped server that
+        // outlives a restart (its client threads still hold it) must not
+        // delete the new server's socket (see DockerProxyServer.closeListener).
+        if wasListening {
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
     }
 
     /// Current number of connected clients.

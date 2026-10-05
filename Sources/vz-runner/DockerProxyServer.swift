@@ -121,12 +121,20 @@ final class DockerProxyServer {
 
     private func closeListener() {
         lock.lock()
-        if fd >= 0 {
+        let wasListening = fd >= 0
+        if wasListening {
             close(fd)
             fd = -1
         }
         lock.unlock()
-        try? FileManager.default.removeItem(atPath: socketPath)
+        // Only the instance that owns the listener removes the path. A
+        // stopped proxy lives on while its clients' threads hold it (a hung
+        // `docker exec -i` across a VM crash); its deinit ran after the
+        // restarted daemon had bound a new proxy and deleted that proxy's
+        // docker.sock — docker was unreachable while status said "ok".
+        if wasListening {
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
     }
 
     // MARK: - Private

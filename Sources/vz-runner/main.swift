@@ -398,6 +398,13 @@ func cmdStatus() {
     // (~100-300 ms) and only makes sense for a human at a terminal — skip it
     // when stdout is not a TTY (bench harness, scripts).
     ControlClient.status()
+    // A running VM is not a usable daemon without its Docker socket (a lost
+    // docker.sock once went unnoticed behind "VM status=ok").
+    var st = stat()
+    guard stat(dockerSocketPath, &st) == 0, (st.st_mode & S_IFMT) == S_IFSOCK else {
+        print("[anvil] docker socket missing: \(dockerSocketPath) (restart the daemon)")
+        exit(1)
+    }
     if isatty(STDOUT_FILENO) == 1 {
         let ctx = shell("docker", "context", "show").trimmingCharacters(in: .whitespacesAndNewlines)
         print("[anvil] docker context: \(ctx)")
