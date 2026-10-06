@@ -107,6 +107,12 @@ backend_compose_cmd() {
     echo "$SCRIPT_DIR/scripts/vzc.sh"
 }
 
+# Docker CLI prefix for the ops phase: the same socket vzc.sh uses, without
+# vzc.sh's pinned compose project name.
+backend_docker_cmd() {
+    echo "env DOCKER_HOST=unix://${ANVIL_DOCKER_SOCK:-$HOME/.anvil-vz/docker.sock} docker"
+}
+
 backend_all_healthy() {
     local unhealthy
     unhealthy=$("$SCRIPT_DIR/scripts/vzc.sh" -f "$HOST_SHARE_ROOT/workloads/docker-compose.bench.yml" ps --format json 2>/dev/null \

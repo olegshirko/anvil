@@ -18,20 +18,29 @@ RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 LATEST_CSV = os.path.join(RESULTS_DIR, "latest.csv")
 LATEST_MD = os.path.join(RESULTS_DIR, "latest.md")
 
+OURS = "vz-runner"
+
+# (phase, metric, table label). Lower is better for every row.
+METRICS = [
+    ("cold_start", "daemon_ready", "Cold start: daemon ready"),
+    ("cold_start", "compose_up_healthy", "Cold start: compose up (all healthy)"),
+    ("resume", "daemon_ready", "Resume: daemon ready"),
+    ("resume", "compose_up_healthy", "Resume: compose up (all healthy)"),
+    ("steady_state", "idle_rss_mb", "Idle RSS (MB)"),
+    ("ops", "run_rm", "Ops: docker run --rm"),
+    ("ops", "stop_t0", "Ops: stop -t 0"),
+    ("ops", "compose_down", "Ops: compose down"),
+    ("ops", "compose15_up", "Ops: compose up 15 services"),
+    ("ops", "compose15_down", "Ops: compose down 15 services"),
+]
+
 
 def _render_table(aggregate):
     backends = sorted(
         set(r["backend"] for r in aggregate),
-        key=lambda b: (b != "vz-runner", b),
+        key=lambda b: (b != OURS, b),
     )
-
-    metrics = [
-        ("cold_start", "daemon_ready", "Cold start: daemon ready"),
-        ("cold_start", "compose_up_healthy", "Cold start: compose up (all healthy)"),
-        ("resume", "daemon_ready", "Resume: daemon ready"),
-        ("resume", "compose_up_healthy", "Resume: compose up (all healthy)"),
-        ("steady_state", "idle_rss_mb", "Idle RSS (MB)"),
-    ]
+    metrics = METRICS
 
     rows = defaultdict(dict)
     for r in aggregate:
@@ -63,6 +72,49 @@ def _render_table(aggregate):
     return "\n".join(lines), backends, rows
 
 
+def _compare(ours, theirs, is_memory):
+    """Phrase ours vs theirs (lower is better) without rounding a loss into a win."""
+    if ours < theirs:
+        word = "less memory than" if is_memory else "faster than"
+        ratio = theirs / ours
+    else:
+        word = "more memory than" if is_memory else "slower than"
+        ratio = ours / theirs
+    if f"{ratio:.1f}" == "1.0":
+        return "about the same as"
+    return f"{ratio:.1f}× {word}"
+
+
+def _render_summary(backends, rows):
+    """One line per metric: vz-runner against every other backend measured."""
+    others = [b for b in backends if b != OURS]
+    if OURS not in backends or not others:
+        return ""
+
+    def num(b, key):
+        v = rows[b].get(key)
+        return v if isinstance(v, int) and v > 0 else None
+
+    lines = []
+    for phase, metric, label in METRICS:
+        ours = num(OURS, (phase, metric))
+        if ours is None:
+            continue
+        is_memory = metric == "idle_rss_mb"
+        unit = "MB" if is_memory else "ms"
+        parts = []
+        for b in others:
+            theirs = num(b, (phase, metric))
+            if theirs is None:
+                continue
+            parts.append(f"{_compare(ours, theirs, is_memory)} {b} ({theirs} {unit})")
+        if parts:
+            lines.append(f"- **{label}** — {OURS} {ours} {unit}: " + "; ".join(parts))
+    if not lines:
+        return ""
+    return f"\n{OURS} compared with each backend (lower is better):\n\n" + "\n".join(lines) + "\n"
+
+
 def main():
     if len(sys.argv) != 2:
         print("Usage: report.py <csv>", file=sys.stderr)
@@ -92,17 +144,7 @@ def main():
     table, backends, rows = _render_table(aggregate)
     md_content = "# Anvil bench harness results\n\n" + table + "\n"
 
-    if "docker-desktop" in backends and "vz-runner" in backends:
-        base = rows["docker-desktop"].get(("cold_start", "compose_up_healthy"))
-        ours = rows["vz-runner"].get(("cold_start", "compose_up_healthy"))
-        if base and ours:
-            md_content += f"\nvz-runner cold-start-to-ready is **{base/ours:.1f}x faster** " \
-                          f"than Docker Desktop on this workload.\n"
-        base_r = rows["docker-desktop"].get(("resume", "compose_up_healthy"))
-        ours_r = rows["vz-runner"].get(("resume", "compose_up_healthy"))
-        if base_r and ours_r:
-            md_content += f"vz-runner resume-to-ready is **{base_r/ours_r:.1f}x faster** " \
-                          f"than a warm Docker Desktop restart on this workload.\n"
+    md_content += _render_summary(backends, rows)
 
     with open(LATEST_MD, "w") as f:
         f.write(md_content)

@@ -74,6 +74,11 @@ backend_compose_cmd() {
     echo "docker compose"
 }
 
+# Plain docker CLI; DOCKER_HOST/DOCKER_CONFIG are exported by backend_start.
+backend_docker_cmd() {
+    echo "docker"
+}
+
 backend_all_healthy() {
     export DOCKER_CONFIG="$(_backend_orbstack_docker_config)"
     export DOCKER_HOST="unix://$ORBSTACK_SOCK"

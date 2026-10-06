@@ -15,6 +15,9 @@
 #   backend_compose_cmd    - print the compose command for this backend
 #   backend_idle_rss       - idle RSS of daemon/VM process in MB (after compose down)
 #   backend_name           - human-readable name for the report
+# Optional:
+#   backend_docker_cmd     - print the docker CLI prefix for this backend; enables
+#                            the "ops" phase (docker run/stop, compose down)
 #
 # Results are written to results/<timestamp>.csv and merged into results/latest.md
 
@@ -52,8 +55,21 @@ else
 fi
 
 # --- timer helper: returns milliseconds ---
+# bash >= 5 has EPOCHREALTIME (no fork/exec, ~1 ms resolution); the python
+# fallback (macOS /bin/bash 3.2) adds a few tens of ms of interpreter startup
+# to every interval, which matters for the sub-second ops metrics.
 now_ms() {
-    python3 -c 'import time; print(int(time.time()*1000))'
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        local us="${EPOCHREALTIME/[.,]/}"
+        echo $(( 10#$us / 1000 ))
+    else
+        python3 -c 'import time; print(int(time.time()*1000))'
+    fi
+}
+
+# --- median of integer arguments (lower median for an even count) ---
+median() {
+    printf '%s\n' "$@" | sort -n | sed -n "$(( ($# + 1) / 2 ))p"
 }
 
 # --- wait for a command to succeed, with timeout ---
@@ -82,6 +98,124 @@ record() {
     printf "  %-12s %-14s %-18s %s%s\n" "$backend" "$phase" "$metric" "$value" "$unit"
 }
 
+# Repetitions for the cheap ops metrics (median is recorded).
+OPS_REPS="${OPS_REPS:-3}"
+OPS_SERVICES=15
+OPS_PROJECT="anvil-bench-ops"
+
+# Compose file with $OPS_SERVICES idle alpine services. It is fed to compose
+# on stdin (-f -), so the path does not have to be visible inside a VM (lima
+# runs the compose CLI in the guest).
+write_ops_compose() {
+    local file="$1" i
+    {
+        echo "services:"
+        for i in $(seq 1 "$OPS_SERVICES"); do
+            echo "  s$i:"
+            echo "    image: alpine"
+            echo "    command: [\"sleep\", \"300\"]"
+        done
+    } > "$file"
+}
+
+# Phase "ops": everyday CLI latency on the warm backend. Expects the workload
+# stack to be up (it is, after the resume phase). A failed command records
+# nothing for that metric instead of aborting the whole run.
+run_ops_phase() {
+    local backend="$1" compose_cmd="$2"
+    if ! declare -f backend_docker_cmd >/dev/null; then
+        echo "  (ops phase skipped: '$backend' has no docker CLI endpoint)"
+        return 0
+    fi
+    local docker_cmd t0 t1 i
+    docker_cmd="$(backend_docker_cmd)"
+
+    # compose down of the benchmark stack (measured once: re-creating the
+    # stack to healthy is not cheap).
+    t0=$(now_ms)
+    if $compose_cmd -f "$WORKLOAD" down -t 0; then
+        t1=$(now_ms)
+        record "$backend" "ops" "compose_down" $((t1 - t0))
+    else
+        echo "!! '$backend' ops: compose down failed"
+    fi
+
+    # Warm-up (unmeasured): make sure alpine is present so no metric
+    # includes a registry pull.
+    if ! $docker_cmd run --rm alpine true >/dev/null 2>&1; then
+        echo "!! '$backend' ops: 'docker run alpine' failed, skipping the rest of ops"
+        return 0
+    fi
+
+    # docker run --rm alpine true
+    local samples=()
+    for i in $(seq 1 "$OPS_REPS"); do
+        t0=$(now_ms)
+        $docker_cmd run --rm alpine true >/dev/null 2>&1 || { samples=(); break; }
+        t1=$(now_ms)
+        samples+=($((t1 - t0)))
+    done
+    if (( ${#samples[@]} > 0 )); then
+        record "$backend" "ops" "run_rm" "$(median "${samples[@]}")"
+    else
+        echo "!! '$backend' ops: docker run --rm failed"
+    fi
+
+    # docker stop -t 0 on a running container (create/remove unmeasured)
+    local name="anvil-bench-ops-sleep"
+    samples=()
+    for i in $(seq 1 "$OPS_REPS"); do
+        $docker_cmd rm -f "$name" >/dev/null 2>&1 || true
+        if ! $docker_cmd run -d --name "$name" alpine sleep 300 >/dev/null 2>&1; then
+            samples=(); break
+        fi
+        t0=$(now_ms)
+        $docker_cmd stop -t 0 "$name" >/dev/null 2>&1 || { samples=(); break; }
+        t1=$(now_ms)
+        samples+=($((t1 - t0)))
+    done
+    $docker_cmd rm -f "$name" >/dev/null 2>&1 || true
+    if (( ${#samples[@]} > 0 )); then
+        record "$backend" "ops" "stop_t0" "$(median "${samples[@]}")"
+    else
+        echo "!! '$backend' ops: docker stop -t 0 failed"
+    fi
+
+    # compose up -d / down -t 0 of $OPS_SERVICES idle services
+    local tmpdir file ups=() downs=()
+    tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/anvil-bench-ops.XXXXXX")"
+    file="$tmpdir/docker-compose.ops.yml"
+    write_ops_compose "$file"
+    local ops_compose="$docker_cmd compose -p $OPS_PROJECT -f -"
+    $ops_compose down -t 0 < "$file" >/dev/null 2>&1 || true
+    for i in $(seq 1 "$OPS_REPS"); do
+        t0=$(now_ms)
+        if ! $ops_compose up -d < "$file" >/dev/null 2>&1; then
+            ups=(); downs=(); break
+        fi
+        t1=$(now_ms)
+        ups+=($((t1 - t0)))
+        t0=$(now_ms)
+        if ! $ops_compose down -t 0 < "$file" >/dev/null 2>&1; then
+            downs=(); break
+        fi
+        t1=$(now_ms)
+        downs+=($((t1 - t0)))
+    done
+    $ops_compose down -t 0 < "$file" >/dev/null 2>&1 || true
+    rm -rf "$tmpdir"
+    if (( ${#ups[@]} > 0 )); then
+        record "$backend" "ops" "compose${OPS_SERVICES}_up" "$(median "${ups[@]}")"
+    else
+        echo "!! '$backend' ops: compose up of $OPS_SERVICES services failed"
+    fi
+    if (( ${#downs[@]} > 0 )); then
+        record "$backend" "ops" "compose${OPS_SERVICES}_down" "$(median "${downs[@]}")"
+    else
+        echo "!! '$backend' ops: compose down of $OPS_SERVICES services failed"
+    fi
+}
+
 run_one_backend() {
     local backend="$1"
     local driver="$DRIVERS_DIR/$backend.sh"
@@ -92,6 +226,9 @@ run_one_backend() {
     fi
 
     echo "=== $backend ==="
+    # Drivers are sourced into the same shell one after another: drop the
+    # optional hooks of the previous driver so they do not leak into this one.
+    unset -f backend_is_available backend_cold_reset backend_docker_cmd
     # shellcheck disable=SC1090
     source "$driver"
 
@@ -164,6 +301,9 @@ run_one_backend() {
     wait_for "all services healthy" 60 backend_all_healthy
     t1=$(now_ms)
     record "$backend" "resume" "compose_up_healthy" $((t1 - t0))
+
+    # --- 8. Ops on the warm backend (takes the workload stack down) ---
+    run_ops_phase "$backend" "$compose_cmd"
 
     # --- cleanup ---
     $compose_cmd -f "$WORKLOAD" down -v

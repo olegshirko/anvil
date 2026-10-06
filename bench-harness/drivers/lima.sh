@@ -39,6 +39,11 @@ backend_compose_cmd() {
     echo "limactl shell $LIMA_INSTANCE docker compose"
 }
 
+# Docker CLI prefix for the ops phase; runs inside the VM like compose does.
+backend_docker_cmd() {
+    echo "limactl shell $LIMA_INSTANCE docker"
+}
+
 backend_all_healthy() {
     local unhealthy
     unhealthy=$(_lima_docker compose -f "$WORKLOAD" ps --format json 2>/dev/null \

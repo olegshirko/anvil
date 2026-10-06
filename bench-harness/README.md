@@ -37,7 +37,7 @@ export VZRUNNER_BIN=/path/to/.build/release/vz-runner
 
 Each backend is run in isolation: full stop → cold start → compose up (first
 time) → idle RSS → compose down → snapshot/stop → resume → compose up (second
-time) → cleanup.
+time) → ops (everyday CLI latency on the warm backend) → cleanup.
 
 ## What is measured
 
@@ -48,6 +48,22 @@ time) → cleanup.
 | resume | daemon_ready | same after snapshot/resume (if supported), otherwise a second cold start |
 | resume | compose_up_healthy | compose up on the already warm backend |
 | steady_state | idle_rss_mb | host daemon/VM process memory at idle |
+| ops | compose_down | `compose down -t 0` of the healthy workload stack (single run) |
+| ops | run_rm | `docker run --rm alpine true` (median of 3) |
+| ops | stop_t0 | `docker stop -t 0` of a running `alpine sleep 300` container (median of 3) |
+| ops | compose15_up | `compose up -d` of a generated file with 15 `alpine sleep 300` services (median of 3) |
+| ops | compose15_down | `compose down -t 0` of those 15 services (median of 3) |
+
+The ops phase runs right after the resume phase, through the driver's
+`backend_docker_cmd` (the same endpoint/context its compose command uses);
+`OPS_REPS` changes the repetition count. An unmeasured `docker run` first
+makes sure `alpine` is present, so no ops metric includes a pull. Backends
+without a docker CLI endpoint (Apple Containers) skip it. For Lima every
+command goes through `limactl shell`, so its ops numbers include that hop.
+
+Below the table, `latest.md` compares vz-runner with every other backend per
+metric (`N× faster/slower`, `N× less/more memory`; ratios that round to 1.0
+read "about the same as").
 
 Backends without a snapshot/resume API (Colima, OrbStack, Docker Desktop,
 Apple Containers today) run an honest second cold start in the "resume"
@@ -96,4 +112,5 @@ does not grow.
 Copy `drivers/colima.sh` as a template, implement the required functions
 (`backend_name`, `backend_start`, `backend_stop`, `backend_stop_keep_snapshot`,
 `backend_resume`, `backend_compose_cmd`, `backend_all_healthy`,
-`backend_idle_rss`), and add the name to `ALL_BACKENDS` in `run_bench.sh`.
+`backend_idle_rss`, and `backend_docker_cmd` for the ops phase), and add the
+name to `ALL_BACKENDS` in `run_bench.sh`.

@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGES=(postgres:16-alpine redis:7-alpine node:20-alpine nginx:alpine)
+IMAGES=(postgres:16-alpine redis:7-alpine node:20-alpine nginx:alpine alpine)
 
 BACKEND="${1:-docker}"
 LIMA_INSTANCE="${LIMA_INSTANCE:-anvil}"

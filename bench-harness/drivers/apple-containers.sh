@@ -9,6 +9,8 @@
 #   `container run` calls.
 # - No snapshot/resume API: "resume" is a second cold start (apiserver
 #   restart), like Colima/Lima.
+# - No docker CLI endpoint: no backend_docker_cmd, so the "ops" phase
+#   (docker run/stop, compose down, 15-service compose) is skipped.
 
 CONTAINER_BIN="${CONTAINER_BIN:-container}"
 export CONTAINER_BIN

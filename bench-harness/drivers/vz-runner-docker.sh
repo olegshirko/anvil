@@ -78,6 +78,11 @@ backend_compose_cmd() {
     echo "docker --context anvil compose"
 }
 
+# Docker CLI prefix for the ops phase (run/stop/compose on the warm backend).
+backend_docker_cmd() {
+    echo "docker --context anvil"
+}
+
 backend_all_healthy() {
     local unhealthy
     unhealthy=$(docker --context anvil compose -f "$HOST_SHARE_ROOT/workloads/docker-compose.bench.yml" ps --format json 2>/dev/null \
