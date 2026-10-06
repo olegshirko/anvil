@@ -59,7 +59,7 @@ final class HostServicesServer: NSObject {
                 return
             }
             defer { close(agent) }
-            relayBothWays(connection.fileDescriptor, agent)
+            relayBothWays(connection.fileDescriptor, agent, vsock: connection.fileDescriptor)
         }
     }
 
@@ -82,7 +82,7 @@ final class HostServicesServer: NSObject {
             defer { close(upstream) }
             guard let data = try? encodeLengthPrefixed(Reply()),
                   (try? writeExactlyFD(vfd, data: data)) != nil else { return }
-            relayBothWays(vfd, upstream)
+            relayBothWays(vfd, upstream, vsock: vfd)
         }
     }
 

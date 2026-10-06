@@ -182,6 +182,6 @@ final class DockerProxyServer {
             }
         }
 
-        relayBothWays(clientFd, conn.fileDescriptor)
+        relayBothWays(clientFd, conn.fileDescriptor, vsock: conn.fileDescriptor)
     }
 }

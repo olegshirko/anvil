@@ -61,7 +61,7 @@ final class EgressServer: NSObject {
             defer { close(upstream) }
             guard let data = try? encodeLengthPrefixed(Reply()),
                   (try? writeExactlyFD(vfd, data: data)) != nil else { return }
-            relayBothWays(vfd, upstream)
+            relayBothWays(vfd, upstream, vsock: vfd)
         }
     }
 

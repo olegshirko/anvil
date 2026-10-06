@@ -4050,6 +4050,50 @@ def test_restart_keeps_ip() -> None:
     record("restart keeps IP", "PASS", f"{first} kept across restart and stop/start")
 
 
+def test_exec_stdin_eof_slow_reader() -> None:
+    """stdin EOF reaches a process that starts reading late, every time: the
+    host relay's blocking read sometimes slept through the client's
+    half-close (about 1 run in 20), and `docker exec -i` never returned."""
+    name = f"{PREFIX}-eofslow"
+    with tempfile.NamedTemporaryFile(suffix=".bin") as f:
+        f.write(os.urandom(1 << 20) * 48)
+        f.flush()
+        size = os.path.getsize(f.name)
+        try:
+            docker("run", "-d", "--name", name, "alpine", "sleep", "600")
+            for i in range(40):
+                with open(f.name, "rb") as stdin:
+                    out = subprocess.run(["docker", "exec", "-i", name, "sh", "-c", "sleep 1; cat | wc -c"],
+                                         stdin=stdin, capture_output=True, text=True, timeout=30)
+                if out.stdout.strip() != str(size):
+                    raise RuntimeError(f"run {i + 1}: got {out.stdout!r} {out.stderr!r}, want {size}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"run {i + 1}: exec -i never saw stdin EOF")
+        finally:
+            cleanup(name)
+    record("exec -i EOF, slow reader", "PASS", f"40 runs x {size >> 20} MB, EOF every time")
+
+
+def test_save_pipe_exec() -> None:
+    """`docker save | docker exec -i c ...` into a reader that starts late
+    completes: a host relay that stopped reading one vsock connection
+    stalled the shared device (a ring deadlock, then "VM crashed")."""
+    name = f"{PREFIX}-savepipe"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sleep", "600")
+        size = len(subprocess.run(["docker", "save", "nginx"], capture_output=True, timeout=120).stdout)
+        for i in range(5):
+            out = subprocess.run(f"docker save nginx | docker exec -i {name} sh -c 'sleep 1; cat | wc -c'",
+                                 shell=True, capture_output=True, text=True, timeout=60)
+            if out.stdout.strip() != str(size):
+                raise RuntimeError(f"run {i + 1}: got {out.stdout!r} {out.stderr!r}, want {size}")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("save | exec -i hung")
+    finally:
+        cleanup(name)
+    record("docker save | exec -i", "PASS", f"5 runs x {size >> 20} MB")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -4079,6 +4123,8 @@ TESTS = [
     ("logs --tail/-t", test_logs_tail_timestamps),
     ("exec", test_exec),
     ("exec -i stdin EOF", test_exec_stdin_eof),
+    ("exec -i EOF, slow reader", test_exec_stdin_eof_slow_reader),
+    ("docker save | exec -i", test_save_pipe_exec),
     ("k3d-style create", test_k3d_style_create),
     ("/etc files writable", test_etc_files_writable),
     ("mount order (parents first)", test_mount_order),

@@ -152,17 +152,59 @@ func withReceiveTimeout<T>(_ fd: Int32, seconds: Int, _ body: () throws -> T) th
 /// draining the other, and a stream whose output grows with its input
 /// (`docker exec -i c xxd` fed a large file) deadlocked once both socket
 /// buffers filled. The calling thread pumps a -> b.
-func relayBothWays(_ a: Int32, _ b: Int32) {
+///
+/// `vsock` names the side that is a virtio-vsock connection to the guest:
+/// what it delivers is read as fast as it arrives (see pumpBuffered).
+func relayBothWays(_ a: Int32, _ b: Int32, vsock: Int32? = nil) {
     let reverseDone = DispatchSemaphore(value: 0)
     let reverse = Thread {
-        pumpOneWay(from: b, to: a)
+        pump(from: b, to: a, buffered: vsock == b)
         reverseDone.signal()
     }
     reverse.name = "relay-reverse"
     reverse.stackSize = 256 * 1024
     reverse.start()
-    pumpOneWay(from: a, to: b)
+    pump(from: a, to: b, buffered: vsock == a)
     reverseDone.wait()
+}
+
+private func pump(from: Int32, to: Int32, buffered: Bool) {
+    if buffered {
+        pumpBuffered(from: from, to: to)
+    } else {
+        pumpOneWay(from: from, to: to)
+    }
+}
+
+/// read(2) that waits in poll(2) first. A thread blocked in read(2) on a
+/// unix socket sometimes slept through the peer's shutdown(SHUT_WR): the
+/// docker CLI's EOF after `docker exec -i` stdin (about 1 in 20 runs) was
+/// seen only when the client exited, so the process in the container never
+/// got its EOF. poll(2) does not miss it.
+func readWhenReady(_ fd: Int32, _ buf: UnsafeMutableRawPointer, _ count: Int) -> Int {
+    var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+    while true {
+        let r = poll(&pfd, 1, -1)
+        if r < 0 && errno == EINTR { continue }
+        break
+    }
+    while true {
+        let n = read(fd, buf, count)
+        if n < 0 && errno == EINTR { continue }
+        return n
+    }
+}
+
+/// Write all of buf; false when the peer is gone.
+private func writeAll(_ fd: Int32, _ buf: UnsafeRawPointer, _ count: Int) -> Bool {
+    var off = 0
+    while off < count {
+        let w = write(fd, buf.advanced(by: off), count - off)
+        if w < 0 && errno == EINTR { continue }
+        if w <= 0 { return false }
+        off += w
+    }
+    return true
 }
 
 /// Copy `from` to `to` until EOF, then half-close `to`. When `to` is gone
@@ -170,23 +212,99 @@ func relayBothWays(_ a: Int32, _ b: Int32) {
 func pumpOneWay(from: Int32, to: Int32) {
     var buf = [UInt8](repeating: 0, count: 65536)
     while true {
-        let n = read(from, &buf, buf.count)
-        if n < 0 && errno == EINTR { continue }
+        let n = buf.withUnsafeMutableBytes { readWhenReady(from, $0.baseAddress!, $0.count) }
         if n <= 0 {
             _ = shutdown(to, Int32(SHUT_WR))
             return
         }
-        var off = 0
-        while off < n {
-            let w = buf.withUnsafeBytes { write(to, $0.baseAddress!.advanced(by: off), n - off) }
-            if w < 0 && errno == EINTR { continue }
-            if w <= 0 {
-                // The peer is gone: unblock the other direction too.
+        if !buf.withUnsafeBytes({ writeAll(to, $0.baseAddress!, n) }) {
+            // The peer is gone: unblock the other direction too.
+            _ = shutdown(to, Int32(SHUT_RDWR))
+            _ = shutdown(from, Int32(SHUT_RDWR))
+            return
+        }
+    }
+}
+
+/// How much a buffered pump holds for a slow client before it stops
+/// reading the guest (ordinary backpressure again).
+let relayBufferLimit = 64 << 20
+
+/// Copy `from` (a vsock connection) to `to` with a reader that never waits
+/// on `to`: it queues what the guest sends, up to `limit`, and a second
+/// thread writes it out.
+///
+/// The guest's vsock connections share one device queue. A host relay that
+/// stopped reading one of them (its client was slow) stalled the guest's
+/// transmit path for all of them, credit updates included: `docker save |
+/// docker exec -i c ...` deadlocked in a ring — save's client waited on
+/// the pipe, exec's stdin waited on the guest's credit, the guest's credit
+/// update waited behind save's data — and the stuck device then refused
+/// new connections, so the daemon declared the VM crashed. Draining keeps
+/// the device moving; the queue stayed at about 2 MB in that pipeline.
+func pumpBuffered(from: Int32, to: Int32, limit: Int = relayBufferLimit) {
+    let cond = NSCondition()
+    var chunks: [[UInt8]] = []
+    var head = 0          // index of the next chunk to write
+    var queued = 0        // bytes in chunks[head...]
+    var readerDone = false
+    var writerGone = false
+
+    let writerDone = DispatchSemaphore(value: 0)
+    let writer = Thread {
+        defer { writerDone.signal() }
+        while true {
+            cond.lock()
+            while head == chunks.count && !readerDone { cond.wait() }
+            if head == chunks.count {
+                cond.unlock()
+                _ = shutdown(to, Int32(SHUT_WR))
+                return
+            }
+            let chunk = chunks[head]
+            head += 1
+            if head > 1024 {
+                chunks.removeFirst(head)
+                head = 0
+            }
+            queued -= chunk.count
+            cond.broadcast()
+            cond.unlock()
+            if !chunk.withUnsafeBytes({ writeAll(to, $0.baseAddress!, $0.count) }) {
+                // The client is gone: stop the reader, and the opposite pump.
+                cond.lock()
+                writerGone = true
+                cond.broadcast()
+                cond.unlock()
                 _ = shutdown(to, Int32(SHUT_RDWR))
                 _ = shutdown(from, Int32(SHUT_RDWR))
                 return
             }
-            off += w
         }
     }
+    writer.name = "relay-drain-writer"
+    writer.stackSize = 256 * 1024
+    writer.start()
+
+    var buf = [UInt8](repeating: 0, count: 65536)
+    while true {
+        cond.lock()
+        while queued >= limit && !writerGone { cond.wait() }
+        let gone = writerGone
+        cond.unlock()
+        if gone { break }
+        let n = buf.withUnsafeMutableBytes { readWhenReady(from, $0.baseAddress!, $0.count) }
+        cond.lock()
+        if n <= 0 {
+            readerDone = true
+            cond.broadcast()
+            cond.unlock()
+            break
+        }
+        chunks.append(Array(buf[0..<n]))
+        queued += n
+        cond.broadcast()
+        cond.unlock()
+    }
+    writerDone.wait()
 }
