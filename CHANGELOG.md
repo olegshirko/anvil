@@ -1,3 +1,19 @@
+## v1.9.1 (2026-10-06)
+
+### Fixed
+- ddf4577 fix(partial): hijacked stdin is drained eagerly; save | exec -i into a not-yet-reading process locks the guest's vsock less often (not fixed: Linux 6.6 vsock rx lockup)
+- 949dce3 fix: ship nft expression modules (limit, log, ...) and xt_pkttype: k3s NetworkPolicy failed iptables-restore with ENOENT
+- 8c28b76 fix: a restarted container gets its previous IP back when free (k3s nodes kept their node IP)
+- 751ddeb fix: a stopped proxy's deinit deleted the restarted daemon's docker.sock; status fails without the socket
+- 2bfec8c fix: network rm deleted no bridge (read the loopback plugin); a reused subnet lost egress to the leaked bridge's route; orphan bridges swept on network create
+- 6fed12d fix: mounts are applied parents first (a tmpfs on /run covered the Docker socket bound inside; k3d image import)
+- 2484101 fix: /etc/hosts, resolv.conf and hostname are writable unless --read-only (k3d rewrites /etc/hosts)
+- bbb6b37 fix: docker exec -i passes stdin EOF to the process (CloseIO on client half-close)
+- d282097 fix(k3d): id list filters are regular expressions; NetworkMode joins only without EndpointsConfig
+
+### Internal
+- e465809 test: port-follows-new-IP forces the IP change (a restart now keeps its address)
+- 7c3a085 test: exec -i stdin EOF, k3d-style create (id regex filters, EndpointsConfig-only network)
 ## v1.9.0 (2026-10-03)
 
 ### Added
