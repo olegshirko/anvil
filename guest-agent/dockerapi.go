@@ -286,7 +286,7 @@ func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
 	// server already buffered), not bufrw's writer side, which the output
 	// goroutine below uses.
 	var detached atomic.Bool
-	in := io.MultiReader(io.LimitReader(bufrw.Reader, int64(bufrw.Reader.Buffered())), conn)
+	in := eagerReader(io.MultiReader(io.LimitReader(bufrw.Reader, int64(bufrw.Reader.Buffered())), conn), stdinBufferLimit)
 	go func() {
 		if stdin == nil {
 			io.Copy(io.Discard, in) //nolint:errcheck

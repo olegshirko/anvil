@@ -347,7 +347,7 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		go func() {
 			// bufrw, not conn: bytes the client sent right behind the
 			// request are already in its buffer.
-			io.Copy(pw, bufrw.Reader)
+			io.Copy(pw, eagerReader(bufrw.Reader, stdinBufferLimit))
 			pw.Close()
 			// The client half-closed (stdin EOF). Closing our pipe ends the
 			// FIFO copy, but the shim keeps its own writer on the FIFO, so
