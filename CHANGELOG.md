@@ -1,3 +1,10 @@
+## v1.9.2 (2026-10-06)
+
+### Fixed
+- 200a51d fix: host relays poll before reading and drain the guest side eagerly
+
+### Docs
+- 20e1e45 docs: host relays (poll, guest-side drain), network rules k3d relies on, k3d/exec -i support
 ## v1.9.1 (2026-10-06)
 
 ### Fixed
