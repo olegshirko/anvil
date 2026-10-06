@@ -1,3 +1,13 @@
+## v1.9.3 (2026-10-06)
+
+### Fixed
+- 2395a24 fix: network disconnect of a running container's primary or last network; a secondary's DEL no longer takes lo down
+
+### Internal
+- 8d25f28 test: the running primary network may be disconnected now (covered by network disconnect live)
+
+### Other
+- e3578fa bench: honest summary lines, ops phase (run --rm, stop -t 0, compose down, 15 services)
 ## v1.9.2 (2026-10-06)
 
 ### Fixed
