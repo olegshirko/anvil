@@ -172,6 +172,23 @@ final class VMLifecycleManager: NSObject {
         vm?.state == .paused && snapshot.hasSnapshot
     }
 
+    /// The VM is running (not paused, released or between restarts). Main queue.
+    var isVMRunning: Bool {
+        vm?.state == .running
+    }
+
+    /// Connects the running VM's network device to a fresh macOS NAT
+    /// (NATRecovery). The guest keeps its interface and MAC, so its DHCP
+    /// lease and address stay. Main queue.
+    @discardableResult
+    func reattachNAT() -> Bool {
+        guard let vm = vm, vm.state == .running, let device = vm.networkDevices.first else {
+            return false
+        }
+        device.attachment = VZNATNetworkDeviceAttachment()
+        return true
+    }
+
     // MARK: - Memory release
 
     /// The VM was stopped to give its memory back; the committed snapshot

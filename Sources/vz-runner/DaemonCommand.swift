@@ -199,12 +199,17 @@ enum DaemonCommand {
         private var guestUnreachableStrikes = 0
         private let cacheManager: ContainerdCacheManager?
         private var clientTracker: ClientTracker?
+        /// Reconnects the VM's NAT when the Mac's network changes under it.
+        private var natRecovery: NATRecovery?
 
         init(manager: VMLifecycleManager, idleSeconds: TimeInterval, phaseTimer: BootPhaseTimer) {
             self.manager = manager
             self.idleSeconds = idleSeconds
             self.phaseTimer = phaseTimer
             self.cacheManager = ContainerdCacheManager(sharePath: manager.args.sharePath)
+            let natRecovery = NATRecovery(manager: manager)
+            natRecovery.start()
+            self.natRecovery = natRecovery
             manager.delegate = self
             manager.portCheckServer = PortCheckServer { [weak self] port in
                 // The domains proxy holds its loopback port too; a
@@ -268,6 +273,7 @@ enum DaemonCommand {
             guard !isShuttingDown else { return }
             isShuttingDown = true
             idleTimer?.invalidate()
+            natRecovery?.stop()
             // Idle-paused with the snapshot saved: there is nothing to save.
             // The cache sync below runs `anvil exec`, whose control
             // connection would resume the VM (deleting the snapshot) only
@@ -318,6 +324,7 @@ enum DaemonCommand {
             // the VM had stayed up for a while.
             guestUnreachableStrikes = 0
             becameReadyAt = Date()
+            natRecovery?.vmBecameReady()
 
             // Host-port availability endpoint for the guest-agent is now
             // attached inside manager.start() before start/restore (its
