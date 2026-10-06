@@ -305,9 +305,15 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   in Docker Desktop; UDP to it goes to the Mac's NAT address.
   `gateway.docker.internal` is the NAT gateway.
 - Kubernetes in containers works (k3s/k3d; `--privileged` containers get
-  the VM's devices, and the kernel carries the modules kube-proxy, flannel
-  and VPN containers load): `docker run --privileged -p 6443:6443
-  rancher/k3s server` gives a cluster `kubectl` on the Mac can reach.
+  the VM's devices, and the kernel carries the modules kube-proxy, flannel,
+  kube-router NetworkPolicy and VPN containers load): `docker run
+  --privileged -p 6443:6443 rancher/k3s server` gives a cluster `kubectl` on
+  the Mac can reach, and `k3d cluster create` / `k3d image import` work
+  unchanged. A restarted container gets its previous IP back when it is
+  free (k3s nodes keep their node IP), and `/etc/hosts`, `/etc/resolv.conf`
+  and `/etc/hostname` are writable unless `--read-only`.
+- `docker exec -i` passes stdin EOF on, so pipelines such as
+  `docker save img | docker exec -i node ctr images import -` complete.
 - Container domains (opt-in, `ANVIL_DOMAINS=1`): every running container
   answers at `http://<name>.anvil.localhost`, compose services also at
   `http://<service>.<project>.anvil.localhost`, without `-p`. The port is the
