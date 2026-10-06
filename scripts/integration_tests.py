@@ -4094,6 +4094,55 @@ def test_save_pipe_exec() -> None:
     record("docker save | exec -i", "PASS", f"5 runs x {size >> 20} MB")
 
 
+def test_network_disconnect_live() -> None:
+    """docker network disconnect on a running container, as in Docker:
+    a secondary network goes without touching lo (its DEL used to bring lo
+    down: a k3s node's 127.0.0.1:6444 load balancer hung), the primary one
+    can go too, and so can the last one — then connect works again."""
+    a, b = f"{PREFIX}-dca", f"{PREFIX}-dcb"
+    c, peer = f"{PREFIX}-dcc", f"{PREFIX}-dcpeer"
+    lo_ok = "wget -qO- -T3 http://127.0.0.1:8080/ >/dev/null && echo LO-OK"
+    try:
+        docker("network", "create", a)
+        docker("network", "create", b)
+        docker("run", "-d", "--name", c, "--network", a, "alpine", "sh", "-c",
+               "mkdir -p /w && echo hi > /w/index.html && httpd -f -p 127.0.0.1:8080 -h /w")
+        docker("run", "-d", "--name", peer, "--network", b, "alpine", "sleep", "300")
+        docker("network", "connect", b, c)
+        # Secondary out: lo keeps serving.
+        docker("network", "disconnect", b, c)
+        if "LO-OK" not in docker("exec", c, "sh", "-c", lo_ok, check=False).stdout:
+            raise RuntimeError("disconnecting a secondary network took lo down")
+        # Primary out while another network stays: eth0 goes, the peer on b
+        # is still reachable, lo still serves.
+        docker("network", "connect", b, c)
+        docker("network", "disconnect", a, c)
+        links = docker("exec", c, "ip", "-o", "link").stdout
+        if "eth0" in links:
+            raise RuntimeError(f"eth0 still there after disconnecting the primary: {links!r}")
+        out = docker("exec", c, "sh", "-c", f"ping -c1 -W3 {peer} >/dev/null && echo PEER-OK; {lo_ok}",
+                     check=False).stdout
+        if "PEER-OK" not in out or "LO-OK" not in out:
+            raise RuntimeError(f"after the primary went: {out!r}")
+        nets = docker("inspect", c, "-f", "{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}").stdout.split()
+        if a in nets:
+            raise RuntimeError(f"inspect still lists {a}: {nets}")
+        # The last network out, then back.
+        docker("network", "disconnect", b, c)
+        if "LO-OK" not in docker("exec", c, "sh", "-c", lo_ok, check=False).stdout:
+            raise RuntimeError("lo gone after disconnecting the last network")
+        docker("network", "connect", a, c)
+        docker("restart", "-t", "0", c)
+        nets = docker("inspect", c, "-f", "{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}").stdout.split()
+        if nets != [a]:
+            raise RuntimeError(f"after reconnect + restart: {nets}, want [{a}]")
+    finally:
+        cleanup(c, peer)
+        for n in (a, b):
+            docker("network", "rm", n, check=False, timeout=60.0)
+    record("network disconnect live", "PASS", "secondary keeps lo, primary and last network can go, reconnect works")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
@@ -4117,6 +4166,7 @@ TESTS = [
     ("compose 15 services", test_compose_many_services),
     ("build context symlinks", test_build_context_symlinks),
     ("network connect/disconnect", test_network_connect),
+    ("network disconnect live", test_network_disconnect_live),
     ("hosts populated before start", test_hosts_before_start),
     ("IPv6 network", test_ipv6_network),
     ("logs", test_logs),

@@ -254,7 +254,7 @@ func connectContainerNetwork(ctx context.Context, networkRef, container string, 
 	if err != nil {
 		return fmt.Errorf("container metadata: %w", err)
 	}
-	if len(meta.Networks) > 0 && (usesHostNetworkName(meta.Networks[0]) || meta.Networks[0] == noneNetwork) {
+	if len(meta.Networks) > 0 && (usesHostNetworkName(meta.Networks[0]) || (meta.Networks[0] == noneNetwork && !meta.Disconnected)) {
 		return &apiError{status: http.StatusBadRequest,
 			msg: fmt.Sprintf("container sharing network namespace with another container or host cannot be connected to any other network (network mode %q)", meta.Networks[0])}
 	}
@@ -287,6 +287,12 @@ func connectContainerNetwork(ctx context.Context, networkRef, container string, 
 			for _, n := range m.Networks {
 				m.NetworkAliases[n] = m.Aliases
 			}
+		}
+		if m.Disconnected {
+			// Back from "none": the network becomes the primary one at
+			// the next start (live, it is a secondary endpoint).
+			m.Networks = slices.DeleteFunc(m.Networks, func(n string) bool { return n == noneNetwork })
+			m.Disconnected = false
 		}
 		if !slices.Contains(m.Networks, network) {
 			m.Networks = append(m.Networks, network)
@@ -332,26 +338,33 @@ func disconnectContainerNetwork(ctx context.Context, networkRef, container strin
 		return &apiError{status: http.StatusBadRequest,
 			msg: fmt.Sprintf("container %s is not connected to network %s", truncateID(dockerID(ns, id)), network)}
 	}
-	if len(meta.Networks) == 1 {
-		return &apiError{status: http.StatusBadRequest,
-			msg: fmt.Sprintf("cannot disconnect container from its last network %s", network)}
-	}
 	running, _, _ := containerTaskState(ctx, ns, id)
 	if running {
-		if idx == 0 {
-			return &apiError{status: http.StatusBadRequest,
-				msg: fmt.Sprintf("cannot disconnect a running container from its primary network %s; stop it first", network)}
-		}
 		ni, _ := loadNetInfo(ns, id)
-		var gone []netEndpoint
-		ni.Extra = slices.DeleteFunc(ni.Extra, func(e netEndpoint) bool {
-			if e.Network == network {
-				gone = append(gone, e)
-				return true
+		if idx == 0 && ni.Network == network {
+			// The primary endpoint (eth0, with the published ports) goes;
+			// lo and the other endpoints stay, as in Docker. The container
+			// is left without a primary until it restarts, when the next
+			// network in the list becomes eth0.
+			dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			err := detachPrimaryLive(dctx, network, id, netnsPathFor(id), meta.Ports)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("disconnect %s: %w", network, err)
 			}
-			return false
-		})
-		detachSecondaryNetworks(ctx, id, gone)
+			ni.Network, ni.IP, ni.Mac, ni.ipv6Addr = noneNetwork, "", "", ipv6Addr{}
+			forgetContainerIP(ns, id)
+		} else {
+			var gone []netEndpoint
+			ni.Extra = slices.DeleteFunc(ni.Extra, func(e netEndpoint) bool {
+				if e.Network == network {
+					gone = append(gone, e)
+					return true
+				}
+				return false
+			})
+			detachSecondaryNetworks(ctx, id, gone)
+		}
 		if err := saveNetInfo(ns, id, ni); err != nil {
 			return err
 		}
@@ -361,6 +374,12 @@ func disconnectContainerNetwork(ctx context.Context, networkRef, container strin
 	var networks []string
 	if err := updateContainerMeta(ns, id, func(m *containerMeta) {
 		m.Networks = slices.DeleteFunc(m.Networks, func(n string) bool { return n == network })
+		if len(m.Networks) == 0 {
+			// The last network: the container is on "none" from now on,
+			// lo only, until a network is connected again.
+			m.Networks = []string{noneNetwork}
+			m.Disconnected = true
+		}
 		delete(m.NetworkAliases, network)
 		delete(m.NetworkIPs, network)
 		networks = m.Networks

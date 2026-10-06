@@ -64,3 +64,7 @@ func releaseSubpathMounts(ns, id string)         {}
 func trimFilesystem(path string) (uint64, error) { return 0, nil }
 
 func ipInNetworkSubnet(network string, ip net.IP) bool { return false }
+
+func detachPrimaryLive(ctx context.Context, netName, id, netnsPath string, ports []cniPortMapping) error {
+	return nil
+}

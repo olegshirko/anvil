@@ -81,6 +81,9 @@ type containerMeta struct {
 	// LastIPs are the IPv4 addresses the container last had per network,
 	// asked for again at the next start (preferredIP).
 	LastIPs map[string]string `json:"LastIPs,omitempty"`
+	// Disconnected marks a container left on "none" by disconnecting its
+	// last network: unlike `--network none`, it may be connected again.
+	Disconnected bool `json:"Disconnected,omitempty"`
 	// SubpathMounts are volume-subpath mounts, re-checked at every start.
 	SubpathMounts []subpathMount `json:"SubpathMounts,omitempty"`
 	Links         []string       `json:"Links,omitempty"`

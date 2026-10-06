@@ -78,6 +78,14 @@ type portScanner struct {
 	hostNetCache map[string]*hostNetCacheEntry
 }
 
+// staleContainerIPs holds "ns/id" keys whose address changed under a
+// running task (a live disconnect from the primary network); the scanner
+// drops their cached IP on its next pass. A sync.Map: written by API
+// handlers, read by the scanner goroutine.
+var staleContainerIPs sync.Map
+
+func forgetContainerIP(ns, id string) { staleContainerIPs.Store(ns+"/"+id, struct{}{}) }
+
 type containerIPEntry struct {
 	pid uint32
 	ip  string
@@ -93,6 +101,9 @@ func newPortScanner() *portScanner {
 // containerIPFor returns the container's CNI address, cached by task pid.
 func (s *portScanner) containerIPFor(ns, id string, pid uint32, name string) string {
 	key := ns + "/" + id
+	if _, stale := staleContainerIPs.LoadAndDelete(key); stale {
+		delete(s.containerIPs, key)
+	}
 	if e, ok := s.containerIPs[key]; ok && e.pid == pid && e.ip != "" {
 		return e.ip
 	}

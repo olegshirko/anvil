@@ -353,6 +353,7 @@ func attachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName, sta
 	if err != nil {
 		return cniAddrs{}, fmt.Errorf("cni config %s: %w", netName, err)
 	}
+	list = withoutLoopback(list)
 	rt := &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: ifName}
 	if staticIP != "" {
 		rt.Args = [][2]string{{"IgnoreUnknown", "1"}, {"IP", staticIP}}
@@ -382,7 +383,53 @@ func detachExtraNetwork(ctx context.Context, netName, id, netnsPath, ifName stri
 	if err != nil {
 		return err
 	}
-	return extraCNI.DelNetworkList(ctx, list, &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: ifName})
+	return extraCNI.DelNetworkList(ctx, withoutLoopback(list), &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: ifName})
+}
+
+// withoutLoopback drops the loopback plugin from a network's list for an
+// endpoint that is not the container's whole network. Its DEL brings lo
+// down whatever interface it is given: disconnecting a second network cut
+// the container's 127.0.0.1 (a k3s node's API load balancer on
+// 127.0.0.1:6444 hung until the node restarted).
+func withoutLoopback(list *cnilibrary.NetworkConfigList) *cnilibrary.NetworkConfigList {
+	out := *list
+	out.Plugins = nil
+	for _, p := range list.Plugins {
+		if p.Network.Type != "loopback" {
+			out.Plugins = append(out.Plugins, p)
+		}
+	}
+	return &out
+}
+
+// detachPrimaryLive removes a running container's primary endpoint (eth0
+// and its published ports) and leaves lo and the other endpoints alone —
+// a live `docker network disconnect` from the primary network.
+func detachPrimaryLive(ctx context.Context, netName, id, netnsPath string, ports []cniPortMapping) error {
+	conflist, err := findConflistForNetwork(netName)
+	if err != nil {
+		return err
+	}
+	list, err := cnilibrary.ConfListFromFile(conflist)
+	if err != nil {
+		return err
+	}
+	rt := &cnilibrary.RuntimeConf{ContainerID: id, NetNS: netnsPath, IfName: "eth0"}
+	var pms []map[string]interface{}
+	for _, p := range ports {
+		if p.HostPort <= 0 {
+			continue
+		}
+		proto := strings.ToLower(p.Protocol)
+		if proto == "" {
+			proto = "tcp"
+		}
+		pms = append(pms, map[string]interface{}{"hostPort": p.HostPort, "containerPort": p.ContainerPort, "protocol": proto, "hostIP": p.HostIP})
+	}
+	if len(pms) > 0 {
+		rt.CapabilityArgs = map[string]interface{}{"portMappings": pms}
+	}
+	return extraCNI.DelNetworkList(ctx, withoutLoopback(list), rt)
 }
 
 // --- --network none -----------------------------------------------------------
