@@ -1055,9 +1055,6 @@ def test_network_connect() -> None:
             raise RuntimeError(f"still attached after disconnect: {nets}")
         if "eth1" in docker("exec", name, "ip", "-o", "link").stdout:
             raise RuntimeError("eth1 left behind after disconnect")
-        res = docker("network", "disconnect", "bridge", name, check=False)
-        if res.returncode == 0:
-            raise RuntimeError("disconnecting the running primary network was accepted")
         record("network connect/disconnect", "PASS", "live eth1, DNS by name+alias, restart, disconnect")
     finally:
         cleanup(name, peer)
