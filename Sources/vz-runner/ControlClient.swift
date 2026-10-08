@@ -41,6 +41,11 @@ enum ControlClient {
         try sendUnix(request: ControlRequest(cmd: cmd, args: nil))
     }
 
+    /// Runs a command in the VM and returns its output (no streaming).
+    static func run(_ args: [String]) throws -> ControlResponse {
+        try sendUnix(request: ControlRequest(cmd: "exec", args: args))
+    }
+
     // MARK: - Private
 
     private static func sendUnix(request: ControlRequest) throws -> ControlResponse {

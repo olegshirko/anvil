@@ -136,6 +136,19 @@ func cmdDoctor(args: [String]) {
         } catch {
             check("vm internet", false, "control socket: \(error)")
         }
+
+        // The Mac must route the VM's address to the NAT bridge. After a
+        // sleep under a VPN it lost that route once: NAT replies to the VM
+        // left through Wi-Fi and the VM had no IPv4 internet at all.
+        if let out = try? ControlClient.run(["ip", "-4", "-o", "addr", "show", "eth0"]).stdout,
+           let vmIP = vmAddress(fromIPAddrOutput: out) {
+            let iface = defaultRouteInterface(fromRouteOutput: shell("route", "-n", "get", vmIP)) ?? "?"
+            check("vm route", iface.hasPrefix("bridge"),
+                  iface.hasPrefix("bridge")
+                    ? "the Mac reaches \(vmIP) through \(iface)"
+                    : "the Mac routes the VM's address \(vmIP) through \(iface), not the NAT bridge — " +
+                      "macOS lost the route; restart anvil (anvil stop && anvil start) to recreate it")
+        }
     }
 
     // The VM's /var/lib (images, containers, volumes): a full disk fails
@@ -256,3 +269,10 @@ func defaultRouteInterface(fromRouteOutput output: String) -> String? {
     return nil
 }
 
+
+/// The IPv4 address in `ip -4 -o addr show` output ("... inet 192.168.64.2/24 ...").
+func vmAddress(fromIPAddrOutput output: String) -> String? {
+    let fields = output.split(whereSeparator: { $0 == " " || $0 == "\n" })
+    guard let i = fields.firstIndex(of: "inet"), i + 1 < fields.count else { return nil }
+    return fields[i + 1].split(separator: "/").first.map(String.init)
+}
