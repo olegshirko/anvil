@@ -1,3 +1,14 @@
+## v1.9.4 (2026-10-08)
+
+### Added
+- 84bb965 feat(doctor): vm route — the Mac must route the VM's address to the NAT bridge
+- 8fd8489 feat: the VM's NAT is reconnected when the Mac's network changes (VPN on/off) and the guest lost its internet
+
+### Fixed
+- 052116f fix(nat): the egress check probes IPv4 (IPv6 through the NAT hid a dead IPv4 path); the NAT watcher also checks after wake and every minute, one reattach per incident
+
+### Internal
+- 8f70a14 test: network disconnect live serves lo with nc (alpine's busybox has no httpd)
 ## v1.9.3 (2026-10-06)
 
 ### Fixed
