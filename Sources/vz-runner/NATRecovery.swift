@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SystemConfiguration
 
@@ -11,6 +12,12 @@ import SystemConfiguration
 /// whether its direct path works ("egress"), and when it does not, connects
 /// the network device to a fresh NAT attachment — no restart. A change seen
 /// while the VM is paused is checked when the VM is running again.
+///
+/// The interface does not always change: after a sleep with a VPN on, the
+/// Mac lost its 192.168.64.0/24 route to the NAT bridge, and NAT replies to
+/// the VM left through Wi-Fi. So the guest is also asked after a wake and
+/// once a minute; a dead path gets one reattach per incident (not one a
+/// minute while a full-tunnel VPN keeps it dead).
 final class NATRecovery {
     /// How often the primary interface is read (a dictionary lookup in
     /// configd, no process spawned).
@@ -24,6 +31,13 @@ final class NATRecovery {
     private var lastInterface: String?
     private var pendingCheck = false
     private var checkScheduled: DispatchWorkItem?
+    /// Periodic guest probe (no change seen on the Mac).
+    private let healthInterval: TimeInterval = 60
+    private var lastHealthCheck = Date()
+    /// One reattach per incident: set when the NAT was reattached, cleared
+    /// when the guest reaches the internet again or the network changes.
+    private var reattachedSinceHealthy = false
+    private var wakeObserver: NSObjectProtocol?
 
     init(manager: VMLifecycleManager) {
         self.manager = manager
@@ -36,12 +50,22 @@ final class NATRecovery {
         timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             self?.poll()
         }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.reattachedSinceHealthy = false
+            self?.scheduleCheck(reason: "the Mac woke up")
+        }
     }
 
     func stop() {
         timer?.invalidate()
         timer = nil
         checkScheduled?.cancel()
+        if let o = wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(o)
+            wakeObserver = nil
+        }
     }
 
     /// The VM is running again: run a check a route change left pending.
@@ -61,9 +85,16 @@ final class NATRecovery {
 
     private func poll() {
         let current = primaryInterface()
-        guard current != lastInterface else { return }
+        guard current != lastInterface else {
+            if current != nil, Date().timeIntervalSince(lastHealthCheck) >= healthInterval {
+                lastHealthCheck = Date()
+                check(reason: "periodic check", quietWhenHealthy: true)
+            }
+            return
+        }
         print("[nat] Mac primary interface \(lastInterface ?? "none") -> \(current ?? "none")")
         lastInterface = current
+        reattachedSinceHealthy = false
         guard current != nil else { return } // offline: nothing to check yet
         scheduleCheck(reason: "primary interface changed")
     }
@@ -76,9 +107,9 @@ final class NATRecovery {
     }
 
     /// Main queue: asks the guest off the main queue, acts back on it.
-    private func check(reason: String) {
+    private func check(reason: String, quietWhenHealthy: Bool = false) {
         guard manager.isVMRunning else {
-            pendingCheck = true
+            if !quietWhenHealthy { pendingCheck = true }
             return
         }
         pendingCheck = false
@@ -86,15 +117,23 @@ final class NATRecovery {
             guard let self = self else { return }
             let before = NATRecovery.guestEgress()
             if before == "ok" {
-                print("[nat] \(reason): the VM still reaches the internet")
+                DispatchQueue.main.async { self.reattachedSinceHealthy = false }
+                if !quietWhenHealthy {
+                    print("[nat] \(reason): the VM still reaches the internet")
+                }
                 return
             }
             DispatchQueue.main.async {
+                // Once per incident: a full-tunnel VPN keeps the path dead,
+                // and reattaching every minute would only cut connections.
+                guard !self.reattachedSinceHealthy, self.manager.isVMRunning else { return }
                 guard self.manager.reattachNAT() else { return }
+                self.reattachedSinceHealthy = true
                 print("[nat] \(reason): VM egress \(before); reattached the NAT")
                 DispatchQueue.global().asyncAfter(deadline: .now() + self.settleDelay) {
                     let after = NATRecovery.guestEgress()
                     if after == "ok" {
+                        DispatchQueue.main.async { self.reattachedSinceHealthy = false }
                         print("[nat] VM internet restored")
                     } else {
                         let iface = DispatchQueue.main.sync { self.lastInterface ?? "" }

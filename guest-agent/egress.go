@@ -32,7 +32,10 @@ func checkEgress(ctx context.Context, target string, lookup func(ctx context.Con
 	if _, err := lookup(ctx, host); err != nil {
 		return fmt.Sprintf("DNS lookup of %s failed: %v", host, err)
 	}
-	conn, err := dial(ctx, "tcp", target)
+	// IPv4 only: the macOS NAT carries the VM's IPv6 too, and an IPv6
+	// connect that worked hid a dead IPv4 path ("ok" while every container
+	// — IPv4-only networks — timed out).
+	conn, err := dial(ctx, "tcp4", target)
 	if err != nil {
 		return fmt.Sprintf("TCP connect to %s failed: %v", target, err)
 	}

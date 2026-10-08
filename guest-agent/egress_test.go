@@ -58,3 +58,17 @@ func TestExplainEgressFailure(t *testing.T) {
 		}
 	}
 }
+
+// The probe must use IPv4: IPv6 through the NAT can work while IPv4 is dead.
+func TestCheckEgressDialsIPv4(t *testing.T) {
+	var network string
+	lookup := func(context.Context, string) ([]string, error) { return []string{"1.2.3.4"}, nil }
+	dial := func(_ context.Context, n, _ string) (net.Conn, error) {
+		network = n
+		return nil, errors.New("refused")
+	}
+	checkEgress(context.Background(), "example.com:443", lookup, dial)
+	if network != "tcp4" {
+		t.Fatalf("probe dialed %q, want tcp4", network)
+	}
+}
