@@ -4098,12 +4098,13 @@ def test_network_disconnect_live() -> None:
     can go too, and so can the last one — then connect works again."""
     a, b = f"{PREFIX}-dca", f"{PREFIX}-dcb"
     c, peer = f"{PREFIX}-dcc", f"{PREFIX}-dcpeer"
-    lo_ok = "wget -qO- -T3 http://127.0.0.1:8080/ >/dev/null && echo LO-OK"
+    lo_ok = "nc -w3 127.0.0.1 8080 </dev/null | grep -q hi && echo LO-OK"
     try:
         docker("network", "create", a)
         docker("network", "create", b)
+        # alpine's busybox has no httpd: a loopback-only nc server instead.
         docker("run", "-d", "--name", c, "--network", a, "alpine", "sh", "-c",
-               "mkdir -p /w && echo hi > /w/index.html && httpd -f -p 127.0.0.1:8080 -h /w")
+               "while true; do echo hi | nc -l -s 127.0.0.1 -p 8080; done")
         docker("run", "-d", "--name", peer, "--network", b, "alpine", "sleep", "300")
         docker("network", "connect", b, c)
         # Secondary out: lo keeps serving.
