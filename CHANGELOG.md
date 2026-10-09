@@ -1,3 +1,14 @@
+## v1.9.5 (2026-10-09)
+
+### Added
+- e8ab5ca feat: ANVIL_INSTANCE — a second, independent anvil (state, VM, context anvil-dev) for development next to the usual service; validate kills only its own instance
+
+### Fixed
+- ae6710e fix: the agent recognizes any instance's docker.sock bind; tests and validate stay on their own instance (docker env, buildx builder, orphan count)
+
+### Internal
+- c971ddf test: relay tests read with poll (a blocked read slept through the half-close and hung swift test for an hour)
+- df237a8 build: Go 1.26.9 and golang.org/x/net 0.60.0 (govulncheck: stdlib html/template, net/http; x/net)
 ## v1.9.4 (2026-10-08)
 
 ### Added
