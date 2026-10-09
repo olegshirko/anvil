@@ -791,6 +791,15 @@ for m in crc32c_generic nf_conntrack nf_nat nf_tables nft_compat nft_ct nft_nat 
     modprobe $m 2>/dev/null || echo "[stage2] modprobe $m failed"
 done
 
+# VM-wide limits as Docker Desktop sets them. Every k3s/kind node (containerd,
+# kubelet, the CNI conf monitor, pods' fsnotify) takes inotify instances from
+# the one uid-0 budget: at the kernel default of 128, a fourth or fifth k3d
+# cluster never got its node up ("failed to create fsnotify watcher: too
+# many open files"). max_map_count is what Elasticsearch-style pods require.
+echo 8192    > /proc/sys/fs/inotify/max_user_instances || echo "[stage2] inotify instances limit not set"
+echo 1048576 > /proc/sys/fs/inotify/max_user_watches   || echo "[stage2] inotify watches limit not set"
+echo 262144  > /proc/sys/vm/max_map_count               || echo "[stage2] max_map_count not set"
+
 # Ensure mount propagation is private so runc can pivot_root into containers.
 mount --make-rprivate /
 

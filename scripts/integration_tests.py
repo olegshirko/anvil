@@ -4151,8 +4151,21 @@ def test_network_disconnect_live() -> None:
     record("network disconnect live", "PASS", "secondary keeps lo, primary and last network can go, reconnect works")
 
 
+def test_vm_sysctl_limits() -> None:
+    """The VM raises the limits Docker Desktop raises: inotify instances
+    and watches (several k3d clusters exhausted the default 128) and
+    vm.max_map_count."""
+    out = docker("run", "--rm", "alpine", "cat", "/proc/sys/fs/inotify/max_user_instances",
+                 "/proc/sys/fs/inotify/max_user_watches", "/proc/sys/vm/max_map_count").stdout.split()
+    want = ["8192", "1048576", "262144"]
+    if out != want:
+        raise RuntimeError(f"limits {out}, want {want}")
+    record("VM sysctl limits", "PASS", "inotify 8192/1048576, max_map_count 262144")
+
+
 TESTS = [
     ("docker version/info handshake", test_handshake),
+    ("VM sysctl limits", test_vm_sysctl_limits),
     ("run --rm attach + exit code", test_run_rm_output_and_exit_code),
     ("run flags P0 (entrypoint/w/add-host/memory/cap)", test_run_flags_p0),
     ("run flags wave2 (read-only/stop-signal/tmpfs/pid/net-host)", test_run_flags_wave2),
