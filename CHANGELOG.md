@@ -1,3 +1,7 @@
+## v1.9.6 (2026-10-09)
+
+### Fixed
+- 6caa3d5 fix: the VM raises inotify limits (8192 instances, 1048576 watches) and vm.max_map_count like Docker Desktop: several k3d clusters ran out of inotify instances
 ## v1.9.5 (2026-10-09)
 
 ### Added
