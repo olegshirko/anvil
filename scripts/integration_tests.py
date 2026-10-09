@@ -34,7 +34,14 @@ HOME = Path.home()
 INSTANCE = os.environ.get("ANVIL_INSTANCE", "")
 STATE_DIR = HOME / (".anvil-vz-" + INSTANCE if INSTANCE else ".anvil-vz")
 DOCKER_SOCKET = STATE_DIR / "docker.sock"
-DOCKER_ENV = {**os.environ, "DOCKER_HOST": f"unix://{DOCKER_SOCKET}"}
+# Every docker child (helpers and the tests' own subprocess calls) talks to
+# this instance. A named one also pins buildx to the docker driver of that
+# endpoint: the selected builder (anvil-remote) belongs to the usual
+# instance, and `docker build` went to its buildkit.
+os.environ["DOCKER_HOST"] = f"unix://{DOCKER_SOCKET}"
+if INSTANCE:
+    os.environ["BUILDX_BUILDER"] = "default"  # the docker driver of DOCKER_HOST
+DOCKER_ENV = dict(os.environ)
 PREFIX = "anvil-it"
 PORT_BASE = 18200
 

@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -526,11 +527,15 @@ func dockerSocketBindSource(src string) (string, bool) {
 	case "/var/run/docker.sock", "/run/docker.sock", "/var/run/docker.sock.raw":
 		return guestDockerSocket, true
 	}
-	if strings.HasSuffix(filepath.Clean(src), "/.anvil-vz/docker.sock") {
+	if anvilSocketPath.MatchString(filepath.Clean(src)) {
 		return guestDockerSocket, true
 	}
 	return src, false
 }
+
+// anvilSocketPath matches the Mac-side socket of any anvil instance:
+// ~/.anvil-vz/docker.sock, ~/.anvil-vz-dev/docker.sock (ANVIL_INSTANCE).
+var anvilSocketPath = regexp.MustCompile(`/\.anvil-vz(-[a-z0-9-]+)?/docker\.sock$`)
 
 // parseResizeQuery extracts the h/w terminal dimensions from a resize request.
 func parseResizeQuery(r *http.Request) (uint32, uint32, error) {

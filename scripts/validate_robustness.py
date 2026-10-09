@@ -368,7 +368,9 @@ def test_kill9_cleanup() -> None:
         # what matters is that vz-runner itself is gone and the singleton lock
         # is released so a new daemon can start immediately.
         ps = run_host(["ps", "aux"], check=False)
-        remaining = [line for line in ps.stdout.splitlines() if "vz-runner" in line and "validate_robustness" not in line]
+        # This instance's processes only: they name files in STATE_DIR/.
+        remaining = [line for line in ps.stdout.splitlines()
+                     if "vz-runner" in line and f"{STATE_DIR}/" in line and "validate_robustness" not in line]
         if remaining:
             record("kill -9 cleanup", False, f"orphan vz-runner processes: {len(remaining)}")
             return

@@ -86,12 +86,12 @@ func TestRequestedVsAssignedPortBindings(t *testing.T) {
 
 func TestDockerSocketBindSource(t *testing.T) {
 	for _, src := range []string{"/var/run/docker.sock", "/run/docker.sock", "/var/run/docker.sock.raw",
-		"/Users/me/.anvil-vz/docker.sock", "/var/run//docker.sock"} {
+		"/Users/me/.anvil-vz/docker.sock", "/Users/me/.anvil-vz-dev/docker.sock", "/var/run//docker.sock"} {
 		if got, ok := dockerSocketBindSource(src); !ok || got != guestDockerSocket {
 			t.Errorf("%s -> %s, %v; want %s", src, got, ok, guestDockerSocket)
 		}
 	}
-	for _, src := range []string{"/Users/me/project", "/var/run/other.sock", "/Users/me/docker.sock"} {
+	for _, src := range []string{"/Users/me/project", "/var/run/other.sock", "/Users/me/docker.sock", "/Users/me/.anvil-vzx/docker.sock"} {
 		if got, ok := dockerSocketBindSource(src); ok || got != src {
 			t.Errorf("%s rewritten to %s", src, got)
 		}
