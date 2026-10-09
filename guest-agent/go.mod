@@ -1,6 +1,6 @@
 module github.com/olegshirko/anvil/guest-agent
 
-go 1.26.8
+go 1.26.9
 
 require (
 	github.com/containerd/containerd/api v1.11.1
@@ -18,7 +18,7 @@ require (
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/opencontainers/runtime-spec v1.3.0
 	github.com/tonistiigi/fsutil v0.0.0-20260717003753-6d9dc2ebad62
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 	golang.org/x/sys v0.48.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
