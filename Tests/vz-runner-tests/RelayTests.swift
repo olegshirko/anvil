@@ -29,7 +29,10 @@ final class RelayTests: XCTestCase {
         var out: [UInt8] = []
         var buf = [UInt8](repeating: 0, count: 65536)
         while true {
-            let n = read(fd, &buf, buf.count)
+            // readWhenReady, not read(2): a blocked read on a unix socket
+            // can sleep through the peer's half-close (see the relay), and
+            // the test hung there for an hour.
+            let n = buf.withUnsafeMutableBytes { readWhenReady(fd, $0.baseAddress!, $0.count) }
             if n <= 0 { return out }
             out.append(contentsOf: buf[0..<n])
         }
