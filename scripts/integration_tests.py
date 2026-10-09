@@ -30,7 +30,10 @@ import time
 from pathlib import Path
 
 HOME = Path.home()
-DOCKER_SOCKET = HOME / ".anvil-vz" / "docker.sock"
+# ANVIL_INSTANCE=dev targets the development instance (~/.anvil-vz-dev).
+INSTANCE = os.environ.get("ANVIL_INSTANCE", "")
+STATE_DIR = HOME / (".anvil-vz-" + INSTANCE if INSTANCE else ".anvil-vz")
+DOCKER_SOCKET = STATE_DIR / "docker.sock"
 DOCKER_ENV = {**os.environ, "DOCKER_HOST": f"unix://{DOCKER_SOCKET}"}
 PREFIX = "anvil-it"
 PORT_BASE = 18200
@@ -2257,7 +2260,7 @@ def test_cp_symlink_race_stays_in_container() -> None:
     share (/mnt/anvil, the Mac) must not get docker cp to write there."""
     name = f"{PREFIX}-cprace"
     marker = f"anvil-cp-escape-{os.getpid()}.txt"
-    share_roots = [HOME / ".anvil-vz"]
+    share_roots = [STATE_DIR]
     ps = subprocess.run(["pgrep", "-fl", "vz-runner daemon"], capture_output=True, text=True).stdout
     m = re.search(r"--share (\S+)", ps)
     if m:

@@ -8,6 +8,10 @@ accident and all covered by tests.
 ## Checklist
 
 - `make unit-tests` — Go + Swift unit tests (no VM needed)
+- `make dev-rebuild && make dev-integration` — the same against a second
+  instance (`ANVIL_INSTANCE=dev`, `~/.anvil-vz-dev`, docker context
+  `anvil-dev`), so rebuilds, cold boots and test runs leave the usual
+  service and its containers alone; `make dev-validate`, `make dev-stop`.
 - `make service-debug-rebuild && make integration` — full integration
   suite against a live VM (pulls alpine/nginx/busybox)
 - English only in code comments and commit messages

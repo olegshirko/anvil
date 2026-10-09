@@ -5,8 +5,23 @@ let dockerAPIPort: UInt32 = 1025
 let buildkitAPIPort: UInt32 = 1026
 // Host-listening port: the guest dials it to check host port availability.
 let portCheckPort: UInt32 = 1027
+/// A second, independent anvil next to the usual one (ANVIL_INSTANCE=dev):
+/// its own state directory, VM, disk, snapshot and sockets, and its own
+/// docker context ("anvil-dev"). Empty for the usual instance.
+let anvilInstance: String = {
+    let raw = ProcessInfo.processInfo.environment["ANVIL_INSTANCE"] ?? ""
+    let allowed = Set("abcdefghijklmnopqrstuvwxyz0123456789-")
+    guard !raw.isEmpty else { return "" }
+    guard raw.count <= 20, raw.allSatisfy({ allowed.contains($0) }) else {
+        FileHandle.standardError.write("[anvil] ANVIL_INSTANCE must be 1-20 of [a-z0-9-]; got \(raw)\n".data(using: .utf8)!)
+        exit(2)
+    }
+    return raw
+}()
 let stateDir = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent(".anvil-vz", isDirectory: true)
+    .appendingPathComponent(anvilInstance.isEmpty ? ".anvil-vz" : ".anvil-vz-\(anvilInstance)", isDirectory: true)
+/// The docker context naming this instance's socket.
+let dockerContextName = anvilInstance.isEmpty ? "anvil" : "anvil-\(anvilInstance)"
 let stateFile = stateDir.appendingPathComponent("run.json")
 let controlSocketPath = stateDir.appendingPathComponent("control.sock").path
 let dockerSocketPath = stateDir.appendingPathComponent("docker.sock").path

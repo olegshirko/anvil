@@ -2,6 +2,7 @@
     start stop daemon stop-daemon \
     service-install service-uninstall service-start service-stop service-restart service-status \
     service-debug service-debug-rebuild rebuild-all \
+    dev-start dev-stop dev-rebuild dev-integration dev-validate \
     docker-context-anvil docker-context-lima lima-restart colima-start colima-stop \
     boot boot-alpine boot-ubuntu boot-containerd \
     download-alpine extract-alpine-kernel \
@@ -14,6 +15,11 @@
     release replace-release update-brew release-notes bottle bottle-resume
 
 BINARY := .build/release/vz-runner
+# ANVIL_INSTANCE=dev: a second, independent anvil (state in ~/.anvil-vz-dev,
+# docker context anvil-dev) next to the usual service — see `make dev-*`.
+ANVIL_INSTANCE ?=
+export ANVIL_INSTANCE
+ANVIL_STATE_DIR := $(HOME)/.anvil-vz$(if $(ANVIL_INSTANCE),-$(ANVIL_INSTANCE))
 ENTITLEMENTS := entitlements.plist
 # Release targets require an explicit VERSION=x.y.z; plain builds are "dev".
 BUILD_VERSION := $(or $(VERSION),dev)
@@ -83,12 +89,25 @@ rebuild-all: sign initramfs-containerd
 # Debug logs from guest-agent are written to $(SHARE_ROOT)/guest-agent.log.
 service-debug:
 	@$(MAKE) service-stop
-	@rm -rf $(HOME)/.anvil-vz/snapshots
+	@rm -rf $(ANVIL_STATE_DIR)/snapshots
 	@DEBUG=1 $(MAKE) service-start
 
 # Rebuild everything (Swift binary, guest-agent, initramfs), then restart the
 # service in debug mode with a fresh VM snapshot.
 service-debug-rebuild: rebuild-all service-debug
+
+# Development instance: the same targets against ANVIL_INSTANCE=dev, so
+# rebuilds, cold boots and test runs never touch the usual service.
+dev-start:
+	@$(MAKE) service-start ANVIL_INSTANCE=dev
+dev-stop:
+	@$(MAKE) service-stop ANVIL_INSTANCE=dev
+dev-rebuild:
+	@$(MAKE) service-debug-rebuild ANVIL_INSTANCE=dev
+dev-integration:
+	@$(MAKE) integration ANVIL_INSTANCE=dev
+dev-validate:
+	@$(MAKE) validate ANVIL_INSTANCE=dev
 
 # Switch Docker CLI context. LIMA_DOCKER_CONTEXT can be overridden, e.g.
 # make docker-context-lima LIMA_DOCKER_CONTEXT=lima.
@@ -137,7 +156,7 @@ prune clean-containers:
 # regions. The file's logical size and content stay identical, so the VM
 # snapshot remains valid. The daemon is stopped for the copy and restarted
 # afterwards.
-CONTAINERD_DISK := $(HOME)/.anvil-vz/containerd-disk.img
+CONTAINERD_DISK := $(ANVIL_STATE_DIR)/containerd-disk.img
 
 disk-compact:
 	@$(MAKE) service-stop

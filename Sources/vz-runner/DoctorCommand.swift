@@ -97,8 +97,12 @@ func cmdDoctor(args: [String]) {
     let dockerHost = ProcessInfo.processInfo.environment["DOCKER_HOST"] ?? ""
     if dockerHost == "unix://\(dockerSocketPath)" {
         check("docker context", true, "DOCKER_HOST=\(dockerHost)")
+    } else if !anvilInstance.isEmpty {
+        // A named instance never takes over the current context.
+        let exists = !shell("docker", "context", "inspect", dockerContextName).isEmpty
+        check("docker context", exists, exists ? "\(dockerContextName) (use --context \(dockerContextName))" : "\(dockerContextName) missing (anvil start)")
     } else {
-        check("docker context", ctx == "anvil", "current: \(ctx)" + (dockerHost.isEmpty ? "" : ", DOCKER_HOST=\(dockerHost)"))
+        check("docker context", ctx == dockerContextName, "current: \(ctx)" + (dockerHost.isEmpty ? "" : ", DOCKER_HOST=\(dockerHost)"))
     }
     check("docker.sock", FileManager.default.fileExists(atPath: dockerSocketPath), dockerSocketPath)
     var ping = ""

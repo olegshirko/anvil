@@ -170,6 +170,7 @@ size changes the snapshot key, so the next start is a cold boot.
 | `ANVIL_DISK_GB` | `64` | containerd disk size (sparse; existing disks only grow, guest fs is resized online) |
 | `ANVIL_BUILD_CACHE_GB` | `20` | Cap on the build cache: buildkit garbage-collects it down to this size after builds (as Docker Desktop's builder does); `0` leaves buildkit's own policy. Takes effect when buildkitd next starts (cold boot) |
 | `ANVIL_SHARE_USERS` | `1` | Shares the Mac's `/Users`, `/Volumes`, `/tmp` and `/var/folders` into the VM at the same paths (Docker Desktop's defaults), so bind mounts of them work; a missing `-v` source elsewhere is refused ("mounts denied") rather than created in VM memory; `0` disables sharing |
+| `ANVIL_INSTANCE` | — | A second, independent anvil next to the usual one (e.g. `dev`): state in `~/.anvil-vz-<name>`, its own VM, disk, snapshot and sockets, docker context `anvil-<name>` and buildx builder `anvil-<name>-remote`. It never becomes the current docker context or the launchd service: `docker --context anvil-dev …` |
 | `ANVIL_SHARE_EXTRA` | `volumes,tmp,varfolders` | Which of the extra shares (`/Volumes`, `/tmp`, `/var/folders`) to set up; empty for none |
 | `ANVIL_IDLE` | `600` | Seconds without Docker clients, forwarded connections or running containers before the VM is paused into its snapshot |
 | `ANVIL_DOMAINS` | off | `1` serves `http://<container>.anvil.localhost` (and `<service>.<project>.anvil.localhost`) |

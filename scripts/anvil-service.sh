@@ -18,7 +18,20 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Homebrew installs assets under $(brew --prefix)/share/anvil; source builds
 # keep them in PROJECT_ROOT/.download/ubuntu. The state dir always lives in
 # the user's home so upgrades do not wipe container data.
-STATE_DIR="$HOME/.anvil-vz"
+# ANVIL_INSTANCE=dev runs a second, independent anvil next to the usual one
+# (development builds while the usual service keeps running): its own state
+# directory, VM, disk and snapshot, docker context "anvil-dev" and buildx
+# builder "anvil-dev-remote". A named instance never takes over the current
+# docker context or buildx builder, and is never the launchd service.
+ANVIL_INSTANCE="${ANVIL_INSTANCE:-}"
+if [[ -n "$ANVIL_INSTANCE" && ! "$ANVIL_INSTANCE" =~ ^[a-z0-9-]{1,20}$ ]]; then
+    echo "[anvil-service] ANVIL_INSTANCE must be 1-20 of [a-z0-9-]" >&2
+    exit 2
+fi
+export ANVIL_INSTANCE
+STATE_DIR="$HOME/.anvil-vz${ANVIL_INSTANCE:+-$ANVIL_INSTANCE}"
+CONTEXT="anvil${ANVIL_INSTANCE:+-$ANVIL_INSTANCE}"
+BUILDER="$CONTEXT-remote"
 BREW_ASSETS_DIR="$PROJECT_ROOT/assets"
 
 # Resolve the vz-runner binary: explicit env var first. In a source tree the
@@ -38,7 +51,11 @@ fi
 
 CONTAINERD_DISK="${CONTAINERD_DISK:-$STATE_DIR/containerd-disk.img}"
 # Source builds share the project directory; brew installs share the state dir.
-if [[ -f "$PROJECT_ROOT/Package.swift" ]]; then
+if [[ -n "$ANVIL_INSTANCE" ]]; then
+    # The guest keeps state under <share>/.anvil-run (networks, logs): a
+    # named instance must not share it with the usual one's project dir.
+    SHARE_ROOT="${SHARE_ROOT:-$STATE_DIR}"
+elif [[ -f "$PROJECT_ROOT/Package.swift" ]]; then
     SHARE_ROOT="${SHARE_ROOT:-$PROJECT_ROOT}"
 else
     SHARE_ROOT="${SHARE_ROOT:-$STATE_DIR}"
@@ -162,7 +179,8 @@ save_docker_context() {
     current_context="$(docker context show 2>/dev/null || echo default)"
     # Already on anvil (a daemon that died without a stop left it there):
     # keep the context saved back then, or stop would fall back to default.
-    if [[ "$current_context" != "anvil" ]]; then
+    [[ -z "$ANVIL_INSTANCE" ]] || return 0
+    if [[ "$current_context" != "$CONTEXT" ]]; then
         echo "$current_context" > "$PREV_CONTEXT_FILE"
     fi
 }
@@ -182,7 +200,7 @@ cmd_start() {
             cmd_stop
         else
             echo "[anvil-service] daemon already running (pid $pid)"
-            docker context use anvil >/dev/null 2>&1 || true
+            [[ -n "$ANVIL_INSTANCE" ]] || docker context use "$CONTEXT" >/dev/null 2>&1 || true
             echo "[anvil-service] docker context: $(docker context show 2>/dev/null || echo unknown)"
             return 0
         fi
@@ -290,11 +308,15 @@ setup_docker_context() {
         echo "[anvil-service] ready (pid $(cat "$PID_FILE")); docker CLI not found, context not switched"
         return 0
     fi
-    echo "[anvil-service] switching docker context to anvil..."
-    if ! docker context inspect anvil >/dev/null 2>&1; then
-        docker context create anvil --docker "host=unix://$STATE_DIR/docker.sock" >/dev/null
+    if ! docker context inspect "$CONTEXT" >/dev/null 2>&1; then
+        docker context create "$CONTEXT" --docker "host=unix://$STATE_DIR/docker.sock" >/dev/null
     fi
-    docker context use anvil >/dev/null
+    if [[ -n "$ANVIL_INSTANCE" ]]; then
+        echo "[anvil-service] instance $ANVIL_INSTANCE: docker context $CONTEXT (not made current; docker --context $CONTEXT ...)"
+    else
+        echo "[anvil-service] switching docker context to $CONTEXT..."
+        docker context use "$CONTEXT" >/dev/null
+    fi
 
     # Point buildx at the in-VM buildkitd via the remote driver so plain
     # `docker build` works without DOCKER_BUILDKIT=0. The previously selected
@@ -302,16 +324,16 @@ setup_docker_context() {
     if command -v docker >/dev/null && docker buildx version >/dev/null 2>&1; then
         local current_builder
         current_builder="$(docker buildx inspect 2>/dev/null | sed -n 's/^Name:[[:space:]]*//p' | head -1)"
-        if [[ "$current_builder" != "anvil-remote" ]]; then
+        if [[ -z "$ANVIL_INSTANCE" && "$current_builder" != "$BUILDER" ]]; then
             echo "${current_builder:-default}" > "$STATE_DIR/previous-buildx-builder"
         fi
         # Missing or wrong driver (stale docker-container builder): recreate.
-        if ! docker buildx inspect anvil-remote 2>/dev/null | grep -q 'Driver:.*remote'; then
-            docker buildx rm -f anvil-remote >/dev/null 2>&1 || true
-            docker buildx create --name anvil-remote --driver remote \
+        if ! docker buildx inspect "$BUILDER" 2>/dev/null | grep -q 'Driver:.*remote'; then
+            docker buildx rm -f "$BUILDER" >/dev/null 2>&1 || true
+            docker buildx create --name "$BUILDER" --driver remote \
                 "unix://$STATE_DIR/buildkit.sock" >/dev/null 2>&1 || true
         fi
-        docker buildx use anvil-remote >/dev/null 2>&1 || true
+        [[ -n "$ANVIL_INSTANCE" ]] || docker buildx use "$BUILDER" >/dev/null 2>&1 || true
     fi
 
     echo "[anvil-service] ready (pid $(cat "$PID_FILE"))"
@@ -349,7 +371,7 @@ cmd_stop() {
     # first: buildx keeps its selection per docker context.
     local current_builder
     current_builder="$(docker buildx inspect 2>/dev/null | sed -n 's/^Name:[[:space:]]*//p' | head -1)"
-    if [[ "$current_builder" == "anvil-remote" ]]; then
+    if [[ "$current_builder" == "$BUILDER" ]]; then
         local prev_builder="default"
         if [[ -f "$STATE_DIR/previous-buildx-builder" ]]; then
             prev_builder="$(tr -d '[:space:]' < "$STATE_DIR/previous-buildx-builder")"
@@ -360,7 +382,7 @@ cmd_stop() {
 
     local current_context
     current_context="$(docker context show 2>/dev/null || echo default)"
-    if [[ "$current_context" == "anvil" ]]; then
+    if [[ "$current_context" == "$CONTEXT" ]]; then
         local target="default"
         if [[ -f "$PREV_CONTEXT_FILE" ]]; then
             target="$(cat "$PREV_CONTEXT_FILE")"

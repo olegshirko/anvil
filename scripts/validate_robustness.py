@@ -47,11 +47,15 @@ PORT_B = _free_port(PORT_A + 1)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VZ_RUNNER = PROJECT_ROOT / ".build" / "release" / "vz-runner"
-SHARE_DIR = Path("/tmp/anvil-share")
-STATE_DIR = Path.home() / ".anvil-vz"
+# ANVIL_INSTANCE=dev validates the development instance; everything below,
+# the daemons it kills included, belongs to that instance only.
+INSTANCE = os.environ.get("ANVIL_INSTANCE", "")
+_SUFFIX = "-" + INSTANCE if INSTANCE else ""
+SHARE_DIR = Path("/tmp/anvil-share" + _SUFFIX)
+STATE_DIR = Path.home() / (".anvil-vz" + _SUFFIX)
 SNAPSHOT_DIR = STATE_DIR / "snapshots"
 SNAPSHOT_FILE = SNAPSHOT_DIR / "default.vzstate"
-LOG_FILE = Path("/tmp/validate_robustness.log")
+LOG_FILE = Path(f"/tmp/validate_robustness{_SUFFIX}.log")
 
 results: list[tuple[str, bool, str]] = []
 
@@ -74,7 +78,9 @@ def run_host(cmd: list[str], timeout: float = 30.0, check: bool = True) -> subpr
 
 
 def kill_daemon() -> None:
-    subprocess.run(["pkill", "-9", "-f", "vz-runner"], capture_output=True)
+    # Only this instance's daemon: its command line names files in
+    # STATE_DIR/. A bare "vz-runner" pattern killed the usual service too.
+    subprocess.run(["pkill", "-9", "-f", f"vz-runner .*{STATE_DIR}/"], capture_output=True)
     time.sleep(0.5)
     for name in ("daemon.pid", "run.json"):
         (STATE_DIR / name).unlink(missing_ok=True)
@@ -95,7 +101,7 @@ def start_daemon(fresh: bool = False, extra_args: list[str] | None = None,
     # rootfs errors from runc), the same reason the bench-harness drivers
     # always pass --containerd-disk.
     disk = os.environ.get("ANVIL_VALIDATE_DISK",
-                          os.path.expanduser("~/.anvil-vz/validate-disk.img"))
+                          str(STATE_DIR / "validate-disk.img"))
     if not os.path.exists(disk):
         # Sparse image, the same way anvil-service.sh provisions its disk.
         os.makedirs(os.path.dirname(disk), exist_ok=True)
@@ -134,7 +140,7 @@ def vz_exec(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
 # users configure their docker context to. A containerd namespace maps to a
 # Docker network here: `--network <name>` puts the container into the
 # namespace/conflist of that name (see guest-agent createDockerContainer).
-DOCKER_SOCKET = Path.home() / ".anvil-vz" / "docker.sock"
+DOCKER_SOCKET = STATE_DIR / "docker.sock"
 
 
 def docker(*args: str, network: str | None = None,

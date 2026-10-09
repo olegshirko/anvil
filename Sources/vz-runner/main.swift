@@ -73,14 +73,30 @@ func saveDockerContext() {
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? "default"
     // Already on anvil (a daemon that died without a stop left it there):
     // keep the context saved back then, or stop would fall back to default.
-    if ctx != "anvil" {
+    if ctx != dockerContextName {
         try? ctx.write(toFile: prevContextFile.path, atomically: true, encoding: .utf8)
+    }
+}
+
+/// The buildx builder pointing at this instance's buildkit socket.
+let buildxBuilderName = dockerContextName + "-remote"
+
+/// (Re)creates this instance's docker context. The usual instance also
+/// makes it current; a named one (ANVIL_INSTANCE=dev) leaves the user's
+/// context alone — use `docker --context anvil-dev` or DOCKER_CONTEXT.
+func registerDockerContext() {
+    _ = shell("docker", "context", "rm", "-f", dockerContextName)
+    _ = shell("docker", "context", "create", dockerContextName, "--docker", "host=unix://\(dockerSocketPath)")
+    if anvilInstance.isEmpty {
+        _ = shell("docker", "context", "use", dockerContextName)
+    } else {
+        print("[anvil] instance \(anvilInstance): docker context \(dockerContextName) (not made current; use `docker --context \(dockerContextName)` or DOCKER_CONTEXT=\(dockerContextName))")
     }
 }
 
 func restoreDockerContext() {
     let current = shell("docker", "context", "show").trimmingCharacters(in: .whitespacesAndNewlines)
-    guard current == "anvil" else { return }
+    guard current == dockerContextName else { return }
     // buildx keeps its selected builder per context: put the previous one
     // back while anvil's context is still current.
     restoreBuildxBuilder()
@@ -115,22 +131,24 @@ func currentBuildxBuilder() -> String {
 func setupBuildxBuilder() {
     guard !shell("docker", "buildx", "version").isEmpty else { return }
     let current = currentBuildxBuilder()
-    if current != "anvil-remote" {
+    if current != buildxBuilderName {
         try? current.write(toFile: prevBuilderFile.path, atomically: true, encoding: .utf8)
     }
-    let inspect = shell("docker", "buildx", "inspect", "anvil-remote")
+    let inspect = shell("docker", "buildx", "inspect", buildxBuilderName)
     if inspect.isEmpty || !inspect.contains("Driver:") || !inspect.contains("remote") {
         // Missing, or a stale builder with the wrong driver (e.g. an older
         // docker-container one) — recreate it against the buildkit socket.
-        _ = shell("docker", "buildx", "rm", "-f", "anvil-remote")
-        _ = shell("docker", "buildx", "create", "--name", "anvil-remote",
+        _ = shell("docker", "buildx", "rm", "-f", buildxBuilderName)
+        _ = shell("docker", "buildx", "create", "--name", buildxBuilderName,
                   "--driver", "remote", "unix://\(buildkitSocketPath)")
     }
-    _ = shell("docker", "buildx", "use", "anvil-remote")
+    if anvilInstance.isEmpty {
+        _ = shell("docker", "buildx", "use", buildxBuilderName)
+    }
 }
 
 func restoreBuildxBuilder() {
-    guard currentBuildxBuilder() == "anvil-remote" else { return }
+    guard currentBuildxBuilder() == buildxBuilderName else { return }
     let saved = (try? String(contentsOf: prevBuilderFile, encoding: .utf8))?
         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     _ = shell("docker", "buildx", "use", saved.isEmpty ? "default" : saved)
@@ -203,9 +221,7 @@ func cmdStart(args: [String]) {
     if isDaemonRunning() {
         let pid = (try? String(contentsOf: daemonPIDFile, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "?"
         print("[anvil] daemon already running (pid \(pid))")
-        _ = shell("docker", "context", "rm", "-f", "anvil")
-        _ = shell("docker", "context", "create", "anvil", "--docker", "host=unix://\(dockerSocketPath)")
-        _ = shell("docker", "context", "use", "anvil")
+        registerDockerContext()
         setupBuildxBuilderAsync()
         return
     }
@@ -335,9 +351,7 @@ func cmdStart(args: [String]) {
         exit(1)
     }
 
-    _ = shell("docker", "context", "rm", "-f", "anvil")
-    _ = shell("docker", "context", "create", "anvil", "--docker", "host=unix://\(dockerSocketPath)")
-    _ = shell("docker", "context", "use", "anvil")
+    registerDockerContext()
     // buildx setup talks to docker/buildx 5-8 times (~3-4s with Docker Desktop
     // installed) and is only needed for `docker buildx build` — plain `docker
     // build` goes through the guest-agent /build endpoint. Run it detached so
