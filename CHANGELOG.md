@@ -1,3 +1,12 @@
+## v1.9.7 (2026-10-11)
+
+### Fixed
+- 5d68bf7 fix(nat): a single failed egress probe no longer reattaches the NAT
+- 2a76627 fix(volumes): a named volume is one volume across compose projects
+- d352f1e fix(events): --until in the past replays the window, as dockerd does
+- 7c164ca fix(net): container /etc/hosts is updated in place, never empty
+- fc9fa95 fix(exec): exec -t without -i no longer dies of SIGHUP
+- 3fe5169 fix(exec): docker exec -u <name> runs as that user
 ## v1.9.6 (2026-10-09)
 
 ### Fixed
