@@ -9,11 +9,12 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // dockerPathStat is the JSON returned in the X-Docker-Container-Path-Stat header.
@@ -242,42 +243,75 @@ func withRootfsMount(ns, containerdID string, withBinds bool, fn func(root strin
 // "name:group", "uid:gid") against the container's own /etc/passwd and
 // /etc/group; the caller is chrooted into the container's root.
 func resolveContainerUser(user string) (int, int, error) {
+	u, err := lookupContainerUser(func(name string) ([]byte, error) {
+		return os.ReadFile("/" + name)
+	}, user)
+	return int(u.UID), int(u.GID), err
+}
+
+// lookupContainerUser resolves a user spec the way runc does for Docker:
+// a name or uid from passwd (its primary gid; a uid without an entry gets
+// gid 0), an optional group by name or gid, and the supplementary groups
+// that list the user. readFile reads "etc/passwd" and "etc/group" from the
+// container's root.
+func lookupContainerUser(readFile func(string) ([]byte, error), user string) (specs.User, error) {
 	if user == "" {
-		return 0, 0, nil
+		return specs.User{}, nil
 	}
 	name, group, hasGroup := strings.Cut(user, ":")
-	lookup := func(file, key string, idField int) (int, int, bool) {
-		data, _ := os.ReadFile(file)
+	entries := func(file string) [][]string {
+		data, _ := readFile(file)
+		var out [][]string
 		for _, line := range strings.Split(string(data), "\n") {
-			f := strings.Split(line, ":")
-			if len(f) < 4 || (f[0] != key && f[2] != key) {
+			if f := strings.Split(line, ":"); len(f) >= 4 {
+				out = append(out, f)
+			}
+		}
+		return out
+	}
+	lookup := func(file, key string, idField int) (uint32, uint32, string, bool) {
+		for _, f := range entries(file) {
+			if f[0] != key && f[2] != key {
 				continue
 			}
-			id, err1 := strconv.Atoi(f[2])
-			other, err2 := strconv.Atoi(f[idField])
+			id, err1 := parseUint32(f[2])
+			other, err2 := parseUint32(f[idField])
 			if err1 != nil || err2 != nil {
 				continue
 			}
-			return id, other, true
+			return id, other, f[0], true
 		}
-		return 0, 0, false
+		return 0, 0, "", false
 	}
-	uid, gid, ok := lookup("/etc/passwd", name, 3)
+	var u specs.User
+	uid, gid, userName, ok := lookup("etc/passwd", name, 3)
 	if !ok {
-		n, err := strconv.Atoi(name)
+		n, err := parseUint32(name)
 		if err != nil {
-			return 0, 0, fmt.Errorf("unable to find user %s: no matching entries in passwd file", name)
+			return u, fmt.Errorf("unable to find user %s: no matching entries in passwd file", name)
 		}
 		uid, gid = n, 0 // as libcontainer's GetExecUser defaults it
 	}
+	u.UID, u.GID = uid, gid
 	if hasGroup {
-		if g, _, ok := lookup("/etc/group", group, 2); ok {
-			gid = g
-		} else if n, err := strconv.Atoi(group); err == nil {
-			gid = n
+		if g, _, _, ok := lookup("etc/group", group, 2); ok {
+			u.GID = g
+		} else if n, err := parseUint32(group); err == nil {
+			u.GID = n
 		} else {
-			return 0, 0, fmt.Errorf("unable to find group %s: no matching entries in group file", group)
+			return u, fmt.Errorf("unable to find group %s: no matching entries in group file", group)
 		}
 	}
-	return uid, gid, nil
+	if userName != "" {
+		for _, f := range entries("etc/group") {
+			gid, err := parseUint32(f[2])
+			if err != nil || gid == u.GID || slices.Contains(u.AdditionalGids, gid) {
+				continue
+			}
+			if slices.Contains(strings.Split(f[3], ","), userName) {
+				u.AdditionalGids = append(u.AdditionalGids, gid)
+			}
+		}
+	}
+	return u, nil
 }

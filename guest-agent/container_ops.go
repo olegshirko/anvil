@@ -763,7 +763,10 @@ func runSimpleExecEnv(ctx context.Context, ns, id string, argv []string, user, c
 		return nil, fmt.Errorf("task: %w", err)
 	}
 
-	u := execUserFor(nsCtx, c, user)
+	u, err := execUserFor(nsCtx, c, task, user)
+	if err != nil {
+		return nil, err
+	}
 	env, ctrCwd := containerProcessDefaults(nsCtx, c)
 	env = mergeEnv(env, extraEnv)
 	pspec := &specs.Process{
@@ -893,26 +896,26 @@ func runSimpleExecEnv(ctx context.Context, ns, id string, argv []string, user, c
 	return &simpleExecResult{stdout: outBuf.String(), stderr: errBuf.String(), exitCode: exitCode}, nil
 }
 
-// execUserFor maps an optional "uid[:gid]" user spec onto the OCI User of the
-// container's own spec. Non-numeric names fall back to the container user.
-func execUserFor(ctx context.Context, c client.Container, userstr string) specs.User {
-	out := specs.User{}
-	if spec, err := c.Spec(ctx); err == nil && spec.Process != nil {
-		out = spec.Process.User
-	}
+// execUserFor resolves an exec's user spec ("name", "uid", "name:group",
+// "uid:gid") against the running container's /etc/passwd and /etc/group,
+// as Docker does; empty keeps the container's own user. Names used to be
+// ignored, so `docker exec -u postgres` ran as root.
+func execUserFor(ctx context.Context, c client.Container, task client.Task, userstr string) (specs.User, error) {
 	if userstr == "" {
-		return out
-	}
-	parts := strings.SplitN(userstr, ":", 2)
-	if uid, err := parseUint32(parts[0]); err == nil {
-		out.UID = uid
-	}
-	if len(parts) == 2 {
-		if gid, err := parseUint32(parts[1]); err == nil {
-			out.GID = gid
+		if spec, err := c.Spec(ctx); err == nil && spec.Process != nil {
+			return spec.Process.User, nil
 		}
+		return specs.User{}, nil
 	}
-	return out
+	// The process's root, opened as an os.Root: the container's symlinks
+	// cannot lead the lookup out of it.
+	root, err := os.OpenRoot(fmt.Sprintf("/proc/%d/root", task.Pid()))
+	readFile := func(string) ([]byte, error) { return nil, err }
+	if err == nil {
+		defer root.Close()
+		readFile = root.ReadFile
+	}
+	return lookupContainerUser(readFile, userstr)
 }
 
 func parseUint32(s string) (uint32, error) {

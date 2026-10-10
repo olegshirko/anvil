@@ -779,7 +779,7 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 				}
 				for _, g := range groups {
 					// Numeric-only by design: names would need /etc/group
-					// from the image rootfs (same punt as execUserFor).
+					// from the image rootfs.
 					gid, err := strconv.Atoi(g)
 					if err != nil || gid < 0 {
 						return fmt.Errorf("group-add %q: only numeric gids are supported", g)

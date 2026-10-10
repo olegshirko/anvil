@@ -2922,6 +2922,29 @@ def test_exec_tty() -> None:
         cleanup(name)
 
 
+def test_exec_user_name() -> None:
+    """`docker exec -u <name>` runs as that user from the container's passwd
+    (regression: names were ignored and the command ran as root)."""
+    name = f"{PREFIX}-execuser"
+    try:
+        docker("run", "-d", "--name", name, "alpine", "sleep", "300")
+        uid = docker("exec", "-u", "nobody", name, "id", "-u").stdout.strip()
+        if uid != "65534":
+            raise RuntimeError(f"exec -u nobody ran as uid {uid}")
+        ids = docker("exec", "-u", "bin", name, "id").stdout.strip()
+        if not ids.startswith("uid=1(bin) gid=1(bin)") or ids.count(",") < 1:
+            raise RuntimeError(f"exec -u bin: {ids!r}, want uid/gid 1 and supplementary groups")
+        grp = docker("exec", "-u", "nobody:bin", name, "id", "-g").stdout.strip()
+        if grp != "1":
+            raise RuntimeError(f"exec -u nobody:bin ran with gid {grp}")
+        bad = docker("exec", "-u", "no-such-user", name, "id", check=False)
+        if bad.returncode == 0 or "unable to find user" not in bad.stderr:
+            raise RuntimeError(f"unknown user: rc={bad.returncode} {bad.stderr.strip()!r}")
+        record("exec -u by name", "PASS", ids)
+    finally:
+        cleanup(name)
+
+
 def test_run_interactive_stdin() -> None:
     """`docker run -i` pipes stdin into the container and closes it at EOF."""
     out = docker("run", "--rm", "-i", "alpine", "sh", "-c", "wc -c; echo done",
@@ -4280,6 +4303,7 @@ TESTS = [
     ("API status codes", test_api_status_codes),
     ("published port half-close", test_published_port_half_close),
     ("exec -t tty", test_exec_tty),
+    ("exec -u by name", test_exec_user_name),
     ("run -i stdin", test_run_interactive_stdin),
     ("start -ai stdin", test_attach_stdin_and_detach),
     ("tty container logs raw", test_tty_logs_raw),

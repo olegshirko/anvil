@@ -366,12 +366,17 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		}()
 	}
 
+	user, uerr := execUserFor(nsCtx, container, task, spec.User)
+	if uerr != nil {
+		failExec("exec", uerr)
+		return
+	}
 	ctrEnv, ctrCwd := containerProcessDefaults(nsCtx, container)
 	pspec := &specs.Process{
 		Args:     spec.Cmd,
 		Env:      mergeEnv(ctrEnv, spec.Env),
 		Cwd:      defaultString(spec.WorkingDir, ctrCwd),
-		User:     execUserFor(nsCtx, container, spec.User),
+		User:     user,
 		Terminal: spec.Tty,
 	}
 
