@@ -24,6 +24,9 @@ final class NATRecovery {
     private let pollInterval: TimeInterval = 5
     /// Lets the new route and DNS settle before the guest is asked.
     private let settleDelay: TimeInterval = 3
+    /// A failed probe is repeated this much later before the NAT is
+    /// reattached.
+    private let confirmDelay: TimeInterval = 5
 
     private let manager: VMLifecycleManager
     private let store: SCDynamicStore?
@@ -115,7 +118,20 @@ final class NATRecovery {
         pendingCheck = false
         DispatchQueue.global().async { [weak self] in
             guard let self = self else { return }
-            let before = NATRecovery.guestEgress()
+            var before = NATRecovery.guestEgress()
+            if before != "ok" {
+                // One failed probe is not a dead NAT: under load (a VM at
+                // load 100+ with several k3d clusters) the guest's DNS or
+                // connect probe timed out once a minute, and every reattach
+                // it caused cut the VM's connections — pulls and builds
+                // failed with EOFs and expired buildkit leases. Ask again.
+                Thread.sleep(forTimeInterval: self.confirmDelay)
+                let again = NATRecovery.guestEgress()
+                if again == "ok" {
+                    print("[nat] \(reason): one VM egress probe failed (\(before)), the next passed; NAT left alone")
+                }
+                before = again
+            }
             if before == "ok" {
                 DispatchQueue.main.async { self.reattachedSinceHealthy = false }
                 if !quietWhenHealthy {
@@ -151,6 +167,9 @@ final class NATRecovery {
     private static func guestEgress() -> String {
         guard let resp = try? ControlClient.request("egress") else { return "unknown (no answer)" }
         if resp.status == "ok" { return "ok" }
-        return resp.status == "via-host" ? "via-host" : (resp.error ?? resp.status ?? "unknown")
+        if resp.status == "via-host" {
+            return resp.error.map { "via-host (\($0))" } ?? "via-host"
+        }
+        return resp.error ?? resp.status ?? "unknown"
     }
 }
