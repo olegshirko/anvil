@@ -570,6 +570,57 @@ def test_compose_up() -> None:
                            capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
 
 
+def test_compose_named_volume_is_global() -> None:
+    """A compose project's named volume is the daemon's volume: `down -v`
+    deletes its data, `volume ls` lists it once, an external volume made
+    with `docker volume create` is the one the project mounts, and a
+    mounted volume cannot be removed (regression: the container mounted an
+    empty twin in the project's namespace, so `down -v` kept the data)."""
+    project = f"{PREFIX}-cvol"
+    ext = f"{PREFIX}-cvol-ext"
+    with tempfile.TemporaryDirectory() as tmp:
+        compose_file = Path(tmp) / "compose.yml"
+        compose_file.write_text(
+            "services:\n"
+            "  db:\n"
+            "    image: alpine\n"
+            "    command: [\"sh\", \"-c\", \"cat /d/f 2>/dev/null || echo EMPTY; echo data >> /d/f; cat /e/x; sleep 300\"]\n"
+            "    volumes: [\"pg:/d\", \"ext:/e\"]\n"
+            "volumes:\n"
+            "  pg: {}\n"
+            f"  ext: {{external: true, name: {ext}}}\n")
+        base = ["compose", "-p", project, "-f", str(compose_file)]
+        try:
+            docker("volume", "create", ext)
+            docker("run", "--rm", "-v", f"{ext}:/e", "alpine", "sh", "-c", "echo external > /e/x")
+            for run in (1, 2):
+                docker(*base, "up", "-d", timeout=300.0)
+                deadline = time.time() + 20
+                logs = ""
+                while time.time() < deadline and "external" not in logs:
+                    time.sleep(0.5)
+                    logs = docker("logs", f"{project}-db-1", check=False).stdout
+                first, *rest = logs.split()
+                if first != "EMPTY" or "external" not in rest:
+                    raise RuntimeError(f"run {run}: volume content {logs.split()} (want EMPTY + external)")
+                names = docker("volume", "ls", "--format", "{{.Name}}").stdout.split()
+                if names.count(f"{project}_pg") != 1:
+                    raise RuntimeError(f"volume ls lists {project}_pg {names.count(f'{project}_pg')} times")
+                busy = docker("volume", "rm", ext, check=False)
+                if busy.returncode == 0 or "in use" not in busy.stderr:
+                    raise RuntimeError(f"removed a mounted volume: rc={busy.returncode} {busy.stderr.strip()!r}")
+                docker(*base, "down", "-v", "--timeout", "1", timeout=120.0)
+            left = docker("volume", "ls", "-q").stdout.split()
+            if f"{project}_pg" in left or ext not in left:
+                raise RuntimeError(f"after down -v: {[v for v in left if PREFIX in v]}")
+            record("compose named volume is global", "PASS",
+                   "down -v cleared the data, listed once, external volume shared, in-use rm refused")
+        finally:
+            subprocess.run(["docker", *base, "down", "-v", "--timeout", "1"],
+                           capture_output=True, text=True, env=DOCKER_ENV, timeout=120.0)
+            docker("volume", "rm", ext, check=False)
+
+
 def test_compose_recreate_over_live() -> None:
     """Regression: `compose up` over LIVE containers creates the replacement
     before stopping the old one. The old nerdctl path reserved host ports at create
@@ -4258,6 +4309,7 @@ TESTS = [
     ("events --since replay", test_events_since_replay),
     ("UDP port publishing", test_udp_publishing),
     ("compose up", test_compose_up),
+    ("compose named volume is global", test_compose_named_volume_is_global),
     ("compose lifecycle verbs", test_compose_lifecycle_verbs),
     ("compose service DNS", test_compose_service_dns),
     ("compose depends_on completed", test_compose_depends_on_completed),

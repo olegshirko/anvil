@@ -236,12 +236,18 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) (_ []specs.M
 		}
 		mounts = append(mounts, specs.Mount{Type: "bind", Source: src, Destination: dst, Options: opts})
 	}
-	addNamedVolume := func(volName, dst string, ro bool) error {
+	addNamedVolume := func(volName, dst string, ro, anonymous bool) error {
 		if dev, ok := bindDeviceOption(loadVolumeOptions(volName)); ok {
 			addBind(dev, dst, ro) // a bind-backed local volume
 			return nil
 		}
-		dir := volumeDataDir(ns, volName)
+		// A named volume is the daemon's, wherever it was created; an
+		// anonymous one belongs to the container's namespace.
+		volNS := ns
+		if !anonymous {
+			volNS = volumeNamespace(ns, volName)
+		}
+		dir := volumeDataDir(volNS, volName)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
@@ -258,7 +264,7 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) (_ []specs.M
 		switch {
 		case src == "":
 			name := newAnonVolName()
-			if err := addNamedVolume(name, dst, ro); err != nil {
+			if err := addNamedVolume(name, dst, ro, true); err != nil {
 				return err
 			}
 			markAnonymousVolume(ns, name)
@@ -274,7 +280,7 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) (_ []specs.M
 			}
 			addBind(src, dst, ro)
 		default:
-			if err := addNamedVolume(src, dst, ro); err != nil {
+			if err := addNamedVolume(src, dst, ro, false); err != nil {
 				return err
 			}
 		}
@@ -324,7 +330,8 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) (_ []specs.M
 		}
 		nocopy = m.VolumeOptions != nil && m.VolumeOptions.NoCopy
 		if m.Type == "volume" && m.Source != "" && m.VolumeOptions != nil && m.VolumeOptions.Subpath != "" {
-			dir, serr := volumeSubpath(volumeDataDir(ns, m.Source), m.VolumeOptions.Subpath)
+			volDir := volumeDataDir(volumeNamespace(ns, m.Source), m.Source)
+			dir, serr := volumeSubpath(volDir, m.VolumeOptions.Subpath)
 			if serr != nil {
 				return nil, nil, nil, nil, fmt.Errorf("mount %q: %w", m.Target, serr)
 			}
@@ -333,7 +340,7 @@ func computeContainerMounts(ns, id string, req dockerCreateRequest) (_ []specs.M
 			// the path itself, which a container could swap meanwhile.
 			staging := subpathStagingPath(ns, id, len(subpaths))
 			addBind(staging, m.Target, m.ReadOnly)
-			subpaths = append(subpaths, subpathMount{VolumeDir: volumeDataDir(ns, m.Source), Subpath: m.VolumeOptions.Subpath, Source: dir, Staging: staging})
+			subpaths = append(subpaths, subpathMount{VolumeDir: volDir, Subpath: m.VolumeOptions.Subpath, Source: dir, Staging: staging})
 			continue
 		}
 		if m.Type != "" && m.Type != "bind" && m.Type != "volume" {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -103,59 +104,113 @@ func volumeDirs() ([]struct{ ns, name string }, error) {
 	return out, nil
 }
 
-// listDockerVolumes returns volumes from all namespaces.
+// A named volume is one volume across the whole daemon, as in Docker. Older
+// anvils created API volumes in "default" but mounted a container's named
+// volume from its own namespace, so a compose project got an empty second
+// copy next to the one compose created: `compose down -v` removed the empty
+// one and the data survived. The copies of one name are still on disk; the
+// helpers below treat them as one volume.
+
+// volumeCopies returns the namespaces holding a directory for volume name,
+// the one containers mount first: a copy in a project namespace holds the
+// data an older anvil wrote, the "default" one is an empty twin then.
+func volumeCopies(name string) []string {
+	dirs, _ := volumeDirs()
+	var nss []string
+	for _, d := range dirs {
+		if d.name == name {
+			nss = append(nss, d.ns)
+		}
+	}
+	sort.SliceStable(nss, func(i, j int) bool { return nss[i] != "default" && nss[j] == "default" })
+	return nss
+}
+
+// volumeNamespace returns where a container in ns finds named volume name:
+// its own namespace when an older anvil put a copy there, else wherever the
+// volume exists, else "default" (where it is then created, so that
+// `docker volume rm` and `compose down -v` find it).
+func volumeNamespace(ns, name string) string {
+	if fi, err := os.Stat(volumeDataDir(ns, name)); err == nil && fi.IsDir() {
+		return ns
+	}
+	if nss := volumeCopies(name); len(nss) > 0 {
+		return nss[0]
+	}
+	return "default"
+}
+
+// dockerVolumeOf describes volume name held in namespaces nss (non-empty,
+// mounted copy first). Labels and options of every copy are merged, the
+// mounted copy's winning.
+func dockerVolumeOf(name string, nss []string) dockerVolume {
+	labels, opts := map[string]string{}, map[string]string{}
+	for i := len(nss) - 1; i >= 0; i-- {
+		maps.Copy(labels, loadVolumeLabels(nss[i], name))
+		maps.Copy(opts, readVolumeOptions(nss[i], name))
+	}
+	return dockerVolume{
+		Name:       name,
+		Driver:     "local",
+		Mountpoint: volumeDataDir(nss[0], name),
+		CreatedAt:  volumeCreatedAt(nss[0], name),
+		Labels:     labels,
+		Options:    opts,
+		Scope:      "local",
+	}
+}
+
+// listDockerVolumes returns every volume once.
 func listDockerVolumes(ctx context.Context, filters map[string]map[string]bool) ([]dockerVolume, error) {
 	dirs, err := volumeDirs()
 	if err != nil {
 		return nil, err
 	}
-	result := make([]dockerVolume, 0, len(dirs))
+	var names []string
+	seen := map[string]bool{}
 	for _, d := range dirs {
-		labels := loadVolumeLabels(d.ns, d.name)
-		dv := dockerVolume{
-			Name:       d.name,
-			Driver:     "local",
-			Mountpoint: volumeDataDir(d.ns, d.name),
-			CreatedAt:  volumeCreatedAt(d.ns, d.name),
-			Labels:     labels,
-			Options:    nonNilMap(readVolumeOptions(d.ns, d.name)),
-			Scope:      "local",
+		if !seen[d.name] {
+			seen[d.name] = true
+			names = append(names, d.name)
 		}
-		if matchesLabelFilters(labels, filters) {
+	}
+	sort.Strings(names)
+	result := make([]dockerVolume, 0, len(names))
+	for _, name := range names {
+		dv := dockerVolumeOf(name, volumeCopies(name))
+		if matchesLabelFilters(dv.Labels, filters) {
 			result = append(result, dv)
 		}
 	}
 	return result, nil
 }
 
-// inspectDockerVolume returns a volume by name from any namespace.
+// inspectDockerVolume returns a volume by name.
 func inspectDockerVolume(ctx context.Context, name string) (*dockerVolume, error) {
-	dirs, err := volumeDirs()
-	if err != nil {
-		return nil, err
+	nss := volumeCopies(name)
+	if len(nss) == 0 {
+		return nil, fmt.Errorf("No such volume: %s", name)
 	}
-	for _, d := range dirs {
-		if d.name != name {
-			continue
-		}
-		return &dockerVolume{
-			Name:       d.name,
-			Driver:     "local",
-			Mountpoint: volumeDataDir(d.ns, d.name),
-			CreatedAt:  volumeCreatedAt(d.ns, d.name),
-			Labels:     loadVolumeLabels(d.ns, d.name),
-			Options:    nonNilMap(readVolumeOptions(d.ns, d.name)),
-			Scope:      "local",
-		}, nil
-	}
-	return nil, fmt.Errorf("No such volume: %s", name)
+	dv := dockerVolumeOf(name, nss)
+	return &dv, nil
 }
 
-// createDockerVolume creates a volume in the default namespace. Of the
+// createDockerVolume creates a volume (in the default namespace). Of the
 // local driver's options, the bind form (type=none, o=bind, device=<path>)
 // is honored at mount time; others are recorded.
 func createDockerVolume(ctx context.Context, req dockerVolumeCreateRequest) (*dockerVolume, error) {
 	const ns = "default"
+	// An existing volume is returned as it is, as Docker does. A copy an
+	// older anvil made when a container mounted the name before compose
+	// created it has no labels: it takes the request's, so compose
+	// recognizes its volume.
+	if nss := volumeCopies(req.Name); len(nss) > 0 {
+		if dv := dockerVolumeOf(req.Name, nss); len(dv.Labels) == 0 && len(req.Labels) > 0 {
+			saveVolumeLabels(nss[0], req.Name, req.Labels) //nolint:errcheck — cosmetic
+		}
+		dv := dockerVolumeOf(req.Name, nss)
+		return &dv, nil
+	}
 	if dev, ok := bindDeviceOption(req.Options); ok {
 		if _, err := os.Stat(dev); err != nil {
 			return nil, &apiError{status: http.StatusBadRequest,
@@ -246,23 +301,38 @@ func bindDeviceOption(opts map[string]string) (string, bool) {
 	return "", false
 }
 
-// removeDockerVolume removes a volume by name from any namespace.
+// removeDockerVolume removes a volume — every copy of its name. A volume a
+// container mounts (running or not) is refused, as by Docker.
 func removeDockerVolume(ctx context.Context, name string) error {
-	dirs, err := volumeDirs()
-	if err != nil {
-		return err
+	nss := volumeCopies(name)
+	if len(nss) == 0 {
+		return fmt.Errorf("No such volume: %s", name)
 	}
-	for _, d := range dirs {
-		if d.name != name {
-			continue
-		}
-		if err := os.RemoveAll(volumeDataDir(d.ns, d.name)); err != nil {
+	mounted, err := mountedBindSources(ctx)
+	if err != nil {
+		return fmt.Errorf("remove %s: list container mounts: %w", name, err)
+	}
+	if volumeCopiesInUse(mounted, name, nss) {
+		return &apiError{status: http.StatusConflict, msg: fmt.Sprintf("remove %s: volume is in use", name)}
+	}
+	for _, ns := range nss {
+		if err := os.RemoveAll(volumeDataDir(ns, name)); err != nil {
 			return err
 		}
-		os.Remove(volumeMetaPath(d.ns, d.name))
-		os.Remove(volumeOptionsPath(d.ns, d.name))
-		publishObjectEvent("volume", "destroy", d.name, map[string]string{"driver": "local"})
-		return nil
+		os.Remove(volumeMetaPath(ns, name))
+		os.Remove(volumeOptionsPath(ns, name))
 	}
-	return fmt.Errorf("No such volume: %s", name)
+	publishObjectEvent("volume", "destroy", name, map[string]string{"driver": "local"})
+	return nil
+}
+
+// volumeCopiesInUse reports whether a container mounts any copy of volume
+// name.
+func volumeCopiesInUse(mounted map[string]bool, name string, nss []string) bool {
+	for _, ns := range nss {
+		if volumeInUse(mounted, volumeDataDir(ns, name)) {
+			return true
+		}
+	}
+	return false
 }

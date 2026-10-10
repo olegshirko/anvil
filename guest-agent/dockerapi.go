@@ -711,7 +711,7 @@ func pruneDockerVolumes(ctx context.Context, filters map[string]map[string]bool)
 	deleted := []string{}
 	var reclaimed int64
 	for _, v := range volumes {
-		if volumeInUse(mounted, v.Mountpoint) {
+		if volumeCopiesInUse(mounted, v.Name, volumeCopies(v.Name)) {
 			continue
 		}
 		// A bind-backed volume is mounted from its device, not its own
