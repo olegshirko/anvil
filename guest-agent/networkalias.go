@@ -175,9 +175,36 @@ func rewriteHostsManagedSection(path, block string) {
 	} else {
 		content = strings.TrimRight(content, "\n") + "\n" + block
 	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	if err := updateHostsFile(path, data, content); err != nil {
 		log.Printf("[net-alias] write %s: %v", path, err)
 	}
+}
+
+// updateHostsFile replaces a container's hosts file content in place. The
+// file is bind-mounted into a running container, so it cannot be swapped
+// by a rename. It used to be truncated and rewritten, and a lookup in that
+// window found no hosts at all: the background refresh right after start
+// raced the container's first lookup (`wget host.docker.internal` -> "bad
+// address"). Unchanged content is not written; otherwise the new content
+// goes over the old one and the file is cut to length afterwards, so the
+// lines at its head (localhost, host.docker.internal) never disappear.
+func updateHostsFile(path string, old []byte, content string) error {
+	if string(old) == content {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteAt([]byte(content), 0); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Truncate(int64(len(content))); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // Container --link entries, remembered at create and applied at start
@@ -228,7 +255,7 @@ func applyLinkAliases(ctx context.Context, ns, containerdID string, links []stri
 			}
 			content += e + "\n"
 		}
-		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		if err := updateHostsFile(p, data, content); err != nil {
 			log.Printf("[net-alias] link write %s: %v", p, err)
 			continue
 		}
