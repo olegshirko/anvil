@@ -2911,13 +2911,16 @@ def test_exec_tty() -> None:
     name = f"{PREFIX}-exectty"
     try:
         docker("run", "-d", "--name", name, "alpine", "sleep", "300")
-        out = docker("exec", "-t", name, "tty", check=False)
-        if out.returncode != 0 or not out.stdout.strip().startswith("/dev/pts/"):
-            raise RuntimeError(f"exec -t tty -> rc={out.returncode} {out.stdout.strip()!r}")
+        # Repeated: the CLI half-closes an exec without -i at once, and that
+        # EOF used to hang up the pty before `tty` ran (exit 129, ~1 in 10).
+        for _ in range(30):
+            out = docker("exec", "-t", name, "tty", check=False)
+            if out.returncode != 0 or not out.stdout.strip().startswith("/dev/pts/"):
+                raise RuntimeError(f"exec -t tty -> rc={out.returncode} {out.stdout.strip()!r}")
         plain = docker("exec", name, "tty", check=False)
         if plain.returncode == 0:
             raise RuntimeError("exec without -t reported a tty")
-        record("exec -t allocates a tty", "PASS", out.stdout.strip())
+        record("exec -t allocates a tty", "PASS", f"30 runs, {out.stdout.strip()}")
     finally:
         cleanup(name)
 

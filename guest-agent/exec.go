@@ -340,7 +340,12 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	started, finished := make(chan struct{}), make(chan struct{})
 	defer close(finished)
 	var proc client.Process
-	if spec.AttachStdin || spec.Tty {
+	// Stdin only with -i, as dockerd does. The CLI half-closes the
+	// connection of an exec without -i at once; with a stdin pipe that EOF
+	// reached the shim through CloseIO, and for a TTY the shim then shuts
+	// the pty down: `docker exec -t c tty` died of SIGHUP (exit 129) when
+	// the EOF came before the process finished.
+	if spec.AttachStdin {
 		pr, pw := io.Pipe()
 		stdinR = pr
 		stdinWriteCloser = pw
