@@ -61,13 +61,43 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid filters: %s", err.Error()))
 		return
 	}
-	// `until` in the past → empty stream; in the future → a deadline that
-	// closes the stream (docker events --until +5s).
+	enc := json.NewEncoder(w)
+	send := func(ev dockerEvent) bool {
+		if !filter.match(ev) {
+			debugLog("events: filtered out %s id=%s", ev.Action, truncateID(ev.Actor.ID))
+			return true
+		}
+		debugLog("events: send %s id=%s attrs=%v", ev.Action, truncateID(ev.Actor.ID), ev.Actor.Attributes)
+		if ev.Type == "container" || ev.Type == "image" {
+			ev.Status, ev.ID = ev.Action, ev.Actor.ID
+			if ev.Type == "container" {
+				ev.From = ev.Actor.Attributes["image"]
+			}
+		}
+		return enc.Encode(ev) == nil
+	}
+	since := parseEventTimestamp(r.URL.Query().Get("since"))
+
+	// `until` in the past → the recorded events up to it, then the stream
+	// closes, as dockerd does (it used to be an empty stream, so
+	// `docker events --since 10m --until 5m` showed nothing, and so did
+	// `--until <now+1s>` whenever the guest clock ran a little ahead of the
+	// Mac's). In the future → a deadline that closes the stream
+	// (docker events --until +5s).
 	var untilTimer <-chan time.Time
 	if until := parseEventTimestamp(r.URL.Query().Get("until")); until != nil {
 		if !until.After(time.Now()) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			from := time.Unix(0, 0) // until alone: everything recorded up to it
+			if since != nil {
+				from = *since
+			}
+			for _, ev := range eventLogSnapshot(from) {
+				if ev.TimeNano <= until.UnixNano() && !send(ev) {
+					return
+				}
+			}
 			return
 		}
 		timer := time.NewTimer(time.Until(*until))
@@ -95,26 +125,10 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	enc := json.NewEncoder(w)
-	send := func(ev dockerEvent) bool {
-		if !filter.match(ev) {
-			debugLog("events: filtered out %s id=%s", ev.Action, truncateID(ev.Actor.ID))
-			return true
-		}
-		debugLog("events: send %s id=%s attrs=%v", ev.Action, truncateID(ev.Actor.ID), ev.Actor.Attributes)
-		if ev.Type == "container" || ev.Type == "image" {
-			ev.Status, ev.ID = ev.Action, ev.Actor.ID
-			if ev.Type == "container" {
-				ev.From = ev.Actor.Attributes["image"]
-			}
-		}
-		return enc.Encode(ev) == nil
-	}
-
 	// Historical replay (`since` in the past): everything the recorder has
 	// buffered up to the subscription moment, then continue live.
 	var replayed map[string]bool
-	if since := parseEventTimestamp(r.URL.Query().Get("since")); since != nil {
+	if since != nil {
 		for _, ev := range eventLogSnapshot(*since) {
 			if ev.TimeNano > snapshotNano {
 				continue

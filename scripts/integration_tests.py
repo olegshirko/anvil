@@ -3269,6 +3269,17 @@ def test_lifecycle_events() -> None:
         for want in (("image", "tag"), ("volume", "create"), ("volume", "destroy")):
             if want not in others:
                 problems.append(f"no {want[0]} {want[1]}")
+        # --until already in the past replays the window and returns, as
+        # dockerd does (it used to be an empty stream).
+        done = time.time()  # everything above is recorded; let until pass
+        until_past = int(done) + 2
+        time.sleep(max(0.0, until_past + 1 - time.time()))
+        past = docker("events", "--since", since, "--until", str(until_past),
+                      "--format", "{{json .}}").stdout
+        past_mine = [json.loads(l)["Action"] for l in past.splitlines() if l.strip()
+                     and json.loads(l).get("Actor", {}).get("ID") == cid]
+        if "destroy" not in past_mine:
+            problems.append(f"--until in the past replayed {past_mine}")
         if problems:
             raise RuntimeError(f"{problems}; container actions: {mine}")
         record("lifecycle events", "PASS", " ".join(mine))

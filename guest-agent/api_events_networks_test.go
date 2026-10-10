@@ -115,18 +115,28 @@ func TestEventsContainerFilterOnReplay(t *testing.T) {
 	}
 }
 
-func TestEventsUntilInPastIsEmptyStream(t *testing.T) {
+// `until` in the past replays the window since..until and closes, as
+// dockerd does — not an empty stream.
+func TestEventsUntilInPastReplaysWindow(t *testing.T) {
 	startFakeContainerd(t, "default")
 	srv := newTestAPIServer(t)
 
 	now := time.Now()
-	seedRing(ringEvent("create", "stale", now.Add(-time.Minute)))
+	seedRing(
+		ringEvent("create", "before", now.Add(-3*time.Minute)),
+		ringEvent("create", "inside", now.Add(-time.Minute)),
+		ringEvent("create", "after", now.Add(-10*time.Second)),
+	)
 	t.Cleanup(func() { eventLog.ring = nil })
 
 	q := fmt.Sprintf("?since=%d&until=%d", now.Add(-2*time.Minute).Unix(), now.Add(-30*time.Second).Unix())
 	events := getEventsStream(t, srv.URL, q)
-	if len(events) != 0 {
-		t.Fatalf("until-in-past stream returned %d events, want 0", len(events))
+	if len(events) != 1 || events[0].Actor.Attributes["name"] != "inside" {
+		t.Fatalf("until-in-past stream returned %+v, want only the event inside the window", events)
+	}
+	// until alone: everything recorded up to it (dockerd's loadBufferedEvents).
+	if events := getEventsStream(t, srv.URL, fmt.Sprintf("?until=%d", now.Add(-30*time.Second).Unix())); len(events) != 2 {
+		t.Fatalf("until in the past without since returned %d events, want 2", len(events))
 	}
 }
 
