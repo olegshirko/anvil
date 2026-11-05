@@ -38,7 +38,11 @@ type execSpec struct {
 	Tty               bool
 	Privileged        bool
 
-	mu       sync.Mutex
+	mu sync.Mutex
+	// started is set by the first accepted start. Docker rejects a second
+	// start with 409; letting both through created two processes for one
+	// exec (one orphaned) with racing exit codes.
+	started  bool
 	running  bool
 	exitCode int
 	// finished is when the exec exited; finished execs are pruned from the
@@ -49,6 +53,20 @@ type execSpec struct {
 	proc client.Process
 	// pid is the exec process's pid (kept after exit, as Docker does).
 	pid uint32
+}
+
+// beginStart atomically claims the exec's single start. It returns false
+// when the exec was already started, which the API reports as 409.
+func (s *execSpec) beginStart() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started {
+		return false
+	}
+	s.started = true
+	s.running = true
+	s.exitCode = 0
+	return true
 }
 
 // setProcess records (or clears with nil) the live containerd exec process.
@@ -241,6 +259,9 @@ func startDetachedExec(id string) error {
 	if spec == nil {
 		return fmt.Errorf("No such exec instance: %s", id)
 	}
+	if !spec.beginStart() {
+		return errConflict("Exec instance already started")
+	}
 	go func() {
 		res, err := runSimpleExecEnv(context.Background(), spec.Namespace,
 			spec.ContainerdID, spec.Cmd, spec.User, spec.WorkingDir, spec.Env, nil, -1)
@@ -261,28 +282,32 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("No such exec instance: %s", id))
 		return
 	}
+	// Claim the one allowed start before hijacking, so a concurrent second
+	// start gets Docker's 409 instead of running the command again.
+	if !spec.beginStart() {
+		writeJSONError(w, http.StatusConflict, "Exec instance already started")
+		return
+	}
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
+		spec.setExit(126)
 		writeJSONError(w, http.StatusInternalServerError, "hijacking not supported")
 		return
 	}
 
 	conn, bufrw, err := hj.Hijack()
 	if err != nil {
+		spec.setExit(126)
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer conn.Close()
 
 	if err := writeHijackHeader(bufrw, r, spec.Tty); err != nil {
+		spec.setExit(126)
 		return
 	}
-
-	spec.mu.Lock()
-	spec.running = true
-	spec.exitCode = 0
-	spec.mu.Unlock()
 
 	// failExec reports a failure to start the process the way Docker does:
 	// the reason on the client's stderr ("OCI runtime exec failed: ...")
