@@ -24,6 +24,26 @@ func TestDockerStatusMapping(t *testing.T) {
 	}
 }
 
+// -t -1 means "wait forever" in Docker, not "use the default": only an
+// absent -t (nil) falls back to the container's StopTimeout or 10 s.
+func TestStopTimeoutExplicitWins(t *testing.T) {
+	zero, negative, thirty := 0, -1, 30
+	cases := []struct {
+		requested *int
+		want      int
+	}{
+		{nil, 10},
+		{&zero, 0},
+		{&negative, -1},
+		{&thirty, 30},
+	}
+	for _, tc := range cases {
+		if got := stopTimeoutFor("testns", "no-such-container", tc.requested); got != tc.want {
+			t.Errorf("stopTimeoutFor(%v) = %d, want %d", tc.requested, got, tc.want)
+		}
+	}
+}
+
 // AutoRemove is implemented by the guest-agent itself (not `nerdctl --rm`),
 // keyed by Docker ID in an in-memory set — see ARCHITECTURE.md §4.3.
 func TestAutoRemoveLifecycle(t *testing.T) {
