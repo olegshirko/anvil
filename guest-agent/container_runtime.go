@@ -872,6 +872,25 @@ func buildSpecOpts(id, hostname string, imgCfg *ocispecImageConfig, req dockerCr
 
 // --- create ----------------------------------------------------------------
 
+// maxHostnameLen is the kernel's UTS name limit (__NEW_UTS_LEN):
+// sethostname refuses anything longer with EINVAL.
+const maxHostnameLen = 64
+
+// containerHostname picks the UTS name: --hostname, else the given
+// container name, else the short ID docker ps shows, as Docker does. A
+// name the kernel cannot take (Testcontainers names Ryuk
+// "reaper_<64 hex>") also falls back to the short ID instead of failing
+// the start in runc.
+func containerHostname(req *dockerCreateRequest, name, id string) string {
+	if req.Hostname != "" {
+		return req.Hostname
+	}
+	if !req.generatedName && name != "" && len(name) <= maxHostnameLen {
+		return name
+	}
+	return truncateID(id)
+}
+
 // createNativeContainer registers the container with containerd and prepares
 // all start-time state. It returns the containerd ID and create warnings.
 func createNativeContainer(ctx context.Context, ns, name, platform string, req dockerCreateRequest) (_ string, warnings []string, err error) {
@@ -946,13 +965,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		}
 	}()
 
-	hostname := req.Hostname
-	if hostname == "" && !req.generatedName {
-		hostname = name
-	}
-	if hostname == "" {
-		hostname = truncateID(dockerID(ns, id)) // the ID docker ps shows, as Docker does
-	}
+	hostname := containerHostname(&req, name, dockerID(ns, id))
 	if perr := prepareContainerRoot(ns, id, hostname, req.HostConfig); perr != nil {
 		return "", nil, perr
 	}
