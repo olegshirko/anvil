@@ -169,6 +169,18 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 			Attrs: map[string]string{"name": strings.Join(exportNames, ",")},
 		}}
 
+		// Open the local mounts before starting the status drainer: an FS
+		// error would otherwise return while the goroutine waits forever
+		// on a channel nothing closes.
+		ctxFS, ferr := fsutil.NewFS(ctxDir)
+		if ferr != nil {
+			return ferr, false
+		}
+		dfFS, ferr := fsutil.NewFS(filepath.Dir(filepath.Join(ctxDir, dockerfile)))
+		if ferr != nil {
+			return ferr, false
+		}
+
 		statusCh := make(chan *bkclient.SolveStatus)
 		done := make(chan error, 1)
 		go func() {
@@ -189,15 +201,6 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 			}
 			done <- nil
 		}()
-
-		ctxFS, ferr := fsutil.NewFS(ctxDir)
-		if ferr != nil {
-			return ferr, false
-		}
-		dfFS, ferr := fsutil.NewFS(filepath.Dir(filepath.Join(ctxDir, dockerfile)))
-		if ferr != nil {
-			return ferr, false
-		}
 		solveOpts := bkclient.SolveOpt{
 			Frontend:      "dockerfile.v0",
 			FrontendAttrs: frontendAttrs,
@@ -228,7 +231,7 @@ func handleBuild(w http.ResponseWriter, r *http.Request) {
 	buildErr, digestMissing := runBuild()
 	if buildErr != nil && digestMissing {
 		writeStream("[anvil] stale buildkit cache detected, pruning and retrying")
-		pruneBuildkitCache(context.Background())
+		pruneBuildkitCache(r.Context())
 		buildErr, _ = runBuild()
 	}
 
@@ -370,6 +373,10 @@ func pruneBuildkitCache(ctx context.Context) {
 		close(done)
 	}()
 	err = c.Prune(ctx, ch, bkclient.PruneAll)
+	// Prune sends every record synchronously and never closes the channel;
+	// without this close the reader below blocked forever (and with it the
+	// build request that prunes and retries).
+	close(ch)
 	<-done
 	if err != nil {
 		log.Printf("[docker-api] buildkit prune: %v", err)
