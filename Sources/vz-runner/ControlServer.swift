@@ -143,10 +143,36 @@ final class ControlServer {
     // MARK: - Private
 
     private func handleClient(fd clientFd: Int32) {
-        incrementClients()
+        // Read the request before counting the connection as a client: the
+        // daemon's own NAT egress probe arrives every minute, and counting it
+        // re-armed the idle timer, so --idle never fired.
+        guard let lengthData = readExactlyFD(clientFd, count: MemoryLayout<UInt32>.size) else {
+            writeControlError(clientFd, "failed to read request length")
+            close(clientFd)
+            return
+        }
+        let length = UInt32(bigEndian: lengthData.withUnsafeBytes { $0.load(as: UInt32.self) })
+        guard length <= 16 * 1024 * 1024,
+              let body = readExactlyFD(clientFd, count: Int(length)) else {
+            writeControlError(clientFd, "failed to read request body")
+            close(clientFd)
+            return
+        }
+
+        let request = try? JSONDecoder().decode(ControlRequest.self, from: body)
+        let internalRequest = request?.internalRequest ?? false
+        if !internalRequest {
+            incrementClients()
+        }
         defer {
             close(clientFd)
-            decrementClients()
+            if !internalRequest {
+                decrementClients()
+            }
+        }
+
+        if debug, let req = request {
+            print("[control] command=\(req.cmd) args=\(req.args ?? [])")
         }
 
         // A VM stopped to free memory is being restored (the connect hook
@@ -158,38 +184,18 @@ final class ControlServer {
             device = deviceProvider()
         }
         guard let device = device else {
-            let data = (try? encodeLengthPrefixed(ControlResponse(stdout: nil, stderr: nil, exitCode: 1, error: "vm not ready", status: nil))) ?? Data()
-            _ = data.withUnsafeBytes { write(clientFd, $0.baseAddress, $0.count) }
+            writeControlError(clientFd, "vm not ready")
             return
         }
 
         let vsockConn = connectVsock(device: device, port: controlPort, until: Date().addingTimeInterval(20))
         guard let conn = vsockConn else {
-            let data = (try? encodeLengthPrefixed(ControlResponse(stdout: nil, stderr: nil, exitCode: 1, error: "vsock connect failed", status: nil))) ?? Data()
-            _ = data.withUnsafeBytes { write(clientFd, $0.baseAddress, $0.count) }
+            writeControlError(clientFd, "vsock connect failed")
             return
         }
         defer { conn.close() }
 
         let vfd = conn.fileDescriptor
-
-        guard let lengthData = readExactlyFD(clientFd, count: MemoryLayout<UInt32>.size) else {
-            let data = (try? encodeLengthPrefixed(ControlResponse(stdout: nil, stderr: nil, exitCode: 1, error: "failed to read request length", status: nil))) ?? Data()
-            _ = data.withUnsafeBytes { write(clientFd, $0.baseAddress, $0.count) }
-            return
-        }
-        let length = UInt32(bigEndian: lengthData.withUnsafeBytes { $0.load(as: UInt32.self) })
-        guard length <= 16 * 1024 * 1024,
-              let body = readExactlyFD(clientFd, count: Int(length)) else {
-            let data = (try? encodeLengthPrefixed(ControlResponse(stdout: nil, stderr: nil, exitCode: 1, error: "failed to read request body", status: nil))) ?? Data()
-            _ = data.withUnsafeBytes { write(clientFd, $0.baseAddress, $0.count) }
-            return
-        }
-
-        if debug,
-           let req = try? JSONDecoder().decode(ControlRequest.self, from: body) {
-            print("[control] command=\(req.cmd) args=\(req.args ?? [])")
-        }
 
         do {
             try writeExactlyFD(vfd, data: lengthData + body)
@@ -200,9 +206,13 @@ final class ControlServer {
             let data = try encodeLengthPrefixed(resp)
             _ = data.withUnsafeBytes { write(clientFd, $0.baseAddress, $0.count) }
         } catch {
-            let data = (try? encodeLengthPrefixed(ControlResponse(stdout: nil, stderr: nil, exitCode: 1, error: error.localizedDescription, status: nil))) ?? Data()
-            _ = data.withUnsafeBytes { write(clientFd, $0.baseAddress, $0.count) }
+            writeControlError(clientFd, error.localizedDescription)
         }
+    }
+
+    private func writeControlError(_ fd: Int32, _ message: String) {
+        let data = (try? encodeLengthPrefixed(ControlResponse(stdout: nil, stderr: nil, exitCode: 1, error: message, status: nil))) ?? Data()
+        _ = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
     }
 
     private func incrementClients() {

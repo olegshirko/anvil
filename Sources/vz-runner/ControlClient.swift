@@ -41,6 +41,13 @@ enum ControlClient {
         try sendUnix(request: ControlRequest(cmd: cmd, args: nil))
     }
 
+    /// One request for the daemon's own probes. The control server does not
+    /// count these as clients: an "egress" probe every minute would otherwise
+    /// re-arm the idle timer and the VM would never pause.
+    static func requestInternal(_ cmd: String) throws -> ControlResponse {
+        try sendUnix(request: ControlRequest(cmd: cmd, args: nil, internalRequest: true))
+    }
+
     /// Runs a command in the VM and returns its output (no streaming).
     static func run(_ args: [String]) throws -> ControlResponse {
         try sendUnix(request: ControlRequest(cmd: "exec", args: args))

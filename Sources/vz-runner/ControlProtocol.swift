@@ -35,6 +35,11 @@ struct RunState: Codable {
 struct ControlRequest: Codable {
     let cmd: String
     let args: [String]?
+    /// Set by the daemon's own probes (NAT egress). The control server does
+    /// not count such a connection as a client, so it neither wakes a paused
+    /// VM nor re-arms the idle timer. Omitted from the wire when nil, which
+    /// keeps the frame unchanged for the guest-agent and older peers.
+    var internalRequest: Bool? = nil
 }
 
 struct ControlResponse: Codable {
