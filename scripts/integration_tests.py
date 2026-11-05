@@ -3098,6 +3098,20 @@ def test_generated_names_and_status() -> None:
         docker("rm", "-f", cid, check=False)
 
 
+def test_long_name_hostname() -> None:
+    """A name over the kernel's 64-byte UTS limit (Testcontainers' Ryuk is
+    reaper_<64 hex>) starts with the short ID as hostname, as Docker does."""
+    name = f"{PREFIX}-{'r' * 64}"
+    try:
+        cid = docker("run", "-d", "--name", name, "alpine", "sleep", "300").stdout.strip()
+        host = docker("exec", cid, "hostname").stdout.strip()
+        if host != cid[:12]:
+            raise RuntimeError(f"hostname {host!r}, want the short ID")
+        record("long name hostname", "PASS", host)
+    finally:
+        cleanup(name)
+
+
 def test_inspect_fields() -> None:
     """Inspect carries the fields devcontainers/testcontainers read."""
     name = f"{PREFIX}-inspect"
@@ -4376,6 +4390,7 @@ TESTS = [
     ("logs -f --tail 0", test_logs_tail_zero_follow),
     ("restart keeps --rm container", test_restart_keeps_rm_container),
     ("generated names + ps status", test_generated_names_and_status),
+    ("long name hostname", test_long_name_hostname),
     ("inspect fields", test_inspect_fields),
     ("info/version", test_info_and_version),
     ("ps filters extended", test_ps_filters_extended),

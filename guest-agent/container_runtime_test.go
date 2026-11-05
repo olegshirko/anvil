@@ -109,3 +109,23 @@ func TestUserProcessArgs(t *testing.T) {
 		t.Errorf("plain args changed: %v", got)
 	}
 }
+
+func TestContainerHostname(t *testing.T) {
+	long := "reaper_" + strings.Repeat("a", 64) // Testcontainers' Ryuk name
+	for _, tc := range []struct {
+		name, explicit, cname string
+		generated             bool
+		want                  string
+	}{
+		{"explicit wins", "box", "web", false, "box"},
+		{"given name", "", "web", false, "web"},
+		{"generated name", "", "brave_turing", true, "0123456789ab"},
+		{"name at the kernel limit", "", strings.Repeat("n", 64), false, strings.Repeat("n", 64)},
+		{"name over the kernel limit", "", long, false, "0123456789ab"},
+	} {
+		req := &dockerCreateRequest{Hostname: tc.explicit, generatedName: tc.generated}
+		if got := containerHostname(req, tc.cname, "0123456789abcdef"); got != tc.want {
+			t.Errorf("%s: hostname %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
