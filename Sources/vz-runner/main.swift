@@ -453,9 +453,11 @@ func cmdStatus() {
 // MARK: - Arg helpers
 
 func currentExecutablePath() -> String {
-    // Bundle.main.executableURL is the most reliable — resolves symlinks.
+    // Bundle.main.executableURL is the most reliable, but it keeps the
+    // symlink a PATH entry points at (~/.local/bin/anvil -> a checkout's
+    // .build/release/vz-runner): resolve it, or the source tree is not found.
     if let url = Bundle.main.executableURL {
-        return url.path
+        return url.resolvingSymlinksInPath().path
     }
     // Fallback: resolve CommandLine.arguments[0] through realpath.
     let arg0 = CommandLine.arguments[0]
