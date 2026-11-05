@@ -165,7 +165,7 @@ final class NATRecovery {
 
     /// The guest's direct-egress state: "ok", "via-host", or an error.
     private static func guestEgress() -> String {
-        guard let resp = try? ControlClient.request("egress") else { return "unknown (no answer)" }
+        guard let resp = try? ControlClient.requestInternal("egress") else { return "unknown (no answer)" }
         if resp.status == "ok" { return "ok" }
         if resp.status == "via-host" {
             return resp.error.map { "via-host (\($0))" } ?? "via-host"
