@@ -232,7 +232,8 @@ enum DaemonCommand {
             /// Set by the daemon during `idleTimeoutFired` to prevent the
             /// exec child processes (cache sync, page-cache drop) from
             /// triggering a new idle cycle via their connect/disconnect.
-            var suppressIdleSchedule = false
+            /// Guarded by `lock`: clients disconnect on their own threads.
+            private var suppressIdleSchedule = false
 
             init(idleSeconds: TimeInterval, scheduleIdle: @escaping () -> Void, cancelIdle: @escaping () -> Void) {
                 self.idleSeconds = idleSeconds
@@ -255,12 +256,20 @@ enum DaemonCommand {
             }
 
             func disconnect() {
-                var isZero = false
+                var shouldSchedule = false
                 lock.lock()
                 count -= 1
-                isZero = count == 0
+                shouldSchedule = count == 0 && !suppressIdleSchedule
                 lock.unlock()
-                if isZero && !suppressIdleSchedule { scheduleIdle() }
+                if shouldSchedule { scheduleIdle() }
+            }
+
+            /// Toggled from the main thread while clients disconnect on their
+            /// own threads; read and written under `lock`.
+            func setSuppressIdleSchedule(_ suppress: Bool) {
+                lock.lock()
+                suppressIdleSchedule = suppress
+                lock.unlock()
             }
         }
 
@@ -573,7 +582,7 @@ enum DaemonCommand {
 
         private func idleTimeoutFired() {
             guard isIdleNow() else { return }
-            clientTracker?.suppressIdleSchedule = true
+            clientTracker?.setSuppressIdleSchedule(true)
             print("[anvil] idle timeout reached, syncing containerd cache...")
             // Off the main queue: both calls run `anvil exec`, whose control
             // connection needs the main queue for device.connect. Run on main
@@ -619,7 +628,7 @@ enum DaemonCommand {
             // have been reaped from clientsCount yet.
             guard !isShuttingDown, clientTracker?.isIdle ?? true,
                   (portForwarder?.runningContainers ?? 0) == 0 else {
-                clientTracker?.suppressIdleSchedule = false
+                clientTracker?.setSuppressIdleSchedule(false)
                 return
             }
             print("[anvil] pausing VM...")
@@ -630,14 +639,14 @@ enum DaemonCommand {
                     print("[anvil] VM paused")
                     self.manager.saveSnapshot { [weak self] error in
                         guard let self = self else { return }
-                        self.clientTracker?.suppressIdleSchedule = false
+                        self.clientTracker?.setSuppressIdleSchedule(false)
                         if error == nil {
                             self.scheduleMemoryRelease()
                         }
                     }
                 case .failure(let error):
                     print("[anvil] idle pause failed: \(error)")
-                    self.clientTracker?.suppressIdleSchedule = false
+                    self.clientTracker?.setSuppressIdleSchedule(false)
                 }
             }
         }
