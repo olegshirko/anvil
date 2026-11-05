@@ -22,6 +22,33 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(decoded.args, ["ps", "aux"])
     }
 
+    func testInternalRequestRoundtrip() throws {
+        let value = ControlRequest(cmd: "egress", args: nil, internalRequest: true)
+        let data = try encodeLengthPrefixed(value)
+
+        let stream = InputStream(data: data)
+        stream.open()
+        defer { stream.close() }
+        let decoded = try decodeLengthPrefixed(ControlRequest.self, from: stream)
+        XCTAssertEqual(decoded.cmd, "egress")
+        XCTAssertEqual(decoded.internalRequest, true)
+    }
+
+    func testInternalRequestDefaultsToNilAndIsOmitted() throws {
+        // The flag is a host-only concern: a normal request must stay
+        // byte-compatible with the guest-agent frame (no extra field).
+        let data = try encodeLengthPrefixed(ControlRequest(cmd: "health", args: nil))
+        let body = String(data: data.dropFirst(4), encoding: .utf8)
+        XCTAssertNotNil(body)
+        XCTAssertFalse(body?.contains("internalRequest") ?? true)
+
+        let stream = InputStream(data: data)
+        stream.open()
+        defer { stream.close() }
+        let decoded = try decodeLengthPrefixed(ControlRequest.self, from: stream)
+        XCTAssertNil(decoded.internalRequest)
+    }
+
     func testLengthPrefixIsBigEndian() throws {
         let data = try encodeLengthPrefixed(ControlRequest(cmd: "ping", args: nil))
         // First 4 bytes = big-endian body length.
