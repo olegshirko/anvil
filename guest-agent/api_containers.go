@@ -200,10 +200,12 @@ func handleContainerStart(w http.ResponseWriter, r *http.Request, p routeParams)
 }
 
 func handleContainerStop(w http.ResponseWriter, r *http.Request, p routeParams) {
-	timeout := -1 // the container's StopTimeout, else 10 s
+	// nil means -t was absent: the container's StopTimeout, else 10 s.
+	// -1 is explicit and must reach stopNativeTask as "wait forever".
+	var timeout *int
 	if t := r.URL.Query().Get("t"); t != "" {
 		if v, err := strconv.Atoi(t); err == nil {
-			timeout = v
+			timeout = &v
 		}
 	}
 	signal := r.URL.Query().Get("signal")
@@ -231,10 +233,12 @@ func handleContainerKill(w http.ResponseWriter, r *http.Request, p routeParams) 
 }
 
 func handleContainerRestart(w http.ResponseWriter, r *http.Request, p routeParams) {
-	timeout := -1 // as docker stop: no -t means the container's grace period
+	// as docker stop: no -t means the container's grace period, while an
+	// explicit -1 means wait forever.
+	var timeout *int
 	if t := r.URL.Query().Get("t"); t != "" {
 		if v, err := strconv.Atoi(t); err == nil {
-			timeout = v
+			timeout = &v
 		}
 	}
 	signal := r.URL.Query().Get("signal")

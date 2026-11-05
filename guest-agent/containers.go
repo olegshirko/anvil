@@ -476,7 +476,7 @@ func awaitRestartDone(did string, limit time.Duration) bool {
 // the containerd task actually reaches the stopped state.
 // return before the task exits, which makes a subsequent `docker rm` fail with
 // "container is in running status".
-func stopDockerContainer(ctx context.Context, id string, timeout int, signal string) error {
+func stopDockerContainer(ctx context.Context, id string, timeout *int, signal string) error {
 	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
@@ -761,7 +761,7 @@ func killDockerContainer(ctx context.Context, id string, signal string) error {
 // restartDockerContainer restarts a container by Docker ID or name. Native
 // implementation: graceful stop (the stopped task is deleted by the next
 // start) followed by a fresh start with CNI re-attach.
-func restartDockerContainer(ctx context.Context, id string, timeout int, signal string) error {
+func restartDockerContainer(ctx context.Context, id string, timeout *int, signal string) error {
 	ns, containerdID, _, err := resolveDockerID(ctx, id)
 	if err != nil {
 		return err
@@ -784,11 +784,13 @@ func restartDockerContainer(ctx context.Context, id string, timeout int, signal 
 	return nil
 }
 
-// stopTimeoutFor resolves a stop grace period: an explicit -t (>= 0) wins,
-// then the container's StopTimeout (compose stop_grace_period), then 10 s.
-func stopTimeoutFor(ns, containerdID string, requested int) int {
-	if requested >= 0 {
-		return requested
+// stopTimeoutFor resolves a stop grace period: an explicit -t wins (including
+// -1, "wait forever"), then the container's StopTimeout (compose
+// stop_grace_period), then 10 s. requested is nil when -t was absent, so an
+// explicit negative value cannot be confused with "not specified".
+func stopTimeoutFor(ns, containerdID string, requested *int) int {
+	if requested != nil {
+		return *requested
 	}
 	if meta, err := loadContainerMeta(ns, containerdID); err == nil && meta.StopTimeout != nil && *meta.StopTimeout >= 0 {
 		return *meta.StopTimeout
