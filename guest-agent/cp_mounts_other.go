@@ -8,4 +8,4 @@ import (
 	"github.com/containerd/containerd/v2/client"
 )
 
-func mountContainerBinds(ctx context.Context, c client.Container, root string) {}
+func mountContainerBinds(ctx context.Context, c client.Container, root string) error { return nil }
