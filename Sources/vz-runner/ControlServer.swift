@@ -175,6 +175,15 @@ final class ControlServer {
             print("[control] command=\(req.cmd) args=\(req.args ?? [])")
         }
 
+        // Bounded I/O on the client socket: a client that connects and
+        // stalls (half a header, an unread response) used to park one of
+        // the dedicated connection threads forever. SO_RCVTIMEO makes the
+        // reads fail, SO_SNDTIMEO keeps writeExactlyFD from hanging on a
+        // client that stopped reading.
+        var tv = timeval(tv_sec: 30, tv_usec: 0)
+        setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
         // A VM stopped to free memory is being restored (the connect hook
         // asked for it): wait for its socket device, bounded.
         var device = deviceProvider()
@@ -203,16 +212,20 @@ final class ControlServer {
             if debug {
                 print("[control] response exit=\(resp.exitCode ?? -1) error=\(resp.error ?? "")")
             }
+            // writeExactlyFD, not a single write(): a response larger than
+            // the client's socket buffer was silently truncated mid-stream.
             let data = try encodeLengthPrefixed(resp)
-            _ = data.withUnsafeBytes { write(clientFd, $0.baseAddress, $0.count) }
+            try writeExactlyFD(clientFd, data: data)
         } catch {
             writeControlError(clientFd, error.localizedDescription)
         }
     }
 
+    /// Sends a length-prefixed error response, fully: a partial write left
+    /// the client waiting on a truncated body.
     private func writeControlError(_ fd: Int32, _ message: String) {
         let data = (try? encodeLengthPrefixed(ControlResponse(stdout: nil, stderr: nil, exitCode: 1, error: message, status: nil))) ?? Data()
-        _ = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+        try? writeExactlyFD(fd, data: data)
     }
 
     private func incrementClients() {
