@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"archive/tar"
 	"crypto/rand"
 	"encoding/hex"
@@ -67,7 +68,7 @@ func copyUpVolumes(ns, id string, vms []volumeMount) error {
 	if len(todo) == 0 {
 		return nil
 	}
-	return withRootfsMount(ns, id, false, func(root string) error {
+	return withRootfsMount(context.Background(), ns, id, false, func(root string) error {
 		var errs []error
 		for _, vm := range todo {
 			if err := copyTreeBetweenRoots(root, vm.dst, vm.dir); err != nil {
