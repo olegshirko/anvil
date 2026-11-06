@@ -476,23 +476,28 @@ define require_version
 		{ echo "Usage: make $@ VERSION=x.y.z (got '$(VERSION)')"; exit 1; }
 endef
 
-# Poll until CI has published the release for the new tag. Through gh when
-# available (authenticated): 80 anonymous API calls in 20 minutes exceed
-# GitHub's unauthenticated rate limit and the wait never sees the release.
+# Poll until CI has published the release for the new tag *and* its
+# downloadable archive. The release object exists before its assets finish
+# uploading, so waiting on the release alone handed update-brew a 404 and
+# spent its own retry window. Through gh when available (authenticated): 80
+# anonymous API calls in 20 minutes exceed GitHub's unauthenticated rate
+# limit and the wait never sees the release.
 define wait_for_release
 	@echo "[$@] waiting for CI to publish release..."
 	@i=0; while [ $$i -lt 80 ]; do \
 		sleep 15; \
 		if command -v gh >/dev/null 2>&1; then \
-			gh release view "v$(VERSION)" --repo olegshirko/anvil >/dev/null 2>&1 && exit 0; \
+			gh release view "v$(VERSION)" --repo olegshirko/anvil --json assets \
+				--jq '.assets[].name' 2>/dev/null | grep -qx 'anvil-darwin-arm64.tar.gz' && exit 0; \
 		else \
 			curl -sf $${GITHUB_TOKEN:+-H "Authorization: token $$GITHUB_TOKEN"} \
-				"https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" >/dev/null 2>&1 && exit 0; \
+				"https://api.github.com/repos/olegshirko/anvil/releases/tags/v$(VERSION)" 2>/dev/null \
+				| grep -Eq '"name":[[:space:]]*"anvil-darwin-arm64\.tar\.gz"' && exit 0; \
 		fi; \
 		i=$$((i + 1)); printf "."; \
 	done; \
 	echo ""; echo "[$@] timeout. Check https://github.com/olegshirko/anvil/actions"; exit 1
-	@echo "[$@] release published."
+	@echo "[$@] release and its archive are published."
 endef
 
 # Preview the notes the next release would carry (commits since the last tag).
