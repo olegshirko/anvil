@@ -340,6 +340,19 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	started, finished := make(chan struct{}), make(chan struct{})
 	defer close(finished)
 	var proc client.Process
+
+	// Every early return after this point must close the stdio pipes: a
+	// leaked pair is two fds and two blocked stream readers per failed
+	// exec, plus the stdin io.Pipe with its copier goroutine.
+	closePipes := func() {
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
+		if stdinWriteCloser != nil {
+			stdinWriteCloser.Close()
+		}
+	}
 	// Stdin only with -i, as dockerd does. The CLI half-closes the
 	// connection of an exec without -i at once; with a stdin pipe that EOF
 	// reached the shim through CloseIO, and for a TTY the shim then shuts
@@ -373,6 +386,7 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 
 	user, uerr := execUserFor(nsCtx, container, task, spec.User)
 	if uerr != nil {
+		closePipes()
 		failExec("exec", uerr)
 		return
 	}
@@ -396,10 +410,7 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	process, xerr := task.Exec(nsCtx, execID, pspec, cio.NewCreator(ioOpts...))
 	if xerr != nil {
-		stdoutR.Close()
-		stdoutW.Close()
-		stderrR.Close()
-		stderrW.Close()
+		closePipes()
 		failExec("exec", xerr)
 		return
 	}
@@ -433,11 +444,8 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 
 	if serr := process.Start(nsCtx); serr != nil {
 		process.Delete(context.WithoutCancel(nsCtx)) //nolint:errcheck
-		stdoutW.Close()
-		stderrW.Close()
+		closePipes()
 		wg.Wait()
-		stdoutR.Close()
-		stderrR.Close()
 		failExec("start", serr)
 		return
 	}
@@ -452,14 +460,8 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		process.Kill(context.WithoutCancel(nsCtx), syscall.SIGKILL)          //nolint:errcheck
 		process.Delete(context.WithoutCancel(nsCtx), client.WithProcessKill) //nolint:errcheck
 		// The stream readers end only on EOF of their pipes.
-		stdoutW.Close()
-		stderrW.Close()
-		if stdinWriteCloser != nil {
-			stdinWriteCloser.Close()
-		}
+		closePipes()
 		wg.Wait()
-		stdoutR.Close()
-		stderrR.Close()
 		spec.setExit(126)
 		return
 	}
@@ -469,11 +471,7 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	// output into our pipes, then close the write ends so the stream
 	// readers see EOF and finish.
 	process.IO().Wait()
-	stdoutW.Close()
-	stderrW.Close()
-	if stdinWriteCloser != nil {
-		stdinWriteCloser.Close()
-	}
+	closePipes()
 	wg.Wait()
 
 	exitCode := 0
@@ -484,8 +482,6 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	spec.setProcess(nil)
 	process.Delete(context.WithoutCancel(nsCtx)) //nolint:errcheck — namespaced: a bare context is rejected and leaks the record
-	stdoutR.Close()
-	stderrR.Close()
 	spec.setExit(exitCode)
 	publishContainerEvent("exec_die", spec.Namespace, spec.ContainerdID,
 		map[string]string{"execID": spec.ID, "exitCode": strconv.Itoa(exitCode)})
