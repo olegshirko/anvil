@@ -891,6 +891,16 @@ func containerHostname(req *dockerCreateRequest, name, id string) string {
 	return truncateID(id)
 }
 
+// validateHostname rejects an explicit --hostname the kernel's UTS limit
+// cannot take, as dockerd does at create: passing it through would fail
+// the start in runc with a bare EINVAL instead of a clear create error.
+func validateHostname(hostname string) error {
+	if len(hostname) > maxHostnameLen {
+		return fmt.Errorf("Invalid hostname %q: cannot exceed %d characters", hostname, maxHostnameLen)
+	}
+	return nil
+}
+
 // createNativeContainer registers the container with containerd and prepares
 // all start-time state. It returns the containerd ID and create warnings.
 func createNativeContainer(ctx context.Context, ns, name, platform string, req dockerCreateRequest) (_ string, warnings []string, err error) {
