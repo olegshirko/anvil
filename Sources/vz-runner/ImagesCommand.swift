@@ -149,18 +149,20 @@ func createMirrorIssue(token: String, title: String, body: String) {
     }
     defer { try? FileManager.default.removeItem(at: tmp) }
 
+    let auth = ghAuthArgs(token: token)
+    defer { auth.cleanup() }
+
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
     proc.arguments = [
         "-sS", "-X", "POST",
         "https://api.github.com/repos/\(dockerMirrorRepo)/issues",
         "-H", "Accept: application/vnd.github+json",
-        "-H", "Authorization: Bearer \(token)",
         "-H", "X-GitHub-Api-Version: 2022-11-28",
         "-H", "Content-Type: application/json",
         "-d", "@\(tmp.path)",
         "-w", "\n%{http_code}",
-    ]
+    ] + auth.args
     let pipe = Pipe()
     proc.standardOutput = pipe
     proc.standardError = Pipe()
@@ -234,19 +236,30 @@ func runCurl(_ args: [String]) -> (output: String, exitCode: Int32) {
     return (out, proc.terminationStatus)
 }
 
-// ghAuthArgs returns the Authorization header args when GITHUB_TOKEN is set,
-// otherwise an empty list (unauthenticated; subject to API rate limits).
-func ghAuthArgs() -> [String] {
-    let token = ProcessInfo.processInfo.environment["GITHUB_TOKEN"] ?? ""
-    return token.isEmpty ? [] : ["-H", "Authorization: Bearer \(token)"]
+// ghAuthArgs returns curl args carrying the Authorization header when a
+// token is given, plus the cleanup for the config file it wrote. The token
+// never appears in argv: `ps` exposes command lines to every process of
+// the user while curl runs, so the header goes through a 0600 curl config
+// file (-K) instead. An empty token means unauthenticated (rate-limited).
+func ghAuthArgs(token: String) -> (args: [String], cleanup: () -> Void) {
+    guard !token.isEmpty else { return ([], {}) }
+    let cfg = FileManager.default.temporaryDirectory
+        .appendingPathComponent("anvil-gh-auth-\(getpid()).cfg")
+    FileManager.default.createFile(
+        atPath: cfg.path,
+        contents: Data("header = \"Authorization: Bearer \(token)\"\n".utf8),
+        attributes: [.posixPermissions: 0o600])
+    return (["-K", cfg.path], { try? FileManager.default.removeItem(atPath: cfg.path) })
 }
 
 // mirrorDockerReleases lists docker-mirror releases that carry an
 // image-<arch>.tar.zst asset (the discriminator that separates Docker mirrors
 // from qcow2 VM base images, which live under the "master" / v* tags).
 func mirrorDockerReleases() -> [[String: Any]]? {
+    let auth = ghAuthArgs(token: ProcessInfo.processInfo.environment["GITHUB_TOKEN"] ?? "")
+    defer { auth.cleanup() }
     var args = ["-sS", "-H", "Accept: application/vnd.github+json"]
-    args.append(contentsOf: ghAuthArgs())
+    args.append(contentsOf: auth.args)
     args.append("https://api.github.com/repos/\(dockerMirrorRepo)/releases?per_page=100")
     let (out, _) = runCurl(args)
     guard let data = out.data(using: .utf8),
