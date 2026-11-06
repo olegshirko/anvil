@@ -33,6 +33,14 @@ const dockerMirrorRepo = "olegshirko/docker-mirror"
 // instead of reporting a noisy download failure.
 var errMirrorNotFound = errors.New("image not found in docker-mirror")
 
+// mirrorHTTPClient adds a header timeout to the mirror download: the body
+// streams for as long as the transfer takes (archives are large), but an
+// endpoint that accepts the connection and then goes silent must not hang
+// the pull before a byte of body arrives.
+var mirrorHTTPClient = &http.Client{
+	Transport: &http.Transport{ResponseHeaderTimeout: 30 * time.Second},
+}
+
 // splitImageTag splits a user image ref into name and tag. Digest refs
 // ("repo@sha256:...") are not mirrorable (ok=false). A ref without an explicit
 // tag gets ":latest", matching Docker semantics and the mirror release naming.
@@ -46,7 +54,13 @@ func splitImageTag(ref string) (name, tag string, ok bool) {
 	if colon == -1 || colon < slash {
 		return ref, "latest", true
 	}
-	return ref[:colon], ref[colon+1:], true
+	tag = ref[colon+1:]
+	if tag == "" {
+		// A dangling colon ("alpine:") has no tag: the mirror release
+		// naming would produce a garbage "<name>--arm64" tag.
+		return "", "", false
+	}
+	return ref[:colon], tag, true
 }
 
 // loadFromMirror downloads an image archive from the docker-mirror GitHub
@@ -64,7 +78,14 @@ func loadFromMirror(ctx context.Context, ref, ns string) error {
 	url := fmt.Sprintf("https://github.com/%s/releases/download/%s-%s-arm64/image-arm64.tar.zst",
 		dockerMirrorRepo, safeName, tag)
 
-	resp, err := http.Get(url)
+	// Bound the download by the caller's context (the pull request dies
+	// with its client) and a header timeout: a GitHub endpoint that never
+	// answers used to hang the pull forever inside http.Get.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("mirror download: %w", err)
+	}
+	resp, err := mirrorHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("mirror download: %w", err)
 	}
@@ -100,7 +121,12 @@ func loadFromMirror(ctx context.Context, ref, ns string) error {
 		return fmt.Errorf("import: %s", stripANSI(err.Error()))
 	}
 	for _, img := range imgs {
-		_ = client.NewImage(cl, img).Unpack(nsCtx, "native")
+		// An unpack failure must fail the load: an imported-but-unpacked
+		// image has no snapshots and every later `docker run` of it dies
+		// with "no unpacked rootfs".
+		if err := client.NewImage(cl, img).Unpack(nsCtx, "native"); err != nil {
+			return fmt.Errorf("unpack %s: %w", img.Name, err)
+		}
 		if canonical := canonicalizeImageRef(img.Name); canonical != img.Name {
 			if err := putImage(cl, nsCtx, images.Image{Name: canonical, Target: img.Target, Labels: img.Labels}); err != nil {
 				log.Printf("[images] mirror canonical alias %s -> %s: %v", img.Name, canonical, err)

@@ -41,6 +41,9 @@ func TestSplitImageTag(t *testing.T) {
 		{"host:5000/foo", "host:5000/foo", "latest", true},
 		// Digest refs are not mirrorable.
 		{"repo@sha256:abc", "", "", false},
+		// A dangling colon has no tag: the mirror release naming would
+		// produce a garbage tag ("<name>--arm64").
+		{"alpine:", "", "", false},
 	}
 	for _, c := range cases {
 		name, tag, ok := splitImageTag(c.ref)
