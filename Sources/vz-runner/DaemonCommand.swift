@@ -297,6 +297,7 @@ enum DaemonCommand {
                 dockerProxyServer?.stop()
                 buildkitProxyServer?.stop()
                 portForwarder?.stop()
+                fsEventsForwarder?.stop()
                 releaseDaemonLock()
                 exit(0)
             }
@@ -314,6 +315,7 @@ enum DaemonCommand {
                     self.dockerProxyServer?.stop()
                     self.buildkitProxyServer?.stop()
                     self.portForwarder?.stop()
+                    self.fsEventsForwarder?.stop()
                     self.manager.stopAndSave {
                         releaseDaemonLock()
                         exit(0)
