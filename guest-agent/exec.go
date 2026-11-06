@@ -69,6 +69,16 @@ func (s *execSpec) beginStart() bool {
 	return true
 }
 
+// releaseStart undoes a beginStart claim when the handler failed before
+// anything ran (hijack infrastructure errors): dockerd answers 500 and
+// leaves the exec startable, so the claim must not burn the exec.
+func (s *execSpec) releaseStart() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.started = false
+	s.running = false
+}
+
 // setProcess records (or clears with nil) the live containerd exec process.
 func (s *execSpec) setProcess(p client.Process) {
 	s.mu.Lock()
@@ -291,14 +301,16 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		spec.setExit(126)
+		// Nothing ran: undo the claim, dockerd's 500 leaves the exec
+		// startable and a retry must not die with 409.
+		spec.releaseStart()
 		writeJSONError(w, http.StatusInternalServerError, "hijacking not supported")
 		return
 	}
 
 	conn, bufrw, err := hj.Hijack()
 	if err != nil {
-		spec.setExit(126)
+		spec.releaseStart()
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

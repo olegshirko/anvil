@@ -129,3 +129,15 @@ func TestContainerHostname(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateHostname(t *testing.T) {
+	if err := validateHostname(strings.Repeat("h", 64)); err != nil {
+		t.Errorf("64-byte hostname rejected: %v", err)
+	}
+	if err := validateHostname(strings.Repeat("h", 65)); err == nil {
+		t.Error("65-byte hostname accepted, want rejection")
+	}
+	if err := validateHostname(""); err != nil {
+		t.Errorf("empty hostname rejected: %v", err)
+	}
+}

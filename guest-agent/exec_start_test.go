@@ -54,3 +54,25 @@ func TestExecStartConcurrent(t *testing.T) {
 		t.Fatalf("accepted %d starts, want exactly 1", got)
 	}
 }
+
+// A failed start before anything ran (hijack infrastructure errors) must
+// not burn the exec: dockerd's 500 leaves it startable.
+func TestExecStartRelease(t *testing.T) {
+	spec := &execSpec{ID: "exec-3"}
+	if !spec.beginStart() {
+		t.Fatal("first start must be accepted")
+	}
+	spec.releaseStart()
+	if spec.beginStart() {
+		// The retry after a released claim takes the start.
+		spec.releaseStart()
+	} else {
+		t.Fatal("a released exec must be startable again")
+	}
+	// releaseStart on a fresh spec must not corrupt anything.
+	fresh := &execSpec{ID: "exec-4"}
+	fresh.releaseStart()
+	if !fresh.beginStart() {
+		t.Fatal("releaseStart on an unstarted spec broke beginStart")
+	}
+}

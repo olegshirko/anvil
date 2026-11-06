@@ -172,6 +172,10 @@ func handleContainerCreate(w http.ResponseWriter, r *http.Request, _ routeParams
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if herr := validateHostname(req.Hostname); herr != nil {
+		writeJSONError(w, http.StatusBadRequest, herr.Error())
+		return
+	}
 	name := r.URL.Query().Get("name")
 	id, platformWarnings, err := createDockerContainer(r.Context(), req, name, platform, parseRegistryAuth(r))
 	if err != nil {
@@ -204,9 +208,12 @@ func handleContainerStop(w http.ResponseWriter, r *http.Request, p routeParams) 
 	// -1 is explicit and must reach stopNativeTask as "wait forever".
 	var timeout *int
 	if t := r.URL.Query().Get("t"); t != "" {
-		if v, err := strconv.Atoi(t); err == nil {
-			timeout = &v
+		v, err := strconv.Atoi(t)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid -t: %s", t))
+			return
 		}
+		timeout = &v
 	}
 	signal := r.URL.Query().Get("signal")
 	if _, ok := signalValue(signal); signal != "" && !ok {
@@ -237,9 +244,12 @@ func handleContainerRestart(w http.ResponseWriter, r *http.Request, p routeParam
 	// explicit -1 means wait forever.
 	var timeout *int
 	if t := r.URL.Query().Get("t"); t != "" {
-		if v, err := strconv.Atoi(t); err == nil {
-			timeout = &v
+		v, err := strconv.Atoi(t)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid -t: %s", t))
+			return
 		}
+		timeout = &v
 	}
 	signal := r.URL.Query().Get("signal")
 	if _, ok := signalValue(signal); signal != "" && !ok {

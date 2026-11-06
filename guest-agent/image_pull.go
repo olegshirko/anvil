@@ -36,9 +36,15 @@ var errMirrorNotFound = errors.New("image not found in docker-mirror")
 // mirrorHTTPClient adds a header timeout to the mirror download: the body
 // streams for as long as the transfer takes (archives are large), but an
 // endpoint that accepts the connection and then goes silent must not hang
-// the pull before a byte of body arrives.
+// the pull before a byte of body arrives. It clones http.DefaultTransport —
+// a bare &http.Transport{} would silently drop ProxyFromEnvironment and the
+// pull would stop honoring HTTP(S)_PROXY.
 var mirrorHTTPClient = &http.Client{
-	Transport: &http.Transport{ResponseHeaderTimeout: 30 * time.Second},
+	Transport: func() http.RoundTripper {
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.ResponseHeaderTimeout = 30 * time.Second
+		return t
+	}(),
 }
 
 // splitImageTag splits a user image ref into name and tag. Digest refs

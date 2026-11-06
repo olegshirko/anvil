@@ -143,6 +143,15 @@ final class ControlServer {
     // MARK: - Private
 
     private func handleClient(fd clientFd: Int32) {
+        // Bounded I/O on the client socket, before ANY read: a client that
+        // connects and stalls (half a header, an unread response) parks one
+        // of the dedicated connection threads forever. SO_RCVTIMEO makes the
+        // reads fail, SO_SNDTIMEO keeps writeExactlyFD from hanging on a
+        // client that stopped reading.
+        var tv = timeval(tv_sec: 30, tv_usec: 0)
+        setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
         // Read the request before counting the connection as a client: the
         // daemon's own NAT egress probe arrives every minute, and counting it
         // re-armed the idle timer, so --idle never fired.
@@ -174,15 +183,6 @@ final class ControlServer {
         if debug, let req = request {
             print("[control] command=\(req.cmd) args=\(req.args ?? [])")
         }
-
-        // Bounded I/O on the client socket: a client that connects and
-        // stalls (half a header, an unread response) used to park one of
-        // the dedicated connection threads forever. SO_RCVTIMEO makes the
-        // reads fail, SO_SNDTIMEO keeps writeExactlyFD from hanging on a
-        // client that stopped reading.
-        var tv = timeval(tv_sec: 30, tv_usec: 0)
-        setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
         // A VM stopped to free memory is being restored (the connect hook
         // asked for it): wait for its socket device, bounded.
