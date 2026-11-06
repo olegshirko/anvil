@@ -253,9 +253,6 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 			cancel()
 			return fmt.Errorf("cni attach: %w", xerr)
 		}
-		saveNetInfo(ns, id, containerNetInfo{IP: addrs.IP, Mac: addrs.Mac, Network: netName, ipv6Addr: addrs.ipv6Addr, Extra: extra})
-		writeOwnHosts(ns, id)
-		publishEndpointEvents("connect", ns, id, netName, extra)
 		defer func() {
 			if err != nil {
 				dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -265,6 +262,16 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 				removeNetInfo(ns, id)
 			}
 		}()
+		// net.json is the only record of the live endpoint: without it a
+		// later stop cannot run CNI DEL, leaking the container IP and the
+		// published host ports until the VM restarts. Fail the start and
+		// let the rollback above detach instead of starting "half-networked".
+		if serr := saveNetInfo(ns, id, containerNetInfo{IP: addrs.IP, Mac: addrs.Mac, Network: netName, ipv6Addr: addrs.ipv6Addr, Extra: extra}); serr != nil {
+			err = fmt.Errorf("save network info: %w", serr)
+			return err
+		}
+		writeOwnHosts(ns, id)
+		publishEndpointEvents("connect", ns, id, netName, extra)
 	}
 
 	// A new run: the previous run's exit code must not answer /wait for
