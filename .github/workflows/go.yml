@@ -62,7 +62,14 @@ jobs:
 
       - name: go test -race
         working-directory: guest-agent
-        run: go test -race ./...
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage
+          path: guest-agent/coverage.out
+          retention-days: 7
 
       - name: staticcheck (linux/arm64)
         working-directory: guest-agent
@@ -77,6 +84,24 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           GOOS=linux GOARCH=arm64 "$(go env GOPATH)/bin/govulncheck" ./...
+
+  # The guest-agent never runs on macOS: run its suite on the real
+  # GOOS/GOARCH, natively, on a hosted arm64 Linux runner.
+  guest-tests:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: guest-agent/go.mod
+          cache-dependency-path: guest-agent/go.sum
+      - name: go vet
+        working-directory: guest-agent
+        run: go vet ./...
+      - name: go test -race
+        working-directory: guest-agent
+        run: go test -race ./...
 
   build:
     needs: checks
@@ -176,8 +201,9 @@ jobs:
   validate:
     # GitHub-hosted macos runners have no hypervisor ("Virtualization is not
     # available on this hardware"), so VM-booting robustness checks only run
-    # on a self-hosted Apple Silicon runner, triggered manually.
-    if: github.event_name == 'workflow_dispatch'
+    # on a self-hosted Apple Silicon runner. A release tag runs it too: a
+    # release must not ship what no VM ever booted.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: [self-hosted, macOS, ARM64]
     needs: guestbuild
     steps:
@@ -215,7 +241,7 @@ jobs:
           .build/release/vz-runner stop
 
   release:
-    needs: [build, guestbuild]
+    needs: [build, guestbuild, validate]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -248,6 +274,19 @@ jobs:
             vmlinuz-raw.gz initramfs-containerd \
             anvil-service.sh com.olegshirko.anvil.plist
           shasum -a 256 anvil-darwin-arm64.tar.gz | awk '{print $1}' > anvil-darwin-arm64.tar.gz.sha256sum
+      # Release smoke: the shipped checksums must match what is actually
+      # uploaded, and every file the service script needs must be present —
+      # a truncated artifact or a renamed file would otherwise surface only
+      # at a user's first `anvil start`.
+      - name: verify release bundle
+        run: |
+          cd _output
+          sha256sum -c vz-runner-darwin-arm64.sha256sum
+          sha256sum -c anvil-darwin-arm64.tar.gz.sha256sum
+          for f in vz-runner-darwin-arm64 vmlinuz-raw.gz initramfs-containerd anvil-service.sh com.olegshirko.anvil.plist; do
+            test -s "$f" || { echo "missing or empty: $f"; exit 1; }
+            tar tzf anvil-darwin-arm64.tar.gz | grep -qx "$f" || { echo "not in tarball: $f"; exit 1; }
+          done
       - name: create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
