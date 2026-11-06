@@ -37,7 +37,17 @@ final class BootPhaseTimer {
 final class VMLifecycleManager: NSObject {
     let args: BootArgs
     private let snapshot: SnapshotManager
-    private var vm: VZVirtualMachine?
+    /// The `vm` storage is lock-guarded: `socketDevice` reads it from proxy
+    /// connection threads while the main queue replaces the VM (start, wake,
+    /// release) — an unsaved read raced the write. The VZVirtualMachine
+    /// object itself stays main-queue-confined; the lock only covers handing
+    /// the current instance out.
+    private let vmLock = NSLock()
+    private var vmStorage: VZVirtualMachine?
+    private var vm: VZVirtualMachine? {
+        get { vmLock.withLock { vmStorage } }
+        set { vmLock.withLock { vmStorage = newValue } }
+    }
     private var coldBootStart: Date?
     /// True when the live VM was booted (not restored) with `args` — only
     /// then may saveSnapshot stamp the config hash. Restored VMs must keep

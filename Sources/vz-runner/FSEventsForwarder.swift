@@ -27,6 +27,12 @@ final class FSEventsForwarder {
     private var pending: [String: FSEventStreamEventFlags] = [:]
     private var flushScheduled = false
     private var connection: VZVirtioSocketConnection?
+    /// The balanced retain behind `passRetained` (see restartStream): held
+    /// while an FSEvents stream is alive, released exactly where the stream
+    /// is released. Without it the stream's callback could fire into freed
+    /// memory — a forwarder replaced on a VM crash restart used to be
+    /// dropped with its stream still running.
+    private var streamRetain: Unmanaged<FSEventsForwarder>?
     /// What was last forwarded per path. FSEvents flags are cumulative for
     /// a recently changed file, so the echo of the guest's touch still says
     /// "modified"; an unchanged mtime is what tells it apart.
@@ -51,6 +57,14 @@ final class FSEventsForwarder {
         self.deviceProvider = deviceProvider
     }
 
+    deinit {
+        // Nothing on `queue` can still be running or queued holding self
+        // (every block captures it strongly), so the state is quiescent
+        // here. The stream itself cannot outlive self: the passRetained
+        // retain keeps the object alive while it exists.
+        connection?.close()
+    }
+
     /// Watch exactly these directories (an empty list stops watching).
     func update(paths newPaths: [String]) {
         queue.async { [self] in
@@ -70,13 +84,21 @@ final class FSEventsForwarder {
 
     // MARK: - FSEvents
 
-    private func restartStream() {
+    /// Runs on `queue`: stops and releases the live stream, if any, together
+    /// with the balanced retain that kept self alive for its callback.
+    private func releaseStream() {
         if let s = stream {
             FSEventStreamStop(s)
             FSEventStreamInvalidate(s)
             FSEventStreamRelease(s)
             stream = nil
+            streamRetain?.release()
+            streamRetain = nil
         }
+    }
+
+    private func restartStream() {
+        releaseStream()
         pending.removeAll()
         deferred.removeAll()
         dirRoots = []
@@ -94,7 +116,8 @@ final class FSEventsForwarder {
             }
         }
         guard !watched.isEmpty else { return }
-        var ctx = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
+        let retained = Unmanaged.passRetained(self)
+        var ctx = FSEventStreamContext(version: 0, info: retained.toOpaque(),
                                        retain: nil, release: nil, copyDescription: nil)
         let callback: FSEventStreamCallback = { _, info, count, eventPaths, eventFlags, _ in
             guard let info = info else { return }
@@ -109,15 +132,18 @@ final class FSEventsForwarder {
         guard let s = FSEventStreamCreate(kCFAllocatorDefault, callback, &ctx, Array(watched) as CFArray,
                                           FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.05, flags) else {
             print("[fsevents] cannot watch \(paths.count) directories")
+            retained.release()
             return
         }
         FSEventStreamSetDispatchQueue(s, queue)
         if FSEventStreamStart(s) {
             stream = s
+            streamRetain = retained
             print("[fsevents] watching \(paths.count) bind-mounted directories")
         } else {
             FSEventStreamInvalidate(s)
             FSEventStreamRelease(s)
+            retained.release()
         }
     }
 
