@@ -156,9 +156,8 @@ func TestTopPSErrors(t *testing.T) {
 }
 
 func TestTopPSEmptyProcs(t *testing.T) {
-	procs, now, boot := topPsFixture()
-	procs = nil
-	titles, rows, err := psFormat(procs, now, boot, 4<<20, "aux")
+	_, now, boot := topPsFixture()
+	titles, rows, err := psFormat(nil, now, boot, 4<<20, "aux")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
