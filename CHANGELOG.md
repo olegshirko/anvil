@@ -1,3 +1,41 @@
+## v1.9.9 (2026-11-06)
+
+### Fixed
+- dc781f4 fix(cli): drain the subprocess pipe before waitUntilExit
+- 75ac800 fix(daemon): saveSnapshot fails without a config hash; shutdown stops the fs-events forwarder
+- 7d8f90c fix(doctor): --json escaping without force unwraps
+- 8dc272d fix(control): bounded client I/O and full writes in ControlServer
+- 7c89afa fix(port-forwarder): the UDP relay loop owns its client sockets
+- 585d794 fix(exec): close the read pipe ends only after the stream readers drain
+- b7559c6 fix(images): the GitHub token no longer appears in curl's argv
+- bc992f2 fix(images): mirror download bounds, unpack errors, empty mirror tag
+- 9ba3180 fix(exec): close the stdio pipes on every failed exec start
+- 43f29c4 fix(cp): a failed bind mount on a stopped container fails the cp
+- 97f4dc3 fix(daemon): the FSEvents forwarder can no longer outlive its owner, and vm reads are lock-guarded
+- c961faf fix(containers): a failed net.json write no longer starts a half-networked container
+- e3cfc9c fix(buildx): the /grpc bridge no longer leaks a server per build
+- 6669342 fix(stop): docker stop/restart -t -1 waits instead of using the default
+- e98dfd5 fix(exec): a second exec start no longer runs the command twice
+- 02cb947 fix(idle): ClientTracker reads the suppression flag under its lock
+- 27721bd fix(idle): the NAT egress probe no longer keeps the VM from pausing
+- 7c6e727 fix(build): a stale-cache prune no longer hangs the build forever
+- 185883b fix(cli): anvil found through a symlink finds its source tree
+- 7e0d045 fix(guest-agent): a container name over 64 bytes no longer fails the start
+
+### Changed
+- a68b784 refactor(archive): request-scoped contexts for the cp paths
+
+### Internal
+- f885aef build: ci-checks pins the go.mod toolchain, like CI does
+- d12cd11 ci: release does not wait for the absent self-hosted runner
+- 9257513 build: make release runs the CI checks job first
+- d0456c4 style: gofmt volume_copyup.go
+- 46d09de ci: native linux/arm64 tests, VM-validated releases, bundle smoke, https downloads
+- b3a3052 build: bump klauspost/compress to 1.20.2 (govulncheck: GO-2026-6865 fixed in 1.20.2)
+- 25357e6 build: Go 1.26.10 (govulncheck: GO-2026-6809 fixed in 1.26.10)
+- bcc1032 build(deps): bump the go-deps group across 1 directory with 5 updates
+- 14d1bc5 build(deps): bump the actions group with 2 updates
+- 89989e2 build: update-brew waits for the release asset
 ## v1.9.8 (2026-10-11)
 
 ### Fixed
