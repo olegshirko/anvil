@@ -52,7 +52,7 @@ func handleContainerArchive(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func handleArchiveHead(w http.ResponseWriter, r *http.Request, ns, containerdID, path string) {
-	stat, err := statContainerPath(ns, containerdID, path)
+	stat, err := statContainerPath(r.Context(), ns, containerdID, path)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
@@ -65,7 +65,7 @@ func handleArchiveHead(w http.ResponseWriter, r *http.Request, ns, containerdID,
 // handleArchiveGet streams a tar of srcPath straight from the container's
 // filesystem to the client (no staging copy in the guest's RAM-backed /tmp).
 func handleArchiveGet(w http.ResponseWriter, r *http.Request, ns, containerdID, srcPath string) {
-	stat, err := statContainerPath(ns, containerdID, srcPath)
+	stat, err := statContainerPath(r.Context(), ns, containerdID, srcPath)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
@@ -130,10 +130,10 @@ func handleArchivePut(w http.ResponseWriter, r *http.Request, ns, containerdID, 
 
 // statContainerPath stats the path inside the container (a final symlink is
 // reported, not followed, as in Docker).
-func statContainerPath(ns, containerdID, path string) (dockerPathStat, error) {
+func statContainerPath(ctx context.Context, ns, containerdID, path string) (dockerPathStat, error) {
 	var stat dockerPathStat
 	p := containerPath(path)
-	err := withContainerFS(context.Background(), ns, containerdID, func(root string) error {
+	err := withContainerFS(ctx, ns, containerdID, func(root string) error {
 		return inChroot(root, func() error {
 			fi, err := os.Lstat(p)
 			if err != nil {
@@ -170,7 +170,7 @@ func withContainerFS(ctx context.Context, ns, containerdID string, fn func(root 
 	if pid, ok := containerTaskRootPid(ctx, ns, containerdID); ok {
 		return fn(fmt.Sprintf("/proc/%d/root", pid))
 	}
-	return withRootfsMount(ns, containerdID, true, fn)
+	return withRootfsMount(ctx, ns, containerdID, true, fn)
 }
 
 // containerTaskRootPid returns the init pid of a running or paused task.
@@ -197,15 +197,16 @@ func containerTaskRootPid(ctx context.Context, ns, containerdID string) (int, bo
 
 // withRootfsMount mounts a stopped container's rootfs snapshot at a temporary
 // directory and calls fn with the mount root. Snapshotter mounts require the
-// container to have no live task.
+// container to have no live task. The containerd calls honor ctx, so an HTTP
+// handler's work stops when its client goes away.
 // withBinds also mounts the container's volumes and bind mounts (docker cp);
 // export and volume copy-up need the bare rootfs.
-func withRootfsMount(ns, containerdID string, withBinds bool, fn func(root string) error) error {
-	cl, err := pc.get(context.Background())
+func withRootfsMount(ctx context.Context, ns, containerdID string, withBinds bool, fn func(root string) error) error {
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return err
 	}
-	ctx := namespaces.WithNamespace(context.Background(), ns)
+	ctx = namespaces.WithNamespace(ctx, ns)
 	c, err := cl.LoadContainer(ctx, containerdID)
 	if err != nil {
 		return fmt.Errorf("load container: %w", err)
