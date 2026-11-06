@@ -241,7 +241,10 @@ jobs:
           .build/release/vz-runner stop
 
   release:
-    needs: [build, guestbuild, validate]
+    # The validate gate is off until a self-hosted Apple Silicon runner is
+    # registered again: with none, a tag would queue forever and never ship.
+    # Restore "needs: [build, guestbuild, validate]" when the runner is back.
+    needs: [build, guestbuild]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
