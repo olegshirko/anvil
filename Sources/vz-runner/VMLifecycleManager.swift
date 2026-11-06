@@ -410,8 +410,16 @@ final class VMLifecycleManager: NSObject {
             // Stamp the config hash ONLY for a VM booted with these args.
             // A restored VM keeps the hash it booted with — otherwise a
             // rebuilt initramfs looks "matching" and restores a stale guest.
+            // A failed stamp must fail the save: without the hash sidecar
+            // hasSnapshot stays false, and the committed multi-GB state
+            // would never restore but sit on disk until the next save.
             if self.bootedWithCurrentArgs {
-                self.snapshot.writeConfigHash(self.vmConfigHash)
+                if !self.snapshot.writeConfigHash(self.vmConfigHash) {
+                    self.snapshot.discardPendingSnapshot()
+                    completion?(NSError(domain: "anvil", code: 104,
+                                        userInfo: [NSLocalizedDescriptionKey: "config hash write failed"]))
+                    return
+                }
             } else {
                 print("[anvil] keeping stored config hash (VM was restored, not booted with current assets)")
             }
