@@ -1,3 +1,13 @@
+## v1.9.10 (2026-11-06)
+
+### Fixed
+- 6116afd fix(containers): accept the local log driver
+- 161ea67 fix(top): honor the ps_args query parameter
+- 0d0c9d6 fix: five review findings on the release branch
+
+### Internal
+- fd53df6 test(top): drop the unused fixture value staticcheck flags
+- b7d2f03 ci: validate stays workflow_dispatch-only while no runner exists
 ## v1.9.9 (2026-11-06)
 
 ### Fixed
