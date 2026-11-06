@@ -11,7 +11,7 @@ import (
 // validator error like `log driver "syslog" ...` broke every client parser).
 func TestWriteJSONErrorEscapesQuotes(t *testing.T) {
 	cases := []string{
-		`log driver "syslog" is not supported by anvil: only json-file and none exist`,
+		`log driver "syslog" is not supported by anvil: only json-file, local and none exist`,
 		`platform "linux/amd64" is not supported`,
 		"multiline\nmessage",
 	}

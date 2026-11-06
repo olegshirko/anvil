@@ -139,6 +139,12 @@ func TestValidateHostConfig(t *testing.T) {
 		{"log none", `{"HostConfig":{"LogConfig":{"Type":"none"}}}`, ""},
 		{"log unset", `{"HostConfig":{"LogConfig":{"Type":""}}}`, ""},
 		{"log syslog", `{"HostConfig":{"LogConfig":{"Type":"syslog"}}}`, "syslog"},
+		// compose's `logging: driver: local` must not be refused: anvil
+		// writes json-file records, and the local driver's rotation opts
+		// (max-size/max-file) mean the same thing here.
+		{"log local", `{"HostConfig":{"LogConfig":{"Type":"local"}}}`, ""},
+		{"log local with opts", `{"HostConfig":{"LogConfig":{"Type":"local","Config":{"max-size":"10m","max-file":"5","compress":"true"}}}}`, ""},
+		{"log local bad max-size", `{"HostConfig":{"LogConfig":{"Type":"local","Config":{"max-size":"zzz"}}}}`, "max-size"},
 		{"null values ignored", `{"HostConfig":{"StorageOpt":null,"Isolation":null}}`, ""},
 		{"honored field passes", `{"HostConfig":{"ShmSize":134217728,"PidsLimit":100}}`, ""},
 		{"malformed body is not ours", `{"HostConfig": 3`, ""},

@@ -286,7 +286,8 @@ The full rationale — every trade-off, benchmark, and post-mortem — is in
   --init/--volumes-from` are honored. Refused with a 400 naming the flag:
   `--oom-kill-disable`, `--blkio-weight` and the per-device blkio limits,
   `--gpus`, `--storage-opt`, `--isolation`, `--runtime`, `--log-driver`
-  other than `json-file`/`none`. `--cgroup-parent` and
+  other than `json-file`/`local`/`none` (`local` is honored with the same
+  rotation opts; compose's `logging: driver: local` works). `--cgroup-parent` and
   `--memory-swappiness` are accepted with a warning and have no effect;
   `--security-opt apparmor=…`/`label=…` are no-ops (the VM has neither
   AppArmor nor SELinux).
