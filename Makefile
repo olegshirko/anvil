@@ -12,7 +12,7 @@
     container-tools time-boot time-service validate doctor unit-tests integration smoke \
     harness harness-prepull harness-tests harness-all bench-all \
     prune clean-containers disk-compact \
-    release replace-release update-brew release-notes bottle bottle-resume
+    release replace-release update-brew release-notes bottle bottle-resume ci-checks
 
 BINARY := .build/release/vz-runner
 # ANVIL_INSTANCE=dev: a second, independent anvil (state in ~/.anvil-vz-dev,
@@ -184,6 +184,17 @@ unit-tests:
 	cd guest-agent && gofmt -l *.go | grep -q . && { echo "[unit-tests] gofmt violations:"; gofmt -l *.go; exit 1; } || true
 	cd guest-agent && go vet ./... && go test ./...
 	swift test
+
+# The go.yml `checks` job, locally: everything CI runs that unit-tests does
+# not. A tag that fails one of these fails CI only after the release flow
+# has already updated the CHANGELOG and pushed the tag, so release runs it
+# first (SKIP_CI_CHECKS=1 to skip, e.g. to re-tag a known-good tree).
+ci-checks:
+	cd guest-agent && go mod tidy -diff
+	cd guest-agent && GOOS=linux GOARCH=arm64 go vet ./...
+	cd guest-agent && go test -race ./...
+	cd guest-agent && go install honnef.co/go/tools/cmd/staticcheck@2026.2.1 && GOOS=linux GOARCH=arm64 "$$(go env GOPATH)/bin/staticcheck" ./...
+	cd guest-agent && go install golang.org/x/vuln/cmd/govulncheck@v1.8.0 && GOOS=linux GOARCH=arm64 "$$(go env GOPATH)/bin/govulncheck" ./...
 
 # Docker API integration tests against a running daemon (requires
 # `make service-start` first; pulls alpine/nginx/busybox on first run).
@@ -497,7 +508,7 @@ endef
 # A tag must not ship an agent or initramfs that never booted: unit tests
 # always, and the smoke suite against the running daemon (`make
 # service-start` first; SKIP_SMOKE=1 skips it, e.g. on a machine without one).
-release: sign unit-tests
+release: sign ci-checks unit-tests
 	$(require_version)
 	@if [ "$(SKIP_SMOKE)" != "1" ]; then \
 		python3 scripts/integration_tests.py --smoke || { echo "[release] smoke tests failed (SKIP_SMOKE=1 to skip)"; exit 1; }; \
@@ -514,7 +525,7 @@ release: sign unit-tests
 	$(wait_for_release)
 	$(MAKE) update-brew VERSION=$(VERSION)
 
-replace-release: sign
+replace-release: sign ci-checks
 	$(require_version)
 	@echo "[replace-release] deleting remote tag and GitHub release..."
 	git push origin ":refs/tags/v$(VERSION)" 2>/dev/null || true
