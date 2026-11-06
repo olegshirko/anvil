@@ -33,56 +33,54 @@ import (
 // containerd worker's image exporter with push=false imports straight into the
 // shared containerd image store, which is what the moby exporter would do.
 
+// lazyConn caches one gRPC client connection. Only success is cached: a
+// buildx session racing buildkitd's startup must not turn its first failure
+// into a permanent error for every later build until the daemon restarts.
+type lazyConn struct {
+	mu sync.Mutex
+	cc *grpc.ClientConn
+}
+
+func (l *lazyConn) get(dial func() (*grpc.ClientConn, error)) (*grpc.ClientConn, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.cc != nil {
+		return l.cc, nil
+	}
+	cc, err := dial()
+	if err != nil {
+		return nil, err
+	}
+	l.cc = cc
+	return cc, nil
+}
+
+var buildkitRawLazy lazyConn
+
 // buildkitRawConn connects to buildkitd with the raw-frame codec (see
 // containerdClientConn) for transparently forwarded services.
-var (
-	buildkitRawOnce sync.Once
-	buildkitRaw     *grpc.ClientConn
-	buildkitRawErr  error
-)
-
 func buildkitRawConn() (*grpc.ClientConn, error) {
-	buildkitRawOnce.Do(func() {
+	return buildkitRawLazy.get(func() (*grpc.ClientConn, error) {
 		if err := ensureBuildkitd(); err != nil {
-			buildkitRawErr = err
-			return
+			return nil, err
 		}
-		cc, err := grpc.NewClient("unix://"+buildkitSocket,
+		return grpc.NewClient("unix://"+buildkitSocket,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithDefaultCallOptions(grpc.CallCustomCodec(hybridCodec{})),
 		)
-		if err != nil {
-			buildkitRawErr = err
-			return
-		}
-		buildkitRaw = cc
 	})
-	return buildkitRaw, buildkitRawErr
 }
 
-var containerdProxyConn *grpc.ClientConn
-
-var (
-	proxyConnOnce sync.Once
-	proxyConn     *grpc.ClientConn
-	proxyConnErr  error
-)
+var controlConnLazy lazyConn
 
 func controlClientConn() (*grpc.ClientConn, error) {
-	proxyConnOnce.Do(func() {
+	return controlConnLazy.get(func() (*grpc.ClientConn, error) {
 		if err := ensureBuildkitd(); err != nil {
-			proxyConnErr = err
-			return
+			return nil, err
 		}
-		cc, err := grpc.NewClient("unix://"+buildkitSocket,
+		return grpc.NewClient("unix://"+buildkitSocket,
 			grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			proxyConnErr = err
-			return
-		}
-		proxyConn = cc
 	})
-	return proxyConn, proxyConnErr
 }
 
 type controlProxy struct {
@@ -260,24 +258,56 @@ func (p *controlProxy) Session(stream grpc.BidiStreamingServer[control.BytesMess
 	return <-errCh
 }
 
-// singleConnListener feeds one hijacked connection to grpc.Server.Serve.
+// singleConnListener feeds one hijacked connection to grpc.Server.Serve and
+// then parks Accept until Close. grpc closes its listeners on Stop, which is
+// what lets Serve return; blocking in Accept forever (the previous version)
+// leaked one goroutine and one gRPC server per finished buildx session.
 type singleConnListener struct {
-	once sync.Once
-	conn net.Conn
+	conn      net.Conn
+	once      sync.Once
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func newSingleConnListener(conn net.Conn) *singleConnListener {
+	return &singleConnListener{conn: conn, closed: make(chan struct{})}
 }
 
 func (l *singleConnListener) Accept() (net.Conn, error) {
-	var c net.Conn
-	l.once.Do(func() { c = l.conn })
-	if c != nil {
-		return c, nil
+	var first bool
+	l.once.Do(func() { first = true })
+	if first {
+		return l.conn, nil
 	}
-	// Serve keeps calling Accept; block forever instead of busy-looping.
-	select {}
+	<-l.closed
+	return nil, net.ErrClosed
 }
 
-func (l *singleConnListener) Close() error   { return nil }
+func (l *singleConnListener) Close() error {
+	l.closeOnce.Do(func() { close(l.closed) })
+	return nil
+}
+
 func (l *singleConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
+
+// notifyConn reports when the gRPC transport closes the hijacked connection
+// (client disconnect, RPC done, server stop), so the one-shot server can be
+// stopped and Serve can return.
+type notifyConn struct {
+	net.Conn
+	once sync.Once
+	done chan struct{}
+}
+
+func newNotifyConn(c net.Conn) *notifyConn {
+	return &notifyConn{Conn: c, done: make(chan struct{})}
+}
+
+func (c *notifyConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() { close(c.done) })
+	return err
+}
 
 // prefixConn restores bytes the bufio reader swallowed after the hijack but
 // before the HTTP/2 preface.
@@ -295,17 +325,28 @@ func serveBuildkitGRPC(conn net.Conn, buffered io.Reader) error {
 	if err != nil {
 		return err
 	}
-	containerdProxyConn, err = containerdClientConn()
+	// containerdClientConn is shared and immutable, so each /grpc session can
+	// use it directly (a per-session global variable raced between builds).
+	contCC, err := containerdClientConn()
 	if err != nil {
 		return err
 	}
 	gs := grpc.NewServer(
 		grpc.ForceServerCodec(hybridCodec{}),
-		grpc.UnknownServiceHandler(proxyUnknownStream(containerdProxyConn)),
+		grpc.UnknownServiceHandler(proxyUnknownStream(contCC)),
 	)
 	control.RegisterControlServer(gs, &controlProxy{cc: cc})
 	pb.RegisterLLBBridgeServer(gs, &llbBridge{cc: cc})
-	return gs.Serve(&singleConnListener{conn: prefixConn{Conn: conn, r: io.MultiReader(buffered, conn)}})
+
+	hijacked := newNotifyConn(prefixConn{Conn: conn, r: io.MultiReader(buffered, conn)})
+	go func() {
+		<-hijacked.done
+		gs.Stop()
+	}()
+	// Serve returns nil once Stop has closed the listener; closing the conn
+	// also releases the watcher if Serve fails before the client connects.
+	defer hijacked.Close()
+	return gs.Serve(newSingleConnListener(hijacked))
 }
 
 // llbBridge forwards the gateway frontend service (the same service buildkitd
@@ -573,25 +614,15 @@ func (hybridCodec) Unmarshal(data []byte, v any) error {
 	return proto.Unmarshal(data, v.(proto.Message))
 }
 
-var (
-	containerdConnOnce sync.Once
-	containerdConn     *grpc.ClientConn
-	containerdConnErr  error
-)
+var containerdConnLazy lazyConn
 
 func containerdClientConn() (*grpc.ClientConn, error) {
-	containerdConnOnce.Do(func() {
-		cc, err := grpc.NewClient("unix:///run/containerd/containerd.sock",
+	return containerdConnLazy.get(func() (*grpc.ClientConn, error) {
+		return grpc.NewClient("unix:///run/containerd/containerd.sock",
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithDefaultCallOptions(grpc.CallCustomCodec(hybridCodec{})),
 		)
-		if err != nil {
-			containerdConnErr = err
-			return
-		}
-		containerdConn = cc
 	})
-	return containerdConn, containerdConnErr
 }
 
 // proxyUnknownStream forwards a gRPC stream for an unregistered service to
