@@ -76,8 +76,9 @@ func validateHostConfig(body []byte) error {
 }
 
 // validateLogConfig enforces the LogConfig contract: json-file (what the
-// guest already writes) and none (discard) are honored; every other driver
-// is refused instead of silently falling back to json-file.
+// guest already writes), local (compose's default alias — honored with the
+// same rotation opts, compress is dropped) and none (discard) are accepted;
+// every other driver is refused instead of silently falling back.
 func validateLogConfig(raw json.RawMessage) error {
 	if len(raw) == 0 || isEmptyJSON(raw) {
 		return nil
@@ -90,13 +91,13 @@ func validateLogConfig(raw json.RawMessage) error {
 		return nil // shape errors surface in the typed decode
 	}
 	switch lc.Type {
-	case "", "json-file":
+	case "", "json-file", "local":
 		_, err := logRotationFor(lc.Config)
 		return err
 	case "none":
 		return nil
 	}
-	return fmt.Errorf("log driver %q is not supported by anvil: only json-file and none exist", lc.Type)
+	return fmt.Errorf("log driver %q is not supported by anvil: only json-file, local and none exist", lc.Type)
 }
 
 // isEmptyJSON reports whether a raw JSON value carries no meaningful
