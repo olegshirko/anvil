@@ -78,16 +78,8 @@ func processName(of pid: Int32) -> String? {
 }
 
 func saveDockerContext() {
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    proc.arguments = ["docker", "context", "show"]
-    let pipe = Pipe()
-    proc.standardOutput = pipe
-    proc.standardError = FileHandle.nullDevice
-    try? proc.run()
-    proc.waitUntilExit()
-    let ctx = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-        .trimmingCharacters(in: .whitespacesAndNewlines) ?? "default"
+    let ctx = runCapturing(["docker", "context", "show"])
+        .trimmingCharacters(in: .whitespacesAndNewlines)
     // Already on anvil (a daemon that died without a stop left it there):
     // keep the context saved back then, or stop would fall back to default.
     if ctx != dockerContextName {
@@ -194,15 +186,29 @@ func setupBuildxBuilderAsync() {
 }
 
 func shell(_ args: String...) -> String {
+    runCapturing(args)
+}
+
+/// Runs `args` (via /usr/bin/env), captures stdout, discards stderr. The
+/// pipe is drained to EOF *before* waitUntilExit: a child producing more
+/// than the pipe buffer blocks on write while the parent waits for an exit
+/// it can never reach — the classic Process+Pipe deadlock (docker context
+/// and buildx output can be arbitrarily large). A failed launch returns "".
+func runCapturing(_ args: [String]) -> String {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
     proc.arguments = args
     let pipe = Pipe()
     proc.standardOutput = pipe
     proc.standardError = FileHandle.nullDevice
-    try? proc.run()
+    do {
+        try proc.run()
+    } catch {
+        return ""
+    }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
     proc.waitUntilExit()
-    return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return String(data: data, encoding: .utf8) ?? ""
 }
 
 func waitForControlSocket(timeout: TimeInterval = 60, process: Process? = nil) -> Bool {
