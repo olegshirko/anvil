@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -19,11 +20,17 @@ import (
 // mounts onto its mounted rootfs, so docker cp into or out of a container
 // that has not started yet (Testcontainers copies files before start) sees
 // the same paths a running container does — a file copied to a volume path
-// lands in the volume, not hidden underneath it.
-func mountContainerBinds(ctx context.Context, c client.Container, root string) {
+// lands in the volume, not hidden underneath it. A bind that fails to
+// mount is an error, not a skip: cp proceeding silently would write into
+// the rootfs overlay underneath the volume and lose the data. A missing
+// source path stays best-effort (skipped), as before.
+func mountContainerBinds(ctx context.Context, c client.Container, root string) error {
 	spec, err := c.Spec(ctx)
-	if err != nil || spec == nil {
-		return
+	if err != nil {
+		return fmt.Errorf("container spec: %w", err)
+	}
+	if spec == nil {
+		return nil
 	}
 	type bind struct {
 		src, dst string
@@ -62,15 +69,15 @@ func mountContainerBinds(ctx context.Context, c client.Container, root string) {
 			continue
 		}
 		if err := ensureMountpoint(target, fi.IsDir()); err != nil {
-			continue
+			return fmt.Errorf("mount %s: %w", b.dst, err)
 		}
 		if err := unix.Mount(b.src, target, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
-			debugLog("[cp] bind %s -> %s: %v", b.src, b.dst, err)
-			continue
+			return fmt.Errorf("mount %s -> %s: %w", b.src, b.dst, err)
 		}
 		if b.ro {
 			// As the container sees it: docker cp into a read-only mount fails.
 			unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY|unix.MS_REC, "") //nolint:errcheck
 		}
 	}
+	return nil
 }

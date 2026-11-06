@@ -234,7 +234,11 @@ func withRootfsMount(ns, containerdID string, withBinds bool, fn func(root strin
 	}
 	defer unmountAll(root) // recursive: the binds below go too
 	if withBinds {
-		mountContainerBinds(ctx, c, root)
+		// A failed volume/bind mount must fail the cp: writing into the
+		// overlay underneath a volume loses the data silently.
+		if berr := mountContainerBinds(ctx, c, root); berr != nil {
+			return fmt.Errorf("mount container binds: %w", berr)
+		}
 	}
 	return fn(root)
 }
