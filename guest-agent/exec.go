@@ -343,15 +343,27 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 
 	// Every early return after this point must close the stdio pipes: a
 	// leaked pair is two fds and two blocked stream readers per failed
-	// exec, plus the stdin io.Pipe with its copier goroutine.
-	closePipes := func() {
-		stdoutR.Close()
+	// exec, plus the stdin io.Pipe with its copier goroutine. Once the
+	// stream readers are running, only the WRITE ends may close before
+	// wg.Wait — closing a read end makes its reader fail with ErrClosed
+	// instead of draining, truncating the exec's output tail. Read ends
+	// close after the readers finish.
+	closeWriteEnds := func() {
 		stdoutW.Close()
-		stderrR.Close()
 		stderrW.Close()
 		if stdinWriteCloser != nil {
 			stdinWriteCloser.Close()
 		}
+	}
+	closeReadEnds := func() {
+		stdoutR.Close()
+		stderrR.Close()
+	}
+	// For the early returns before the stream readers exist (execUserFor,
+	// task.Exec failures): nothing can drain the pipes anymore.
+	closePipes := func() {
+		closeWriteEnds()
+		closeReadEnds()
 	}
 	// Stdin only with -i, as dockerd does. The CLI half-closes the
 	// connection of an exec without -i at once; with a stdin pipe that EOF
@@ -444,8 +456,9 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 
 	if serr := process.Start(nsCtx); serr != nil {
 		process.Delete(context.WithoutCancel(nsCtx)) //nolint:errcheck
-		closePipes()
+		closeWriteEnds()
 		wg.Wait()
+		closeReadEnds()
 		failExec("start", serr)
 		return
 	}
@@ -460,8 +473,9 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		process.Kill(context.WithoutCancel(nsCtx), syscall.SIGKILL)          //nolint:errcheck
 		process.Delete(context.WithoutCancel(nsCtx), client.WithProcessKill) //nolint:errcheck
 		// The stream readers end only on EOF of their pipes.
-		closePipes()
+		closeWriteEnds()
 		wg.Wait()
+		closeReadEnds()
 		spec.setExit(126)
 		return
 	}
@@ -469,10 +483,13 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 
 	// Wait for the client-side fifo copy goroutines to drain the process
 	// output into our pipes, then close the write ends so the stream
-	// readers see EOF and finish.
+	// readers see EOF and finish; the read ends go only after the readers
+	// are done (closing one early would fail it with ErrClosed and drop
+	// whatever was still buffered in the pipe).
 	process.IO().Wait()
-	closePipes()
+	closeWriteEnds()
 	wg.Wait()
+	closeReadEnds()
 
 	exitCode := 0
 	if serr := st.Error(); serr != nil {
