@@ -216,13 +216,7 @@ func cmdDoctor(args: [String]) {
 
     if asJSON {
         let checks = results.map { r in
-            // Strings are plain data (paths, versions); JSON-escaping via
-            // JSONSerialization keeps quotes/newlines correct.
-            func esc(_ s: String) -> String {
-                let d = try! JSONSerialization.data(withJSONObject: [s])
-                return String(data: d.dropFirst().dropLast(), encoding: .utf8)!
-            }
-            return "{\"name\":\(esc(r.name)),\"ok\":\(r.ok),\"detail\":\(esc(r.detail))}"
+            "{\"name\":\(jsonEscape(r.name)),\"ok\":\(r.ok),\"detail\":\(jsonEscape(r.detail))}"
         }
         print("{\"ok\":\(failures == 0),\"failed\":\(failures),\"checks\":[")
         print(checks.joined(separator: ",\n"))
@@ -233,6 +227,30 @@ func cmdDoctor(args: [String]) {
         exit(1)
     }
     if !asJSON { print("\nall checks passed") }
+}
+
+/// JSON-escapes a string for the `--json` output without force unwraps:
+/// a diagnostic command must not crash on its own output. Quotes,
+/// backslashes and control characters are escaped; everything else
+/// passes through as UTF-8, same as JSONSerialization produced before.
+func jsonEscape(_ s: String) -> String {
+    var out = "\""
+    for ch in s.unicodeScalars {
+        switch ch {
+        case "\"": out += "\\\""
+        case "\\": out += "\\\\"
+        case "\n": out += "\\n"
+        case "\r": out += "\\r"
+        case "\t": out += "\\t"
+        default:
+            if ch.value < 0x20 {
+                out += String(format: "\\u%04x", ch.value)
+            } else {
+                out.unicodeScalars.append(ch)
+            }
+        }
+    }
+    return out + "\""
 }
 
 // `anvil logs [daemon|console|guest]` — tail the relevant log files.
