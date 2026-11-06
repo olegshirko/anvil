@@ -30,7 +30,7 @@ var containerRoutes = []apiRoute{
 	newRoute(http.MethodPost, "/containers/:id/pause", handleContainerPause),
 	newRoute(http.MethodPost, "/containers/:id/unpause", handleContainerUnpause),
 	newRoute(http.MethodGet, "/containers/:id/top", func(w http.ResponseWriter, r *http.Request, p routeParams) {
-		handleContainerTop(r.Context(), w, p["id"])
+		handleContainerTop(r.Context(), w, p["id"], r.URL.Query().Get("ps_args"))
 	}),
 	newRoute(http.MethodGet, "/containers/:id/stats", func(w http.ResponseWriter, r *http.Request, p routeParams) {
 		// Docker streams unless told otherwise (docker-py and docker-java
