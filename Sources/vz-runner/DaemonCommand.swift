@@ -430,6 +430,9 @@ enum DaemonCommand {
                     }
                 }
             }
+            // A leftover forwarder from the previous VM (crash restart)
+            // must be torn down before its slot is taken.
+            self.fsEventsForwarder?.stop()
             let fsEvents = FSEventsForwarder(deviceProvider: { [weak manager] in manager?.socketDevice })
             forwarder.onWatchPathsChange = { paths in
                 fsEvents.update(paths: paths)
@@ -524,10 +527,16 @@ enum DaemonCommand {
                 self.dockerProxyServer?.stop()
                 self.buildkitProxyServer?.stop()
                 self.portForwarder?.stop()
+                // The forwarder holds the dead VM's vsock connection and an
+                // FSEvents stream on it; a replacement is built in
+                // didBecomeReady. stop() tears the stream down on its queue
+                // (dropping it unreleased once crashed the restarted daemon).
+                self.fsEventsForwarder?.stop()
                 self.server = nil
                 self.dockerProxyServer = nil
                 self.buildkitProxyServer = nil
                 self.portForwarder = nil
+                self.fsEventsForwarder = nil
                 self.clientTracker = nil
 
                 let delay = daemonRestartDelay(attempt: self.restartAttempts)
