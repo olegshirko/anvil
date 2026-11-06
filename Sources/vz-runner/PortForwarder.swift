@@ -574,14 +574,10 @@ private final class Listener {
             fd = -1
         }
         lock.unlock()
-        udpClientsLock.lock()
-        for (_, c) in udpClients {
-            close(c.fd)
-        }
-        udpClients.removeAll()
-        udpClientsLock.unlock()
-        // Closing the listener fd is enough to unblock accept; relay sockets will be
-        // closed when the next read/write fails.
+        // The per-client UDP sockets belong to the relay loop's thread:
+        // closing them here raced its poll/recv on the same descriptors
+        // (a closed number is quickly reused). Closing the listener fd
+        // ends the loop, and its exit path closes every client socket.
     }
 
     // MARK: - UDP relay
@@ -650,7 +646,20 @@ private final class Listener {
         release(fd, onFailure: onFailure)
     }
 
+    /// Closes every per-client UDP socket. Runs on the relay loop's thread
+    /// (loop exit, or stop-then-exit) — the only thread that touches those
+    /// descriptors while they may still be polled or read.
+    private func closeAllUDPClients() {
+        udpClientsLock.lock()
+        for (_, c) in udpClients {
+            close(c.fd)
+        }
+        udpClients.removeAll()
+        udpClientsLock.unlock()
+    }
+
     private func udpRelayLoop(_ fd: Int32, targetIP: String, targetPort: Int) {
+        defer { closeAllUDPClients() }
         var buffer = [UInt8](repeating: 0, count: 65536)
         while owns(fd) {
             // Wait on the listener and every per-client guest socket at once.
@@ -762,6 +771,15 @@ private final class Listener {
             return -1
         }
         udpClientsLock.lock()
+        // Re-check under the lock: a socket created before we re-acquired
+        // the lock must not overwrite an existing entry (the loser's fd
+        // would leak).
+        if let existing = udpClients[key], existing.fd >= 0 {
+            udpClients[key]?.lastUsed = Date()
+            udpClientsLock.unlock()
+            close(fd)
+            return existing.fd
+        }
         if udpClients.count >= udpMaxClients,
            let oldest = udpClients.min(by: { $0.value.lastUsed < $1.value.lastUsed }) {
             close(oldest.value.fd)
