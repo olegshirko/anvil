@@ -284,8 +284,10 @@ jobs:
       - name: verify release bundle
         run: |
           cd _output
-          sha256sum -c vz-runner-darwin-arm64.sha256sum
-          sha256sum -c anvil-darwin-arm64.tar.gz.sha256sum
+          # The build job's hash files name paths under _output/; compare the
+          # digests themselves instead of sha256sum -c's path resolution.
+          grep -q "$(sha256sum vz-runner-darwin-arm64 | cut -d" " -f1)" vz-runner-darwin-arm64.sha256sum
+          grep -q "$(sha256sum anvil-darwin-arm64.tar.gz | cut -d" " -f1)" anvil-darwin-arm64.tar.gz.sha256sum
           for f in vz-runner-darwin-arm64 vmlinuz-raw.gz initramfs-containerd anvil-service.sh com.olegshirko.anvil.plist; do
             test -s "$f" || { echo "missing or empty: $f"; exit 1; }
             tar tzf anvil-darwin-arm64.tar.gz | grep -qx "$f" || { echo "not in tarball: $f"; exit 1; }

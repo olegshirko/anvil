@@ -482,7 +482,7 @@ endef
 define wait_for_release
 	@echo "[$@] waiting for CI to publish release..."
 	@i=0; while [ $$i -lt 80 ]; do \
-		sleep 15; \
+		sleep 30; \
 		if command -v gh >/dev/null 2>&1; then \
 			gh release view "v$(VERSION)" --repo olegshirko/anvil >/dev/null 2>&1 && exit 0; \
 		else \
