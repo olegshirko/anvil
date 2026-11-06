@@ -258,9 +258,9 @@ ubuntu-modules: $(UBUNTU_DIR)
 	@KVER=$$(strings $(UBUNTU_KERNEL) 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic' | head -1); \
 	PKGVER=$${KVER%-*}; \
 	echo "[ubuntu-modules] kernel $$KVER"; \
-	DEB_PATH=$$(curl -sL "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/" | grep -o "linux-modules-$${KVER}_$${PKGVER}\.[0-9.]*_arm64.deb" | sort -V | tail -1); \
+	DEB_PATH=$$(curl -sL "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/" | grep -o "linux-modules-$${KVER}_$${PKGVER}\.[0-9.]*_arm64.deb" | sort -V | tail -1); \
 	echo "[ubuntu-modules] $$DEB_PATH"; \
-	curl -L -o $(UBUNTU_DEB) "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/$$DEB_PATH"
+	curl -L -o $(UBUNTU_DEB) "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/$$DEB_PATH"
 
 # No `go mod tidy` here: a build must not rewrite go.mod/go.sum (CI checks
 # tidiness with `go mod tidy -diff`).
