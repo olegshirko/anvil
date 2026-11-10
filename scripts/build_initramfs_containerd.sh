@@ -471,9 +471,9 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 # scripts/time_boot.py. Pure-shell: busybox in the initramfs has no `cut`
 # applet, and `read` avoids even the cat fork.
 bmark() { read -r up _ < /proc/uptime; echo "[boot] $1 up=$up"; }
-bmark myinit_start
-
+# bmark reads /proc/uptime, so the first mark waits for proc to be mounted.
 mount -t proc proc /proc
+bmark myinit_start
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 mkdir -p /dev/pts
@@ -578,20 +578,28 @@ CTREOF
 echo "[myinit] preparing tmpfs root"
 mkdir -p /newroot
 mount -t tmpfs tmpfs /newroot
-# Copy the rootfs contents; bind mounts keep us on rootfs, which breaks pivot_root.
+# Copy the rootfs contents; bind mounts keep us on rootfs, which breaks
+# pivot_root. The trees are independent, so copy them in parallel: the
+# memory-to-memory copy of ~250-300 MB is myinit's longest step.
+mkdir -p /newroot/usr
+copy_root() { # <source under /> <destination parent>
+    [ -d "/$1" ] || return 0
+    cp -a "/$1" "$2/" 2>/dev/null
+}
+copy_pids=""
 for d in bin sbin lib etc opt; do
-    rm -rf /newroot/$d
-    if [ -d "/$d" ]; then
-        cp -a /$d /newroot/ 2>/dev/null || true
-    fi
+    copy_root "$d" /newroot &
+    copy_pids="$copy_pids $!"
 done
 for d in usr/bin usr/sbin usr/lib; do
-    rm -rf /newroot/$d
-    mkdir -p /newroot/usr
-    if [ -d "/$d" ]; then
-        cp -a /$d /newroot/usr/ 2>/dev/null || true
-    fi
+    copy_root "$d" /newroot/usr &
+    copy_pids="$copy_pids $!"
 done
+copy_failed=0
+for pid in $copy_pids; do
+    wait "$pid" || copy_failed=1
+done
+[ "$copy_failed" = 0 ] || echo "[myinit] WARNING: a rootfs copy failed; the boot may be incomplete"
 bmark tmpfs_copy
 mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/run /newroot/tmp /newroot/var /newroot/mnt
 mount --make-rprivate /
@@ -781,6 +789,12 @@ mkdir -p /var/lib/containerd /var/lib/anvil /var/lib/cni
   ln -sf /opt/containerd/bin/runc                   /opt/containerd/bin/buildkit-runc
 ) &
 
+# Netfilter setup used to run here, before containerd and the guest-agent,
+# and cost ~100 ms of the boot critical path. Nothing on the status/health
+# path needs it: the rules matter only when the first container installs its
+# CNI port mappings, and guest-agent's boot finalize waits for this marker
+# before opening the Docker API (container starts are gated on it).
+(
 # Load netfilter modules so CNI bridge/portmap/firewall and iptables-nft work.
 # modprobe resolves dependency order itself; crc32c_generic must come first
 # (busybox modprobe misses the libcrc32c->crc32c softdep).
@@ -810,7 +824,10 @@ mount --make-rprivate /
 # guest, making localhost:PORT forwarding from the host work.
 iptables -t nat -C POSTROUTING -p tcp -m conntrack --ctstate DNAT -j MASQUERADE -m comment --comment "anvil-dnat-masq" 2>/dev/null || \
 iptables -t nat -A POSTROUTING -p tcp -m conntrack --ctstate DNAT -j MASQUERADE -m comment --comment "anvil-dnat-masq"
+
+: > /run/anvil-netfilter-ready
 bmark netfilter
+) &
 
 # Start containerd in background.
 echo "[stage2] starting containerd"

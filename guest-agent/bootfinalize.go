@@ -76,11 +76,37 @@ killall -9 runc 2>/dev/null && killed=1
 		time.Sleep(100 * time.Millisecond)
 	}
 
+	// stage2 loads the netfilter modules and installs the CNI masquerade
+	// rule in the background, in parallel with containerd and this agent
+	// starting. setupHostLoopback below needs those modules, and the first
+	// container needs the port-mapping rules.
+	waitForNetfilter()
+
 	ensureGuestZoneinfo()
 
 	// host.docker.internal -> the Mac's localhost. Before the Docker API
 	// opens, so every container's /etc/hosts gets the redirect address.
 	setupHostLoopback()
+}
+
+// waitForNetfilter waits for stage2's background netfilter setup (module
+// load, sysctls, CNI masquerade) to signal completion. The setup normally
+// finishes while the containerd socket is still appearing, so the wait is
+// usually a single stat; the timeout keeps a broken setup from blocking the
+// first container forever.
+func waitForNetfilter() {
+	const marker = "/run/anvil-netfilter-ready"
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			log.Printf("[boot] netfilter setup did not finish within 10s; container port mappings may fail")
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // cleanupStaleContainers deletes every task and container record left over

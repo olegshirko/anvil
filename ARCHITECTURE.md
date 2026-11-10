@@ -508,7 +508,9 @@ The base is the Alpine initramfs-virt. Inside a Linux container
 Bind mounts into `/newroot` were used before, but `pivot_root` cannot be
 called from the initramfs pseudo-fs `rootfs`. busybox `switch_root` does
 `mount --move` + `chroot` + `exec`, which correctly moves init into the
-tmpfs root.
+tmpfs root. Before that, `myinit` copies the rootfs into the tmpfs root;
+the independent top-level trees are copied in parallel, since the
+memory-to-memory copy is the longest single initramfs step.
 
 ### 5.3 stage2
 
@@ -526,24 +528,26 @@ tmpfs root.
    root. When volumes filled up (e.g. PostgreSQL), tmpfs ran out. Now all
    of `/var/lib` is persistent (a lesson from the early nerdctl-based
    design).
-4. Loads the netfilter/bridge/veth modules;
-5. Adds an iptables MASQUERADE rule for DNATed TCP (fixes asymmetric
-   routing under VZ NAT);
-6. Starts containerd and immediately `exec`s the guest-agent — the
-   containerd-socket wait, the stale-task cleanup and the DHCP lease
-   wait all run inside the agent (`runBootFinalize`) after its control
-   channel is up. A cold boot keeps containers, as a Docker daemon restart
-   does: only the previous boot's tasks, netns and CNI state go; `--rm`
-   containers and records without anvil metadata are removed; a container
-   that was running becomes `Exited (255)`; the in-memory state set at
-   create (TTY, entrypoint, stop signal, links, healthcheck, restart policy)
-   is rebuilt from the metadata; and `always`, `unless-stopped` (not after a
-   user stop) and `on-failure` (if the boot cut it off) start once the boot
-   is finalized. Network conflists are on tmpfs, so a start recreates the
-   ones its container needs. The Docker API server on vsock:1025 and exec'd commands
-   wait on that finalize (bounded), so container operations never race a
-   boot still in flight; `status`/`health` does not wait, keeping the
-   readiness gate honest but fast.
+4. Starts a background netfilter setup (module load, VM-wide sysctls,
+   private mount propagation, the MASQUERADE rule) and touches
+   `/run/anvil-netfilter-ready` when done. None of it is needed on the
+   status/health path, so it runs in parallel with containerd and the
+   agent instead of delaying them;
+5. Starts containerd and immediately `exec`s the guest-agent — the
+   containerd-socket wait, the stale-task cleanup, the DHCP lease wait and
+   the netfilter-marker wait all run inside the agent (`runBootFinalize`)
+   after its control channel is up. A cold boot keeps containers, as a
+   Docker daemon restart does: only the previous boot's tasks, netns and
+   CNI state go; `--rm` containers and records without anvil metadata are
+   removed; a container that was running becomes `Exited (255)`; the
+   in-memory state set at create (TTY, entrypoint, stop signal, links,
+   healthcheck, restart policy) is rebuilt from the metadata; and `always`,
+   `unless-stopped` (not after a user stop) and `on-failure` (if the boot
+   cut it off) start once the boot is finalized. Network conflists are on
+   tmpfs, so a start recreates the ones its container needs. The Docker API
+   server on vsock:1025 and exec'd commands wait on that finalize (bounded),
+   so container operations never race a boot still in flight; `status`/`health`
+   does not wait, keeping the readiness gate honest but fast.
 
    The DHCP lease itself is obtained by a background `udhcpc` in stage2
    (with retries — the VZ NAT DHCP server occasionally drops the first
