@@ -1,3 +1,13 @@
+## v1.9.11 (2026-11-10)
+
+### Changed
+- c9019ad perf(boot): keep netfilter setup and the rootfs copy off the guest critical path
+
+### Internal
+- a5f54c2 test(validate): report why no cycle resumed, not "division by zero"
+- 9cb0217 test(integration): probe egress on reachable targets, not 1.1.1.1
+- c12cae7 ci: run the VM suites on the self-hosted runner in an isolated ci instance
+- 3e8a8bd build(release): wait for the release archive, not just the release
 ## v1.9.10 (2026-11-06)
 
 ### Fixed
