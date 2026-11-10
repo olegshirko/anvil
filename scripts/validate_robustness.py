@@ -56,6 +56,9 @@ STATE_DIR = Path.home() / (".anvil-vz" + _SUFFIX)
 SNAPSHOT_DIR = STATE_DIR / "snapshots"
 SNAPSHOT_FILE = SNAPSHOT_DIR / "default.vzstate"
 LOG_FILE = Path(f"/tmp/validate_robustness{_SUFFIX}.log")
+# CI must exercise the resume path, not silently fall back to cold boots: a
+# locked Mac cannot use the Secure Enclave key that seals the saved state.
+REQUIRE_RESUME = os.environ.get("ANVIL_REQUIRE_RESUME") == "1"
 
 results: list[tuple[str, bool, str]] = []
 
@@ -130,6 +133,16 @@ def wait_for_marker(marker: str, timeout: float = 120.0) -> float:
                 return time.time() - t0
         time.sleep(0.1)
     raise TimeoutError(f"marker not found within {timeout}s: {marker}")
+
+
+def wait_for_resume(timeout: float = 60.0) -> float:
+    elapsed = wait_for_marker("daemon ready", timeout=timeout)
+    if REQUIRE_RESUME and "restore failed" in LOG_FILE.read_text(errors="replace"):
+        raise RuntimeError(
+            "snapshot restore failed and the VM cold-booted instead; the "
+            "suite is not exercising resume (a locked Mac cannot use the "
+            "Secure Enclave key — keep the test machine unlocked)")
+    return elapsed
 
 
 def vz_exec(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
@@ -227,7 +240,7 @@ def test_repeated_resume_cycles() -> None:
             sizes.append(snapshot_size())
             proc = start_daemon(fresh=False)
             try:
-                times.append(wait_for_marker("daemon ready", timeout=60.0))
+                times.append(wait_for_resume(timeout=60.0))
                 vz_exec("uname", "-a", timeout=10.0)
             except Exception as e:
                 failures += 1
@@ -273,7 +286,7 @@ def test_resume_after_workload() -> None:
 
         # Resume and check container is still reachable.
         proc = start_daemon(fresh=False)
-        resume_time = wait_for_marker("daemon ready", timeout=60.0)
+        resume_time = wait_for_resume(timeout=60.0)
         for _ in range(30):
             p = run_host(["curl", "--noproxy", "*", "-s", "-o", "/dev/null", "-w", "%{http_code}", f"http://localhost:{PORT_A}"], check=False)
             if p.stdout.strip() == "200":
@@ -581,7 +594,7 @@ def test_restart_policy_survives_resume() -> None:
             raise RuntimeError("container not restarted before save")
         stop_daemon(proc)  # save
         proc = start_daemon(fresh=False)  # resume
-        wait_for_marker("daemon ready", timeout=60.0)
+        wait_for_resume(timeout=60.0)
 
         # The policy registry is in guest-agent memory, which IS the
         # snapshot: after resume the monitor must still own the policy.
@@ -634,7 +647,7 @@ def test_udp_survives_resume() -> None:
         before = udp_probe()
         stop_daemon(proc)  # save
         proc = start_daemon(fresh=False)  # resume
-        wait_for_marker("daemon ready", timeout=60.0)
+        wait_for_resume(timeout=60.0)
         time.sleep(4.0)  # scanner push + listener rebind + a fresh nc
         after = udp_probe()
 

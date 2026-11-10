@@ -1,0 +1,4 @@
+# Labels of the self-hosted runner registered by scripts/setup-ci-runner.sh.
+self-hosted-runner:
+  labels:
+    - anvil-vm

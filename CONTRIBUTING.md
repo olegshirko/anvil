@@ -28,19 +28,43 @@ API docs — e.g. `/_ping` headers, `/wait` streaming behavior).
 GitHub-hosted macOS runners have no hypervisor, so the VM-booting checks
 (`scripts/validate_robustness.py` and `scripts/integration_tests.py`) run in
 the `validate` job of `.github/workflows/go.yml` on a self-hosted Apple
-Silicon runner only, when the workflow is started by hand.
+Silicon runner with the `anvil-vm` label.
 
-Register a runner once, on a Mac with Xcode, Go, Docker CLI and compose:
+Register a Mac once (`gh auth login` with repository admin rights):
 
-1. Repository → Settings → Actions → Runners → New self-hosted runner,
-   macOS / ARM64. Follow the download and `./config.sh` steps, and keep the
-   default labels (`self-hosted`, `macOS`, `ARM64`).
-2. `./svc.sh install && ./svc.sh start` to keep it running as a launch agent.
-   It must run as a logged-in user: Virtualization.framework does not work
-   from a system daemon.
-3. Before a release: `gh workflow run Release --ref main` and wait for the
-   `validate` job (about 25 minutes).
+```sh
+scripts/setup-ci-runner.sh
+```
+
+The script installs the runner service and writes `ANVIL_INSTANCE=ci` into
+the runner's environment: every job gets its own `~/.anvil-vz-ci` state,
+snapshot, disk and sockets, so the machine's usual anvil service, containers
+and docker context are untouched. It deliberately does not change the screen
+lock: keep the Mac awake and unlocked while jobs run — Virtualization.framework
+cannot restore a snapshot while the screen is locked, and the save/resume
+checks would quietly degrade into cold boots. The job sets
+`ANVIL_REQUIRE_RESUME=1`, so that case fails with a message instead of
+passing.
+
+The job runs:
+
+- on pushes to `main` — robustness checks + the smoke slice of the Docker API
+  suite;
+- nightly at 03:00 UTC and on `workflow_dispatch` — the full suites;
+- on release tags, in parallel with the release (see below).
+
+Pull requests never run on the self-hosted runner: it must not execute
+untrusted fork code. To check a branch, dispatch the workflow on it:
+
+```sh
+gh workflow run Release --ref <branch>
+```
+
+The release job does not wait for `validate` yet, because the runner is a
+workstation that can be offline. Add `validate` to the release job's `needs`
+once it is a dedicated, always-on Mac.
 
 Locally, `make smoke` runs a few-minute cross-section of the integration
-suite (every branch), `make integration` the whole suite and `make validate`
-the robustness checks (both before a release).
+suite (every branch), `make integration` the whole suite, `make validate` the
+robustness checks, and `make ci-vm` the same robustness + smoke pair the CI
+job runs against the isolated `ci` instance.

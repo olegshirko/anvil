@@ -15,6 +15,10 @@ on:
       - "**/*.nix"
       - "**/*.lock"
   workflow_dispatch:
+  schedule:
+    # Nightly full VM run on the self-hosted runner (the same job also runs
+    # on pushes to main, with the fast smoke slice of the Docker API suite).
+    - cron: "0 3 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -84,6 +88,14 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           GOOS=linux GOARCH=arm64 "$(go env GOPATH)/bin/govulncheck" ./...
+
+      # The workflows are hand-edited YAML with expressions the YAML parser
+      # does not check; custom self-hosted labels are declared in
+      # .github/actionlint.yaml.
+      - name: actionlint (workflow files)
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" -color
 
   # The guest-agent never runs on macOS: run its suite on the real
   # GOOS/GOARCH, natively, on a hosted arm64 Linux runner.
@@ -199,16 +211,32 @@ jobs:
           retention-days: 1
 
   validate:
-    # GitHub-hosted macos runners have no hypervisor ("Virtualization is not
-    # available on this hardware"), so VM-booting robustness checks only run
-    # on a self-hosted Apple Silicon runner — none registered right now, and
-    # on release tags it would queue forever, so tags run without it
-    # (see the comment on the release job's needs). When a runner exists:
-    # restore "startsWith(github.ref, 'refs/tags/v')" here AND "validate"
-    # in the release job's needs.
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, macOS, ARM64]
+    # GitHub-hosted macOS runners have no hypervisor ("Virtualization is not
+    # available on this hardware"), so VM-booting checks run on the
+    # self-hosted Apple Silicon runner that scripts/setup-ci-runner.sh
+    # registers with the `anvil-vm` label. Pull requests never run here:
+    # a self-hosted runner must not execute untrusted fork code — dispatch
+    # the workflow on the branch instead. The release job stays ungated:
+    # the runner is a workstation that can be offline, and a tag must not
+    # queue behind it forever. Restore "validate" in the release job's needs
+    # once the runner is a dedicated, always-on machine.
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+        (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+    runs-on: [self-hosted, macOS, ARM64, anvil-vm]
     needs: guestbuild
+    timeout-minutes: 90
+    env:
+      # Every suite works in the dedicated ci instance (~/.anvil-vz-ci): it
+      # kills daemons, rewrites snapshots and pulls images, while the machine
+      # owner's usual instance and docker context stay untouched.
+      ANVIL_INSTANCE: ci
+      # A locked Mac cannot restore a snapshot (the Secure Enclave key is
+      # unusable), and the suite must fail loudly instead of passing on cold
+      # boots that never exercise resume.
+      ANVIL_REQUIRE_RESUME: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -223,30 +251,69 @@ jobs:
       - name: Robustness checks (save/resume, kill -9, FD leaks, CNI, isolation)
         run: |
           python3 scripts/validate_robustness.py || {
-            echo "=== /tmp/validate_robustness.log ==="
-            tail -60 /tmp/validate_robustness.log 2>/dev/null
+            echo "=== /tmp/validate_robustness-ci.log ==="
+            tail -60 /tmp/validate_robustness-ci.log 2>/dev/null
             echo "=== daemon.log ==="
-            tail -40 ~/.anvil-vz/daemon.log 2>/dev/null
+            tail -40 ~/.anvil-vz-ci/daemon.log 2>/dev/null
             echo "=== console.log ==="
-            tail -20 ~/.anvil-vz/console.log 2>/dev/null
+            tail -20 ~/.anvil-vz-ci/console.log 2>/dev/null
             exit 1
           }
 
-      - name: Docker API integration tests (docker CLI + compose against the daemon)
+      # Main pushes get the fast cross-section; the nightly and release runs
+      # get the whole Docker API suite.
+      - name: Docker API integration tests (smoke, main pushes)
+        if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v')
         run: |
           .build/release/vz-runner start
-          python3 scripts/integration_tests.py || {
-            .build/release/vz-runner stop || true
+          python3 scripts/integration_tests.py --smoke || {
             echo "=== daemon.log ==="
-            tail -40 ~/.anvil-vz/daemon.log 2>/dev/null
+            tail -40 ~/.anvil-vz-ci/daemon.log 2>/dev/null
             exit 1
           }
           .build/release/vz-runner stop
 
+      - name: Docker API integration tests (full, nightly and releases)
+        if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
+        run: |
+          .build/release/vz-runner start
+          python3 scripts/integration_tests.py || {
+            echo "=== daemon.log ==="
+            tail -40 ~/.anvil-vz-ci/daemon.log 2>/dev/null
+            exit 1
+          }
+          .build/release/vz-runner stop
+
+      - name: Collect VM logs
+        if: failure()
+        run: |
+          mkdir -p vm-test-logs
+          cp /tmp/validate_robustness-ci.log vm-test-logs/ 2>/dev/null || true
+          cp ~/.anvil-vz-ci/daemon.log vm-test-logs/ 2>/dev/null || true
+          cp ~/.anvil-vz-ci/console.log vm-test-logs/ 2>/dev/null || true
+
+      - name: Upload VM logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vm-test-logs
+          path: vm-test-logs/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # A cancelled run or a failed step above must not leave a daemon (and
+      # its VM) behind on the runner.
+      - name: Stop the CI instance
+        if: always()
+        run: |
+          .build/release/vz-runner stop || true
+          pkill -9 -f "vz-runner .*$HOME/.anvil-vz-ci/" || true
+
   release:
-    # The validate gate is off until a self-hosted Apple Silicon runner is
-    # registered again: with none, a tag would queue forever and never ship.
-    # Restore "needs: [build, guestbuild, validate]" when the runner is back.
+    # The VM checks are not a release gate yet: the self-hosted runner is a
+    # workstation that can be offline, and a tag must not queue behind it
+    # forever. They still run on tags, in parallel with this job. Add
+    # "validate" to needs once the runner is a dedicated, always-on machine.
     needs: [build, guestbuild]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')

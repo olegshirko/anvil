@@ -9,7 +9,7 @@
     download-ubuntu ubuntu-modules \
     guest-agent initramfs-agent initramfs-ubuntu initramfs-containerd \
     boot-containerd-fresh alpine-virt-modules alpine-iptables download-upx \
-    container-tools time-boot time-service validate doctor unit-tests integration smoke \
+    container-tools time-boot time-service validate doctor unit-tests integration smoke ci-vm \
     harness harness-prepull harness-tests harness-all bench-all \
     prune clean-containers disk-compact \
     release replace-release update-brew release-notes bottle bottle-resume ci-checks
@@ -200,6 +200,8 @@ ci-checks:
 	cd guest-agent && GOTOOLCHAIN=$(CI_GO) go test -race ./...
 	cd guest-agent && GOTOOLCHAIN=$(CI_GO) go install honnef.co/go/tools/cmd/staticcheck@2026.2.1 && GOTOOLCHAIN=$(CI_GO) GOOS=linux GOARCH=arm64 "$$(go env GOPATH)/bin/staticcheck" ./...
 	cd guest-agent && GOTOOLCHAIN=$(CI_GO) go install golang.org/x/vuln/cmd/govulncheck@v1.8.0 && GOTOOLCHAIN=$(CI_GO) GOOS=linux GOARCH=arm64 "$$(go env GOPATH)/bin/govulncheck" ./...
+	cd guest-agent && GOTOOLCHAIN=$(CI_GO) go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+	"$$(go env GOPATH)/bin/actionlint" -color
 
 # Docker API integration tests against a running daemon (requires
 # `make service-start` first; pulls alpine/nginx/busybox on first run).
@@ -218,6 +220,15 @@ time-service: sign
 
 validate: sign
 	python3 scripts/validate_robustness.py
+
+# The go.yml `validate` job, locally: robustness checks plus the smoke slice
+# of the integration suite against the dedicated ci instance (~/.anvil-vz-ci),
+# so the usual service and its docker context stay untouched.
+ci-vm: sign
+	@set -e; trap 'ANVIL_INSTANCE=ci $(BINARY) stop >/dev/null 2>&1 || true' EXIT; \
+	  ANVIL_INSTANCE=ci python3 scripts/validate_robustness.py; \
+	  ANVIL_INSTANCE=ci $(BINARY) start; \
+	  ANVIL_INSTANCE=ci python3 scripts/integration_tests.py --smoke
 
 # Diagnose the install: hypervisor, signing, assets, API, shares.
 doctor: sign
