@@ -44,6 +44,12 @@ if INSTANCE:
 DOCKER_ENV = dict(os.environ)
 PREFIX = "anvil-it"
 PORT_BASE = 18200
+# Egress probes must not name a single third-party IP: uplinks filter some of
+# them (1.1.1.1 is unreachable from this runner's network). example.com:80 is
+# already required by the compose test; 8.8.8.8:53 is probed by IP, so a test
+# can check routing without involving DNS.
+EGRESS_URL = "http://example.com"
+EGRESS_TCP = "8.8.8.8 53"
 
 results: list[tuple[str, str, str]] = []  # (name, PASS/FAIL/SKIP, detail)
 
@@ -2255,7 +2261,7 @@ def test_network_none() -> None:
     if ifaces != ["lo"] or "UP" not in out:
         raise RuntimeError(f"--network none interfaces: {out!r}")
     res = docker("run", "--rm", "--network", "none", "alpine", "wget", "-q", "-T", "3",
-                 "-O", "/dev/null", "http://1.1.1.1/", check=False)
+                 "-O", "/dev/null", EGRESS_URL, check=False)
     if res.returncode == 0:
         raise RuntimeError("--network none reached the internet")
     res = docker("run", "--rm", "--network", "none", "-p", "18480:80", "alpine", "true", check=False)
@@ -2780,7 +2786,7 @@ def test_compose_many_services() -> None:
             if out.returncode != 0:
                 raise RuntimeError(f"s1 cannot reach s{n}: {out.stdout!r} {out.stderr!r}")
             out = docker(*base, "exec", "-T", "s2", "wget", "-q", "-O", "/dev/null", "-T", "10",
-                         "http://example.com", check=False, timeout=60.0)
+                         EGRESS_URL, check=False, timeout=60.0)
             if out.returncode != 0:
                 raise RuntimeError(f"no egress from a compose network: {out.stderr!r}")
             t0 = time.time()
@@ -3578,7 +3584,7 @@ def test_bind_source_checks() -> None:
 def test_internal_network_isolation() -> None:
     net = f"{PREFIX}-internal"
     peer = f"{PREFIX}-internal-peer"
-    probe = "nc -w 3 1.1.1.1 80 </dev/null >/dev/null 2>&1 && echo open || echo closed"
+    probe = f"nc -w 3 {EGRESS_TCP} </dev/null >/dev/null 2>&1 && echo open || echo closed"
     try:
         docker("network", "create", "--internal", net)
         if docker("network", "inspect", "-f", "{{.Internal}}", net).stdout.strip() != "true":
@@ -4122,10 +4128,11 @@ def test_network_rm_frees_bridge() -> None:
         docker("run", "--rm", "--network", a, "alpine", "true")
         docker("network", "rm", a)
         docker("network", "create", "--subnet", subnet, b)
-        out = docker("run", "--rm", "--network", b, "alpine", "ping", "-c1", "-W3", "1.1.1.1",
+        out = docker("run", "--rm", "--network", b, "alpine",
+                     "wget", "-q", "-O", "/dev/null", "-T", "10", EGRESS_URL,
                      check=False, timeout=60.0)
         if out.returncode != 0:
-            raise RuntimeError(f"no egress on a reused subnet: {out.stdout!r}")
+            raise RuntimeError(f"no egress on a reused subnet: {out.stdout!r} {out.stderr!r}")
         routes = docker("run", "--rm", "--net=host", "alpine", "ip", "route").stdout
         if routes.count("10.10.247.0/24") != 1:
             raise RuntimeError(f"stale route for the subnet: {routes!r}")
