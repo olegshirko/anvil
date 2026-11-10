@@ -233,6 +233,7 @@ def test_repeated_resume_cycles() -> None:
         sizes = [base_size]
         times = []
         failures = 0
+        last_failure: Exception | None = None
 
         for i in range(1, 11):
             # Each iteration: stop (save) -> start (resume) -> exec health check.
@@ -244,10 +245,15 @@ def test_repeated_resume_cycles() -> None:
                 vz_exec("uname", "-a", timeout=10.0)
             except Exception as e:
                 failures += 1
+                last_failure = e
                 log(f"  cycle {i} failed: {e}")
                 break
 
         stop_daemon(proc)
+        if not times:
+            # The summary below divides by len(times); without a single
+            # resume it reported "division by zero" instead of the cause.
+            raise RuntimeError(f"no cycle resumed (last failure: {last_failure})")
         detail = (
             f"10 cycles, {failures} failures, "
             f"resume ready avg={sum(times)/len(times):.2f}s max={max(times):.2f}s, "
