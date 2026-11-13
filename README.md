@@ -56,6 +56,15 @@ brew install olegshirko/tap/anvil
 anvil start        # first run is a cold boot (~0.6 s), then a snapshot is saved
 ```
 
+To upgrade, restart onto the new version; `--restore` starts the
+containers that were running again (the VM cold-boots, which otherwise
+brings back only those with a restart policy):
+
+```sh
+brew upgrade olegshirko/tap/anvil
+anvil restart --restore
+```
+
 ### zerobrew
 
 The same tap works with zerobrew:
@@ -136,7 +145,7 @@ Host ports of published containers are forwarded to `localhost` automatically.
 ```
 anvil start      Launch the daemon, wait for ready, switch docker context
 anvil stop       Stop the daemon, restore the previous docker context
-anvil restart    Stop + start
+anvil restart    Stop + start (--restore: start the containers that were running again)
 anvil status     Daemon + guest readiness (usable as a health gate)
 anvil doctor     Diagnose install: hypervisor, signing, assets, API, shares (--json for scripts)
 anvil logs       Tail daemon/console/guest logs
