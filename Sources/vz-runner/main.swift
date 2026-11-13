@@ -675,7 +675,10 @@ func printUsage() {
       start     Launch the daemon in the background, wait for ready,
                 switch Docker context to "anvil".
       stop      Stop the daemon, restore the previous Docker context.
-      restart   Stop + start.
+      restart   Stop + start. --restore starts the containers that were
+                running again (a cold boot otherwise brings back only those
+                with a restart policy); start --restore applies a list a
+                failed restart left behind.
       status    Show daemon status and Docker context.
 
     Daemon options (start / daemon):
@@ -712,14 +715,33 @@ guard let subcommand = arguments.first else {
 
 switch subcommand {
 case "start":
-    cmdStart(args: Array(arguments.dropFirst()))
+    var startArgs = Array(arguments.dropFirst())
+    let restoreOnStart = startArgs.contains("--restore")
+    startArgs.removeAll { $0 == "--restore" }
+    // start restarts a daemon an upgrade left on the old binary: record first.
+    if restoreOnStart, isDaemonRunning() {
+        _ = RestoreContainers.record()
+    }
+    cmdStart(args: startArgs)
+    if restoreOnStart {
+        RestoreContainers.restore()
+    }
 case "stop":
     cmdStop(args: Array(arguments.dropFirst()))
 case "status":
     cmdStatus()
 case "restart":
+    var restartArgs = Array(arguments.dropFirst())
+    let restore = restartArgs.contains("--restore")
+    restartArgs.removeAll { $0 == "--restore" }
+    if restore, isDaemonRunning(), !RestoreContainers.record() {
+        print("[anvil] --restore: the Docker API did not answer; nothing recorded")
+    }
     cmdStop(args: [])
-    cmdStart(args: Array(arguments.dropFirst()))
+    cmdStart(args: restartArgs)
+    if restore {
+        RestoreContainers.restore()
+    }
 case "daemon":
     DaemonCommand.run(args: Array(arguments.dropFirst()))
 case "boot":
