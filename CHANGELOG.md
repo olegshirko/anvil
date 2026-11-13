@@ -1,3 +1,14 @@
+## v1.9.12 (2026-11-13)
+
+### Added
+- 376f8a7 feat(host): anvil restart --restore starts the containers that were running
+
+### Docs
+- fc7dbb3 docs: the build cache cap is in GiB and excludes layers shared with images
+- c84496d docs(changelog): drop the duplicated v1.9.9 section
+
+### Internal
+- d60bb69 build: Go 1.26.11 (govulncheck: GO-2026-6859 fixed in 1.26.11)
 ## v1.9.11 (2026-11-10)
 
 ### Changed
