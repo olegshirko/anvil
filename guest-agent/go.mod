@@ -1,6 +1,6 @@
 module github.com/olegshirko/anvil/guest-agent
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/containerd/containerd/api v1.11.1
