@@ -76,13 +76,19 @@ func splitImageTag(ref string) (name, tag string, ok bool) {
 // hits API rate limits. Returns errMirrorNotFound when the image has not been
 // mirrored, so callers can distinguish "mirror it first" from a real failure.
 func loadFromMirror(ctx context.Context, ref, ns string) error {
-	name, tag, ok := splitImageTag(ref)
-	if !ok {
-		return errMirrorNotFound
+	return loadFromMirrorPlatform(ctx, ref, ns, "")
+}
+
+// loadFromMirrorPlatform is loadFromMirror with an explicit platform:
+// "" / linux/arm64 uses the native -arm64 release, linux/amd64 the -amd64
+// one (naming per mirrorReleaseAsset).
+func loadFromMirrorPlatform(ctx context.Context, ref, ns, platform string) error {
+	release, asset, err := mirrorReleaseAsset(ref, platform)
+	if err != nil {
+		return err
 	}
-	safeName := strings.ReplaceAll(name, "/", "-")
-	url := fmt.Sprintf("https://github.com/%s/releases/download/%s-%s-arm64/image-arm64.tar.zst",
-		dockerMirrorRepo, safeName, tag)
+	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s",
+		dockerMirrorRepo, release, asset)
 
 	// Bound the download by the caller's context (the pull request dies
 	// with its client) and a header timeout: a GitHub endpoint that never
