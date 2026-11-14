@@ -150,7 +150,7 @@ anvil status     Daemon + guest readiness (usable as a health gate)
 anvil doctor     Diagnose install: hypervisor, signing, assets, API, shares (--json for scripts)
 anvil logs       Tail daemon/console/guest logs
 anvil exec ...   Run a command inside the VM (debugging)
-anvil images     Manage the image-mirror fallback (list / check / request)
+anvil images     Manage the image-mirror fallback (list / check / request / push)
 anvil prune      Remove all containers, unused images/volumes/networks and the build cache (-f skips the prompt)
 anvil disk-compact  Give space freed in the VM back to macOS (stops the daemon; snapshot stays valid)
 ```
@@ -164,6 +164,24 @@ Logs: `~/.anvil-vz/daemon.log` (host daemon), `~/.anvil-vz/console.log` (VM
 console), and after a `DEBUG=1` cold boot (`make service-debug`) the guest
 agent's `<share>/.anvil-run/guest-agent.log` (the project directory in a source
 tree, `~/.anvil-vz` otherwise). `anvil logs [daemon|console|guest]` tails them.
+
+### Forced image-mirror pulls
+
+`docker pull mirror.anvil/<image:tag>` loads an image straight from the
+[olegshirko/docker-mirror](https://github.com/olegshirko/docker-mirror)
+GitHub releases — Docker Hub is never contacted, which is the way out when
+the registry route is dead or rate-limited. The image lands under its real
+name (`postgres:15.5`) and under the `mirror.anvil/…` ref, so compose files
+can pin the forced source. `--platform linux/amd64` picks the mirror's
+amd64 release; anything not mirrored answers with a pointer to
+`anvil images push`.
+
+`anvil images push <image:tag> [--arch arm64|amd64]` publishes a local
+image right now: `docker save` + zstd + upload as the release the guest
+agent downloads from — no reconcile-workflow round trip. `anvil images
+list` shows everything mirrored; `anvil images request --docker
+<image:tag>` asks the reconcile workflow to mirror an image you do not
+have locally.
 
 ### Configuration (environment variables)
 

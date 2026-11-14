@@ -199,6 +199,12 @@ func handleImageCreate(w http.ResponseWriter, r *http.Request, _ routeParams) {
 		writeJSONError(w, http.StatusBadRequest, "missing fromImage")
 		return
 	}
+	// `docker pull mirror.anvil/<image>`: straight from the docker-mirror
+	// GitHub releases, Docker Hub never contacted.
+	if realRef, forced := splitMirrorForcedRef(image); forced {
+		handleForcedMirrorPull(w, r, image, realRef)
+		return
+	}
 	// Headers and progress go out as the pull runs, as from dockerd.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

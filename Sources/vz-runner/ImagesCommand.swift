@@ -19,6 +19,8 @@ func cmdImages(args: [String]) {
     switch args[0] {
     case "request":
         cmdImagesRequest(args: Array(args.dropFirst()))
+    case "push":
+        cmdImagesPush(args: Array(args.dropFirst()))
     case "list":
         cmdImagesList(args: Array(args.dropFirst()))
     case "check":
@@ -39,6 +41,7 @@ func printImagesUsage() {
       anvil images list
       anvil images check --docker <image:tag> [--arch <arm64|amd64>] [--json]
       anvil images request --docker <image:tag> [--platform <os/arch>]
+      anvil images push <image:tag> [--arch arm64|amd64]
 
     Manage Docker image mirrors in the docker-mirror repo
     (\(dockerMirrorRepo)). The reconcile workflow pulls requested images from
@@ -50,6 +53,9 @@ func printImagesUsage() {
       list      List Docker images already mirrored in docker-mirror.
       check     Check whether an image is on Docker Hub and/or mirrored.
       request   Request a new mirror (creates a docker-mirror issue).
+      push      Mirror a local image right now: docker save + zstd, published
+                as the release `anvil images list` shows. Bypasses the
+                reconcile workflow.
 
     Options:
       --docker <image:tag>   Image (check / request), e.g. postgres:15.5
@@ -60,6 +66,164 @@ func printImagesUsage() {
     list and request use the GitHub API: set GITHUB_TOKEN to avoid rate
     limits. Without a token, request prints the prefilled issue URL instead.
     """)
+}
+
+// cmdImagesPush publishes a local image to docker-mirror immediately:
+// `docker save` the ref, compress to image-<arch>.tar.zst, and create/replace
+// the GitHub release the guest-agent downloads from — no reconcile workflow
+// round-trip. docker and zstd come from PATH; GITHUB_TOKEN (or gh auth)
+// authorizes the release API.
+func cmdImagesPush(args: [String]) {
+    var image: String?
+    var arch = "arm64"
+    var it = args.makeIterator()
+    while let a = it.next() {
+        switch a {
+        case "--arch", "-a":
+            guard let v = it.next() else { fallthrough }
+            arch = v
+        case "--help", "-h":
+            printImagesUsage()
+            exit(0)
+        default:
+            if a.hasPrefix("-") {
+                print("unknown images push option: \(a)")
+                exit(1)
+            }
+            image = a
+        }
+    }
+    guard let ref = image else {
+        print("usage: anvil images push <image:tag> [--arch arm64|amd64]")
+        exit(1)
+    }
+    guard arch == "arm64" || arch == "amd64" else {
+        print("error: --arch must be arm64 or amd64 (only these are mirrored)")
+        exit(1)
+    }
+    guard let (name, tag) = splitMirrorRef(ref) else {
+        print("error: \(ref) is not mirrorable (digest refs and dangling colons are not)")
+        exit(1)
+    }
+
+    // 1. docker save + zstd into a temp dir.
+    let fm = FileManager.default
+    let tmp = fm.temporaryDirectory.appendingPathComponent("anvil-mirror-push-\(getpid())")
+    try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: tmp) }
+    let tarPath = tmp.appendingPathComponent("image.tar")
+    let zstPath = tmp.appendingPathComponent("image-\(arch).tar.zst")
+    print("[push] docker save \(ref)...")
+    runTool("/usr/bin/env", ["docker", "save", "-o", tarPath.path, ref])
+    print("[push] compressing with zstd...")
+    runTool("/usr/bin/env", ["zstd", "-q", "-f", "-11", "-o", zstPath.path, tarPath.path])
+
+    // 2. Create (or reuse) the release, then upload the asset with clobber.
+    let releaseTag = mirrorReleaseTag(image: name, tag: tag, arch: arch)
+    let token = ProcessInfo.processInfo.environment["GITHUB_TOKEN"] ?? ""
+    let auth = ghAuthArgs(token: token)
+    defer { auth.cleanup() }
+
+    print("[push] release \(releaseTag) in \(dockerMirrorRepo)...")
+    let createBody: [String: Any] = [
+        "tag_name": releaseTag,
+        "name": "\(ref) (\(arch))",
+        "body": "Docker image mirror of \(ref) for \(arch), published by `anvil images push`.",
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: createBody) else {
+        print("error: cannot encode release payload")
+        exit(1)
+    }
+    let bodyFile = tmp.appendingPathComponent("release.json")
+    try? data.write(to: bodyFile)
+
+    var curlArgs = ["-sS", "-X", "POST",
+                    "https://api.github.com/repos/\(dockerMirrorRepo)/releases",
+                    "-H", "Accept: application/vnd.github+json",
+                    "-H", "Content-Type: application/json",
+                    "-d", "@\(bodyFile.path)",
+                    "-w", "\n%{http_code}"]
+    curlArgs.append(contentsOf: auth.args)
+    let (out, _) = runCurl(curlArgs)
+    var status = "0"
+    if let nl = out.lastIndex(of: "\n") { status = String(out[out.index(after: nl)...]) }
+
+    var releaseID: Int?
+    if status == "201" {
+        releaseID = releaseIDFromJSON(String(out[..<out.lastIndex(of: "\n")!]))
+    } else {
+        // 422 "already_exists": fetch the existing release's id by tag.
+        var getArgs = ["-sS",
+                       "https://api.github.com/repos/\(dockerMirrorRepo)/releases/tags/\(releaseTag)",
+                       "-w", "\n%{http_code}"]
+        getArgs.append(contentsOf: auth.args)
+        let (getOut, _) = runCurl(getArgs)
+        var getStatus = "0"
+        if let nl = getOut.lastIndex(of: "\n") { getStatus = String(getOut[getOut.index(after: nl)...]) }
+        guard getStatus == "200" else {
+            print("error: cannot create release \(releaseTag) (HTTP \(status)) and cannot read it (HTTP \(getStatus)). Set GITHUB_TOKEN with repo access to \(dockerMirrorRepo).")
+            exit(1)
+        }
+        releaseID = releaseIDFromJSON(String(getOut[..<getOut.lastIndex(of: "\n")!]))
+        print("[push] release exists, replacing the asset")
+    }
+    guard let id = releaseID else {
+        print("error: release \(releaseTag) has no id in the API response")
+        exit(1)
+    }
+
+    print("[push] uploading image-\(arch).tar.zst...")
+    var upArgs = ["-sS", "-X", "POST",
+                  "https://uploads.github.com/repos/\(dockerMirrorRepo)/releases/\(id)/assets?name=image-\(arch).tar.zst",
+                  "-H", "Content-Type: application/octet-stream",
+                  "--data-binary", "@\(zstPath.path)",
+                  "-w", "\n%{http_code}"]
+    upArgs.append(contentsOf: auth.args)
+    let (upOut, _) = runCurl(upArgs)
+    var upStatus = "0"
+    if let nl = upOut.lastIndex(of: "\n") { upStatus = String(upOut[upOut.index(after: nl)...]) }
+    guard upStatus == "201" else {
+        print("error: asset upload failed (HTTP \(upStatus)):")
+        if let nl = upOut.lastIndex(of: "\n") {
+            print(String(upOut[..<nl]))
+        } else {
+            print(upOut)
+        }
+        exit(1)
+    }
+    print("Mirrored \(ref) (\(arch)) as release \(releaseTag).")
+    print("Force-load it anywhere without touching Docker Hub: docker pull mirror.anvil/\(ref)")
+}
+
+// releaseIDFromJSON extracts "id" from a GitHub release JSON body.
+func releaseIDFromJSON(_ body: String) -> Int? {
+    guard let data = body.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return nil
+    }
+    return obj["id"] as? Int
+}
+
+// runTool runs a PATH-resolved tool to completion; any failure exits.
+func runTool(_ path: String, _ args: [String]) {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: path)
+    proc.arguments = args
+    proc.standardOutput = FileHandle.nullDevice
+    let errPipe = Pipe()
+    proc.standardError = errPipe
+    do {
+        try proc.run()
+    } catch {
+        print("error: cannot run \(path.contains("env") ? args.first ?? path : path) — \(error)")
+        exit(1)
+    }
+    proc.waitUntilExit()
+    guard proc.terminationStatus == 0 else {
+        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        print("error: \(args.first ?? path) failed (\(proc.terminationStatus))\(err.isEmpty ? "" : ":\n" + err)")
+        exit(1)
+    }
 }
 
 func cmdImagesRequest(args: [String]) {
@@ -125,9 +289,31 @@ func cmdImagesRequest(args: [String]) {
 
 // safe-name: replace "/" with "-" (e.g. "library/nginx" -> "library-nginx").
 // Must match guest-agent loadFromMirror and the reconcile workflow naming.
-func mirrorReleaseTag(image: String, tag: String) -> String {
+func mirrorReleaseTag(image: String, tag: String, arch: String = "arm64") -> String {
     let safe = image.replacingOccurrences(of: "/", with: "-")
-    return "\(safe)-\(tag)-arm64"
+    return "\(safe)-\(tag)-\(arch)"
+}
+
+// splitMirrorRef splits an image ref into (image, tag) the way the mirror
+// naming needs it: a ":" before the last "/" is a registry port, not a tag,
+// and a missing tag means "latest" (guest-agent splitImageTag semantics).
+func splitMirrorRef(_ ref: String) -> (image: String, tag: String)? {
+    if ref.contains("@") { return nil } // digest refs are not mirrorable
+    let slash = ref.lastIndex(of: "/")
+    let colon = ref.lastIndex(of: ":")
+    switch (colon, slash) {
+    case (nil, _):
+        return (ref, "latest")
+    case (let c?, let s?):
+        if s > c { return (ref, "latest") } // registry port, no tag
+        let tag = String(ref[ref.index(after: c)...])
+        if tag.isEmpty { return nil } // dangling colon ("alpine:")
+        return (String(ref[..<c]), tag)
+    case (let c?, nil):
+        let tag = String(ref[ref.index(after: c)...])
+        if tag.isEmpty { return nil }
+        return (String(ref[..<c]), tag)
+    }
 }
 
 // createMirrorIssue POSTs the issue via the GitHub API using curl (always
