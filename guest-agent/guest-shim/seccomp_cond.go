@@ -10,6 +10,30 @@ import (
 // OCI-to-BPF seccomp condition mapping. Portable (pure table work), so the
 // tests run on the dev Mac; the linux-tagged seccomp.go assembles the filter.
 
+// defaultPolicyAction maps the OCI default action to the module's bare
+// action value. ActErrno maps to the bare ActionErrno (no errno bits): the
+// module's Validate whitelists action values, and applySeccomp rewrites the
+// assembled bare returns to EPERM — which is the OCI default errno anyway
+// (the default profile carries no per-default errno of its own).
+func defaultPolicyAction(sc *specs.LinuxSeccomp) seccomp.Action {
+	switch sc.DefaultAction {
+	case specs.ActKill, specs.ActKillThread:
+		return seccomp.ActionKillThread
+	case specs.ActKillProcess:
+		return seccomp.ActionKillProcess
+	case specs.ActTrap:
+		return seccomp.ActionTrap
+	case specs.ActErrno:
+		return seccomp.ActionErrno
+	case specs.ActTrace:
+		return seccomp.ActionTrace
+	case specs.ActLog:
+		return seccomp.ActionLog
+	default:
+		return seccomp.ActionAllow
+	}
+}
+
 // validateSeccompOps rejects profiles with argument operators the condition
 // converter cannot express faithfully (SCMP_CMP_MASKED_EQ outside its two
 // expressible shapes); the agent's eligibility excludes custom profiles, so
