@@ -76,6 +76,7 @@ IPTABLES_DIR="$DOWNLOAD_DIR/alpine-iptables"
 
 ALPINE_INITRD="$ALPINE_DIR/initramfs-virt"
 AGENT_BIN="$ALPINE_DIR/guest-agent"
+SHIM_BIN="$ALPINE_DIR/anvil-fast-shim"
 VIRT_APK="$ALPINE_DIR/linux-virt.apk"
 OUT="${OUT:-$DOWNLOAD_DIR/ubuntu/initramfs-containerd}"
 
@@ -85,6 +86,10 @@ if [[ ! -f "$ALPINE_INITRD" ]]; then
 fi
 if [[ ! -f "$AGENT_BIN" ]]; then
     echo "guest-agent not found; run 'make guest-agent' first"
+    exit 1
+fi
+if [[ ! -f "$SHIM_BIN" ]]; then
+    echo "anvil-fast-shim not found; run 'make guest-shim' first"
     exit 1
 fi
 if [[ ! -d "$ALPINE_DIR/linux-virt-pkg/lib/modules" ]]; then
@@ -131,6 +136,11 @@ cp /usr/bin/zstd bin/zstd
 # Inject guest agent.
 cp "$AGENT_BIN" bin/guest-agent
 chmod +x bin/guest-agent
+
+# Fast shim (containerd runtime-v2; the agent picks it per container via
+# WithRuntime with this absolute path). Unpacked: it is on the start hot path.
+cp "$SHIM_BIN" bin/anvil-fast-shim
+chmod +x bin/anvil-fast-shim
 
 # Container tools.
 mkdir -p opt/containerd/bin

@@ -294,6 +294,14 @@ ubuntu-modules: $(UBUNTU_DIR)
 guest-agent:
 	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.anvilVersion=$(BUILD_VERSION)" -o ../$(AGENT_BIN) .
 
+# The fast shim (runtime-v2 ttrpc shim without runc; the agent selects it per
+# container via WithRuntime). Same module as guest-agent, own main package;
+# stays unpacked in the initramfs like the other hot-path binaries.
+SHIM_BIN := $(ALPINE_DIR)/anvil-fast-shim
+
+guest-shim:
+	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o ../$(SHIM_BIN) ./guest-shim
+
 initramfs-agent: extract-alpine-kernel guest-agent
 	scripts/build_initramfs.sh
 
@@ -427,7 +435,7 @@ download-upx:
 	    rm -f /tmp/anvil-upx.tar.xz; \
 	fi
 
-initramfs-containerd: download-alpine extract-alpine-kernel alpine-virt-modules guest-agent container-tools alpine-iptables download-upx
+initramfs-containerd: download-alpine extract-alpine-kernel alpine-virt-modules guest-agent guest-shim container-tools alpine-iptables download-upx
 	@if command -v limactl >/dev/null 2>&1 && limactl list anvil --format '{{.Status}}' 2>/dev/null | grep -q Running; then \
 	    echo "Building initramfs inside Lima VM 'anvil'..."; \
 	    limactl shell anvil -- bash $(CURDIR)/scripts/build_initramfs_containerd.sh; \
