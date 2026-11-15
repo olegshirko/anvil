@@ -161,3 +161,24 @@ Hang count must stay 0/30.
   healthchecks, restart policy, ports, events, pause, stats, top, export,
   diff, cp and cold-boot reconciliation all run against the registry.
 
+
+## Measured rungs (dev instance, 2026-11-16, host ~2.5 load avg)
+
+| rung | CLI median | API median | start RPC |
+|---|---|---|---|
+| baseline (containerd + fast shim) | 344 ms | 246 ms | 123 ms |
+| 5a — agent spawns the helper directly | 242 ms | 192 ms | 91 ms |
+| + fixed fds below NR_OPEN_DEFAULT (72476cb) | — | 160 ms | 67 ms |
+| + clone3 CLONE_INTO_CGROUP (a2db6f7) | 192 ms | 128 ms | 46 ms |
+
+Two waits dominated the helper's stage A and both were pure waits (~0.03 ms
+of CPU): the first `dup3` onto a descriptor >= 64 (fd-table expansion,
+20–50 ms) and the post-start cgroup self-move (27 ms). Neither existed in
+Kiri because their agent never leaves the low-fd range and births the child
+straight into its cgroup.
+
+5b (forking the container init inside the agent, no helper exec) was
+measured at a realistic 2–3 ms gain for the highest risk in the ladder — it
+is not the route to the target. Remaining order, cheapest first: CNI
+pre-allocation at create (−13 ms of start), create-path trims (snapshot
+memo), and the exit-path CNI teardown competing with inspect.
