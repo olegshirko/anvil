@@ -58,9 +58,9 @@ func mountFlagOpts(opts []string) (int, []string) {
 }
 
 // applySpecMounts mounts every spec mount onto the rootfs (pre-pivot).
-func applySpecMounts(rootfs string, mounts []specs.Mount) error {
-	for i := range mounts {
-		m := &mounts[i]
+func applySpecMounts(rootfs string, spec *specs.Spec) error {
+	for i := range spec.Mounts {
+		m := &spec.Mounts[i]
 		// runc's mountpoint rule: a bind mount whose source is a regular
 		// file binds onto a file. The image usually ships one already
 		// (alpine's /etc/hosts), and mkdir-ing over it fails with
@@ -109,19 +109,28 @@ func applySpecMounts(rootfs string, mounts []specs.Mount) error {
 				return fmt.Errorf("remount bind %s: %w", m.Destination, err)
 			}
 		case "cgroup":
-			// cgroup v2: bind the guest's own cgroup2 mount, like runc
-			// does for the unified hierarchy. A fresh mount of the cgroup2
-			// (or the legacy "cgroup") filesystem fails with EBUSY here:
-			// the mount namespace is a copy of the guest's and already
-			// carries the hierarchy at /sys/fs/cgroup, and the kernel
-			// refuses a second mount of it under the legacy name. The
-			// private cgroup namespace (joined below, before this runs)
-			// restricts the bound view to the container's own subtree.
-			if err := unix.Mount("/sys/fs/cgroup", dst, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
-				return fmt.Errorf("bind cgroup root to %s: %w", m.Destination, err)
+			// cgroup v2. With a private cgroup namespace (the docker
+			// default) the container must see its OWN cgroup subtree at
+			// /sys/fs/cgroup: mount a fresh cgroup2 hierarchy — the new
+			// mount is rooted at the namespace root, which is the
+			// container's cgroup (stage A moved into it / stage B was
+			// born into it). Binding the guest's existing mount instead
+			// exposes the whole guest hierarchy: a bind copy keeps the
+			// superblock root and the cgroup namespace does not rewrite
+			// an already-mounted view, so memory.max/cpu.max/pids.max
+			// were absent. With a shared cgroup namespace (--cgroupns
+			// host) runc binds the guest root, and so do we.
+			if !cgroupNamespacePrivate(spec) {
+				if err := unix.Mount("/sys/fs/cgroup", dst, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+					return fmt.Errorf("bind cgroup root to %s: %w", m.Destination, err)
+				}
+				if err := unix.Mount("", dst, "", uintptr(unix.MS_BIND|unix.MS_REC|unix.MS_REMOUNT|flags), ""); err != nil {
+					return fmt.Errorf("remount cgroup root %s: %w", m.Destination, err)
+				}
+				break
 			}
-			if err := unix.Mount("", dst, "", uintptr(unix.MS_BIND|unix.MS_REC|unix.MS_REMOUNT|flags), ""); err != nil {
-				return fmt.Errorf("remount cgroup root %s: %w", m.Destination, err)
+			if err := unix.Mount("cgroup2", dst, "cgroup2", uintptr(flags), dataStr); err != nil {
+				return fmt.Errorf("mount cgroup2 %s: %w", m.Destination, err)
 			}
 		default:
 			src := m.Source
@@ -134,6 +143,22 @@ func applySpecMounts(rootfs string, mounts []specs.Mount) error {
 		}
 	}
 	return nil
+}
+
+// cgroupNamespacePrivate reports whether the spec gives the container its own
+// cgroup namespace (a pathless CgroupNamespace entry). That is what makes a
+// freshly mounted cgroup2 hierarchy root at the container's cgroup; a shared
+// namespace (--cgroupns host: no entry) keeps the guest-wide view.
+func cgroupNamespacePrivate(spec *specs.Spec) bool {
+	if spec.Linux == nil {
+		return false
+	}
+	for _, ns := range spec.Linux.Namespaces {
+		if ns.Type == specs.CgroupNamespace {
+			return ns.Path == ""
+		}
+	}
+	return false
 }
 
 // safeJoin joins dest under root, refusing escapes.

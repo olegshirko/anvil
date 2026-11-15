@@ -385,7 +385,7 @@ func runInitApply(id, bundle string) int {
 		return 1
 	}
 	helperTrace(id, "B-ns")
-	if err := applySpecMounts(rootfs, spec.Mounts); err != nil {
+	if err := applySpecMounts(rootfs, spec); err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
