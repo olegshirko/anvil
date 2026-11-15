@@ -58,6 +58,11 @@ const (
 	// fdConfirm carries the stage-B confirm pipe write end (cleared
 	// close-on-exec so it survives stage B's exec; stage B marks it
 	// close-on-exec again so the user exec closes it as the start signal).
+	// Keep every fixed fd below 64 (NR_OPEN_DEFAULT): the first dup3 onto a
+	// descriptor >= 64 expands the fd table and was measured at 20-50 ms
+	// wall with ~0.02 ms of CPU on the dev guest (the A-confirm trace mark).
+	// Stage B's fdReportFinal (init.go, runInitApply) is below 64 for the
+	// same reason — and only stays cheap today because it inherits this one.
 	fdConfirm = 200
 )
 
@@ -112,17 +117,25 @@ func waitGate() bool {
 }
 
 // helperTrace appends one setup-phase timestamp for latency analysis of the
-// direct-creation path. It is off unless ANVIL_HELPER_TRACE is set (the agent
-// sets it in debug mode); the file lives on the shared .anvil-run directory.
-// The descriptor is opened once: a per-mark open on virtiofs costs tens of
-// milliseconds and would drown the measurement.
+// direct-creation path: "<id> <stage> <wall-ns> <thread-cpu-ns>". It is off
+// unless ANVIL_HELPER_TRACE is set (the agent sets it in debug mode); the file
+// lives on tmpfs. The descriptor is opened once: a per-mark open on virtiofs
+// costs tens of milliseconds and would drown the measurement.
 var helperTraceOut *os.File
 
 func helperTrace(id, stage string) {
 	if os.Getenv("ANVIL_HELPER_TRACE") == "" {
 		return
 	}
+	// Wall time alone cannot tell a slow syscall from time spent waiting
+	// for a vCPU: the CPU time of the calling thread is recorded alongside
+	// it, so a gap with little CPU burned is a wait, not work.
 	ts := time.Now().UnixNano()
+	cpu := int64(-1)
+	var cpuTs unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_THREAD_CPUTIME_ID, &cpuTs); err == nil {
+		cpu = cpuTs.Nano()
+	}
 	if helperTraceOut == nil {
 		// tmpfs, not the shared virtiofs directory: a share write can block
 		// tens of milliseconds and would distort the very phases it records.
@@ -133,7 +146,7 @@ func helperTrace(id, stage string) {
 		}
 		helperTraceOut = f
 	}
-	fmt.Fprintf(helperTraceOut, "%s %s %d\n", id, stage, ts)
+	fmt.Fprintf(helperTraceOut, "%s %s %d %d\n", id, stage, ts, cpu)
 }
 
 // runInit is stage A. Returns the process exit code (stage B's exit code —
@@ -162,7 +175,7 @@ func runInit(id, bundle string, ownCgroup bool) int {
 		helperTrace(id, "A-cgroup")
 		defer removeCgroup(cgPath)
 	}
-	if err := joinCgroup(spec); err != nil {
+	if err := joinCgroup(id, spec); err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
@@ -185,6 +198,7 @@ func runInit(id, bundle string, ownCgroup bool) int {
 	unix.CloseOnExec(confirm[0])
 	defer unix.Close(confirm[0]) //nolint:errcheck
 	defer unix.Close(confirm[1]) //nolint:errcheck
+	helperTrace(id, "A-pipe")
 
 	// Stage B must be born INSIDE the new pid namespace: unshare(NEWPID)
 	// does not switch the caller's active namespace, and a Go fork after
@@ -198,6 +212,7 @@ func runInit(id, bundle string, ownCgroup bool) int {
 		reportLine(reportSetupPrefix+"resolve self: %v", err)
 		return 1
 	}
+	helperTrace(id, "A-self")
 	argv := []string{self, "init-apply", "-id", id, "-bundle", bundle}
 	argvPtrs, err := argvBytePtrs(argv)
 	if err != nil {
@@ -214,6 +229,7 @@ func runInit(id, bundle string, ownCgroup bool) int {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
+	helperTrace(id, "A-ptrs")
 	// The confirm write end must survive the child's execve (its closure
 	// is the start signal), so hand it over at a fixed fd with the
 	// close-on-exec bit cleared.
@@ -429,6 +445,9 @@ func runInitApply(id, bundle string) int {
 	// the container exits by itself). A close-on-exec duplicate carries
 	// the failure report if the execve fails — the only case the dup is
 	// still open after the exec attempt.
+	// Cheap here only because stage B inherits fdConfirm=200, which has
+	// already expanded its fd table; if fdConfirm moves below 64, this must
+	// move below 64 too (the first expansion costs 20-50 ms).
 	const fdReportFinal = 201
 	if err := unix.Dup3(fdReport, fdReportFinal, unix.O_CLOEXEC); err != nil {
 		reportLine(reportStartPrefix+"dup report: %v", err)
@@ -545,12 +564,23 @@ func joinNamespacesApply(spec *specs.Spec) error {
 // already created it and wrote the spec's limits): the container init born
 // from this process inherits the placement — the fast shim's equivalent of
 // entering the cgroup at process creation.
-func joinCgroup(spec *specs.Spec) error {
+func joinCgroup(id string, spec *specs.Spec) error {
 	if spec.Linux == nil || spec.Linux.CgroupsPath == "" {
 		return nil
 	}
 	procs := filepath.Join(cgroupAbsPath(spec.Linux.CgroupsPath), "cgroup.procs")
-	return os.WriteFile(procs, []byte(strconv.Itoa(os.Getpid())), 0o600)
+	f, err := os.OpenFile(procs, os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	helperTrace(id, "A-join-open")
+	_, werr := f.WriteString(strconv.Itoa(os.Getpid()))
+	helperTrace(id, "A-join-write")
+	cerr := f.Close()
+	if werr != nil {
+		return werr
+	}
+	return cerr
 }
 
 // prSetOomScoreAdj is PR_SET_OOM_SCORE_ADJ (not in x/sys).
