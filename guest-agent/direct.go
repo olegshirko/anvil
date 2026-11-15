@@ -593,7 +593,7 @@ func stopDirectTask(ctx context.Context, ns, id string, t *directTask, timeoutSe
 	pid := t.pid
 	helper := t.helperPID
 	t.mu.Unlock()
-	_ = pid
+	_ = pid // the signal goes through t.signal (init pid, else the helper)
 
 	sig := syscall.SIGTERM
 	if meta, merr := loadContainerMeta(ns, id); merr == nil && meta.StopSignal != "" {

@@ -126,3 +126,38 @@ Hang count must stay 0/30.
   metadata dir; containerd no longer needs to be involved in task creation.
 - containerd v2 has no shim grouping (checked), so keeping the shim in the
   path cannot avoid the per-container spawn — 5a is the right first rung.
+
+## 5a results (measured, 2026-11-16, dev instance, `alpine true`)
+
+- `docker run --rm` CLI: median 344 → **242 ms** (n=20, debug agent; host
+  load ~3.5 during the run).
+- API-shaped flow: median 246 → **212 ms** (n=15): create 12, start RPC 103
+  (guest-side trace 87: CNI attach 13.6 + helper 68 + stage B/gate ~3),
+  attach EOF **0 ms** (was 112), inspect 3, rm 68.
+- Start is **not** ≤ 40 ms and the API flow is not ≤ 120 ms. The measured
+  reason: the init helper's stage A costs ~67 ms on its own, the same work
+  the fast shim did inside NewTask — the shim process and its ttrpc
+  handshake were only ~30 ms of the old 123 ms start. Helper trace split
+  (medians, 8 runs): read spec 0.17, prepare cgroup 0.07, **joinCgroup
+  28.0**, **pre-clone setup (pipe/argv/env/dup) 40.1**, clone 0.14; stage
+  B's entire join/mount/device/pivot work 1.6 ms. The cgroup-move cost and
+  the pre-clone block are what 5b's in-agent fork window and
+  `CLONE_INTO_CGROUP` remove.
+- The attach drain is gone by mechanism, not a constant: the agent owns the
+  helper's output pipes and writes the json-file log itself, so the eof
+  marker lands within ~5 ms of the exit. The hijacked attach handler's
+  unconditional 100 ms post-stream sleep was the last timer in the path and
+  is removed.
+- rm now pays the CNI DEL (~70–100 ms) that the attach drain used to hide;
+  moving it off the response path is 5c's job, as the ladder says.
+- 0 hangs and 0 failures in 40 back-to-back runs. One race the fast path
+  exposed was fixed: `/wait?condition=removed` is armed before `/start`, and
+  a run that finishes inside one 50 ms poll can be observed only after its
+  removal — the waiter now answers the condition with the recorded exit code
+  (a lost exit code made `docker run --rm ... exit 42` return 0 in ~1/5
+  runs).
+- TTY containers keep the containerd fast-shim path (their console copy is
+  unchanged); privileged and non-eligible containers keep runc. Direct exec,
+  healthchecks, restart policy, ports, events, pause, stats, top, export,
+  diff, cp and cold-boot reconciliation all run against the registry.
+
