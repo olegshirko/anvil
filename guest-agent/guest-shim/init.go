@@ -538,11 +538,9 @@ func applyProcessAttrs(spec *specs.Spec) error {
 		}
 	}
 	if spec.Linux != nil && spec.Linux.Seccomp != nil {
-		reportLine(reportStartPrefix + "probe pre-seccomp")
 		if err := applySeccomp(spec.Linux.Seccomp); err != nil {
 			return err
 		}
-		reportLine(reportStartPrefix + "probe post-seccomp")
 	}
 	return nil
 }
