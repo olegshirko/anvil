@@ -46,21 +46,32 @@ func waitContainerTaskCond(ctx context.Context, ns, containerdID string, nextExi
 	for {
 		c, err := cl.LoadContainer(nsCtx, containerdID)
 		if err != nil {
-			return 0, fmt.Errorf("load container: %w", err)
-		}
-		_, err = c.Task(nsCtx, nil)
-		if err == nil {
-			wtr.mark("task-ready")
-			break
-		}
-		// not-running: no task is not running. A created container
-		// answers 0, one that exited (before a cold boot took its task,
-		// too) the code in its metadata.
-		if !nextExit {
-			if meta, merr := loadContainerMeta(ns, containerdID); merr == nil && !meta.StartedAt.IsZero() {
-				return meta.ExitCode, nil
+			// next-exit: a missing record can be the fast-shim fallback
+			// recreating the container mid-start (the runtime is immutable,
+			// so the fallback deletes and re-registers the record). Poll
+			// through the gap while the agent still owns the container
+			// (metadata present), exactly like the not-yet-created task
+			// poll below. A container the agent no longer knows is real.
+			if !nextExit {
+				return 0, fmt.Errorf("load container: %w", err)
 			}
-			return 0, nil
+			if _, merr := loadContainerMeta(ns, containerdID); merr != nil {
+				return 0, fmt.Errorf("load container: %w", err)
+			}
+		} else {
+			if _, terr := c.Task(nsCtx, nil); terr == nil {
+				wtr.mark("task-ready")
+				break
+			}
+			// not-running: no task is not running. A created container
+			// answers 0, one that exited (before a cold boot took its task,
+			// too) the code in its metadata.
+			if !nextExit {
+				if meta, merr := loadContainerMeta(ns, containerdID); merr == nil && !meta.StartedAt.IsZero() {
+					return meta.ExitCode, nil
+				}
+				return 0, nil
+			}
 		}
 		select {
 		case <-ctx.Done():
