@@ -4,46 +4,31 @@ package main
 
 import (
 	"context"
-	"os"
 
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
-	"github.com/containerd/containerd/v2/core/mount"
-	"github.com/containerd/containerd/v2/pkg/shim"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/errdefs/pkg/errgrpc"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-// TaskService implementation, Linux side. Create/Start and the rest of the
-// task lifecycle are filled in by the fast-path tasks; the skeleton answers
-// State/Connect/Shutdown (service.go) and reports the rest as not implemented
-// so containerd's surface probe fails loudly instead of silently.
+// TaskService implementation, Linux side. Create/Start live in task.go;
+// the teardown and supervision RPCs below are filled in by the fast-path
+// tasks. Everything not implemented yet fails loudly so containerd's
+// surface probe shows exactly what is missing.
 
-// cleanupDeadShim is the "delete" action of the shim binary: best-effort
-// cleanup after the shim server died without a proper Delete. cwd is the
-// bundle; unmount the rootfs so the snapshot mounts do not leak.
-func cleanupDeadShim(ctx context.Context, id string) (shim.StopStatus, error) {
-	if err := mount.UnmountRecursive("rootfs", 0); err != nil {
-		cleanupErr := err
-		if _, statErr := os.Stat("rootfs"); statErr != nil {
-			cleanupErr = nil // no rootfs in this bundle, nothing to do
-		}
-		if cleanupErr != nil {
-			return shim.StopStatus{}, err
-		}
-	}
-	return shim.StopStatus{}, nil
+// startExec is filled in by the exec task; the skeleton reports it as not
+// implemented.
+func (s *taskService) startExec(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.StartResponse, error) {
+	return nil, errgrpc.ToGRPC(errdefs.ErrNotImplemented)
+}
+
+// runExecHelper is the exec helper's entry (second argument "exec-init");
+// filled in by the exec task.
+func runExecHelper(initpid, bundle string) int {
+	return 1
 }
 
 // --- TaskService RPCs -------------------------------------------------------
-
-func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (*taskAPI.CreateTaskResponse, error) {
-	return nil, errgrpc.ToGRPC(errdefs.ErrNotImplemented)
-}
-
-func (s *taskService) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.StartResponse, error) {
-	return nil, errgrpc.ToGRPC(errdefs.ErrNotImplemented)
-}
 
 func (s *taskService) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAPI.DeleteResponse, error) {
 	return nil, errgrpc.ToGRPC(errdefs.ErrNotImplemented)
