@@ -269,6 +269,7 @@ func (s *taskService) readReports(c *container) {
 			// Helper gone. A start still pending resolves as failed; the
 			// exit code comes from the helper's own exit status (the stub
 			// exits with the container's code).
+			log.L.WithField("id", c.id).Info("report EOF")
 			code := waitExitCode(c.cmd)
 			if !started {
 				c.startedCh <- startMsg{err: fmt.Errorf("init helper exited (code %d)", code)}
@@ -277,6 +278,7 @@ func (s *taskService) readReports(c *container) {
 			return
 		}
 		line = strings.TrimRight(line, "\n")
+		log.L.WithField("id", c.id).Infof("report line: %q", line)
 		switch {
 		case strings.HasPrefix(line, reportStartedPrefix):
 			pid, _ := strconv.Atoi(strings.TrimPrefix(line, reportStartedPrefix))

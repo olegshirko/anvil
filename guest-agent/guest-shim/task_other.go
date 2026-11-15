@@ -20,11 +20,16 @@ import (
 // stdioSet is the io plumbing type; off Linux it is an empty shell.
 type stdioSet struct{}
 
-// isInitHelper / isExecHelper / runInit / runExecHelper are the Linux
-// helper entries; off Linux they never trigger.
+// The helper entries are Linux-only; off Linux they never trigger.
 func isInitHelper() bool { return false }
+func isInitApply() bool  { return false }
 func isExecHelper() bool { return false }
 func runInit(id, bundle string) int {
+	_, _ = id, bundle
+	return 1
+}
+
+func runInitApply(id, bundle string) int {
 	_, _ = id, bundle
 	return 1
 }

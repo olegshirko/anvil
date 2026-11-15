@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"unsafe"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
@@ -15,19 +14,15 @@ import (
 // directly inside the prepared cgroup (CLONE_INTO_CGROUP) — no intermediate
 // runc processes, no second exec.
 
-// cloneArgs mirrors the kernel's struct clone_args (uapi/linux/sched.h).
-type cloneArgs struct {
-	flags      uint64
-	pidfd      uint64
-	childTid   uint64
-	parentTid  uint64
-	exitSignal uint64
-	stack      uint64
-	stackSize  uint64
-	tls        uint64
-	setTid     uint64
-	setTidSize uint64
-	cgroup     uint64
+// cloneRawPid creates a child inside a NEW pid namespace (clone with
+// CLONE_NEWPID: unshare(CLONE_NEWPID) does not switch the caller's active
+// namespace, and a Go fork after that unshare fails with ENOMEM — the
+// child must be born inside the namespace). Returns the child's pid in the
+// caller's namespace (the global pid), 0 in the child.
+func cloneRawPid() (int, unix.Errno) {
+	pid, _, errno := unix.RawSyscall(unix.SYS_CLONE,
+		uintptr(unix.SIGCHLD|unix.CLONE_NEWPID), 0, 0)
+	return int(pid), errno
 }
 
 // namespaceCloneFlag maps an OCI namespace type to its clone(2) flag.
@@ -67,22 +62,4 @@ func namespaceFlags(spec *specs.Spec) (uint64, error) {
 		flags |= f
 	}
 	return flags, nil
-}
-
-// cloneInto runs clone3 and returns the child's pid. cgroupFd (-1 = none)
-// places the child into that cgroup before it runs its first instruction.
-func cloneInto(flags uint64, cgroupFd int) (int, error) {
-	args := cloneArgs{
-		flags:      flags | uint64(unix.SIGCHLD),
-		exitSignal: uint64(unix.SIGCHLD),
-	}
-	if cgroupFd >= 0 {
-		args.flags |= unix.CLONE_INTO_CGROUP
-		args.cgroup = uint64(cgroupFd)
-	}
-	pid, _, errno := unix.RawSyscall(unix.SYS_CLONE3, uintptr(unsafe.Pointer(&args)), unsafe.Sizeof(args), 0)
-	if errno != 0 {
-		return -1, fmt.Errorf("clone3: %w", errno)
-	}
-	return int(pid), nil
 }

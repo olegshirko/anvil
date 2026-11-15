@@ -276,6 +276,7 @@ func runExecHelper(initpidArg, bundle string) int {
 		reportLine(reportSetupPrefix+"bad init pid %q: %v", initpidArg, err)
 		return 1
 	}
+	helperGlobalPid = os.Getpid()
 	specJSON := os.Getenv("ANVIL_EXEC_SPEC")
 	var pspec specs.Process
 	if err := json.Unmarshal([]byte(specJSON), &pspec); err != nil {
@@ -331,15 +332,16 @@ func runExecHelper(initpidArg, bundle string) int {
 	if !waitGate() {
 		return 0
 	}
-	code, pid, detail, err := forkAndExecUser(&pspec, fdExecGate)
+	code, nsPid, globalPid, detail, err := forkAndExecUser(&pspec, fdExecGate)
 	if err != nil {
 		reportLine(reportStartPrefix+"%s", detail)
 		return 127
 	}
-	reportLine(reportStartedPrefix+"%d", globalPidOf(pid))
+	reportLine(reportStartedPrefix+"%d", globalPid)
 
+	// Wait with the namespace pid (the global pid is not visible here).
 	var ws unix.WaitStatus
-	if _, waitErr := unix.Wait4(pid, &ws, 0, nil); waitErr != nil {
+	if _, waitErr := unix.Wait4(nsPid, &ws, 0, nil); waitErr != nil {
 		code = 137
 	} else {
 		code = int(exitStatus(ws))
@@ -366,27 +368,49 @@ func joinExecNamespaces(initpid int, initSpec *specs.Spec) error {
 		specs.UserNamespace, specs.IPCNamespace, specs.UTSNamespace,
 		specs.NetworkNamespace, specs.CgroupNamespace, specs.PIDNamespace,
 	}
+	// The PID namespace must be joined from a single-threaded process
+	// (setns(pid) is EINVAL for a multithreaded one — the Go runtime is
+	// always multi-threaded), so pid+mount join later in the raw fork
+	// window; the rest joins here.
+	var pidFd int
 	for _, typ := range types {
 		fd, err := unix.Open(fmt.Sprintf("/proc/%d/ns/%s", initpid, nsTypeName(typ)), unix.O_RDONLY, 0)
 		if err != nil {
 			if typ == specs.UserNamespace {
-				continue // no user namespace: fine
+				continue // no private user namespace: fine
 			}
 			return fmt.Errorf("open %s ns: %w", typ, err)
 		}
 		if err := unix.Setns(fd, 0); err != nil {
 			unix.Close(fd) //nolint:errcheck
+			if typ == specs.UserNamespace {
+				// Containers without a private user namespace share the
+				// host's; setns into the namespace we are already in
+				// returns EINVAL. Best effort, like runc's nsenter.
+				continue
+			}
 			return fmt.Errorf("setns %s: %w", typ, err)
+		}
+		if typ == specs.PIDNamespace {
+			pidFd = fd // kept open for the raw window (close-on-exec)
+			continue
 		}
 		unix.Close(fd) //nolint:errcheck
 	}
 	mntFd, err := unix.Open(fmt.Sprintf("/proc/%d/ns/mnt", initpid), unix.O_RDONLY, 0)
 	if err != nil {
+		if pidFd > 0 {
+			unix.Close(pidFd) //nolint:errcheck
+		}
 		return fmt.Errorf("open mnt ns: %w", err)
 	}
-	defer unix.Close(mntFd) //nolint:errcheck
-	return unix.Setns(mntFd, 0)
+	execPidNsFd, execMntNsFd = pidFd, mntFd
+	return nil
 }
+
+// execPidNsFd / execMntNsFd carry the namespace fds into the raw fork
+// window (single-threaded there, so pid+mount setns is legal).
+var execPidNsFd, execMntNsFd = -1, -1
 
 // nsTypeName maps a namespace type to its /proc/<pid>/ns directory name.
 func nsTypeName(t specs.LinuxNamespaceType) string {
@@ -433,35 +457,112 @@ func joinCgroupOf(initpid int) {
 	}
 }
 
-// globalPidOf reads the global pid of a process known by its pid-namespace
-// pid (/proc/<pid>/status NSpid first field; kernel 4.9+).
-func globalPidOf(nsPid int) int {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", nsPid))
+// helperGlobalPid is the exec helper's own global pid, captured before any
+// namespace join (os.Getpid turns into the namespace pid after setns(pid)).
+var helperGlobalPid = 0
+
+// globalPidOfExec resolves the global pid of the exec'd process from the
+// container's cgroup membership: the helper and the exec'd process are the
+// only members, and cgroup.procs lists global pids.
+func globalPidOfExec() int {
+	data, err := os.ReadFile("/sys/fs/cgroup/anvil-exec/cgroup.procs")
 	if err != nil {
-		return nsPid
+		return 0
 	}
 	for _, line := range strings.Split(string(data), "\n") {
-		v, ok := strings.CutPrefix(line, "NSpid:")
-		if !ok {
+		pid, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil || pid == helperGlobalPid {
 			continue
 		}
-		fields := strings.Fields(v)
-		if len(fields) > 0 {
-			if g, err := strconv.Atoi(fields[0]); err == nil {
-				return g
-			}
-		}
+		return pid
 	}
-	return nsPid
+	return 0
 }
 
 // forkAndExecUser is the exec trampoline: the shared forkExecUser with the
 // exec helper's gate/report fd layout. Returns once the execve landed
 // (confirm pipe EOF) or failed (message came through instead).
-func forkAndExecUser(pspec *specs.Process, gateFD int) (code int, pid int, detail string, err error) {
+// execCwdPtr carries the exec spec's working directory into the raw
+// window (set by runExecHelper before the fork).
+var execCwdPtr *byte
+
+// forkExecUser is the raw fork+execve trampoline shared with the exec
+// helper: pre-built pointers, syscalls only in the child. Returns the
+// parent-side read end of the confirm pipe plus the child's pid (namespace
+// view of the caller).
+func forkExecUser(p *specs.Process, gateFD, reportFD int) (confirmR int, pid int, detail string, err error) {
+	argv0, err := resolveExecPath(&specs.Spec{Process: p})
+	if err != nil {
+		return -1, 0, err.Error(), err
+	}
+	pathPtr, err := unix.BytePtrFromString(argv0)
+	if err != nil {
+		return -1, 0, "", err
+	}
+	argvPtrs, err := argvBytePtrs(p.Args)
+	if err != nil {
+		return -1, 0, "", err
+	}
+	envPtrs, err := envBytePtrs(p.Env)
+	if err != nil {
+		return -1, 0, "", err
+	}
+	confirm := make([]int, 2)
+	if err := unix.Pipe(confirm); err != nil {
+		return -1, 0, "", fmt.Errorf("confirm pipe: %w", err)
+	}
+	args := pid0Args{
+		confirmFD:  confirm[1],
+		gateFD:     gateFD,
+		reportFD:   reportFD,
+		pathPtr:    pathPtr,
+		argvPtrs:   argvPtrs,
+		envPtrs:    envPtrs,
+		failMsg:    &failExecMessage[0],
+		failMsgLen: len(failExecMessage),
+		pidNsFd:    execPidNsFd,
+		mntNsFd:    execMntNsFd,
+		cwdPtr:     execCwdPtr,
+	}
+	pid, errno := forkRaw()
+	if errno != 0 {
+		unix.Close(confirm[0])
+		unix.Close(confirm[1])
+		return -1, 0, "", fmt.Errorf("fork: %w", errno)
+	}
+	if pid == 0 {
+		pid0RawChild(args)
+		// unreached
+	}
+	unix.Close(confirm[1]) //nolint:errcheck — parent keeps the read end
+	return confirm[0], pid, "", nil
+}
+
+// forkAndExecUser is the exec trampoline: the raw fork+execve of the user
+// process inside the joined namespaces. Returns once the execve landed
+// (confirm pipe EOF) or failed (message came through instead).
+func forkAndExecUser(pspec *specs.Process, gateFD int) (code int, nsPid int, globalPid int, detail string, err error) {
+	defer func() {
+		if execPidNsFd > 0 {
+			unix.Close(execPidNsFd) //nolint:errcheck
+			execPidNsFd = -1
+		}
+		if execMntNsFd > 0 {
+			unix.Close(execMntNsFd) //nolint:errcheck
+			execMntNsFd = -1
+		}
+		execCwdPtr = nil
+	}()
+	var cwdErr error
+	if pspec.Cwd != "" {
+		execCwdPtr, cwdErr = unix.BytePtrFromString(pspec.Cwd)
+		if cwdErr != nil {
+			return 127, 0, 0, "", cwdErr
+		}
+	}
 	confirmR, childPid, detail, err := forkExecUser(pspec, gateFD, fdReport)
 	if err != nil {
-		return 127, 0, detail, err
+		return 127, 0, 0, detail, err
 	}
 	defer unix.Close(confirmR) //nolint:errcheck
 	buf := make([]byte, 128)
@@ -477,7 +578,10 @@ func forkAndExecUser(pspec *specs.Process, gateFD int) (code int, pid int, detai
 		if werr == nil && wp == childPid {
 			code = int(exitStatus(ws))
 		}
-		return code, 0, msg, fmt.Errorf("exec failed")
+		return code, 0, 0, msg, fmt.Errorf("exec failed")
 	}
-	return 0, globalPidOf(childPid), "", nil
+	// The exec process keeps running under the helper; report the global
+	// pid (from the container's cgroup membership), keep the namespace pid
+	// for the wait.
+	return 0, childPid, globalPidOfExec(), "", nil
 }

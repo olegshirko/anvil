@@ -48,6 +48,9 @@ func main() {
 	if isInitHelper() {
 		os.Exit(runInit(helperArg("id"), helperArg("bundle")))
 	}
+	if isInitApply() {
+		os.Exit(runInitApply(helperArg("id"), helperArg("bundle")))
+	}
 	if isExecHelper() {
 		os.Exit(runExecHelper(helperArg("initpid"), helperArg("bundle")))
 	}
