@@ -696,8 +696,11 @@ func resolveExecPath(spec *specs.Spec) (string, error) {
 				p := filepath.Join(dir, argv[0])
 				if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
 					return p, nil
+				} else if err != nil {
+					tried = append(tried, fmt.Sprintf("%s: %v", p, err))
+				} else {
+					tried = append(tried, fmt.Sprintf("%s: mode %v", p, st.Mode()))
 				}
-				tried = append(tried, p)
 			}
 			break
 		}
