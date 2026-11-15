@@ -36,12 +36,16 @@ func pid0RawChild(a pid0Args) {
 	if a.pidNsFd >= 0 {
 		_, _, errno := unix.RawSyscall(unix.SYS_SETNS, uintptr(a.pidNsFd), 0, 0)
 		if errno != 0 {
+			unix.RawSyscall(unix.SYS_WRITE, uintptr(a.confirmFD),
+				uintptr(unsafe.Pointer(&failSetnsPidMessage[0])), uintptr(len(failSetnsPidMessage)))
 			unix.RawSyscall(unix.SYS_EXIT_GROUP, 126, 0, 0) //nolint:errcheck
 		}
 	}
 	if a.mntNsFd >= 0 {
 		_, _, errno := unix.RawSyscall(unix.SYS_SETNS, uintptr(a.mntNsFd), 0, 0)
 		if errno != 0 {
+			unix.RawSyscall(unix.SYS_WRITE, uintptr(a.confirmFD),
+				uintptr(unsafe.Pointer(&failSetnsMntMessage[0])), uintptr(len(failSetnsMntMessage)))
 			unix.RawSyscall(unix.SYS_EXIT_GROUP, 126, 0, 0) //nolint:errcheck
 		}
 	}
@@ -96,3 +100,9 @@ var failExecMessage = []byte("X exec failed (executable not found or blocked)\n"
 // failCwdMessage is the pre-built report for a failed chdir into the exec
 // spec's working directory.
 var failCwdMessage = []byte("X exec failed (working directory missing)\n")
+
+// failSetns*Message are the pre-built reports for a failed namespace join
+// in the raw window (previously these exited silently, leaving the exec
+// dead with no diagnostic).
+var failSetnsPidMessage = []byte("X exec failed (setns pid namespace)\n")
+var failSetnsMntMessage = []byte("X exec failed (setns mount namespace)\n")
