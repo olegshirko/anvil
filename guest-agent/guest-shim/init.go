@@ -63,7 +63,10 @@ const (
 	// wall with ~0.02 ms of CPU on the dev guest (the A-confirm trace mark).
 	// Stage B's fdReportFinal (init.go, runInitApply) is below 64 for the
 	// same reason — and only stays cheap today because it inherits this one.
-	fdConfirm = 200
+	// 8/9 are NOT free: the Go runtime's netpoll epoll and self-binary probe
+	// can own them (dup3 there caused a netpoll fatal), so the fixed fds sit
+	// just under the boundary instead.
+	fdConfirm = 60
 )
 
 // gateStartLine is the gate release message (written by the shim at start).
@@ -445,10 +448,10 @@ func runInitApply(id, bundle string) int {
 	// the container exits by itself). A close-on-exec duplicate carries
 	// the failure report if the execve fails — the only case the dup is
 	// still open after the exec attempt.
-	// Cheap here only because stage B inherits fdConfirm=200, which has
-	// already expanded its fd table; if fdConfirm moves below 64, this must
-	// move below 64 too (the first expansion costs 20-50 ms).
-	const fdReportFinal = 201
+	// Both fixed fds stay below 64 (NR_OPEN_DEFAULT): the first dup3 onto a
+	// descriptor >= 64 expands the fd table at 20-50 ms wall and ~0.02 ms
+	// CPU, so fdConfirm (60) and this one (61) sit under the boundary.
+	const fdReportFinal = 61
 	if err := unix.Dup3(fdReport, fdReportFinal, unix.O_CLOEXEC); err != nil {
 		reportLine(reportStartPrefix+"dup report: %v", err)
 		return 126
