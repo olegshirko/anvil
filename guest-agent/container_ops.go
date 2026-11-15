@@ -191,6 +191,7 @@ func forgetTaskRuns(did string) {
 // logging and starts it. A leftover stopped task from a previous run is
 // deleted first.
 func startNativeTask(ctx context.Context, ns, id string) error {
+	tr := newPhaseTrace("start", id[:12])
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd client: %w", err)
@@ -201,6 +202,7 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 	if err != nil {
 		return fmt.Errorf("load container: %w", err)
 	}
+	tr.mark("load")
 
 	// A stopped task left over from a previous run/restart must go first.
 	if old, terr := c.Task(nsCtx, nil); terr == nil {
@@ -210,6 +212,7 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 		dctx, cancel := context.WithTimeout(nsCtx, 5*time.Second)
 		old.Delete(dctx, client.WithProcessKill) //nolint:errcheck
 		cancel()
+		tr.mark("old-task-delete")
 	}
 
 	meta, merr := loadContainerMeta(ns, id)
@@ -228,6 +231,7 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 		if nerr := ensureNamedNetNS(id); nerr != nil {
 			return fmt.Errorf("netns: %w", nerr)
 		}
+		tr.mark("netns-ensure")
 		// Self-healing attach: the exit watcher's CNI detach is asynchronous,
 		// so a restart (the monitor, docker restart, compose) can race it and
 		// hit a leftover veth ("eth0 peer already exists") or a torn-down
@@ -235,6 +239,7 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 		// attach failure, run the matching DEL to clear the stale endpoint
 		// state and attach again.
 		addrs, aerr := attachNetwork(ctx, netName, ns, id, netnsPathFor(id), ports)
+		tr.mark("cni-attach")
 		if aerr != nil {
 			time.Sleep(200 * time.Millisecond)
 			dctx, dcancel := context.WithTimeout(ctx, 10*time.Second)
@@ -337,6 +342,7 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 	task, terr := c.NewTask(nsCtx, func(string) (cio.IO, error) {
 		return taskIO, nil
 	})
+	tr.mark("new-task")
 	if terr != nil {
 		if stopLogger != nil {
 			stopLogger()
@@ -353,6 +359,7 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 		err = fmt.Errorf("start task: %w", serr)
 		return err
 	}
+	tr.mark("task-start")
 	updateContainerMeta(ns, id, func(m *containerMeta) { //nolint:errcheck
 		m.StartedAt, m.FinishedAt = time.Now().UTC(), time.Time{}
 	})
