@@ -32,11 +32,43 @@ import (
 
 const logReadyFD = 5
 
-// logLine mirrors Docker's json-file record shape.
+// logLine mirrors Docker's json-file record shape. EOF marks the
+// end-of-stream record the loggers append when the container output is final
+// (Task: deterministic attach EOF); it is never surfaced as output.
 type logLine struct {
 	Log    string    `json:"log"`
 	Stream string    `json:"stream"`
 	Time   time.Time `json:"time"`
+	EOF    bool      `json:"eof,omitempty"`
+}
+
+// eofMarker is the end-of-stream record: the follow loop in readTaskLog ends
+// the stream as soon as it reads one, replay emitters skip it. It still goes
+// through the rotation policy like any record, so replay readers of old logs
+// (and other engines' json-file readers) see a well-formed line.
+func eofMarker() logLine {
+	return logLine{EOF: true, Time: time.Now().UTC()}
+}
+
+// writeEOFMarker appends the end-of-stream record to out.
+func writeEOFMarker(out io.Writer) {
+	rec, err := json.Marshal(eofMarker())
+	if err != nil {
+		return
+	}
+	out.Write(append(rec, '\n'))
+}
+
+// isEOFMarker reports whether a raw log line is the end-of-stream record.
+// The `"eof":true` substring cannot appear inside a real record (quotes in
+// the log payload are JSON-escaped), so it is a safe prefilter before the
+// decode.
+func isEOFMarker(raw []byte) bool {
+	if !bytes.Contains(raw, []byte(`"eof":true`)) {
+		return false
+	}
+	var rec logLine
+	return json.Unmarshal(raw, &rec) == nil && rec.EOF
 }
 
 // runJSONLogger implements the `guest-agent --log-json <path>` logging
@@ -308,6 +340,9 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 		}
 	}
 	emitRecord := func(rec logLine) {
+		if rec.EOF {
+			return // end-of-stream marker: never output, no since/until either
+		}
 		if !opts.since.IsZero() && rec.Time.Before(opts.since) {
 			return
 		}
@@ -545,7 +580,7 @@ func completeLogEnd(logPath string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_, end, err := lastLogLines(f, fi.Size(), 1)
+	_, end, err := lastLogLines(f, fi.Size(), 1, nil)
 	return end, err
 }
 
@@ -567,7 +602,7 @@ func replayLogTail(files []string, logPath string, n int, emit func(raw []byte))
 			f.Close()
 			return 0, err
 		}
-		lines, completeEnd, err := lastLogLines(f, fi.Size(), n-len(newestFirst))
+		lines, completeEnd, err := lastLogLines(f, fi.Size(), n-len(newestFirst), isEOFMarker)
 		f.Close()
 		if err != nil {
 			return 0, err
@@ -584,8 +619,10 @@ func replayLogTail(files []string, logPath string, n int, emit func(raw []byte))
 }
 
 // lastLogLines returns up to want complete lines (without '\n') from the end
-// of f, newest first, plus the offset after the file's last '\n'.
-func lastLogLines(f io.ReaderAt, size int64, want int) ([][]byte, int64, error) {
+// of f, newest first, plus the offset after the file's last '\n'. Lines the
+// skip predicate rejects (eof markers) do not count toward want and are not
+// returned — scanning continues further back to fill the window.
+func lastLogLines(f io.ReaderAt, size int64, want int, skip func([]byte) bool) ([][]byte, int64, error) {
 	const block = 64 << 10
 	var out [][]byte
 	var carry []byte // the not yet split bytes in [pos, completeEnd)
@@ -618,12 +655,16 @@ func lastLogLines(f io.ReaderAt, size int64, want int) ([][]byte, int64, error) 
 			if idx < 0 {
 				break
 			}
-			out = append(out, append([]byte(nil), body[idx+1:]...))
+			if line := body[idx+1:]; skip == nil || !skip(line) {
+				out = append(out, append([]byte(nil), line...))
+			}
 			carry = carry[:idx+1]
 		}
 	}
 	if pos == 0 && completeEnd >= 0 && len(out) < want && len(carry) > 0 {
-		out = append(out, append([]byte(nil), carry[:len(carry)-1]...)) // the file's first line
+		if first := carry[:len(carry)-1]; skip == nil || !skip(first) {
+			out = append(out, append([]byte(nil), first...)) // the file's first line
+		}
 	}
 	if completeEnd < 0 {
 		completeEnd = 0
