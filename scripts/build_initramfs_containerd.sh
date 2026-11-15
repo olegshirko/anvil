@@ -43,7 +43,7 @@ if [[ -z "${IN_CONTAINER:-}" ]]; then
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
             alpine:3.20 \
-            sh -c 'apk add --no-cache bash cpio zstd binutils upx && exec bash /scripts/build_initramfs_containerd.sh'
+            sh -c 'for i in 1 2 3 4; do apk add --no-cache bash cpio zstd binutils upx && break; [ "$i" = 4 ] && exit 1; echo "apk add failed (attempt $i), retrying in $((i*5))s..." >&2; sleep $((i*5)); done && exec bash /scripts/build_initramfs_containerd.sh'
         exit 0
     fi
 fi
@@ -61,7 +61,20 @@ command -v cpio >/dev/null 2>&1 || need_pkgs="$need_pkgs cpio"
 command -v zstd >/dev/null 2>&1 || need_pkgs="$need_pkgs zstd"
 command -v objdump >/dev/null 2>&1 || need_pkgs="$need_pkgs binutils"
 if [[ -n "$need_pkgs" ]]; then
-    apk add --no-cache $need_pkgs
+    # The CDN intermittently answers "temporary error (try again later)",
+    # which fails the whole build on a transient network blip. Retry with
+    # backoff before giving up.
+    for attempt in 1 2 3 4; do
+        if apk add --no-cache $need_pkgs; then
+            break
+        fi
+        if [[ "$attempt" == 4 ]]; then
+            echo "apk add failed after $attempt attempts (CDN unreachable?)" >&2
+            exit 1
+        fi
+        echo "apk add failed (attempt $attempt), retrying in $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+    done
 fi
 
 # BUILD_DIR points at the shared download directory: /build/download inside
