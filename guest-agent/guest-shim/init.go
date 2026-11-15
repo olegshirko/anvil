@@ -127,7 +127,7 @@ func runInit(id, bundle string) int {
 			return 1
 		}
 	}
-	if len(spec.Linux.Sysctl) > 0 {
+	if spec.Linux != nil && len(spec.Linux.Sysctl) > 0 {
 		if err := applySysctls(spec.Linux.Sysctl); err != nil {
 			reportLine(reportSetupPrefix+"%v", err)
 			return 1
@@ -227,6 +227,9 @@ func waitGate() bool {
 // utsNamespaceShared reports a UTS namespace joined by path (host uts or
 // container:<x>): the hostname is shared, so it must not be set.
 func utsNamespaceShared(spec *specs.Spec) bool {
+	if spec.Linux == nil {
+		return false
+	}
 	for _, ns := range spec.Linux.Namespaces {
 		if ns.Type == specs.UTSNamespace && ns.Path != "" {
 			return true
@@ -240,6 +243,9 @@ func utsNamespaceShared(spec *specs.Spec) bool {
 // mount namespace is unshared before the mount work; the cgroup namespace
 // is unshared after the cgroup join in joinCgroup.
 func joinNamespaces(spec *specs.Spec) error {
+	if spec.Linux == nil {
+		return nil
+	}
 	type nsEntry struct {
 		typ  specs.LinuxNamespaceType
 		path string

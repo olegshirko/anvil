@@ -40,6 +40,7 @@ type stdioSet struct {
 	childStdout *os.File // write end for the init's fd1
 	childStderr *os.File // write end for the init's fd2
 	console     console.Console
+	stdinSrc    *os.File // console stdin source (the stdin fifo; tty only)
 	logger      *exec.Cmd
 	sinkEOF     bool // stdout sink should close when the console copy ends
 	closeFns    []func()
@@ -91,6 +92,18 @@ func newStdioSet(ctx context.Context, id string, stdin, stdout, stderr string, t
 		s.console = master
 		s.childStdin, s.childStdout, s.childStderr = slave, slave, slave
 		s.closeFns = append(s.closeFns, func() { master.Close() })
+		if stdin != "" {
+			// The console's input is the stdin fifo (docker run -it, attach):
+			// the shim copies fifo -> master; the slave is the tty itself.
+			src, err := openFifoRead(stdin)
+			if err != nil {
+				master.Close()
+				slave.Close()
+				return nil, err
+			}
+			s.stdinSrc = src
+			s.closeFns = append(s.closeFns, func() { src.Close() }) //nolint:errcheck
+		}
 	} else {
 		switch schemeOf(outU) {
 		case "binary", "binary-v2":
@@ -313,15 +326,15 @@ func (s *stdioSet) startCopies(ctx context.Context) {
 			}
 		}()
 	}
-	if s.childStdin != nil {
+	if s.stdinSrc != nil {
 		go func() {
-			_, err := io.Copy(master, s.childStdin)
+			_, err := io.Copy(master, s.stdinSrc)
 			if err != nil && !isBenignCopyErr(err) {
 				log.G(ctx).WithError(err).Debug("console stdin copy ended")
 			}
-			// Closing the read end wakes nobody inside the container
-			// (its fd is separate); the write side is simply done.
-			s.childStdin.Close() //nolint:errcheck
+			// The fifo read end closing does not EOF the container's own
+			// slave copy; the copy is simply done.
+			s.stdinSrc.Close() //nolint:errcheck
 		}()
 	}
 }
@@ -334,11 +347,16 @@ func isBenignCopyErr(err error) bool {
 		strings.Contains(err.Error(), "input/output error")
 }
 
-// closeIOStdin implements CloseIO: the container's stdin sees EOF.
+// closeIOStdin implements CloseIO: the shim drops its stdin ends (the
+// container's read sees EOF once the fifo writers close).
 func (s *stdioSet) closeIOStdin() {
 	if s.childStdin != nil {
 		s.childStdin.Close() //nolint:errcheck
 		s.childStdin = nil
+	}
+	if s.stdinSrc != nil {
+		s.stdinSrc.Close() //nolint:errcheck
+		s.stdinSrc = nil
 	}
 }
 
@@ -354,6 +372,10 @@ func (s *stdioSet) close() {
 	if s.childStdin != nil {
 		s.childStdin.Close() //nolint:errcheck
 		s.childStdin = nil
+	}
+	if s.stdinSrc != nil {
+		s.stdinSrc.Close() //nolint:errcheck
+		s.stdinSrc = nil
 	}
 }
 
