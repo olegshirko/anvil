@@ -168,6 +168,11 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 	var initPid int
 	for {
 		pid, ready, rerr := consumeSetupReport(reportBuf)
+		// probe: server-clock arrival of each helper report line.
+		if rerr == nil {
+			log.G(ctx).Infof("create-profile %s: report pid=%d ready=%v at=%.1fms mono=%d",
+				r.ID, pid, ready, time.Since(createT0).Seconds()*1000, time.Now().UnixNano())
+		}
 		if rerr != nil {
 			watchdog.Stop()
 			cmd.Process.Kill() //nolint:errcheck — a stuck helper must not leak
