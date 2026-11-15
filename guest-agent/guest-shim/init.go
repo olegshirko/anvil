@@ -354,6 +354,18 @@ func runInitApply(id, bundle string) int {
 	// process (runc's init execs with exactly 0/1/2).
 	unix.Close(fdGate) //nolint:errcheck
 
+	// Resolve the exec path before the user-process attributes are applied:
+	// the seccomp filter (part of those attributes) is active on this
+	// process from its install until the exec, and everything in between
+	// must be syscalls the profile allows. Resolution needs only stat, but
+	// runc's ordering is the same for a reason - keep Go work ahead of the
+	// filter.
+	argv0, err := resolveExecPath(spec)
+	if err != nil {
+		reportLine(reportStartPrefix+"%v", err)
+		return 127
+	}
+
 	// Everything the user process must already carry is applied to this
 	// process before the exec: the exec'd init inherits it all.
 	if err := applyProcessAttrs(spec); err != nil {
@@ -361,13 +373,6 @@ func runInitApply(id, bundle string) int {
 		return 126
 	}
 
-	// Become the user process in place: PID 1 of the container, children
-	// reparent to it, its exit ends the namespace.
-	argv0, err := resolveExecPath(spec)
-	if err != nil {
-		reportLine(reportStartPrefix+"%v", err)
-		return 127
-	}
 	// The report fd closes before the exec too (a live write end in the
 	// user process would hold the shim's report-EOF fallback open until
 	// the container exits by itself). A close-on-exec duplicate carries
