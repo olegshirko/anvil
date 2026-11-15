@@ -133,6 +133,7 @@ type execProcess struct {
 	gateW     *os.File
 	reportR   *os.File
 	reportBuf *bufio.Reader
+	startedCh chan startMsg
 	io        *stdioSet
 	stdinOpen bool
 	term      bool
