@@ -122,13 +122,9 @@ func seccompFilter(sc *specs.LinuxSeccomp) (*seccomp.Filter, error) {
 	for i := range sc.Syscalls {
 		s := &sc.Syscalls[i]
 		action := bpfAction(s.Action, s.ErrnoRet)
-		var names []string
-		for _, name := range s.Names {
-			if _, ok := archInfo.SyscallNames[name]; ok {
-				names = append(names, name)
-			}
-			// Unknown-for-arch names are skipped, matching runc/libseccomp.
-		}
+		// Unknown-for-arch names are skipped (with alias fallback),
+		// matching runc/libseccomp.
+		names := resolveSeccompNames(s.Names, archInfo)
 		if len(names) == 0 {
 			continue
 		}

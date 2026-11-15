@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/elastic/go-seccomp-bpf"
+	"github.com/elastic/go-seccomp-bpf/arch"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -48,6 +49,54 @@ func validateSeccompOps(sc *specs.LinuxSeccomp) error {
 		}
 	}
 	return nil
+}
+
+// seccompNameAliases maps OCI syscall names to the alias the module's
+// syscall table actually knows, for names libseccomp resolves but
+// go-seccomp-bpf names differently on the same architecture. The one
+// collision that matters: the kernel's generic aarch64 table calls syscall
+// 79 "fstatat", libseccomp (and the OCI profiles, and every docker default
+// profile) call it "newfstatat" — dropped as unknown-for-arch, the syscall
+// then falls to the default deny and stat()/lstat() wrappers (musl: ls,
+// shell PATH lookup) fail EPERM across the whole container. The alias only
+// applies when the target name exists for the arch, so foreign arch tables
+// are untouched.
+var seccompNameAliases = map[string]string{
+	"newfstatat": "fstatat",
+}
+
+// resolveSeccompName maps one OCI syscall name to the module's table name
+// for the architecture. Known names pass through; unknown ones try the
+// alias table (and must then exist for the arch too). Returns the resolved
+// name (or "" when the name has no number for this arch and must be
+// skipped, matching runc/libseccomp's foreign-arch behavior).
+func resolveSeccompName(name string, archInfo *arch.Info) string {
+	if _, ok := archInfo.SyscallNames[name]; ok {
+		return name
+	}
+	if alias, ok := seccompNameAliases[name]; ok {
+		if _, ok := archInfo.SyscallNames[alias]; ok {
+			return alias
+		}
+	}
+	return ""
+}
+
+// resolveSeccompNames resolves a whole OCI name list: aliasing, duplicate
+// collapse (aliasing can land two OCI names on one table name and the
+// assembler rejects duplicates), order preserved.
+func resolveSeccompNames(names []string, archInfo *arch.Info) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, name := range names {
+		resolved := resolveSeccompName(name, archInfo)
+		if resolved == "" || seen[resolved] {
+			continue
+		}
+		seen[resolved] = true
+		out = append(out, resolved)
+	}
+	return out
 }
 
 // bpfCondition maps one OCI argument comparison to the filter's condition.

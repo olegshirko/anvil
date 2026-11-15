@@ -55,6 +55,9 @@ func main() {
 	if isExecHelper() {
 		os.Exit(runExecHelper(helperArg("initpid"), helperArg("bundle")))
 	}
+	if isExecApply() {
+		os.Exit(runExecApply())
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "secprobe" {
 		os.Exit(runSecProbe(os.Args[2:]))
 	}
