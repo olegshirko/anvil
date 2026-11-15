@@ -442,3 +442,56 @@ func TestFollowRunsPastQuietWithoutMarker(t *testing.T) {
 		t.Errorf("emitted %q, want exactly the kept record", lines)
 	}
 }
+
+// A trailing marker from the container's PREVIOUS run must not end a follow
+// of the next one: `docker start -a` (attach before start) attaches while
+// the old run's log still ends on its marker and the new task does not
+// exist yet — the stop condition says "keep waiting" and the follow stays
+// open until the stop condition ends it.
+func TestFollowKeepsWaitingAcrossRuns(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log.json")
+	body := `{"time":"2026-01-01T00:00:00Z","stream":"stdout","log":"old run\n"}` + "\n" +
+		`{"eof":true}` + "\n"
+	if err := os.WriteFile(logPath, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// "created, not started yet" for 500 ms, then the new run's exit.
+	begin := time.Now()
+	stop := func() bool { return time.Since(begin) > 500*time.Millisecond }
+
+	done := make(chan error, 1)
+	var lines []string
+	go func() {
+		done <- readTaskLog(logPath, logReadOptions{
+			follow:     true,
+			tail:       -1,
+			stop:       stop,
+			stopQuiet:  50 * time.Millisecond,
+			noStopWait: 10 * time.Second,
+		}, func(_ byte, line []byte) {
+			lines = append(lines, string(line))
+		})
+	}()
+
+	// While the stop condition says "keep waiting", the trailing marker
+	// must not have ended the follow.
+	select {
+	case <-done:
+		t.Fatalf("follow ended on the previous run's trailing marker; emitted %q", lines)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("readTaskLog: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follow did not end after the stop condition fired")
+	}
+	if len(lines) != 1 || lines[0] != "old run\n" {
+		t.Errorf("emitted %q, want exactly the old run's record", lines)
+	}
+}
