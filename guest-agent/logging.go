@@ -442,6 +442,11 @@ type logReadOptions struct {
 const (
 	stopQuietDefault = 2 * partialFlushAfter
 	stopQuietTTY     = 500 * time.Millisecond
+	// followLogPoll is the follow loop's log-file cadence. The eof marker
+	// is read straight off the file, so it is seen this long after the
+	// logger writes it; the stop condition is throttled separately (it is
+	// a containerd round-trip, not a file read).
+	followLogPoll = 5 * time.Millisecond
 )
 
 // readTaskLog replays the container's json-file log. Each decoded record is
@@ -546,6 +551,13 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	ino := logInode(logPath)
 	var quietSince time.Time
 	var stopDeadline time.Time
+	// The eof marker is checked on every read (a stat + size compare), so
+	// the log is polled fast: the marker lands within ~10 ms of the init's
+	// death and `docker run` returns on it, exactly the deterministic end
+	// Stage 1 promised. The stop condition, in contrast, costs a containerd
+	// state round-trip per call (taskExitedStopper) — it keeps the coarse
+	// cadence below, quiet logic included.
+	var lastStopEval time.Time
 	// A running container is followed indefinitely (docker logs -f must not
 	// end on a timer); production callers always pass a stop condition
 	// (task exit, client disconnect). Only the stop-less mode — tests — is
@@ -597,34 +609,37 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 				quietSince = time.Time{} // fresh bytes: restart the quiet clock
 			}
 		}
-		if stopFired() {
-			if stopDeadline.IsZero() {
-				stopDeadline = time.Now().Add(5 * time.Second)
-			}
-			if quietSince.IsZero() {
-				quietSince = time.Now()
-			}
-			// The logging binary's final flush can land after the task
-			// exit is observable; end only once no new bytes arrived for
-			// a second (or the hard stop deadline passes).
-			quiet := opts.stopQuiet
-			if quiet <= 0 {
-				quiet = stopQuietDefault
-			}
-			if time.Since(quietSince) >= quiet || time.Now().After(stopDeadline) {
-				debugLog("follow %s: ended by stop condition (quiet %v, hard deadline %v)",
-					logPath, time.Since(quietSince) >= quiet, time.Now().After(stopDeadline))
-				return nil
+		stopEvalEvery := 100 * time.Millisecond
+		if stopCount > 0 {
+			stopEvalEvery = 50 * time.Millisecond // exiting: finish promptly
+		}
+		if lastStopEval.IsZero() || time.Since(lastStopEval) >= stopEvalEvery {
+			lastStopEval = time.Now()
+			if stopFired() {
+				if stopDeadline.IsZero() {
+					stopDeadline = time.Now().Add(5 * time.Second)
+				}
+				if quietSince.IsZero() {
+					quietSince = time.Now()
+				}
+				// The logging binary's final flush can land after the task
+				// exit is observable; end only once no new bytes arrived for
+				// a second (or the hard stop deadline passes).
+				quiet := opts.stopQuiet
+				if quiet <= 0 {
+					quiet = stopQuietDefault
+				}
+				if time.Since(quietSince) >= quiet || time.Now().After(stopDeadline) {
+					debugLog("follow %s: ended by stop condition (quiet %v, hard deadline %v)",
+						logPath, time.Since(quietSince) >= quiet, time.Now().After(stopDeadline))
+					return nil
+				}
 			}
 		}
 		if !noStopDeadline.IsZero() && time.Now().After(noStopDeadline) {
 			return nil // stop-less mode is bounded (tests; production sets stop)
 		}
-		if stopCount > 0 {
-			time.Sleep(50 * time.Millisecond) // exiting: finish promptly
-		} else {
-			time.Sleep(100 * time.Millisecond)
-		}
+		time.Sleep(followLogPoll)
 	}
 }
 
