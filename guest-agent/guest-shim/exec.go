@@ -324,6 +324,19 @@ func runExecHelper(initpidArg, bundle string) int {
 	unix.Close(fdExecStdout) //nolint:errcheck
 	unix.Close(fdExecStderr) //nolint:errcheck
 
+	// Resolve the exec path before the process attributes are applied —
+	// the seccomp filter is part of those attributes and is active on this
+	// process (and the forked child doing the lookup) from its install
+	// until the exec. Resolution needs stat under the container's PATH,
+	// which the default profile denies (runc's ordering is the same for a
+	// reason). The namespaces are already joined above, so the lookup sees
+	// the container's rootfs.
+	argv0, err := resolveExecPath(&specs.Spec{Process: &pspec})
+	if err != nil {
+		reportLine(reportStartPrefix+"%v", err)
+		return 127
+	}
+
 	// Attributes: the merged exec process (falls back to the init's caps,
 	// rlimits and oom score) plus the container's seccomp filter — the
 	// filter is inherited only from the parent, and this process is a
@@ -337,7 +350,7 @@ func runExecHelper(initpidArg, bundle string) int {
 	if !waitGate() {
 		return 0
 	}
-	code, pid, detail, err := forkAndExecUser(&pspec, fdExecGate)
+	code, pid, detail, err := forkAndExecUser(&pspec, fdExecGate, argv0)
 	if err != nil {
 		reportLine(reportStartPrefix+"%s", detail)
 		return 127
@@ -472,14 +485,12 @@ func joinCgroupOf(initpid int) {
 var execCwdPtr *byte
 
 // forkExecUser is the raw fork+execve trampoline shared with the exec
-// helper: pre-built pointers, syscalls only in the child. Returns the
-// parent-side read end of the confirm pipe plus the child's pid (namespace
-// view of the caller).
-func forkExecUser(p *specs.Process, gateFD, reportFD int) (confirmR int, pid int, detail string, err error) {
-	argv0, err := resolveExecPath(&specs.Spec{Process: p})
-	if err != nil {
-		return -1, 0, err.Error(), err
-	}
+// helper: pre-built pointers, syscalls only in the child. argv0 arrives
+// already resolved to an absolute path — the caller resolves it before the
+// container's seccomp filter is installed, since the lookup's stat calls
+// are not on the profile's allowlist. Returns the parent-side read end of
+// the confirm pipe plus the child's pid (namespace view of the caller).
+func forkExecUser(p *specs.Process, gateFD, reportFD int, argv0 string) (confirmR int, pid int, detail string, err error) {
 	pathPtr, err := unix.BytePtrFromString(argv0)
 	if err != nil {
 		return -1, 0, "", err
@@ -540,7 +551,7 @@ func forkExecUser(p *specs.Process, gateFD, reportFD int) (confirmR int, pid int
 // namespace (setns(pid) is reserved for the raw child), so the fork's
 // return value in the helper is already the host-view pid — the one
 // TaskExecStarted, exec state and the shim's kill need.
-func forkAndExecUser(pspec *specs.Process, gateFD int) (code int, pid int, detail string, err error) {
+func forkAndExecUser(pspec *specs.Process, gateFD int, argv0 string) (code int, pid int, detail string, err error) {
 	defer func() {
 		if execPidNsFd > 0 {
 			unix.Close(execPidNsFd) //nolint:errcheck
@@ -559,7 +570,7 @@ func forkAndExecUser(pspec *specs.Process, gateFD int) (code int, pid int, detai
 			return 127, 0, "", cwdErr
 		}
 	}
-	confirmR, childPid, detail, err := forkExecUser(pspec, gateFD, fdReport)
+	confirmR, childPid, detail, err := forkExecUser(pspec, gateFD, fdReport, argv0)
 	if err != nil {
 		return 127, 0, detail, err
 	}
