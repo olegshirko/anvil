@@ -97,9 +97,13 @@ func pickContainerRef(ref string, cands []containerRef) (containerRef, error) {
 	return containerRef{}, fmt.Errorf("No such container: %s", ref)
 }
 
-// containerTaskState reads the task state for a container directly from
-// containerd. Returns ("", false) when the task does not exist.
+// containerTaskState reads the task state for a container: the agent's
+// direct-task registry first (stage 5a), then containerd. Returns ("", false)
+// when neither knows a task.
 func containerTaskState(ctx context.Context, ns, id string) (running bool, status string, ok bool) {
+	if state, _, directRunning, found := directStateOf(ns, id); found {
+		return directRunning, dockerStatus(string(state)), true
+	}
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return false, "", false

@@ -18,6 +18,9 @@ import (
 
 // containerTaskPid returns the host-side PID of the container's init process.
 func containerTaskPid(ctx context.Context, ns, containerdID string) (int, bool) {
+	if t, ok := supervisor.lookup(ns, containerdID); ok {
+		return t.pidFor()
+	}
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return 0, false
@@ -42,6 +45,12 @@ func containerTaskPid(ctx context.Context, ns, containerdID string) (int, bool) 
 // own cgroup (nested cgroups included): DinD and systemd move their init
 // into a child cgroup, so walking the init's cgroup missed their siblings.
 func containerTaskPids(ctx context.Context, ns, containerdID string) []int {
+	if t, ok := supervisor.lookup(ns, containerdID); ok {
+		if pid, running := t.pidFor(); running {
+			return pidNamespacePids(pid)
+		}
+		return nil
+	}
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return nil
@@ -79,6 +88,9 @@ func pauseDockerContainer(ctx context.Context, id string, pause bool) error {
 		return fmt.Errorf("containerd client: %w", err)
 	}
 	nsCtx := namespaces.WithNamespace(ctx, ns)
+	if t, ok := supervisor.lookup(ns, containerdID); ok {
+		return pauseDirectTask(ns, containerdID, t, pause)
+	}
 	c, lerr := cl.LoadContainer(nsCtx, containerdID)
 	if lerr != nil {
 		return lerr

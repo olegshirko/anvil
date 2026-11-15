@@ -175,6 +175,9 @@ func withContainerFS(ctx context.Context, ns, containerdID string, fn func(root 
 
 // containerTaskRootPid returns the init pid of a running or paused task.
 func containerTaskRootPid(ctx context.Context, ns, containerdID string) (int, bool) {
+	if t, ok := supervisor.lookup(ns, containerdID); ok {
+		return t.pidFor()
+	}
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return 0, false

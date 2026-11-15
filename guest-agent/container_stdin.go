@@ -149,8 +149,12 @@ func (cs *containerStdin) closeLocked() {
 }
 
 // closeTaskStdin asks the shim to close the task's stdin once the FIFO is
-// drained.
+// drained. A direct (stage 5a) container needs nothing: its init reads the
+// FIFO directly, and closing the agent's holder above is its EOF.
 func closeTaskStdin(ns, id string) {
+	if _, ok := supervisor.lookup(ns, id); ok {
+		return
+	}
 	ctx, cancel := context.WithTimeout(namespaces.WithNamespace(context.Background(), ns), 10*time.Second)
 	defer cancel()
 	cl, err := pc.get(ctx)

@@ -224,68 +224,35 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 	}
 
 	meta, merr := loadContainerMeta(ns, id)
-	netName := ""
-	var ports []cniPortMapping
-	if merr == nil && len(meta.Networks) > 0 {
-		netName = meta.Networks[0]
-		ports = meta.Ports
+	// Stage 5a: eligible containers start with no containerd task at all —
+	// the agent prepares the rootfs and spawns the init helper itself. Any
+	// failure before the user process starts falls through to the containerd
+	// path below, invisibly (the helper's cleanup already detached/undid
+	// what it had done). TTY containers and non-fast-shim records keep the
+	// containerd path.
+	if merr == nil && directEligible(meta) && usesFastShim(nsCtx, c) {
+		derr := startDirectContainer(ctx, ns, id, c, meta, nsCtx)
+		if derr == nil {
+			tr.mark("direct")
+			return nil
+		}
+		debugLog("[direct] %s: falling back to the containerd task path: %v", truncateID(id), derr)
+		// The failed attempt must not leave a record a waiter could return:
+		// the containerd task path is this run's source of truth.
+		supervisor.remove(ns, id)
 	}
-
-	if !usesHostNetworkName(netName) {
-		// A stop/exit detach of the previous run may still be going: its
-		// CNI DEL shares this container's cache and IPAM keys with the ADD
-		// below. Then recreate the netns that detach released.
-		awaitNetRelease(ns, id)
-		if nerr := ensureNamedNetNS(id); nerr != nil {
-			return fmt.Errorf("netns: %w", nerr)
-		}
-		tr.mark("netns-ensure")
-		// Self-healing attach: the exit watcher's CNI detach is asynchronous,
-		// so a restart (the monitor, docker restart, compose) can race it and
-		// hit a leftover veth ("eth0 peer already exists") or a torn-down
-		// iptables chain ("No chain/target/match by that name"). On any
-		// attach failure, run the matching DEL to clear the stale endpoint
-		// state and attach again.
-		addrs, aerr := attachNetwork(ctx, netName, ns, id, netnsPathFor(id), ports)
-		tr.mark("cni-attach")
-		if aerr != nil {
-			time.Sleep(200 * time.Millisecond)
-			dctx, dcancel := context.WithTimeout(ctx, 10*time.Second)
-			detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports) //nolint:errcheck
-			dcancel()
-			time.Sleep(100 * time.Millisecond)
-			addrs, aerr = attachNetwork(ctx, netName, ns, id, netnsPathFor(id), ports)
-		}
-		if aerr != nil {
-			return fmt.Errorf("cni attach: %w", aerr)
-		}
-		extra, xerr := attachSecondaryNetworks(ctx, ns, id, meta.Networks[1:])
-		if xerr != nil {
-			dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-			detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports) //nolint:errcheck
-			cancel()
-			return fmt.Errorf("cni attach: %w", xerr)
-		}
-		defer func() {
-			if err != nil {
-				dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-				detachSecondaryNetworks(dctx, id, extra)
-				detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports) //nolint:errcheck
-				cancel()
-				removeNetInfo(ns, id)
-			}
-		}()
-		// net.json is the only record of the live endpoint: without it a
-		// later stop cannot run CNI DEL, leaking the container IP and the
-		// published host ports until the VM restarts. Fail the start and
-		// let the rollback above detach instead of starting "half-networked".
-		if serr := saveNetInfo(ns, id, containerNetInfo{IP: addrs.IP, Mac: addrs.Mac, Network: netName, ipv6Addr: addrs.ipv6Addr, Extra: extra}); serr != nil {
-			err = fmt.Errorf("save network info: %w", serr)
-			return err
-		}
-		writeOwnHosts(ns, id)
-		publishEndpointEvents("connect", ns, id, netName, extra)
+	// Start-time CNI attach (shared with the direct start path). detachNet
+	// undoes it if the start fails after this point.
+	netName, ports, detachNet, nerr := startContainerNetwork(ctx, ns, id, meta, tr)
+	if nerr != nil {
+		err = nerr
+		return nerr
 	}
+	defer func() {
+		if err != nil {
+			detachNet()
+		}
+	}()
 
 	// A new run: the previous run's exit code must not answer /wait for
 	// this one.
@@ -371,6 +338,80 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 		startHealthCheck(did, ns, id, hc, getHealthcheckUser(did))
 	}
 	return nil
+}
+
+// startContainerNetwork runs the start-time CNI attach for a container whose
+// previous run is not holding the network: the netns comes back first, then
+// the primary endpoint (self-healing once), then the secondary networks, and
+// net.json records the live endpoint. It returns the primary network name,
+// its port mappings, and the detach that undoes the attach on a failed start
+// (idempotent: a later stop/exit detach is harmless). Both the containerd
+// task path and the stage-5 direct path use it.
+func startContainerNetwork(ctx context.Context, ns, id string, meta *containerMeta, tr *phaseTrace) (netName string, ports []cniPortMapping, detach func(), err error) {
+	detach = func() {}
+	if meta == nil || len(meta.Networks) == 0 {
+		return "", nil, detach, nil
+	}
+	netName = meta.Networks[0]
+	ports = meta.Ports
+	if usesHostNetworkName(netName) {
+		return netName, ports, detach, nil
+	}
+	// A stop/exit detach of the previous run may still be going: its CNI DEL
+	// shares this container's cache and IPAM keys with the ADD below. Then
+	// recreate the netns that detach released.
+	awaitNetRelease(ns, id)
+	if nerr := ensureNamedNetNS(id); nerr != nil {
+		return netName, ports, detach, fmt.Errorf("netns: %w", nerr)
+	}
+	if tr != nil {
+		tr.mark("netns-ensure")
+	}
+	// Self-healing attach: the exit watcher's CNI detach is asynchronous, so
+	// a restart (the monitor, docker restart, compose) can race it and hit a
+	// leftover veth ("eth0 peer already exists") or a torn-down iptables
+	// chain ("No chain/target/match by that name"). On any attach failure,
+	// run the matching DEL to clear the stale endpoint state and attach
+	// again.
+	addrs, aerr := attachNetwork(ctx, netName, ns, id, netnsPathFor(id), ports)
+	if tr != nil {
+		tr.mark("cni-attach")
+	}
+	if aerr != nil {
+		time.Sleep(200 * time.Millisecond)
+		dctx, dcancel := context.WithTimeout(ctx, 10*time.Second)
+		detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports) //nolint:errcheck
+		dcancel()
+		time.Sleep(100 * time.Millisecond)
+		addrs, aerr = attachNetwork(ctx, netName, ns, id, netnsPathFor(id), ports)
+	}
+	if aerr != nil {
+		return netName, ports, detach, fmt.Errorf("cni attach: %w", aerr)
+	}
+	extra, xerr := attachSecondaryNetworks(ctx, ns, id, meta.Networks[1:])
+	if xerr != nil {
+		dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports) //nolint:errcheck
+		cancel()
+		return netName, ports, detach, fmt.Errorf("cni attach: %w", xerr)
+	}
+	detach = func() {
+		dctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		detachSecondaryNetworks(dctx, id, extra)
+		detachNetwork(dctx, netName, ns, id, netnsPathFor(id), ports) //nolint:errcheck
+		removeNetInfo(ns, id)
+	}
+	// net.json is the only record of the live endpoint: without it a later
+	// stop cannot run CNI DEL, leaking the container IP and the published
+	// host ports until the VM restarts. Fail the start and let the rollback
+	// detach instead of starting "half-networked".
+	if serr := saveNetInfo(ns, id, containerNetInfo{IP: addrs.IP, Mac: addrs.Mac, Network: netName, ipv6Addr: addrs.ipv6Addr, Extra: extra}); serr != nil {
+		return netName, ports, detach, fmt.Errorf("save network info: %w", serr)
+	}
+	writeOwnHosts(ns, id)
+	publishEndpointEvents("connect", ns, id, netName, extra)
+	return netName, ports, detach, nil
 }
 
 // watchTaskExit waits for the task to die and performs teardown Docker
@@ -480,6 +521,10 @@ func taskHasExited(ctx context.Context, task client.Task) (bool, int) {
 // stopNativeTask stops the task with signal (docker stop -s), else the
 // container's stop signal, else SIGTERM; SIGKILL after timeoutSec.
 func stopNativeTask(ctx context.Context, ns, id string, timeoutSec int, signal string) error {
+	// Stage 5a: the agent supervises the run; no containerd task exists.
+	if t, ok := supervisor.lookup(ns, id); ok {
+		return stopDirectTask(ctx, ns, id, t, timeoutSec, signal)
+	}
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return fmt.Errorf("containerd client: %w", err)
@@ -617,6 +662,16 @@ func deleteNativeContainer(ctx context.Context, ns, id string, force, removeVolu
 	nsCtx := namespaces.WithNamespace(ctx, ns)
 
 	meta, _ := loadContainerMeta(ns, id)
+
+	// Stage 5a: tear the agent-supervised run down first (kill, wait,
+	// unmount the direct bundle); the containerd record below still holds
+	// the snapshot and goes through the normal delete.
+	if t, ok := supervisor.lookup(ns, id); ok {
+		if derr := directDelete(t, force); derr != nil {
+			return derr
+		}
+	}
+	cleanupDirectBundle(ns, id)
 
 	if c, cerr := cl.LoadContainer(nsCtx, id); cerr == nil {
 		if task, terr := c.Task(nsCtx, nil); terr == nil {
@@ -772,12 +827,24 @@ func runSimpleExecEnv(ctx context.Context, ns, id string, argv []string, user, c
 	if err != nil {
 		return nil, err
 	}
-	task, err := c.Task(nsCtx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("task: %w", err)
+	// Direct containers have no containerd task: the registry pid is the
+	// init, and the exec goes through the helper below.
+	execPid := 0
+	if t, ok := supervisor.lookup(ns, id); ok {
+		pid, running := t.pidFor()
+		if !running {
+			return nil, fmt.Errorf("task: container is not running")
+		}
+		execPid = pid
+	} else {
+		task, terr := c.Task(nsCtx, nil)
+		if terr != nil {
+			return nil, fmt.Errorf("task: %w", terr)
+		}
+		execPid = int(task.Pid())
 	}
 
-	u, err := execUserFor(nsCtx, c, task, user)
+	u, err := execUserFor(nsCtx, c, execPid, user)
 	if err != nil {
 		return nil, err
 	}
@@ -793,7 +860,6 @@ func runSimpleExecEnv(ctx context.Context, ns, id string, argv []string, user, c
 		pspec.Cwd = ctrCwd
 	}
 
-	execID := newContainerID()[:32]
 	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -804,12 +870,12 @@ func runSimpleExecEnv(ctx context.Context, ns, id string, argv []string, user, c
 		stdoutR.Close()
 		return nil, err
 	}
-
 	var stdinR io.Reader
 	if len(stdin) > 0 {
 		stdinR = bytes.NewReader(stdin)
 	}
-	process, err := task.Exec(nsCtx, execID, pspec, cio.NewCreator(cio.WithStreams(stdinR, stdoutW, stderrW)))
+
+	process, err := containerExecProcess(nsCtx, ns, id, pspec, false, stdinR, stdoutW, stderrW)
 	if err != nil {
 		stdoutW.Close()
 		stderrW.Close()
@@ -913,8 +979,9 @@ func runSimpleExecEnv(ctx context.Context, ns, id string, argv []string, user, c
 // execUserFor resolves an exec's user spec ("name", "uid", "name:group",
 // "uid:gid") against the running container's /etc/passwd and /etc/group,
 // as Docker does; empty keeps the container's own user. Names used to be
-// ignored, so `docker exec -u postgres` ran as root.
-func execUserFor(ctx context.Context, c client.Container, task client.Task, userstr string) (specs.User, error) {
+// ignored, so `docker exec -u postgres` ran as root. pid is the container
+// init's (containerd task or direct registry pid).
+func execUserFor(ctx context.Context, c client.Container, pid int, userstr string) (specs.User, error) {
 	if userstr == "" {
 		if spec, err := c.Spec(ctx); err == nil && spec.Process != nil {
 			return spec.Process.User, nil
@@ -923,7 +990,7 @@ func execUserFor(ctx context.Context, c client.Container, task client.Task, user
 	}
 	// The process's root, opened as an os.Root: the container's symlinks
 	// cannot lead the lookup out of it.
-	root, err := os.OpenRoot(fmt.Sprintf("/proc/%d/root", task.Pid()))
+	root, err := os.OpenRoot(fmt.Sprintf("/proc/%d/root", pid))
 	readFile := func(string) ([]byte, error) { return nil, err }
 	if err == nil {
 		defer root.Close()
