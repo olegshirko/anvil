@@ -9,34 +9,40 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 )
 
-// The init helper ("stage 1"): a fresh process the shim starts with exec.Cmd
-// (a plain fork+exec, no unsafe Go-in-forked-child window). It joins the
-// container's namespaces, moves into the prepared cgroup, applies the spec
-// mounts and pivot_roots, then holds on the start gate. On start it applies
-// the exec-time attributes (oom score, rlimits, no-new-privileges, user,
-// capabilities, seccomp) and creates the container init process: a raw
-// fork+execve window (pre-built pointers, syscalls only — the exact contract
-// os/exec's forkAndExecInChild keeps) so the user process is PID 1 of the
-// container's pid namespace without any Go code running inside the fork.
+// The init helper, in two stages (the same shape as runc's nsexec + init):
 //
-// Why not clone3 from the shim: Go code cannot run safely in a child of a
-// multithreaded fork beyond raw syscalls, and clone3 cannot join namespaces
-// that have paths (the pre-created netns). The unshare-based trampoline is
-// the safe equivalent: one process creation into every namespace, the same
-// work runc's nsexec bootstrap does, without the C constructor.
+//	stage A ("init", started by the shim via exec.Cmd): joins the
+//	     namespaces (setns for the pathed ones, unshare for the fresh
+//	     ones), moves into the cgroup, then forks stage B and supervises
+//	     it: it confirms the start upstream (the user exec closed the
+//	     confirm pipe), reports the exit code and exits with it.
 //
-// Report protocol over fd 4 (one line each):
+//	stage B ("init-apply", the raw-forked child of A, re-exec'd as a
+//	     fresh Go process so the new PID namespace is its ACTIVE one):
+//	     applies the spec mounts onto the prepared rootfs, creates
+//	     devices, pivot_roots, applies sysctls and hostname, holds at the
+//	     start gate, applies the exec-time attributes (oom score,
+//	     rlimits, no-new-privileges, user, capabilities, seccomp) and
+//	     finally execve's the user process in place — PID 1 of the
+//	     container.
 //
-//	R\n          setup complete, holding at the gate
-//	E <detail>\n setup failed (create fails)
-//	S <pid>\n    init created and alive, <pid> is its global pid
-//	X <detail>\n init creation failed (start fails)
-//	D <code>\n   init exited with <code> (128+signal for signal deaths)
+// Why the second stage: unshare(CLONE_NEWPID) does not switch the caller's
+// active namespace (only its children enter it), so a procfs mounted by
+// stage A would expose the VM's process table inside the container, and no
+// pid seen by stage A translates across the boundary. Stage B, born inside
+// the new namespace, mounts the container's own procfs and execs the user
+// process as PID 1. Stage A's fork return is the child's GLOBAL pid (the
+// creator stays in the old namespace), which is what containerd needs.
+//
+// Report protocol over fd 4 (one line each): "R" setup complete; "S <pid>"
+// user process started (global pid); "X <detail>" start failed; "D <code>"
+// init exited; "E <detail>" setup failed at create.
 
 // Fixed fd numbers the shim hands over via exec.Cmd ExtraFiles (fds start
 // at 3).
@@ -46,12 +52,35 @@ const (
 	fdStdin  = 5 // final stdin (fifo read end or console slave)
 	fdStdout = 6 // final stdout (logger pipe or fifo write end)
 	fdStderr = 7 // final stderr
+
+	// fdConfirm carries the stage-B confirm pipe write end (cleared
+	// close-on-exec so it survives stage B's exec; stage B marks it
+	// close-on-exec again so the user exec closes it as the start signal).
+	fdConfirm = 200
 )
 
-// isInitHelper reports whether this process runs as the container init
-// helper (second argument "init").
+// gateStartLine is the gate release message (written by the shim at start).
+const gateStartLine = "s\n"
+
+// Report line prefixes; the shim parses these over the report pipe.
+const (
+	reportReady         = "R\n"
+	reportSetupPrefix   = "E " // setup failed: create fails
+	reportStartPrefix   = "X " // init creation failed: start fails
+	reportStartedPrefix = "S " // init created and alive, value = global pid
+	reportDonePrefix    = "D " // init exited, value = exit code
+)
+
+// isInitHelper reports whether this process runs as stage A of the
+// container init helper.
 func isInitHelper() bool {
 	return len(os.Args) >= 2 && os.Args[1] == "init"
+}
+
+// isInitApply reports whether this process runs as stage B (the container
+// init itself).
+func isInitApply() bool {
+	return len(os.Args) >= 2 && os.Args[1] == "init-apply"
 }
 
 // isExecHelper reports whether this process runs as an exec helper
@@ -60,8 +89,168 @@ func isExecHelper() bool {
 	return len(os.Args) >= 2 && os.Args[1] == "exec-init"
 }
 
-// runInit is the init helper's main. Returns the process exit code.
+// reportLine writes one line to the shim through the report fd.
+func reportLine(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if !strings.HasSuffix(msg, "\n") {
+		msg += "\n"
+	}
+	f := os.NewFile(fdReport, "report")
+	fmt.Fprint(f, msg)
+}
+
+// waitGate blocks on the release pipe. It returns false only when the pipe
+// closed (deleted-while-created / shim death).
+func waitGate() bool {
+	f := os.NewFile(fdGate, "gate")
+	buf := make([]byte, 8)
+	for {
+		n, err := f.Read(buf)
+		for i := 0; i < n; i++ {
+			if buf[i] == 's' {
+				return true
+			}
+		}
+		if err != nil {
+			return false
+		}
+	}
+}
+
+// runInit is stage A. Returns the process exit code (stage B's exit code —
+// the container init's).
 func runInit(id, bundle string) int {
+	spec, err := readSpecFile(filepath.Join(bundle, "config.json"))
+	if err != nil {
+		reportLine(reportSetupPrefix+"%v", err)
+		return 1
+	}
+	if spec.Process == nil {
+		reportLine(reportSetupPrefix + "spec has no process")
+		return 1
+	}
+	if err := joinCgroup(spec); err != nil {
+		reportLine(reportSetupPrefix+"%v", err)
+		return 1
+	}
+
+	// The confirm pipe: stage B holds the write end close-on-exec, so a
+	// successful execve of the user process closes it instantly (EOF =
+	// started) and a failed one reports through it.
+	confirm := make([]int, 2)
+	if err := unix.Pipe(confirm); err != nil {
+		reportLine(reportSetupPrefix+"confirm pipe: %v", err)
+		return 1
+	}
+	// The original write end must not leak into stage B (or the exec'd
+	// user process) — its LAST closure is what produces the start
+	// confirmation EOF. The fixed-fd dup below clears the flag on the
+	// handed-over copy only.
+	unix.CloseOnExec(confirm[1])
+	defer unix.Close(confirm[0]) //nolint:errcheck
+	defer unix.Close(confirm[1]) //nolint:errcheck
+
+	// Stage B must be born INSIDE the new pid namespace: unshare(NEWPID)
+	// does not switch the caller's active namespace, and a Go fork after
+	// unshare(CLONE_NEWPID) fails outright (ENOMEM from the runtime's
+	// vfork-style clone). So stage B is created by a raw
+	// clone(CLONE_NEWPID|SIGCHLD) whose child execve's this binary as
+	// "init-apply" before any Go code runs. The creator stays in the old
+	// pid namespace, so the clone return IS the child's global pid.
+	self, err := os.Executable()
+	if err != nil {
+		reportLine(reportSetupPrefix+"resolve self: %v", err)
+		return 1
+	}
+	argv := []string{self, "init-apply", "-id", id, "-bundle", bundle}
+	argvPtrs, err := argvBytePtrs(argv)
+	if err != nil {
+		reportLine(reportSetupPrefix+"%v", err)
+		return 1
+	}
+	pathPtr, err := unix.BytePtrFromString(self)
+	if err != nil {
+		reportLine(reportSetupPrefix+"%v", err)
+		return 1
+	}
+	envPtrs, err := envBytePtrs(os.Environ())
+	if err != nil {
+		reportLine(reportSetupPrefix+"%v", err)
+		return 1
+	}
+	// The confirm write end must survive the child's execve (its closure
+	// is the start signal), so hand it over at a fixed fd with the
+	// close-on-exec bit cleared.
+	const fdConfirm = 200
+	if err := unix.Dup3(confirm[1], fdConfirm, 0); err != nil {
+		reportLine(reportSetupPrefix+"dup confirm: %v", err)
+		return 1
+	}
+	stageBGlobal, errno := cloneRawPid()
+	if errno != 0 {
+		unix.Close(fdConfirm) //nolint:errcheck
+		reportLine(reportSetupPrefix+"clone stage B: %v", errno)
+		return 1
+	}
+	if stageBGlobal == 0 {
+		// Raw window (born into the new pid namespace as its PID 1): no
+		// Go runtime calls, pre-built pointers only.
+		unix.RawSyscall(unix.SYS_EXECVE, uintptr(unsafe.Pointer(pathPtr)),
+			uintptr(unsafe.Pointer(&argvPtrs[0])), uintptr(unsafe.Pointer(&envPtrs[0])))
+		unix.RawSyscall(unix.SYS_EXIT_GROUP, 127, 0, 0) //nolint:errcheck
+	}
+	// Parent: drop BOTH write ends (the fixed-fd dup and the original);
+	// only then does stage B's death turn into EOF on the confirm pipe.
+	unix.Close(fdConfirm)  //nolint:errcheck
+	unix.Close(confirm[1]) //nolint:errcheck
+
+	// EOF = the user exec happened; a line is the failure the child wrote.
+	buf := make([]byte, 128)
+	readN := readConfirm(confirm[0], buf)
+	if readN > 0 {
+		// The child wrote the failure message (or died mid-report).
+		msg := strings.TrimSpace(string(buf[:readN]))
+		if msg == "" {
+			msg = "init died before exec"
+		}
+		var ws unix.WaitStatus
+		wp, werr := unix.Wait4(stageBGlobal, &ws, 0, nil)
+		code := 127
+		if werr == nil && wp == stageBGlobal {
+			code = int(exitStatus(ws))
+		}
+		reportLine(reportStartPrefix+"%s", msg)
+		reportLine(reportDonePrefix+"%d", code)
+		return code
+	}
+
+	// The container init is alive and is PID 1 of the namespace; report
+	// its global pid for containerd's state.
+	reportLine(reportStartedPrefix+"%d", stageBGlobal)
+
+	// Supervise until the init exits, then report and mirror its exit code.
+	var ws unix.WaitStatus
+	_, waitErr := unix.Wait4(stageBGlobal, &ws, 0, nil)
+	code := 137 // lost the child (should not happen); kill-style code
+	if waitErr == nil {
+		code = int(exitStatus(ws))
+	}
+	reportLine(reportDonePrefix+"%d", code)
+	return code
+}
+
+// readConfirm reads one confirmation from the pipe: EOF (no bytes) means
+// the user exec succeeded, anything else is the failure message. Returns
+// the byte count read (0 = EOF).
+func readConfirm(fd int, buf []byte) int {
+	n, _ := unix.Read(fd, buf)
+	return n
+}
+
+// runInitApply is stage B: the container init itself. Runs with the new
+// PID namespace as its active one, so the procfs it mounts shows the
+// container's own processes and the exec'd user process is PID 1.
+func runInitApply(id, bundle string) int {
 	spec, err := readSpecFile(filepath.Join(bundle, "config.json"))
 	if err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
@@ -93,14 +282,18 @@ func runInit(id, bundle string) int {
 	unix.Close(fdStdin)  //nolint:errcheck
 	unix.Close(fdStdout) //nolint:errcheck
 	unix.Close(fdStderr) //nolint:errcheck
+	// The confirm fd must die at the user exec (its closure is the start
+	// confirmation stage A waits for).
+	unix.CloseOnExec(fdConfirm)
 
 	rootfs := filepath.Join(bundle, "rootfs")
 
-	if err := joinNamespaces(spec); err != nil {
-		reportLine(reportSetupPrefix+"%v", err)
-		return 1
-	}
-	if err := joinCgroup(spec); err != nil {
+	// The pid namespace came with the birth (stage A's clone carried
+	// CLONE_NEWPID); everything else joins here — unshare cannot be done
+	// in stage A for the pid namespace, and the rest is safe in this
+	// fresh process (it is single-threaded at this point, so even the
+	// mount namespace unshare behaves).
+	if err := joinNamespacesApply(spec); err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
@@ -153,74 +346,24 @@ func runInit(id, bundle string) int {
 	}
 
 	// Everything the user process must already carry is applied to this
-	// process before the fork: the forked init inherits it all.
+	// process before the exec: the exec'd init inherits it all.
 	if err := applyProcessAttrs(spec); err != nil {
 		reportLine(reportStartPrefix+"%v", err)
 		return 126
 	}
 
-	code, pid, startDetail, err := forkAndExecInit(spec)
+	// Become the user process in place: PID 1 of the container, children
+	// reparent to it, its exit ends the namespace.
+	argv0, err := resolveExecPath(spec)
 	if err != nil {
-		reportLine(reportStartPrefix+"%s", startDetail)
+		reportLine(reportStartPrefix+"%v", err)
 		return 127
 	}
-	// The container init is alive; report its global pid for the shim's
-	// state (procfs translates NSpid across the pid namespace boundary).
-	reportLine(reportStartedPrefix+"%d", pid)
-
-	// Supervise: the stub is the parent of the container init (PID 1 of
-	// the namespace). When it dies the namespace dies with it; report the
-	// exit code first — the stub may be killed by the namespace teardown
-	// right after.
-	var ws unix.WaitStatus
-	_, waitErr := unix.Wait4(pid, &ws, 0, nil)
-	if waitErr != nil {
-		code = 137 // lost the child (should not happen); kill-style code
-	} else {
-		code = int(exitStatus(ws))
+	if err := unix.Exec(argv0, spec.Process.Args, spec.Process.Env); err != nil {
+		reportLine(reportStartPrefix+"exec %s: %v", argv0, err)
+		return 127
 	}
-	reportLine(reportDonePrefix+"%d", code)
-	return code // the shim's own reaper sees this as a fallback signal
-}
-
-// gateStartLine is the gate release message (written by the shim at start).
-const gateStartLine = "s\n"
-
-// Report line prefixes; the shim parses these over the report pipe.
-const (
-	reportReady         = "R\n"
-	reportSetupPrefix   = "E " // setup failed: create fails
-	reportStartPrefix   = "X " // init creation failed: start fails
-	reportStartedPrefix = "S " // init created and alive, value = global pid
-	reportDonePrefix    = "D " // init exited, value = exit code
-)
-
-// reportLine writes one line to the shim through the report fd.
-func reportLine(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	if !strings.HasSuffix(msg, "\n") {
-		msg += "\n"
-	}
-	f := os.NewFile(fdReport, "report")
-	fmt.Fprint(f, msg)
-}
-
-// waitGate blocks on the release pipe. It returns false only when the pipe
-// closed (deleted-while-created / shim death).
-func waitGate() bool {
-	f := os.NewFile(fdGate, "gate")
-	buf := make([]byte, 8)
-	for {
-		n, err := f.Read(buf)
-		for i := 0; i < n; i++ {
-			if buf[i] == 's' {
-				return true
-			}
-		}
-		if err != nil {
-			return false
-		}
-	}
+	return 0 // unreached
 }
 
 // utsNamespaceShared reports a UTS namespace joined by path (host uts or
@@ -237,11 +380,11 @@ func utsNamespaceShared(spec *specs.Spec) bool {
 	return false
 }
 
-// joinNamespaces enters every namespace of the spec: pathed ones via setns
-// (fds opened before any mount-ns switch), pathless ones via unshare. The
-// mount namespace is unshared before the mount work; the cgroup namespace
-// is unshared after the cgroup join in joinCgroup.
-func joinNamespaces(spec *specs.Spec) error {
+// joinNamespacesApply joins the non-pid namespaces of the spec in stage B:
+// pathed ones via setns (fds opened before any mount-ns switch), pathless
+// ones via unshare. The pid namespace is skipped (stage A's clone put this
+// process inside it — unsharing another would nest a second one).
+func joinNamespacesApply(spec *specs.Spec) error {
 	if spec.Linux == nil {
 		return nil
 	}
@@ -255,8 +398,13 @@ func joinNamespaces(spec *specs.Spec) error {
 	)
 	for _, ns := range spec.Linux.Namespaces {
 		switch ns.Type {
+		case specs.PIDNamespace:
+			if ns.Path != "" {
+				return fmt.Errorf("pid namespace joined by path is not supported")
+			}
+			continue // already active
 		case specs.CgroupNamespace:
-			continue // handled in joinCgroup (after the cgroup switch)
+			continue // joined with the cgroup switch in stage A's cgroup join
 		case specs.MountNamespace:
 			if ns.Path != "" {
 				return fmt.Errorf("mount namespace joined by path is not supported")
@@ -277,6 +425,7 @@ func joinNamespaces(spec *specs.Spec) error {
 	// namespace first, mount last.
 	type opened struct {
 		fd  int
+		typ specs.LinuxNamespaceType
 		mnt bool
 	}
 	var fds []opened
@@ -285,7 +434,7 @@ func joinNamespaces(spec *specs.Spec) error {
 		if err != nil {
 			return fmt.Errorf("open %s: %w", p.path, err)
 		}
-		fds = append(fds, opened{fd: fd, mnt: p.typ == specs.MountNamespace})
+		fds = append(fds, opened{fd: fd, typ: p.typ, mnt: p.typ == specs.MountNamespace})
 	}
 	defer func() {
 		for _, o := range fds {
@@ -295,7 +444,7 @@ func joinNamespaces(spec *specs.Spec) error {
 	for _, o := range fds {
 		if !o.mnt {
 			if err := unix.Setns(o.fd, 0); err != nil {
-				return fmt.Errorf("setns: %w", err)
+				return fmt.Errorf("setns %s: %w", o.typ, err)
 			}
 		}
 	}
@@ -333,7 +482,7 @@ const prSetOomScoreAdj = 36
 // container init starts: oom score, rlimits, no-new-privileges, user, caps
 // and (last) the seccomp filter. Order matters: credentials before caps,
 // seccomp strictly last — the filter also applies to this process, and the
-// forked init inherits it across the exec.
+// exec'd user process inherits it across the exec.
 func applyProcessAttrs(spec *specs.Spec) error {
 	p := spec.Process
 	if p.OOMScoreAdj != nil {
@@ -465,112 +614,6 @@ func readSpecFile(path string) (*specs.Spec, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return &spec, nil
-}
-
-// forkAndExecInit creates the container init: a raw fork whose child
-// execve's the user process (PID 1 of the namespace). Between fork and
-// execve the child executes raw syscalls only — pointers prepared here —
-// the same discipline os/exec's forkAndExecInChild applies.
-//
-// Start confirmation runs over a dedicated pipe: the child holds its write
-// end close-on-exec, so a SUCCESSFUL execve closes it instantly (EOF) and a
-// failed one reports the failure through it. Polling the child would race
-// containers whose whole life fits between fork and the first poll.
-func forkAndExecInit(spec *specs.Spec) (code int, pid int, detail string, err error) {
-	confirmR, pid, detail, err := forkExecUser(spec.Process, fdGate, fdReport)
-	if err != nil {
-		return 127, 0, detail, err
-	}
-	defer unix.Close(confirmR) //nolint:errcheck
-
-	// EOF = the execve happened (the confirm fd closed at exec).
-	buf := make([]byte, 128)
-	n, rerr := unix.Read(confirmR, buf)
-	if rerr != nil || n > 0 {
-		// The child wrote the failure message (or died mid-report).
-		msg := strings.TrimSpace(string(buf[:n]))
-		if msg == "" {
-			msg = "init died before exec"
-		}
-		var ws unix.WaitStatus
-		wp, werr := unix.Wait4(pid, &ws, 0, nil)
-		code := 127
-		if werr == nil && wp == pid {
-			code = int(exitStatus(ws))
-		}
-		return code, 0, msg, fmt.Errorf("exec failed")
-	}
-	// Started: report the container init's global pid (procfs translates
-	// NSpid across the pid namespace boundary).
-	return 0, globalPidOf(pid), "", nil
-}
-
-// forkExecUser is the shared trampoline for the container init and exec
-// processes: applies nothing (attributes are the caller's, pre-fork),
-// forks, closes gateFD in the child, marks the confirm fd close-on-exec and
-// execve's. Returns the parent-side read end of the confirm pipe plus the
-// child pid; on exec failure the message comes back in detail.
-func forkExecUser(p *specs.Process, gateFD, reportFD int) (confirmR int, pid int, detail string, err error) {
-	argv0, err := resolveExecPath(&specs.Spec{Process: p})
-	if err != nil {
-		return -1, 0, err.Error(), err
-	}
-	// Pre-build every pointer the raw window needs: no allocation there.
-	pathPtr, err := unix.BytePtrFromString(argv0)
-	if err != nil {
-		return -1, 0, "", err
-	}
-	argvPtrs, err := argvBytePtrs(p.Args)
-	if err != nil {
-		return -1, 0, "", err
-	}
-	envPtrs, err := envBytePtrs(p.Env)
-	if err != nil {
-		return -1, 0, "", err
-	}
-
-	// The confirm pipe: child's write end dies at a successful execve.
-	confirm := make([]int, 2)
-	if err := unix.Pipe(confirm); err != nil {
-		return -1, 0, "", fmt.Errorf("confirm pipe: %w", err)
-	}
-
-	args := pid0Args{
-		confirmFD:  confirm[1],
-		gateFD:     gateFD,
-		reportFD:   reportFD,
-		pathPtr:    pathPtr,
-		argvPtrs:   argvPtrs,
-		envPtrs:    envPtrs,
-		failMsg:    &failExecMessage[0],
-		failMsgLen: len(failExecMessage),
-	}
-
-	// Raw fork. In the child only raw syscalls run (pid0RawChild).
-	pid, errno := forkRaw()
-	if errno != 0 {
-		unix.Close(confirm[0])
-		unix.Close(confirm[1])
-		return -1, 0, "", fmt.Errorf("fork: %w", errno)
-	}
-	if pid == 0 {
-		pid0RawChild(args)
-		// unreached
-	}
-	unix.Close(confirm[1]) //nolint:errcheck — parent keeps the read end
-	return confirm[0], pid, "", nil
-}
-
-// pid0Args carries the pre-built pointers across the fork boundary.
-type pid0Args struct {
-	confirmFD  int
-	gateFD     int
-	reportFD   int
-	pathPtr    *byte
-	argvPtrs   []*byte
-	envPtrs    []*byte
-	failMsg    *byte
-	failMsgLen int
 }
 
 // exitStatus converts a wait status to the conventional exit code

@@ -28,6 +28,29 @@ func forkRaw() (int, unix.Errno) {
 // execve. A failed execve reports through the confirm fd with a pre-built
 // message and exits 127. Raw syscalls only.
 func pid0RawChild(a pid0Args) {
+	// Exec processes join the pid and mount namespaces here: setns(pid) is
+	// EINVAL for a multi-threaded process, and only this raw window is
+	// single-threaded.
+	if a.pidNsFd >= 0 {
+		_, _, errno := unix.RawSyscall(unix.SYS_SETNS, uintptr(a.pidNsFd), 0, 0)
+		if errno != 0 {
+			unix.RawSyscall(unix.SYS_EXIT_GROUP, 126, 0, 0) //nolint:errcheck
+		}
+	}
+	if a.mntNsFd >= 0 {
+		_, _, errno := unix.RawSyscall(unix.SYS_SETNS, uintptr(a.mntNsFd), 0, 0)
+		if errno != 0 {
+			unix.RawSyscall(unix.SYS_EXIT_GROUP, 126, 0, 0) //nolint:errcheck
+		}
+	}
+	if a.cwdPtr != nil {
+		_, _, errno := unix.RawSyscall(unix.SYS_CHDIR, uintptr(unsafe.Pointer(a.cwdPtr)), 0, 0)
+		if errno != 0 {
+			unix.RawSyscall(unix.SYS_WRITE, uintptr(a.confirmFD),
+				uintptr(unsafe.Pointer(&failCwdMessage[0])), uintptr(len(failCwdMessage)))
+			unix.RawSyscall(unix.SYS_EXIT_GROUP, 126, 0, 0) //nolint:errcheck
+		}
+	}
 	unix.RawSyscall(unix.SYS_CLOSE, uintptr(a.gateFD), 0, 0) //nolint:errcheck
 	// F_SETFD=2, FD_CLOEXEC=1: fcntl(confirmFD, F_SETFD, FD_CLOEXEC).
 	unix.RawSyscall(unix.SYS_FCNTL, uintptr(a.confirmFD), 2, 1) //nolint:errcheck
@@ -43,6 +66,28 @@ func pid0RawChild(a pid0Args) {
 	unix.RawSyscall(unix.SYS_EXIT_GROUP, 127, 0, 0) //nolint:errcheck
 }
 
+// pid0Args carries the pre-built pointers across the fork boundary. The
+// namespace fds (pid/mount) are only set for exec processes, which join
+// them in the raw window; chdir happens there too (paths resolve in the
+// container's mount namespace).
+type pid0Args struct {
+	confirmFD  int
+	gateFD     int
+	reportFD   int
+	pathPtr    *byte
+	argvPtrs   []*byte
+	envPtrs    []*byte
+	failMsg    *byte
+	failMsgLen int
+	pidNsFd    int   // -1 = none
+	mntNsFd    int   // -1 = none
+	cwdPtr     *byte // nil = no chdir
+}
+
 // failExecMessage is the pre-built report the child writes on execve
 // failure (the errno itself is not formattable without allocations).
 var failExecMessage = []byte("X exec failed (executable not found or blocked)\n")
+
+// failCwdMessage is the pre-built report for a failed chdir into the exec
+// spec's working directory.
+var failCwdMessage = []byte("X exec failed (working directory missing)\n")

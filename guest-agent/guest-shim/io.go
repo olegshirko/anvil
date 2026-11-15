@@ -41,6 +41,7 @@ type stdioSet struct {
 	childStderr *os.File // write end for the init's fd2
 	console     console.Console
 	stdinSrc    *os.File // console stdin source (the stdin fifo; tty only)
+	outSink     *os.File // console copy destination (the stdout sink; tty only)
 	logger      *exec.Cmd
 	sinkEOF     bool // stdout sink should close when the console copy ends
 	closeFns    []func()
@@ -63,6 +64,10 @@ func urlFromIO(path string) (*url.URL, error) {
 }
 
 // newStdioSet prepares the parent-side io for one process (init or exec).
+// The stdout/stderr sinks (binary-v2 logger pipes, fifo write ends or log
+// files) exist in every mode; with a terminal the child gets a pty slave
+// and the shim copies master -> stdout sink instead of wiring the sinks to
+// the child directly.
 func newStdioSet(ctx context.Context, id string, stdin, stdout, stderr string, terminal bool) (*stdioSet, error) {
 	s := &stdioSet{}
 	ns, _ := namespaces.NamespaceRequired(ctx)
@@ -76,91 +81,98 @@ func newStdioSet(ctx context.Context, id string, stdin, stdout, stderr string, t
 		return nil, err
 	}
 
-	// stdout/stderr sinks. With a terminal they both receive the console
-	// copy from the pty master.
+	// stdout/stderr sinks, exactly as the request names them. An empty
+	// stderr (ctr's -t requests carry only stdout) shares the stdout sink.
 	var outSink, errSink *os.File
-	if terminal {
-		master, slavePath, err := console.NewPty()
-		if err != nil {
-			return nil, fmt.Errorf("openpty: %w", err)
+	switch {
+	case outU == nil:
+		// No stdout requested (detached io): console copies go nowhere.
+	case schemeOf(outU) == "binary" || schemeOf(outU) == "binary-v2":
+		outW, errW, logger, lerr := spawnLogger(ctx, id, ns, outU)
+		if lerr != nil {
+			return nil, lerr
 		}
-		slave, err := os.OpenFile(slavePath, os.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
+		outSink, errSink, s.logger = outW, errW, logger
+	case schemeOf(outU) == "fifo":
+		if outSink, err = openFifoWrite(outU.Path); err != nil {
+			return nil, err
+		}
+		s.sinkEOF = true
+	case schemeOf(outU) == "file":
+		outSink, err = os.OpenFile(outU.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
+			return nil, fmt.Errorf("open log file: %w", err)
+		}
+		s.sinkEOF = true
+	default:
+		return nil, fmt.Errorf("unknown stdout scheme %q", schemeOf(outU))
+	}
+	// stderr is only ever the same sink kind as stdout in our flows, but
+	// handle every combination like the runc shim does. An empty descriptor
+	// duplicates stdout (the terminal case).
+	switch {
+	case errU == nil:
+		errSink = outSink
+	case schemeOf(errU) == "binary" || schemeOf(errU) == "binary-v2":
+		if errSink == nil && sameURL(outU, errU) && s.logger != nil {
+			// Same URI: reuse the one logger (its fd4 carries stderr).
+			errSink = outSink
+		} else {
+			_, errSink, _, err = spawnLogger(ctx, id, ns, errU)
+			if err != nil {
+				return nil, err
+			}
+		}
+	case schemeOf(errU) == "fifo":
+		if errSink, err = openFifoWrite(errU.Path); err != nil {
+			return nil, err
+		}
+	case schemeOf(errU) == "file":
+		if errSink, err = os.OpenFile(errU.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unknown stderr scheme %q", schemeOf(errU))
+	}
+	s.outSink = outSink
+	if outSink != nil {
+		s.closeFns = append(s.closeFns, func() { outSink.Close() }) //nolint:errcheck
+	}
+	if errSink != nil && errSink != outSink {
+		s.closeFns = append(s.closeFns, func() { errSink.Close() }) //nolint:errcheck
+	}
+
+	if terminal {
+		// The child's 0/1/2 are the pty slave (its controlling terminal);
+		// the shim copies master -> stdout sink and, when the stdin fifo is
+		// wired (docker run -it, attach), fifo -> master.
+		master, slavePath, cerr := console.NewPty()
+		if cerr != nil {
+			return nil, fmt.Errorf("openpty: %w", cerr)
+		}
+		slave, cerr := os.OpenFile(slavePath, os.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
+		if cerr != nil {
 			master.Close()
-			return nil, fmt.Errorf("open console slave: %w", err)
+			return nil, fmt.Errorf("open console slave: %w", cerr)
 		}
 		s.console = master
 		s.childStdin, s.childStdout, s.childStderr = slave, slave, slave
 		s.closeFns = append(s.closeFns, func() { master.Close() })
 		if stdin != "" {
-			// The console's input is the stdin fifo (docker run -it, attach):
-			// the shim copies fifo -> master; the slave is the tty itself.
-			src, err := openFifoRead(stdin)
-			if err != nil {
-				master.Close()
-				slave.Close()
-				return nil, err
+			src, ferr := openFifoRead(stdin)
+			if ferr != nil {
+				return nil, ferr
 			}
 			s.stdinSrc = src
 			s.closeFns = append(s.closeFns, func() { src.Close() }) //nolint:errcheck
 		}
-	} else {
-		switch schemeOf(outU) {
-		case "binary", "binary-v2":
-			outW, errW, logger, lerr := spawnLogger(ctx, id, ns, outU)
-			if lerr != nil {
-				return nil, lerr
-			}
-			outSink, errSink, s.logger = outW, errW, logger
-		case "fifo":
-			if outSink, err = openFifoWrite(outU.Path); err != nil {
-				return nil, err
-			}
-			s.sinkEOF = true
-		case "file":
-			outSink, err = os.OpenFile(outU.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-			if err != nil {
-				return nil, fmt.Errorf("open log file: %w", err)
-			}
-			s.sinkEOF = true
-		default:
-			return nil, fmt.Errorf("unknown stdout scheme %q", schemeOf(outU))
-		}
-		// stderr is only ever the same sink kind as stdout in our flows,
-		// but handle every combination like the runc shim does.
-		switch schemeOf(errU) {
-		case "binary", "binary-v2":
-			if errSink == nil && sameURL(outU, errU) && s.logger != nil {
-				// Same URI: reuse the one logger (its fd4 carries stderr).
-				errSink = outSink
-			} else {
-				_, errSink, _, err = spawnLogger(ctx, id, ns, errU)
-				if err != nil {
-					return nil, err
-				}
-			}
-		case "fifo":
-			if errSink, err = openFifoWrite(errU.Path); err != nil {
-				return nil, err
-			}
-		case "file":
-			if errSink, err = os.OpenFile(errU.Path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err != nil {
-				return nil, err
-			}
-		default:
-			return nil, fmt.Errorf("unknown stderr scheme %q", schemeOf(errU))
-		}
-		s.childStdout, s.childStderr = outSink, errSink
-		if outSink != nil {
-			s.closeFns = append(s.closeFns, func() { outSink.Close() }) //nolint:errcheck
-		}
-		if errSink != nil && errSink != outSink {
-			s.closeFns = append(s.closeFns, func() { errSink.Close() }) //nolint:errcheck
-		}
+		return s, nil
 	}
 
-	// stdin: a fifo path (opened read end) or nothing (/dev/null).
-	if stdin != "" && !terminal {
+	// Without a terminal the sinks ARE the child's streams, and stdin is a
+	// fifo read end (or /dev/null via the nil dup).
+	s.childStdout, s.childStderr = outSink, errSink
+	if stdin != "" {
 		if s.childStdin, err = openFifoRead(stdin); err != nil {
 			return nil, err
 		}
@@ -314,14 +326,14 @@ func (s *stdioSet) startCopies(ctx context.Context) {
 		return
 	}
 	master := s.console
-	if s.childStdout != nil {
+	if s.outSink != nil {
 		go func() {
 			defer func() {
 				if s.sinkEOF {
-					s.childStdout.Close() //nolint:errcheck
+					s.outSink.Close() //nolint:errcheck
 				}
 			}()
-			if _, err := io.Copy(s.childStdout, master); err != nil && !isBenignCopyErr(err) {
+			if _, err := io.Copy(s.outSink, master); err != nil && !isBenignCopyErr(err) {
 				log.G(ctx).WithError(err).Debug("console copy ended")
 			}
 		}()
