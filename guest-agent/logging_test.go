@@ -332,3 +332,113 @@ func TestFifoLoggerWritesMarkerOnStreamEOF(t *testing.T) {
 		t.Fatalf("records = %+v, want [hi record, marker]", recs)
 	}
 }
+
+// followResult collects what a follow emitted, with the caller deciding how
+// long to wait for it to end.
+func followResult(t *testing.T, logPath string, opts logReadOptions, wait time.Duration) ([]string, bool) {
+	t.Helper()
+	done := make(chan error, 1)
+	var lines []string
+	go func() {
+		done <- readTaskLog(logPath, opts, func(stream byte, line []byte) {
+			lines = append(lines, string(line))
+		})
+	}()
+	select {
+	case <-done:
+		return lines, true
+	case <-time.After(wait):
+		return lines, false
+	}
+}
+
+// A log that already ends on the marker is final: the follow emits the real
+// records and ends at once instead of waiting on the timers.
+func TestFollowEndsOnMarker(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log.json")
+	body := `{"time":"2026-01-01T00:00:00Z","stream":"stdout","log":"real line\n"}` + "\n" +
+		`{"eof":true}` + "\n"
+	if err := os.WriteFile(logPath, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	lines, ended := followResult(t, logPath, logReadOptions{
+		follow:     true,
+		tail:       -1,
+		noStopWait: 10 * time.Second,
+	}, 3*time.Second)
+	if !ended {
+		t.Fatalf("follow did not end; emitted %q", lines)
+	}
+	if time.Since(start) > time.Second {
+		t.Errorf("follow took %v to end on the marker", time.Since(start))
+	}
+	if len(lines) != 1 || lines[0] != "real line\n" {
+		t.Errorf("emitted %q, want exactly the real record", lines)
+	}
+}
+
+// A marker written while the follow is running (the container exits during
+// `docker run` / `docker logs -f`) ends the stream at once.
+func TestFollowEndsOnLiveMarker(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log.json")
+	if err := os.WriteFile(logPath, []byte(`{"time":"2026-01-01T00:00:00Z","stream":"stdout","log":"live\n"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The logger appends the marker after the follow is already running:
+	// give the follow two poll ticks, then write the marker in the exact
+	// production shape.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Errorf("append marker: %v", err)
+			return
+		}
+		defer f.Close()
+		writeEOFMarker(f)
+	}()
+	lines, ended := followResult(t, logPath, logReadOptions{
+		follow:     true,
+		tail:       -1,
+		noStopWait: 10 * time.Second,
+	}, 3*time.Second)
+	if !ended {
+		t.Fatalf("follow did not end after the live marker; emitted %q", lines)
+	}
+	if len(lines) != 1 || lines[0] != "live\n" {
+		t.Errorf("emitted %q, want exactly the live record", lines)
+	}
+}
+
+// Without a marker the follow is not ended by the old quiet heuristics: a
+// stop-less follow (tests; production callers always pass a stop condition)
+// runs until its bounded wait, not until the log has been quiet for a
+// moment. This is the review-focus pin: a live container's log stream must
+// not end just because nothing was written lately.
+func TestFollowRunsPastQuietWithoutMarker(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log.json")
+	if err := os.WriteFile(logPath, []byte(`{"time":"2026-01-01T00:00:00Z","stream":"stdout","log":"kept\n"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const noStopWait = 600 * time.Millisecond
+	start := time.Now()
+	lines, ended := followResult(t, logPath, logReadOptions{
+		follow:     true,
+		tail:       -1,
+		noStopWait: noStopWait,
+	}, 3*time.Second)
+	if !ended {
+		t.Fatalf("stop-less follow not bounded by noStopWait; emitted %q", lines)
+	}
+	if elapsed := time.Since(start); elapsed < noStopWait-100*time.Millisecond {
+		t.Errorf("follow ended after %v, want it to run past the quiet window (~%v)",
+			elapsed, partialFlushAfter*2)
+	}
+	if len(lines) != 1 || lines[0] != "kept\n" {
+		t.Errorf("emitted %q, want exactly the kept record", lines)
+	}
+}
