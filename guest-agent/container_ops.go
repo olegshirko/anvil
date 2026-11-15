@@ -349,32 +349,14 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 	}
 	// A previous run's pid file must not survive into this one: the new
 	// run's logger would watch the old (dead) pid and write its marker into
-	// the fresh log before this task ever ran.
+	// the fresh log before this task ever ran. (The remove runs again per
+	// attempt inside newStartedTask.)
 	os.Remove(initPidPath(containerLogPath(ns, id))) //nolint:errcheck — stale file only
-	task, terr := c.NewTask(nsCtx, func(string) (cio.IO, error) {
-		return taskIO, nil
-	})
-	tr.mark("new-task")
-	if terr != nil {
+	if _, terr := newStartedTask(nsCtx, cl, c, taskIO, tty, stdin, containerLogPath(ns, id), tr); terr != nil {
 		if stopLogger != nil {
 			stopLogger()
 		}
-		err = fmt.Errorf("new task: %w", terr)
-		return err
-	}
-	// Post the init pid for the task logger's eof marker — the pid comes
-	// with the create RPC, before the init even runs (non-TTY only: TTY
-	// containers keep the timer-based follow end to end).
-	if !tty {
-		writeInitPidFile(containerLogPath(ns, id), int(task.Pid()))
-	}
-	if stdin != nil {
-		stdin.taskCreated() // the shim holds the FIFO now
-	}
-
-	if serr := task.Start(nsCtx); serr != nil {
-		task.Delete(context.WithoutCancel(nsCtx)) //nolint:errcheck — namespaced: a bare context is rejected and leaks the record
-		err = fmt.Errorf("start task: %w", serr)
+		err = terr
 		return err
 	}
 	tr.mark("task-start")

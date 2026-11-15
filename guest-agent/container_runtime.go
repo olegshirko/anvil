@@ -1095,11 +1095,20 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		labels[labelPorts] = string(portsJSON)
 	}
 
-	if _, cerr := cl.NewContainer(nsCtx, id,
+	newContainerOpts := []client.NewContainerOpts{
 		client.WithNewSnapshot(id, img),
 		client.WithImage(img),
 		client.WithContainerLabels(labels),
 		client.WithNewSpec(specOpts...),
+	}
+	// Fast-shim containers are decided here: the runtime is a property of
+	// the container record. A fast-shim failure at start still falls back to
+	// the default runtime (startNativeTask), invisibly to the client.
+	if fastShimEligible(req, meta) {
+		newContainerOpts = append(newContainerOpts, withFastShim())
+	}
+	if _, cerr := cl.NewContainer(nsCtx, id,
+		newContainerOpts...,
 	); cerr != nil {
 		return "", nil, fmt.Errorf("new container: %w", cerr)
 	}
