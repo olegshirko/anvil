@@ -40,9 +40,10 @@ import (
 // process as PID 1. Stage A's fork return is the child's GLOBAL pid (the
 // creator stays in the old namespace), which is what containerd needs.
 //
-// Report protocol over fd 4 (one line each): "R" setup complete; "S <pid>"
-// user process started (global pid); "X <detail>" start failed; "D <code>"
-// init exited; "E <detail>" setup failed at create.
+// Report protocol over fd 4 (one line each, prefixes defined in reports.go):
+// "R" setup complete; "P <pid>" stage B born (its global pid, reported at
+// create); "S <pid>" user process started (global pid); "X <detail>" start
+// failed; "D <code>" init exited; "E <detail>" setup failed at create.
 
 // Fixed fd numbers the shim hands over via exec.Cmd ExtraFiles (fds start
 // at 3).
@@ -61,15 +62,6 @@ const (
 
 // gateStartLine is the gate release message (written by the shim at start).
 const gateStartLine = "s\n"
-
-// Report line prefixes; the shim parses these over the report pipe.
-const (
-	reportReady         = "R\n"
-	reportSetupPrefix   = "E " // setup failed: create fails
-	reportStartPrefix   = "X " // init creation failed: start fails
-	reportStartedPrefix = "S " // init created and alive, value = global pid
-	reportDonePrefix    = "D " // init exited, value = exit code
-)
 
 // isInitHelper reports whether this process runs as stage A of the
 // container init helper.
@@ -91,11 +83,18 @@ func isExecHelper() bool {
 
 // reportLine writes one line to the shim through the report fd.
 func reportLine(format string, args ...any) {
+	reportLineTo(fdReport, format, args...)
+}
+
+// reportLineTo writes one report line to an arbitrary descriptor (the
+// exec path reports through a duplicate after closing the report fd
+// itself, so nothing leaks into the exec'd process).
+func reportLineTo(fd int, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	if !strings.HasSuffix(msg, "\n") {
 		msg += "\n"
 	}
-	f := os.NewFile(fdReport, "report")
+	f := os.NewFile(uintptr(fd), "report")
 	fmt.Fprint(f, msg)
 }
 
@@ -145,8 +144,10 @@ func runInit(id, bundle string) int {
 	// The original write end must not leak into stage B (or the exec'd
 	// user process) — its LAST closure is what produces the start
 	// confirmation EOF. The fixed-fd dup below clears the flag on the
-	// handed-over copy only.
+	// handed-over copy only. The read end is close-on-exec too: it is
+	// stage A's alone and must never reach stage B or the user process.
 	unix.CloseOnExec(confirm[1])
+	unix.CloseOnExec(confirm[0])
 	defer unix.Close(confirm[0]) //nolint:errcheck
 	defer unix.Close(confirm[1]) //nolint:errcheck
 
@@ -181,7 +182,6 @@ func runInit(id, bundle string) int {
 	// The confirm write end must survive the child's execve (its closure
 	// is the start signal), so hand it over at a fixed fd with the
 	// close-on-exec bit cleared.
-	const fdConfirm = 200
 	if err := unix.Dup3(confirm[1], fdConfirm, 0); err != nil {
 		reportLine(reportSetupPrefix+"dup confirm: %v", err)
 		return 1
@@ -203,6 +203,12 @@ func runInit(id, bundle string) int {
 	// only then does stage B's death turn into EOF on the confirm pipe.
 	unix.Close(fdConfirm)  //nolint:errcheck
 	unix.Close(confirm[1]) //nolint:errcheck
+
+	// Stage B exists from this moment (it holds the gate through its
+	// mount setup), so its global pid is already reportable: create
+	// answers with it — the same contract the runc shim's Create has —
+	// and kill/delete/state key off it before any start happens.
+	reportLine(reportInitPrefix+"%d", stageBGlobal)
 
 	// EOF = the user exec happened; a line is the failure the child wrote.
 	buf := make([]byte, 128)
@@ -344,6 +350,9 @@ func runInitApply(id, bundle string) int {
 	if !waitGate() {
 		return 0
 	}
+	// The gate is consumed; its read end must not leak into the user
+	// process (runc's init execs with exactly 0/1/2).
+	unix.Close(fdGate) //nolint:errcheck
 
 	// Everything the user process must already carry is applied to this
 	// process before the exec: the exec'd init inherits it all.
@@ -359,8 +368,19 @@ func runInitApply(id, bundle string) int {
 		reportLine(reportStartPrefix+"%v", err)
 		return 127
 	}
+	// The report fd closes before the exec too (a live write end in the
+	// user process would hold the shim's report-EOF fallback open until
+	// the container exits by itself). A close-on-exec duplicate carries
+	// the failure report if the execve fails — the only case the dup is
+	// still open after the exec attempt.
+	const fdReportFinal = 201
+	if err := unix.Dup3(fdReport, fdReportFinal, unix.O_CLOEXEC); err != nil {
+		reportLine(reportStartPrefix+"dup report: %v", err)
+		return 126
+	}
+	unix.Close(fdReport) //nolint:errcheck — dup'ed above
 	if err := unix.Exec(argv0, spec.Process.Args, spec.Process.Env); err != nil {
-		reportLine(reportStartPrefix+"exec %s: %v", argv0, err)
+		reportLineTo(fdReportFinal, reportStartPrefix+"exec %s: %v", argv0, err)
 		return 127
 	}
 	return 0 // unreached
@@ -464,9 +484,9 @@ func joinNamespacesApply(spec *specs.Spec) error {
 }
 
 // joinCgroup moves this process into the container's cgroup (the shim
-// already created it and wrote the spec's limits): the forked container
-// init inherits it, which is the clone3(CLONE_INTO_CGROUP) equivalent for
-// the trampoline design.
+// already created it and wrote the spec's limits): the container init born
+// from this process inherits the placement — the fast shim's equivalent of
+// entering the cgroup at process creation.
 func joinCgroup(spec *specs.Spec) error {
 	if spec.Linux == nil || spec.Linux.CgroupsPath == "" {
 		return nil

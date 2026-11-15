@@ -1,9 +1,10 @@
 // anvil-fast-shim is a lightweight containerd runtime-v2 shim. It implements
 // the shim TaskService contract (Create/Start/Wait/Kill/Delete/exec/stats)
-// without runc: the container init is created with a single clone3 into a
-// prepared cgroup (CLONE_INTO_CGROUP), the rootfs mounts prepared by the
-// agent are applied by a small init helper, and the user process is exec'd
-// as PID 1 of the container's pid namespace.
+// without runc: at create a two-stage init helper joins the cgroup and the
+// namespaces, applies the rootfs mounts prepared by the agent and holds at
+// a start gate; start releases the gate and the init execs the user process
+// as PID 1 of the container's pid namespace — one raw clone(CLONE_NEWPID),
+// no runc in between.
 //
 // The wire protocol is the standard shim v2 one: containerd starts the
 // binary with action "start" and a BootstrapParams blob on stdin; we fork
@@ -12,7 +13,7 @@
 // The agent selects this binary per container via containerd's WithRuntime
 // (an absolute binary path is accepted as the runtime name).
 //
-// Linux-only at runtime (clone3, namespaces, cgroup v2); the process
+// Linux-only at runtime (raw clone, namespaces, cgroup v2); the process
 // scaffolding here is portable so the package still builds for darwin
 // (go vet / go test on the dev Mac).
 package main

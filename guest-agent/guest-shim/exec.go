@@ -227,7 +227,9 @@ func (s *taskService) readExecReports(c *container, e *execProcess) {
 	}
 }
 
-// finalizeExecExit records one exec process's exit.
+// finalizeExecExit records one exec process's exit: status, exit code,
+// TaskExit, and the fifo/file output sinks closed (the exec's readers EOF
+// at process death, like the runc shim's io teardown).
 func (s *taskService) finalizeExecExit(c *container, e *execProcess, code uint32) {
 	s.mu.Lock()
 	if e.exited {
@@ -241,6 +243,7 @@ func (s *taskService) finalizeExecExit(c *container, e *execProcess, code uint32
 	pid := e.pid
 	s.mu.Unlock()
 	close(e.waitCh)
+	e.io.closeSinks()
 	publishTaskExit(s, c.id, e.id, pid, code, e.exitedAt)
 	log.L.WithFields(log.Fields{"id": c.id, "exec": e.id, "code": code}).Debug("exec exited")
 }
@@ -276,7 +279,6 @@ func runExecHelper(initpidArg, bundle string) int {
 		reportLine(reportSetupPrefix+"bad init pid %q: %v", initpidArg, err)
 		return 1
 	}
-	helperGlobalPid = os.Getpid()
 	specJSON := os.Getenv("ANVIL_EXEC_SPEC")
 	var pspec specs.Process
 	if err := json.Unmarshal([]byte(specJSON), &pspec); err != nil {
@@ -332,16 +334,18 @@ func runExecHelper(initpidArg, bundle string) int {
 	if !waitGate() {
 		return 0
 	}
-	code, nsPid, globalPid, detail, err := forkAndExecUser(&pspec, fdExecGate)
+	code, pid, detail, err := forkAndExecUser(&pspec, fdExecGate)
 	if err != nil {
 		reportLine(reportStartPrefix+"%s", detail)
 		return 127
 	}
-	reportLine(reportStartedPrefix+"%d", globalPid)
+	reportLine(reportStartedPrefix+"%d", pid)
 
-	// Wait with the namespace pid (the global pid is not visible here).
+	// Wait for the exec'd process. The helper never entered the pid
+	// namespace (only its raw child does, inside the fork window), so this
+	// pid IS the global one — the same number TaskExecStarted carried.
 	var ws unix.WaitStatus
-	if _, waitErr := unix.Wait4(nsPid, &ws, 0, nil); waitErr != nil {
+	if _, waitErr := unix.Wait4(pid, &ws, 0, nil); waitErr != nil {
 		code = 137
 	} else {
 		code = int(exitStatus(ws))
@@ -457,28 +461,6 @@ func joinCgroupOf(initpid int) {
 	}
 }
 
-// helperGlobalPid is the exec helper's own global pid, captured before any
-// namespace join (os.Getpid turns into the namespace pid after setns(pid)).
-var helperGlobalPid = 0
-
-// globalPidOfExec resolves the global pid of the exec'd process from the
-// container's cgroup membership: the helper and the exec'd process are the
-// only members, and cgroup.procs lists global pids.
-func globalPidOfExec() int {
-	data, err := os.ReadFile("/sys/fs/cgroup/anvil-exec/cgroup.procs")
-	if err != nil {
-		return 0
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		pid, err := strconv.Atoi(strings.TrimSpace(line))
-		if err != nil || pid == helperGlobalPid {
-			continue
-		}
-		return pid
-	}
-	return 0
-}
-
 // forkAndExecUser is the exec trampoline: the shared forkExecUser with the
 // exec helper's gate/report fd layout. Returns once the execve landed
 // (confirm pipe EOF) or failed (message came through instead).
@@ -511,10 +493,19 @@ func forkExecUser(p *specs.Process, gateFD, reportFD int) (confirmR int, pid int
 	if err := unix.Pipe(confirm); err != nil {
 		return -1, 0, "", fmt.Errorf("confirm pipe: %w", err)
 	}
+	// Everything the exec'd process must not inherit: the gate (consumed),
+	// the report pipe (stage exit goes through Wait4, and a live write end
+	// would hold the shim's report-EOF fallback open), the confirm read
+	// end and the namespace fds (consumed by the setns above).
+	closeFDs := []int{gateFD, reportFD, confirm[0]}
+	if execPidNsFd >= 0 {
+		closeFDs = append(closeFDs, execPidNsFd)
+	}
+	if execMntNsFd >= 0 {
+		closeFDs = append(closeFDs, execMntNsFd)
+	}
 	args := pid0Args{
 		confirmFD:  confirm[1],
-		gateFD:     gateFD,
-		reportFD:   reportFD,
 		pathPtr:    pathPtr,
 		argvPtrs:   argvPtrs,
 		envPtrs:    envPtrs,
@@ -523,6 +514,7 @@ func forkExecUser(p *specs.Process, gateFD, reportFD int) (confirmR int, pid int
 		pidNsFd:    execPidNsFd,
 		mntNsFd:    execMntNsFd,
 		cwdPtr:     execCwdPtr,
+		closeFDs:   closeFDs,
 	}
 	pid, errno := forkRaw()
 	if errno != 0 {
@@ -540,8 +532,12 @@ func forkExecUser(p *specs.Process, gateFD, reportFD int) (confirmR int, pid int
 
 // forkAndExecUser is the exec trampoline: the raw fork+execve of the user
 // process inside the joined namespaces. Returns once the execve landed
-// (confirm pipe EOF) or failed (message came through instead).
-func forkAndExecUser(pspec *specs.Process, gateFD int) (code int, nsPid int, globalPid int, detail string, err error) {
+// (confirm pipe EOF) or failed (message came through instead). The returned
+// pid is the exec'd process's global pid: the helper never joins the pid
+// namespace (setns(pid) is reserved for the raw child), so the fork's
+// return value in the helper is already the host-view pid — the one
+// TaskExecStarted, exec state and the shim's kill need.
+func forkAndExecUser(pspec *specs.Process, gateFD int) (code int, pid int, detail string, err error) {
 	defer func() {
 		if execPidNsFd > 0 {
 			unix.Close(execPidNsFd) //nolint:errcheck
@@ -557,12 +553,12 @@ func forkAndExecUser(pspec *specs.Process, gateFD int) (code int, nsPid int, glo
 	if pspec.Cwd != "" {
 		execCwdPtr, cwdErr = unix.BytePtrFromString(pspec.Cwd)
 		if cwdErr != nil {
-			return 127, 0, 0, "", cwdErr
+			return 127, 0, "", cwdErr
 		}
 	}
 	confirmR, childPid, detail, err := forkExecUser(pspec, gateFD, fdReport)
 	if err != nil {
-		return 127, 0, 0, detail, err
+		return 127, 0, detail, err
 	}
 	defer unix.Close(confirmR) //nolint:errcheck
 	buf := make([]byte, 128)
@@ -578,10 +574,7 @@ func forkAndExecUser(pspec *specs.Process, gateFD int) (code int, nsPid int, glo
 		if werr == nil && wp == childPid {
 			code = int(exitStatus(ws))
 		}
-		return code, 0, 0, msg, fmt.Errorf("exec failed")
+		return code, 0, msg, fmt.Errorf("exec failed")
 	}
-	// The exec process keeps running under the helper; report the global
-	// pid (from the container's cgroup membership), keep the namespace pid
-	// for the wait.
-	return 0, childPid, globalPidOfExec(), "", nil
+	return 0, childPid, "", nil
 }
