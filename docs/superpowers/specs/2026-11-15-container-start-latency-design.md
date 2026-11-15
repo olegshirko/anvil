@@ -54,8 +54,11 @@ Docker-API emulation and containerd/shim path.
 
 - Guest agent is PID 1 in an initramfs; every change rebuilds initramfs and
   invalidates the snapshot (`make dev-rebuild`).
-- The shim never closes container output fifos at task exit — EOF on the
-  log side does not exist today and must be created, not assumed.
+- The shim never closes the stream fds of the shim-spawned binary-v2 logger
+  (`--log-json`) at task exit — that logger never sees EOF. The FIFO-mode
+  logger (stdin-attached non-TTY containers, `docker run -i`) is different:
+  it reads the FIFOs by path and the shim closes them at process exit, so
+  it exits naturally (logging.go: runFifoJSONLogger).
 - `restart.go`, `scanner.go` (port push), `healthcheck.go`, exec and events
   all key off containerd tasks/events. The fast path must preserve the
   containerd task abstraction (a faster shim, not no shim) unless a stage
@@ -82,6 +85,27 @@ heuristics with a deterministic signal:
   no marker support (old snapshots); everything else is marker-driven.
 - Fallback: if the logger can't resolve the pid, today's timers stay as the
   safety net (the marker simply never appears).
+- TTY containers keep today's `stopQuietTTY` timers end to end in Stage 1:
+  the marker fires when the init pid dies, which is when the shim *begins*
+  copying the console, so marker-driven EOF would truncate TTY tails. The
+  marker is emitted only by the non-TTY loggers (binary-v2 on pid
+  disappearance; the FIFO logger on its natural stream EOF, before exit —
+  that also picks up `docker run -i`); `docker logs -f` and attach map the
+  marker to EOF after emitting what precedes it.
+
+### Builder-check resolutions (2026-11-15)
+
+- Stage 2 shim gating: decided by Oleg (below).
+- CNI move: netns + veth pair are prepared at create (parallel with
+  snapshot creation); the full CNI ADD (IP assignment, iptables, net.json,
+  hosts files, connect events) stays at start with its existing
+  self-healing and rollback. A created-never-started container holds no IP.
+- Exit-code truth: the direct shim wait feeds the same exit-code cache and
+  run-generation guard watchTaskExit uses today (single source of truth);
+  containerd's task.Wait stays the fallback when the shim subscription
+  fails (the shim deletes its socket at exit). restart.go keeps its
+  containerd-state poll: a ~1 s restart-policy detection on fast-shim
+  containers is accepted while /wait answers in < 5 ms.
 
 ### Stage 2 — fast task path (≤ 120 → ≤ 40 ms, medium risk)
 
