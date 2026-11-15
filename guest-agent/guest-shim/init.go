@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 	"unsafe"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -119,22 +118,8 @@ func waitGate() bool {
 
 // runInit is stage A. Returns the process exit code (stage B's exit code —
 // the container init's).
-// probeT0 anchors the init helper's timing prints (init-profile, stderr);
-// temporary diagnostics while the create cost is tuned.
-var probeT0 = time.Now()
-
-// probeStep prints one init-profile timing line to stderr (the shim's
-// stderr, i.e. containerd's log): relative ms plus the absolute monotonic
-// clock so the stages can be correlated across the helper and the shim.
-func probeStep(stage string) {
-	fmt.Fprintf(os.Stderr, "init-profile %s=%.1fms mono=%d\n", stage,
-		time.Since(probeT0).Seconds()*1000, time.Now().UnixNano())
-}
-
 func runInit(id, bundle string) int {
-	probeStep("A-enter")
 	spec, err := readSpecFile(filepath.Join(bundle, "config.json"))
-	probeStep("A-spec")
 	if err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
@@ -147,7 +132,6 @@ func runInit(id, bundle string) int {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
-	probeStep("A-cgroup")
 
 	// The confirm pipe: stage B holds the write end close-on-exec, so a
 	// successful execve of the user process closes it instantly (EOF =
@@ -157,7 +141,6 @@ func runInit(id, bundle string) int {
 		reportLine(reportSetupPrefix+"confirm pipe: %v", err)
 		return 1
 	}
-	probeStep("A-pipe")
 	// The original write end must not leak into stage B (or the exec'd
 	// user process) — its LAST closure is what produces the start
 	// confirmation EOF. The fixed-fd dup below clears the flag on the
@@ -180,7 +163,6 @@ func runInit(id, bundle string) int {
 		reportLine(reportSetupPrefix+"resolve self: %v", err)
 		return 1
 	}
-	probeStep("A-self")
 	argv := []string{self, "init-apply", "-id", id, "-bundle", bundle}
 	argvPtrs, err := argvBytePtrs(argv)
 	if err != nil {
@@ -204,9 +186,7 @@ func runInit(id, bundle string) int {
 		reportLine(reportSetupPrefix+"dup confirm: %v", err)
 		return 1
 	}
-	probeStep("A-dup")
 	stageBGlobal, errno := cloneRawPid()
-	probeStep("A-cloned")
 	if errno != 0 {
 		unix.Close(fdConfirm) //nolint:errcheck
 		reportLine(reportSetupPrefix+"clone stage B: %v", errno)
@@ -277,9 +257,7 @@ func readConfirm(fd int, buf []byte) int {
 // PID namespace as its active one, so the procfs it mounts shows the
 // container's own processes and the exec'd user process is PID 1.
 func runInitApply(id, bundle string) int {
-	probeStep("B-enter")
 	spec, err := readSpecFile(filepath.Join(bundle, "config.json"))
-	probeStep("B-spec")
 	if err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
@@ -325,27 +303,22 @@ func runInitApply(id, bundle string) int {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
-	probeStep("B-namespaces")
 	if err := applySpecMounts(rootfs, spec.Mounts); err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
-	probeStep("B-mounts")
 	if err := setupDevices(rootfs, spec); err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
-	probeStep("B-devices")
 	if err := applyMaskedAndReadonly(rootfs, spec); err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
-	probeStep("B-masked")
 	if err := pivotRoot(rootfs); err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
-	probeStep("B-pivot")
 	if spec.Root != nil && spec.Root.Readonly {
 		if err := unix.Mount("", "/", "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
 			reportLine(reportSetupPrefix+"readonly root: %v", err)
@@ -371,7 +344,6 @@ func runInitApply(id, bundle string) int {
 		}
 	}
 	reportLine(reportReady)
-	probeStep("B-ready")
 
 	// Hold at the gate. EOF without a start: the task was deleted (or the
 	// shim died) — leave quietly like a killed created init.
@@ -527,10 +499,7 @@ func joinCgroup(spec *specs.Spec) error {
 		return nil
 	}
 	procs := filepath.Join(cgroupAbsPath(spec.Linux.CgroupsPath), "cgroup.procs")
-	probeStep("A-cg-open")
-	err := os.WriteFile(procs, []byte(strconv.Itoa(os.Getpid())), 0o600)
-	probeStep("A-cg-wrote")
-	return err
+	return os.WriteFile(procs, []byte(strconv.Itoa(os.Getpid())), 0o600)
 }
 
 // prSetOomScoreAdj is PR_SET_OOM_SCORE_ADJ (not in x/sys).

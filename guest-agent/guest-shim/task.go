@@ -54,16 +54,6 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 		return nil, errgrpc.ToGRPCf(errdefs.ErrInvalidArgument, "spec has no process")
 	}
 
-	// probe: per-phase create timing, info level so containerd's info log
-	// captures it. Temporary diagnostics while the create cost is tuned.
-	createT0 := time.Now()
-	probe := func(what string) {
-		log.G(ctx).Infof("create-profile %s: %s=%.1fms", r.ID, what, time.Since(createT0).Seconds()*1000)
-	}
-	defer func() {
-		log.G(ctx).Infof("create-profile %s: total=%.1fms", r.ID, time.Since(createT0).Seconds()*1000)
-	}()
-
 	// Everything acquired below must be undone on failure, in order.
 	var cleanups []func()
 	cleanup := func() {
@@ -94,7 +84,6 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 	if err := mount.All(snapshotMounts, rootfs); err != nil {
 		return fail(fmt.Errorf("mount rootfs: %w", err))
 	}
-	probe("mounts")
 	cleanups = append(cleanups, func() {
 		if err := mount.UnmountMounts(snapshotMounts, rootfs, 0); err != nil {
 			log.G(ctx).WithError(err).Warn("unmount rootfs after failed create")
@@ -107,7 +96,6 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 	if err != nil {
 		return fail(err)
 	}
-	probe("cgroup")
 	cleanups = append(cleanups, func() { removeCgroup(cgPath) })
 
 	// IO plumbing (binary-v2 logger spawn / fifo ends / console pty).
@@ -116,7 +104,6 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 	if err != nil {
 		return fail(err)
 	}
-	probe("io")
 	cleanups = append(cleanups, func() { ioSet.close() })
 
 	// Gate (shim -> helper) and report (helper -> shim) pipes; kept ends
@@ -144,9 +131,6 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 	cmd := exec.Command(self, "init", "-id", r.ID, "-bundle", bundle)
 	cmd.ExtraFiles = []*os.File{gateR, reportW, ioSet.childStdin, ioSet.childStdout, ioSet.childStderr}
 	cmd.Env = os.Environ()
-	// probe: helper stderr joins the shim's (containerd's log) so its
-	// init-profile timing prints are visible. Temporary diagnostics.
-	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		gateW.Close()
 		gateR.Close()
@@ -157,7 +141,6 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 	// The child holds its copies now; parent drops the child-only ends.
 	gateR.Close()
 	reportW.Close()
-	probe("helper-spawn")
 
 	// Wait for the helper's setup report: "P <pid>" (the init process was
 	// born and holds the gate) then "R" (mounts applied) — or "E <error>".
@@ -168,11 +151,6 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 	var initPid int
 	for {
 		pid, ready, rerr := consumeSetupReport(reportBuf)
-		// probe: server-clock arrival of each helper report line.
-		if rerr == nil {
-			log.G(ctx).Infof("create-profile %s: report pid=%d ready=%v at=%.1fms mono=%d",
-				r.ID, pid, ready, time.Since(createT0).Seconds()*1000, time.Now().UnixNano())
-		}
 		if rerr != nil {
 			watchdog.Stop()
 			cmd.Process.Kill() //nolint:errcheck — a stuck helper must not leak
@@ -190,7 +168,6 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 		}
 	}
 	watchdog.Stop()
-	probe("helper-ready")
 
 	c := &container{
 		id:        r.ID,
@@ -277,7 +254,6 @@ func (s *taskService) startInit(ctx context.Context, c *container) (*taskAPI.Sta
 	s.mu.Unlock()
 
 	// Release the gate; the helper creates the init and reports back.
-	startT0 := time.Now()
 	if _, err := c.gateW.WriteString(gateStartLine); err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
@@ -290,8 +266,6 @@ func (s *taskService) startInit(ctx context.Context, c *container) (*taskAPI.Sta
 	case <-time.After(10 * time.Second):
 		return nil, errgrpc.ToGRPCf(errdefs.ErrUnknown, "start timed out waiting for the init")
 	}
-	// probe: gate-release -> init running (temporary, see create-profile).
-	log.G(ctx).Infof("start-profile %s: gate=%.1fms", c.id, time.Since(startT0).Seconds()*1000)
 	if msg.err != nil {
 		return nil, errgrpc.ToGRPCf(errdefs.ErrUnknown, "failed to start: %v", msg.err)
 	}
