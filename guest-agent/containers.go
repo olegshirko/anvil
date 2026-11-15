@@ -64,7 +64,16 @@ func waitContainerTaskCond(ctx context.Context, ns, containerdID string, nextExi
 				return 0, fmt.Errorf("load container: %w", err)
 			}
 			if _, merr := loadContainerMeta(ns, containerdID); merr != nil {
-				return 0, fmt.Errorf("load container: %w", err)
+				// Both the record and its metadata are gone: the container
+				// was removed while this wait was polling. `docker run --rm`
+				// arms /wait?condition=removed before /start, and the whole
+				// run can complete inside one poll interval — the removal is
+				// exactly the condition the client asked for, so answer it,
+				// with the cached exit code when the exit path recorded one.
+				if code, ok := peekContainerExitCode(dockerID(ns, containerdID)); ok {
+					return code, nil
+				}
+				return 0, nil
 			}
 		} else {
 			if _, terr := c.Task(nsCtx, nil); terr == nil {
