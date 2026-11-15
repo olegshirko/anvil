@@ -165,6 +165,8 @@ func (s *taskService) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*ta
 	}
 	// Close the gate first: a created helper blocked on it exits cleanly.
 	c.gateW.Close()
+	// End the OOM watcher before the cgroup it reads disappears.
+	c.stopOOMWatcher()
 	// IO teardown: fifo write ends and logger pipes close — the loggers
 	// (agent-side fifo logger, binary-v2 json logger) see EOF and exit.
 	c.io.close()

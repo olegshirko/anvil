@@ -111,6 +111,9 @@ type container struct {
 	// spec places no cgroup).
 	cgPath string
 
+	// oomStop ends the cgroup OOM watcher (closed at delete).
+	oomStop chan struct{}
+
 	execs map[string]*execProcess
 }
 
