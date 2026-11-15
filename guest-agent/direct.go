@@ -233,6 +233,11 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 	cmd := exec.Command(fastShimRuntimeName, "init", "-id", id, "-bundle", bundle, "-cgroup")
 	cmd.ExtraFiles = []*os.File{gateR, reportW, childStdin, stdoutW, stderrW}
 	cmd.Env = os.Environ()
+	if debugMode {
+		// Debug builds record the helper's setup phases for `docker run`
+		// latency traces (helperTrace in guest-shim/init.go).
+		cmd.Env = append(cmd.Env, "ANVIL_HELPER_TRACE=1")
+	}
 	tr.mark("spawn")
 	if serr := cmd.Start(); serr != nil {
 		closeFile(childStdin)

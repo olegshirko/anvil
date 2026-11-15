@@ -310,9 +310,12 @@ func handleAttach(w http.ResponseWriter, r *http.Request, id string) {
 
 	streamTaskLogToTTY(bufrw, ns, containerdID, tty, ao)
 
-	// Ensure all buffered output reaches the client before closing.
+	// Ensure all buffered output reaches the client before closing. The end of
+	// the stream itself is deterministic — the loggers' eof marker (non-TTY)
+	// or the console-copy quiet window (TTY) — so no extra linger is needed;
+	// the old unconditional 100 ms sleep was the attach drain behind
+	// `docker run`'s tail latency.
 	bufrw.Flush()
-	time.Sleep(100 * time.Millisecond)
 }
 
 // queryBool reads a boolean query parameter the way Docker's BoolValue
