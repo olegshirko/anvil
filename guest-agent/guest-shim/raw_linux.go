@@ -22,11 +22,13 @@ func forkRaw() (int, unix.Errno) {
 }
 
 // pid0RawChild is everything the forked container init runs before it
-// becomes the user process: close the gate fd (never leak it into the
-// container), mark the confirm fd close-on-exec (its closure IS the start
-// confirmation — the kernel does it as part of a successful execve) and
-// execve. A failed execve reports through the confirm fd with a pre-built
-// message and exits 127. Raw syscalls only.
+// becomes the user process: join the exec's pid/mount namespaces, chdir,
+// close every fd the user process must not inherit (gate, report, the
+// confirm pipe's read end, the namespace fds — the shim passes the list),
+// mark the confirm fd close-on-exec (its closure IS the start confirmation
+// — the kernel does it as part of a successful execve) and execve. A failed
+// execve reports through the confirm fd with a pre-built message and exits
+// 127. Raw syscalls only.
 func pid0RawChild(a pid0Args) {
 	// Exec processes join the pid and mount namespaces here: setns(pid) is
 	// EINVAL for a multi-threaded process, and only this raw window is
@@ -51,7 +53,9 @@ func pid0RawChild(a pid0Args) {
 			unix.RawSyscall(unix.SYS_EXIT_GROUP, 126, 0, 0) //nolint:errcheck
 		}
 	}
-	unix.RawSyscall(unix.SYS_CLOSE, uintptr(a.gateFD), 0, 0) //nolint:errcheck
+	for _, fd := range a.closeFDs {
+		unix.RawSyscall(unix.SYS_CLOSE, uintptr(fd), 0, 0) //nolint:errcheck
+	}
 	// F_SETFD=2, FD_CLOEXEC=1: fcntl(confirmFD, F_SETFD, FD_CLOEXEC).
 	unix.RawSyscall(unix.SYS_FCNTL, uintptr(a.confirmFD), 2, 1) //nolint:errcheck
 	_, _, errno := unix.RawSyscall6(unix.SYS_EXECVE,
@@ -69,11 +73,11 @@ func pid0RawChild(a pid0Args) {
 // pid0Args carries the pre-built pointers across the fork boundary. The
 // namespace fds (pid/mount) are only set for exec processes, which join
 // them in the raw window; chdir happens there too (paths resolve in the
-// container's mount namespace).
+// container's mount namespace). closeFDs lists everything closed before
+// the execve — the user process must be left with exactly 0/1/2 plus the
+// close-on-exec confirm fd.
 type pid0Args struct {
 	confirmFD  int
-	gateFD     int
-	reportFD   int
 	pathPtr    *byte
 	argvPtrs   []*byte
 	envPtrs    []*byte
@@ -82,6 +86,7 @@ type pid0Args struct {
 	pidNsFd    int   // -1 = none
 	mntNsFd    int   // -1 = none
 	cwdPtr     *byte // nil = no chdir
+	closeFDs   []int // closed before the execve
 }
 
 // failExecMessage is the pre-built report the child writes on execve

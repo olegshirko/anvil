@@ -31,9 +31,13 @@ import (
 //     master <-> stdout sink and stdin fifo -> master, and passes the slave
 //     as the init's stdio.
 //
-// Per the anvil logging contract, binary-v2 logger pipes are NEVER closed at
-// task exit (that logger never sees EOF; the attach layer decides the end of
-// stream). FIFO write ends and the console master are closed with the task.
+// Per the anvil logging contract, the binary-v2 logger's pipe ends are never
+// closed at task exit — that logger never sees EOF while the task record
+// exists (the attach layer decides the end of stream); its pipes close at
+// Delete so `docker rm` does not leak logger processes. FIFO write ends and
+// log-file sinks are different: they close as soon as the init exits (the
+// agent-side fifo logger ends on that EOF and writes its marker), and the
+// console master closes with the task.
 
 type stdioSet struct {
 	childStdin  *os.File // read end for the init's fd0 (nil = /dev/null)
@@ -42,6 +46,7 @@ type stdioSet struct {
 	console     console.Console
 	stdinSrc    *os.File // console stdin source (the stdin fifo; tty only)
 	outSink     *os.File // console copy destination (the stdout sink; tty only)
+	errSink     *os.File // stderr sink when it is not the stdout sink
 	logger      *exec.Cmd
 	sinkEOF     bool // stdout sink should close when the console copy ends
 	closeFns    []func()
@@ -135,6 +140,7 @@ func newStdioSet(ctx context.Context, id string, stdin, stdout, stderr string, t
 		return nil, fmt.Errorf("unknown stderr scheme %q", schemeOf(errU))
 	}
 	s.outSink = outSink
+	s.errSink = errSink
 	if outSink != nil {
 		s.closeFns = append(s.closeFns, func() { outSink.Close() }) //nolint:errcheck
 	}
@@ -388,6 +394,25 @@ func (s *stdioSet) close() {
 	if s.stdinSrc != nil {
 		s.stdinSrc.Close() //nolint:errcheck
 		s.stdinSrc = nil
+	}
+}
+
+// closeSinks ends the shim's output-sink copies at init exit. Only fifo
+// write ends and log-file sinks close (sinkEOF): the agent-side fifo logger
+// reads those paths, and its natural EOF here is what writes the eof marker
+// while any attach is still live. Binary-v2 logger pipes stay open — that
+// logger ends via the pid-file marker, never an EOF, and its stream stays
+// open until Delete. Double closes (a sink also closed by the console copy
+// or a later Delete) are harmless.
+func (s *stdioSet) closeSinks() {
+	if !s.sinkEOF {
+		return
+	}
+	if s.outSink != nil {
+		s.outSink.Close() //nolint:errcheck
+	}
+	if s.errSink != nil && s.errSink != s.outSink {
+		s.errSink.Close() //nolint:errcheck
 	}
 }
 

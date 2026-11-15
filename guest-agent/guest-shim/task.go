@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	eventstypes "github.com/containerd/containerd/api/events"
@@ -90,7 +91,7 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 	})
 
 	// Cgroup v2 dir with the spec's limits; the init helper moves into it
-	// (the clone3 CLONE_INTO_CGROUP equivalent for the trampoline design).
+	// and the container init it creates inherits the placement.
 	cgPath, err := prepareCgroup(spec)
 	if err != nil {
 		return fail(err)
@@ -141,23 +142,32 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 	gateR.Close()
 	reportW.Close()
 
-	// Wait for the helper's setup report ("R\n" or "E <error>"). The
-	// watchdog kills a wedged helper; the pipe read then returns with EOF.
+	// Wait for the helper's setup report: "P <pid>" (the init process was
+	// born and holds the gate) then "R" (mounts applied) — or "E <error>".
+	// The watchdog kills a wedged helper; the pipe read then returns with
+	// EOF.
 	reportBuf := bufio.NewReader(reportR)
 	watchdog := time.AfterFunc(15*time.Second, func() { cmd.Process.Kill() }) //nolint:errcheck
-	line, rerr := reportBuf.ReadString('\n')
-	watchdog.Stop()
-	if rerr != nil || line != reportReady {
-		detail := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), reportSetupPrefix))
+	var initPid int
+	for {
+		pid, ready, rerr := consumeSetupReport(reportBuf)
 		if rerr != nil {
-			detail = rerr.Error()
+			watchdog.Stop()
+			cmd.Process.Kill() //nolint:errcheck — a stuck helper must not leak
+			cmd.Wait()         //nolint:errcheck — join it
+			gateW.Close()
+			reportR.Close()
+			return fail(fmt.Errorf("init setup failed: %s", rerr.Error()))
 		}
-		cmd.Process.Kill() //nolint:errcheck — a stuck helper must not leak
-		cmd.Wait()         //nolint:errcheck — join it
-		gateW.Close()
-		reportR.Close()
-		return fail(fmt.Errorf("init setup failed: %s", detail))
+		if pid > 0 {
+			initPid = pid
+			continue
+		}
+		if ready {
+			break
+		}
 	}
+	watchdog.Stop()
 
 	c := &container{
 		id:        r.ID,
@@ -168,6 +178,7 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 		stdout:    r.Stdout,
 		stderr:    r.Stderr,
 		stdinOpen: r.Stdin != "",
+		pid:       initPid,
 		status:    task.Status_CREATED,
 		waitCh:    make(chan struct{}),
 		gateW:     gateW,
@@ -204,9 +215,11 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 	// code, EOF fallback.
 	go s.readReports(c)
 
-	// Docker reports Pid 0 for created (never started) containers; the real
-	// pid arrives with the start report.
-	return &taskAPI.CreateTaskResponse{}, nil
+	// The init process is alive (holding the gate), so the create response
+	// carries its global pid — the runc shim's contract: containerd's task
+	// pid, the agent's eof-marker pid file and created-state kill all key
+	// off it.
+	return &taskAPI.CreateTaskResponse{Pid: uint32(initPid)}, nil
 }
 
 // Start releases the created init from its gate. The mount work already
@@ -302,7 +315,9 @@ func (s *taskService) readReports(c *container) {
 }
 
 // finalizeExit records the container init's exit once: exit code cached for
-// late waiters, wait channel closed, TaskExit published.
+// late waiters, wait channel closed, TaskExit published, and the fifo/file
+// output sinks closed (the shim's last copies — the agent-side fifo logger
+// ends on their EOF and writes its marker now, while any attach is live).
 func (s *taskService) finalizeExit(c *container, code uint32) {
 	s.mu.Lock()
 	if c.exited {
@@ -316,12 +331,15 @@ func (s *taskService) finalizeExit(c *container, code uint32) {
 	pid := c.pid
 	s.mu.Unlock()
 	close(c.waitCh)
+	c.io.closeSinks()
 	publishTaskExit(s, c.id, "", pid, code, c.exitedAt)
 	log.L.WithFields(log.Fields{"id": c.id, "code": code}).Debug("container init exited")
 }
 
 // waitExitCode joins the helper process and returns its exit code (128+sig
-// for signal deaths). Called exactly once, by the report reader.
+// for signal deaths — the helper mirrors the container init's exit, so a
+// SIGKILLed helper reports the kill convention, not a wrapped -1). Called
+// exactly once, by the report reader.
 func waitExitCode(cmd *exec.Cmd) uint32 {
 	err := cmd.Wait()
 	if err == nil {
@@ -329,6 +347,9 @@ func waitExitCode(cmd *exec.Cmd) uint32 {
 	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			return uint32(128 + int(ws.Signal()))
+		}
 		return uint32(ee.ExitCode())
 	}
 	return 0

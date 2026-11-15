@@ -35,8 +35,9 @@ import (
 // --- TaskService RPCs -------------------------------------------------------
 
 // Kill signals the init (or an exec) — or the whole cgroup with All. In the
-// created state the gate-holding helper plays the paused-init role: the
-// signal lands there and its death resolves the container.
+// created state the init process exists (born at create, holding the gate)
+// and is the signal target; its supervising helper reports the exit and the
+// report EOF resolves the task.
 func (s *taskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (*emptypb.Empty, error) {
 	c, err := s.getContainer(r.ID)
 	if err != nil {
@@ -68,10 +69,14 @@ func (s *taskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (*emptyp
 	if r.All {
 		killCgroup(cgPath)
 	}
-	// In the created state the container init does not exist yet; the
-	// gate-holding helper is the process a signal must reach.
 	target := pid
-	if target <= 0 && r.ExecID == "" {
+	if target <= 0 && r.ExecID == "" && isCreated {
+		// The created init's pid report never landed (broken protocol):
+		// sweep the cgroup — the gate-holding helper and anything it
+		// created are its only members — and signal the helper, so the
+		// report EOF still resolves the task instead of leaving a created
+		// record that nothing can exit.
+		killCgroup(cgPath)
 		target = helperPid(c)
 	}
 	if target > 0 {
@@ -79,7 +84,6 @@ func (s *taskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (*emptyp
 			return nil, errgrpc.ToGRPCf(errdefs.ErrUnknown, "kill %d: %v", target, err)
 		}
 	}
-	_ = isCreated
 	return &emptypb.Empty{}, nil
 }
 

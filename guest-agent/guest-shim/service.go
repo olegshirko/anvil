@@ -81,9 +81,9 @@ type container struct {
 	stderr    string
 	stdinOpen bool
 
-	// init process state. pid is 0 until the init helper reports the
-	// container init's creation at start (docker shows Pid 0 for created
-	// containers).
+	// init process state. pid is the container init's global pid, known
+	// from the create-time "P" report (the init is born holding the gate
+	// and the create response answers with it, like the runc shim does).
 	pid      int
 	status   task.Status
 	exitCode uint32

@@ -15,9 +15,10 @@ import (
 
 // cgroup v2 management for the fast shim: one directory under
 // /sys/fs/cgroup (the containerd default spec sets Linux.CgroupsPath to
-// "/<namespace>/<id>"), limits written from the spec before Create, the dir
-// fd handed to clone3 (CLONE_INTO_CGROUP — the init is born inside its
-// limits, no later MoveProcess), and freeze/pause via cgroup.freeze.
+// "/<namespace>/<id>"), limits written from the spec before Create, the
+// init helper moving itself — and with it the container init it creates —
+// into the dir via a cgroup.procs write, and freeze/pause via
+// cgroup.freeze.
 
 const cgroupRoot = "/sys/fs/cgroup"
 
