@@ -267,6 +267,13 @@ func (s *taskService) startInit(ctx context.Context, c *container) (*taskAPI.Sta
 	s.mu.Lock()
 	c.status = task.Status_RUNNING
 	s.mu.Unlock()
+	// The runc shim publishes TaskStart; without it containerd never sees
+	// the running transition and the agent's docker "start" event dies the
+	// moment fast-shim containers are wired.
+	s.send(&eventstypes.TaskStart{
+		ContainerID: c.id,
+		Pid:         uint32(msg.pid),
+	})
 	log.G(ctx).WithFields(log.Fields{"id": c.id, "pid": msg.pid}).Debug("container init created")
 	return &taskAPI.StartResponse{Pid: uint32(msg.pid)}, nil
 }
@@ -291,7 +298,7 @@ func (s *taskService) readReports(c *container) {
 			return
 		}
 		line = strings.TrimRight(line, "\n")
-		log.L.WithField("id", c.id).Infof("report line: %q", line)
+		log.L.WithField("id", c.id).Debugf("report line: %q", line)
 		switch {
 		case strings.HasPrefix(line, reportStartedPrefix):
 			pid, _ := strconv.Atoi(strings.TrimPrefix(line, reportStartedPrefix))
