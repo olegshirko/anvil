@@ -115,7 +115,6 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 	if nerr != nil {
 		return nerr
 	}
-	tr.mark("cni-attach")
 
 	did := dockerID(ns, id)
 	run := beginTaskRun(did)
@@ -234,6 +233,7 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 	cmd := exec.Command(fastShimRuntimeName, "init", "-id", id, "-bundle", bundle, "-cgroup")
 	cmd.ExtraFiles = []*os.File{gateR, reportW, childStdin, stdoutW, stderrW}
 	cmd.Env = os.Environ()
+	tr.mark("spawn")
 	if serr := cmd.Start(); serr != nil {
 		closeFile(childStdin)
 		stdoutR.Close()
@@ -283,7 +283,9 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 					task.pid = ev.pid
 					task.mu.Unlock()
 				}
+				tr.mark("init-born")
 			case 'R':
+				tr.mark("init-ready")
 				ready = true
 			case 'E':
 				setupErr = fmt.Errorf("%s", ev.detail)
@@ -324,20 +326,26 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 		supervisor.remove(ns, id)
 		task.failStart(fmt.Errorf("release init gate: %w", werr))
 		cmd.Process.Kill() //nolint:errcheck
+		if task.cgroupPath != "" {
+			os.RemoveAll(task.cgroupPath) //nolint:errcheck — the killed helper cannot remove it
+		}
 		return fmt.Errorf("release init gate: %w", werr)
 	}
 	gateW.Close()
-	tr.mark("helper")
+	tr.mark("gate")
 
 	// Wait for the started report: the helper confirms the user exec landed.
 	startCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	perr = waitDirectStarted(startCtx, events, task)
+	perr = waitDirectStarted(startCtx, events, task, tr)
 	cancel()
 	if perr != nil {
 		sink.close()
 		supervisor.remove(ns, id)
 		task.failStart(perr)
 		cmd.Process.Kill() //nolint:errcheck
+		if task.cgroupPath != "" {
+			os.RemoveAll(task.cgroupPath) //nolint:errcheck — the killed helper cannot remove it
+		}
 		return fmt.Errorf("start: %w", perr)
 	}
 	tr.mark("task-start")
@@ -364,7 +372,7 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 
 // waitDirectStarted consumes reports until the started one (S), a start
 // failure (X/D) or helper EOF.
-func waitDirectStarted(ctx context.Context, events <-chan directReportEvent, task *directTask) error {
+func waitDirectStarted(ctx context.Context, events <-chan directReportEvent, task *directTask, tr *phaseTrace) error {
 	for {
 		select {
 		case ev, ok := <-events:
@@ -379,6 +387,7 @@ func waitDirectStarted(ctx context.Context, events <-chan directReportEvent, tas
 					task.mu.Unlock()
 				}
 				task.markStarted(ev.pid)
+				tr.mark("init-exec")
 				return nil
 			case 'X', 'E':
 				return fmt.Errorf("%s", ev.detail)
