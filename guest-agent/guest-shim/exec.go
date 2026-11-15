@@ -302,6 +302,27 @@ func runExecHelper(initpidArg, bundle string) int {
 		return 1
 	}
 
+	// Move this process's root into the container now: the mount
+	// namespace join happens later, in the single-threaded raw window,
+	// and a namespace switch does NOT carry the root directory with it —
+	// without this chroot every path (the exec lookup below, the final
+	// execve) still resolves against the initramfs. runc's nsenter does
+	// the same via /proc/<pid>/root.
+	rootFd, err := unix.Open(fmt.Sprintf("/proc/%d/root", initpid), unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		reportLine(reportSetupPrefix+"open init root: %v", err)
+		return 1
+	}
+	if err := unix.Fchdir(rootFd); err != nil {
+		reportLine(reportSetupPrefix+"fchdir init root: %v", err)
+		return 1
+	}
+	unix.Close(rootFd) //nolint:errcheck
+	if err := unix.Chroot("."); err != nil {
+		reportLine(reportSetupPrefix+"chroot init root: %v", err)
+		return 1
+	}
+
 	// Final stdio (fds 4/5/6 were handed over by the shim).
 	tty := pspec.Terminal
 	if tty {
@@ -329,8 +350,8 @@ func runExecHelper(initpidArg, bundle string) int {
 	// process (and the forked child doing the lookup) from its install
 	// until the exec. Resolution needs stat under the container's PATH,
 	// which the default profile denies (runc's ordering is the same for a
-	// reason). The namespaces are already joined above, so the lookup sees
-	// the container's rootfs.
+	// reason). The root was chrooted into the container's rootfs above,
+	// so the lookup sees the container's filesystem.
 	argv0, err := resolveExecPath(&specs.Spec{Process: &pspec})
 	if err != nil {
 		reportLine(reportStartPrefix+"%v", err)
