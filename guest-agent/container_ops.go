@@ -708,7 +708,12 @@ func deleteNativeContainer(ctx context.Context, ns, id string, force, removeVolu
 		if meta != nil {
 			ports = meta.Ports
 		}
-		releaseEndpoints(ctx, ns, id, ni, ports)
+		// The CNI DEL costs ~70 ms and sits on the DELETE response path,
+		// which `docker run --rm` waits for. It need not: the endpoint is
+		// claimed here (so a later start of the same name still waits via
+		// awaitNetRelease), and the caller keeps its ordering — the detach
+		// only has to finish before that name is started again.
+		go releaseEndpoints(context.WithoutCancel(ctx), ns, id, ni, ports)
 	} else {
 		awaitNetRelease(ns, id) // before the netns goes away under it
 	}
