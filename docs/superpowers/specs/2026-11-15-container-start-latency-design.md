@@ -30,7 +30,8 @@ Docker-API emulation and containerd/shim path.
 
 - `docker run --rm alpine true` (CLI): 556 ms → **≤ 30 ms** (staged: 120 →
   40 → 30).
-- Same op via API: ≤ 15 ms.
+- Same op via API: ≤ 15 ms after Stages 1–3, **≤ 5 ms after Stage 4**
+  (Kiri: 2.55 ms).
 - Every stage keeps `make unit-tests` green and dev-instance integration
   suite passing; bench scripts (`scripts/time_run.py`, `time_api.py`) are
   the regression gate, run before/after each stage.
@@ -147,13 +148,35 @@ HTTP/gRPC roundtrips. Plan:
   DEL on the response path — answer first, detach async (exit watcher
   already does; verify rm waits on nothing it shouldn't).
 
-### North star (explicitly not this project)
+### Stage 4 — direct supervision (≤ 30 → ≤ 15 ms API; Oleg's call: in scope)
 
-Full Kiri parity (≤ 5 ms API) requires no containerd in the hot path —
-their agent is the supervisor (one clone3, no shim, no runc, no dockerd).
-That means migrating restart.go/scanner/exec off containerd tasks first.
-Out of scope here; Stage 2's shim keeps every consumer intact and gets
-anvil within ~10× of Kiri.
+Remove containerd from the task hot path for fast-shim containers. The
+agent spawns and dials the fast shim directly (ttrpc over its socket);
+containerd keeps the container record (store, snapshots, labels, leases)
+but never learns about the task. An agent-side supervisor registry becomes
+the task source of truth:
+
+- `supervise.go`: registry of fast tasks (ns, containerd id, shim socket,
+  pid, state, exit code) with exit-event subscribers and a
+  `RunningTasks(ns)` view. Built at start; rebuilt at boot by the existing
+  orphan cleanup, which learns to reap stale shim sockets/processes.
+- scanner: `buildState` merges `supervisor.RunningTasks` with containerd's
+  `TaskService().List` (runc-shim containers) — port push unchanged.
+- restart.go: supervisor exit events call the existing
+  `restartMonitor.update(..., running=false)`; the 1 s containerd poll
+  stays as fallback for runc-shim containers.
+- exec: `docker exec`/healthchecks on fast containers dial the shim's
+  ttrpc Exec directly (the shim owns init, so exec goes through it as
+  before — only the containerd middleman drops out).
+- /wait, events, stats and watchTaskExit read the supervisor; the
+  exit-code cache and run-generation guard remain the single source of
+  truth they are today.
+
+Runc-shim containers keep the exact today path end to end; every consumer
+works against both registries. Full parity arithmetic: create (snapshot +
+spec, ~5 ms after Stage 3) + start (clone3, ~2 ms) + exit observed (~2 ms)
+≈ Kiri's 2.55 ms regime; the residual gap is HTTP+snapshot work Kiri does
+not have at all.
 
 ## What the builder decides
 
