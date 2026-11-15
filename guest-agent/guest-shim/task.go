@@ -270,15 +270,27 @@ func (s *taskService) startInit(ctx context.Context, c *container) (*taskAPI.Sta
 		return nil, errgrpc.ToGRPCf(errdefs.ErrUnknown, "failed to start: %v", msg.err)
 	}
 	s.mu.Lock()
-	c.status = task.Status_RUNNING
+	// A container that ran faster than this RPC keeps its STOPPED status:
+	// its exit may already have been recorded by readReports.
+	if !c.exited {
+		c.status = task.Status_RUNNING
+	}
+	c.pid = msg.pid
+	c.started = true
+	pending, pid, code, at := c.exitPending, c.pid, c.exitCode, c.exitedAt
+	c.exitPending = false
 	s.mu.Unlock()
 	// The runc shim publishes TaskStart; without it containerd never sees
 	// the running transition and the agent's docker "start" event dies the
-	// moment fast-shim containers are wired.
+	// moment fast-shim containers are wired. Order matters: TaskStart goes
+	// out before any held-back TaskExit.
 	s.send(&eventstypes.TaskStart{
 		ContainerID: c.id,
 		Pid:         uint32(msg.pid),
 	})
+	if pending {
+		publishTaskExit(s, c.id, "", pid, code, at)
+	}
 	log.G(ctx).WithFields(log.Fields{"id": c.id, "pid": msg.pid}).Debug("container init created")
 	return &taskAPI.StartResponse{Pid: uint32(msg.pid)}, nil
 }
@@ -340,12 +352,22 @@ func (s *taskService) finalizeExit(c *container, code uint32) {
 	c.exitCode = code
 	c.exitedAt = time.Now()
 	c.status = task.Status_STOPPED
-	pid := c.pid
+	pid, at := c.pid, c.exitedAt
+	// The exit can land before the Start RPC published TaskStart (a
+	// container that runs faster than the round trip). containerd drops a
+	// TaskExit for a task it never saw start, so the event waits for
+	// startInit to publish TaskStart first.
+	started := c.started
+	if !started {
+		c.exitPending = true
+	}
 	s.mu.Unlock()
 	close(c.waitCh)
 	c.io.closeSinks()
-	publishTaskExit(s, c.id, "", pid, code, c.exitedAt)
-	log.L.WithFields(log.Fields{"id": c.id, "code": code}).Debug("container init exited")
+	if started {
+		publishTaskExit(s, c.id, "", pid, code, at)
+	}
+	log.L.WithFields(log.Fields{"id": c.id, "code": code, "deferred": !started}).Debug("container init exited")
 }
 
 // waitExitCode joins the helper process and returns its exit code (128+sig

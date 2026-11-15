@@ -42,12 +42,25 @@ TRACE_EXIT_RE = re.compile(
 )
 
 
-def run_once(context: str, image: str, cmd: str) -> float:
+HANGS = 0
+
+
+def run_once(context: str, image: str, cmd: str, timeout: float = 30.0) -> float:
+    global HANGS
     t0 = time.perf_counter()
-    subprocess.run(
-        ["docker", "--context", context, "run", "--rm", image, cmd],
-        check=True, capture_output=True,
-    )
+    try:
+        subprocess.run(
+            ["docker", "--context", context, "run", "--rm", image, cmd],
+            check=True, capture_output=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        # A hung run must not stall the whole bench; count it and let the
+        # summary expose it (a hang is a correctness bug, not slowness).
+        HANGS += 1
+        subprocess.run(
+            ["docker", "--context", context, "ps", "-aq", "--filter", "ancestor=" + image],
+            capture_output=True,
+        )
     return (time.perf_counter() - t0) * 1000.0
 
 
@@ -102,6 +115,8 @@ def main() -> None:
     print(f"\n{args.runs} timed `docker run --rm {args.image} {args.cmd}` ({args.context}):")
     print(f"  median {statistics.median(samples):.1f} ms | min {samples[0]:.1f} ms | "
           f"max {samples[-1]:.1f} ms | p10 {samples[n // 10]:.1f} ms | p90 {samples[(9 * n) // 10]:.1f} ms")
+    if HANGS:
+        print(f"  WARNING: {HANGS} run(s) hung past the timeout and were counted as slow")
 
     if exit_waits:
         print(f"\n  /wait exit observed after: median {fmt_us(statistics.median(exit_waits))}")

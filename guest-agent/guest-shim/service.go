@@ -90,6 +90,15 @@ type container struct {
 	exitedAt time.Time
 	exited   bool
 
+	// started is set once TaskStart has been published, exitPending marks an
+	// exit recorded before that happened. A fast container (alpine true)
+	// can exit before its Start RPC returns; publishing TaskExit first makes
+	// containerd drop the exit for a task it never saw start, leaving the
+	// container "running" forever. The exit event is therefore held until
+	// TaskStart is out.
+	started     bool
+	exitPending bool
+
 	// waitCh is closed once the init exit is recorded; late waiters read
 	// exitCode directly (the code is cached, mirroring the agent's
 	// watchTaskExit semantics).
