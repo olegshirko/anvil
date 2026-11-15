@@ -291,6 +291,7 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 				tr.mark("init-born")
 			case 'R':
 				tr.mark("init-ready")
+				copyHelperTrace(id)
 				ready = true
 			case 'E':
 				setupErr = fmt.Errorf("%s", ev.detail)
@@ -373,6 +374,28 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 	// die event, registry exit, meta, CNI detach) in the report consumer.
 	go finishDirectRun(context.Background(), task, events, sink, netName, ports, run)
 	return nil
+}
+
+// copyHelperTrace moves the helper's setup-phase trace out of the guest
+// tmpfs into the shared .anvil-run directory (debug builds only). The helper
+// writes to tmpfs so the marks themselves cost microseconds; a virtiofs write
+// there can block for tens of milliseconds and distort the phases.
+func copyHelperTrace(id string) {
+	if !debugMode {
+		return
+	}
+	src := "/tmp/anvil-helper-trace-" + id
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return
+	}
+	os.Remove(src) //nolint:errcheck — best effort
+	f, err := os.OpenFile(filepath.Join(anvilRunDir, "direct-helper-trace.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.Write(data) //nolint:errcheck — diagnostics only
 }
 
 // waitDirectStarted consumes reports until the started one (S), a start

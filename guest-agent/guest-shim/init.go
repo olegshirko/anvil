@@ -124,7 +124,10 @@ func helperTrace(id, stage string) {
 	}
 	ts := time.Now().UnixNano()
 	if helperTraceOut == nil {
-		f, err := os.OpenFile("/mnt/anvil/.anvil-run/direct-helper-trace.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		// tmpfs, not the shared virtiofs directory: a share write can block
+		// tens of milliseconds and would distort the very phases it records.
+		// The agent copies the per-container file out when setup completes.
+		f, err := os.OpenFile("/tmp/anvil-helper-trace-"+id, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
 			return
 		}
