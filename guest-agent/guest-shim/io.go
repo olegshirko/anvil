@@ -141,6 +141,19 @@ func newStdioSet(ctx context.Context, id string, stdin, stdout, stderr string, t
 	}
 	s.outSink = outSink
 	s.errSink = errSink
+	// Detached io (no URIs at all — a ctr NullIO attach): the helper's
+	// fixed-fd handover expects all three child fds to exist (ExtraFiles
+	// 5..7 must stay contiguous), so absent ends point at /dev/null.
+	if outSink == nil {
+		if outSink, err = os.OpenFile("/dev/null", os.O_RDWR, 0); err != nil {
+			return nil, fmt.Errorf("open /dev/null: %w", err)
+		}
+		s.outSink = outSink
+	}
+	if errSink == nil {
+		errSink = outSink
+		s.errSink = errSink
+	}
 	if outSink != nil {
 		s.closeFns = append(s.closeFns, func() { outSink.Close() }) //nolint:errcheck
 	}
@@ -176,12 +189,15 @@ func newStdioSet(ctx context.Context, id string, stdin, stdout, stderr string, t
 	}
 
 	// Without a terminal the sinks ARE the child's streams, and stdin is a
-	// fifo read end (or /dev/null via the nil dup).
+	// fifo read end (or /dev/null when detached — the child's fd trio must
+	// exist for the fixed-fd handover).
 	s.childStdout, s.childStderr = outSink, errSink
 	if stdin != "" {
 		if s.childStdin, err = openFifoRead(stdin); err != nil {
 			return nil, err
 		}
+	} else if s.childStdin, err = os.OpenFile("/dev/null", os.O_RDONLY, 0); err != nil {
+		return nil, fmt.Errorf("open /dev/null: %w", err)
 	}
 	return s, nil
 }
@@ -303,26 +319,6 @@ func openFifoRead(path string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), path), nil
 }
 
-// dupTo returns the fd duplicated at target (clearing close-on-exec so it
-// survives the child's execve).
-func dupTo(f *os.File, target int) error {
-	if f == nil {
-		// Nothing wired for this stream: point it at /dev/null.
-		null, err := unix.Open("/dev/null", unix.O_RDWR, 0)
-		if err != nil {
-			return err
-		}
-		if null != target {
-			if err := unix.Dup3(null, target, 0); err != nil {
-				return err
-			}
-			unix.Close(null) //nolint:errcheck
-		}
-		return nil
-	}
-	return unix.Dup3(int(f.Fd()), target, 0)
-}
-
 // startCopies runs the shim-side copying for a console: master -> stdout
 // sink and, when stdin is wired, stdin -> master. Master EOF (all slaves
 // closed, i.e. the process is gone) ends the out copy; stdin EOF ends only
@@ -429,20 +425,4 @@ func resizeConsole(master console.Console, w, h uint32) error {
 	return unix.IoctlSetWinsize(int(master.Fd()), unix.TIOCSWINSZ, &unix.Winsize{
 		Row: uint16(w), Col: uint16(h),
 	})
-}
-
-// dupChildFds places the stdio fds at the fixed fd numbers the init helper
-// expects (extra files 3..7 of the helper's exec.Cmd; the stdio trio is the
-// last three).
-func (s *stdioSet) dupChildFds() error {
-	if err := dupTo(s.childStdin, fdStdin); err != nil {
-		return fmt.Errorf("dup stdin: %w", err)
-	}
-	if err := dupTo(s.childStdout, fdStdout); err != nil {
-		return fmt.Errorf("dup stdout: %w", err)
-	}
-	if err := dupTo(s.childStderr, fdStderr); err != nil {
-		return fmt.Errorf("dup stderr: %w", err)
-	}
-	return nil
 }
