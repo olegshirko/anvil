@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -73,7 +74,7 @@ func isEOFMarker(raw []byte) bool {
 
 // runJSONLogger implements the `guest-agent --log-json <path>` logging
 // subcommand. It never returns until both input streams are closed.
-func runJSONLogger(path string, rot logRotation) error {
+func runJSONLogger(path string, rot logRotation, marker bool) error {
 	out, err := openRotatingLog(path, rot)
 	if err != nil {
 		return err
@@ -87,6 +88,21 @@ func runJSONLogger(path string, rot logRotation) error {
 		ready.Close()
 	}
 
+	var stdout, stderr io.Reader
+	if f := os.NewFile(3, "CONTAINER_stdout"); f != nil {
+		stdout = f
+	}
+	if f := os.NewFile(4, "CONTAINER_stderr"); f != nil {
+		stderr = f
+	}
+	return runStreamLogger(out, path, marker, stdout, stderr)
+}
+
+// runStreamLogger is the logger body shared by the shim-spawned (fd3/fd4)
+// and FIFO-mode loggers: split both streams into records, and — when the
+// eof marker is armed — end the log with the marker once the container
+// output is final. It returns when both readers are exhausted.
+func runStreamLogger(out *rotatingLog, logPath string, marker bool, stdout, stderr io.Reader) error {
 	// The shim never closes the stream fds, so the readers never see EOF
 	// while the task record exists — a trailing partial line (printf
 	// without newline, `... | head -c N`) would be lost forever. Partials
@@ -94,23 +110,26 @@ func runJSONLogger(path string, rot logRotation) error {
 	// stream immediately.
 	startPartialFlusher(out)
 
+	if marker {
+		go watchPidFileForMarker(out, logPath)
+	}
+
 	var wg sync.WaitGroup
 	for _, s := range []struct {
 		name string
-		fd   uintptr
+		r    io.Reader
 	}{
-		{"stdout", 3},
-		{"stderr", 4},
+		{"stdout", stdout},
+		{"stderr", stderr},
 	} {
+		if s.r == nil {
+			continue
+		}
 		wg.Add(1)
-		go func(name string, fd uintptr) {
+		go func(name string, r io.Reader) {
 			defer wg.Done()
-			f := os.NewFile(fd, "CONTAINER_"+name)
-			if f == nil {
-				return
-			}
-			writeStream(out, name, f)
-		}(s.name, s.fd)
+			writeStream(out, name, r)
+		}(s.name, s.r)
 	}
 	wg.Wait()
 	return nil
@@ -118,8 +137,9 @@ func runJSONLogger(path string, rot logRotation) error {
 
 // runFifoJSONLogger is the logger for a task the shim runs in FIFO mode
 // (stdin-attached, non-TTY containers): it reads the stream FIFOs by path and
-// exits when the shim closes them at the process exit.
-func runFifoJSONLogger(path string, rot logRotation, fifos loggerFifos) error {
+// exits when the shim closes them at the process exit. That natural EOF is
+// the output being final, so the log ends with the eof marker.
+func runFifoJSONLogger(path string, rot logRotation, fifos loggerFifos, marker bool) error {
 	out, err := openRotatingLog(path, rot)
 	if err != nil {
 		return err
@@ -141,7 +161,100 @@ func runFifoJSONLogger(path string, rot logRotation, fifos loggerFifos) error {
 		}(name, p)
 	}
 	wg.Wait()
+	if marker {
+		finalizeLogRecords(out)
+	}
 	return nil
+}
+
+// initPidPoll and initGonePoll pace the logger's two waits: for the agent's
+// pid file (written right after the task starts) and for the init process
+// to disappear. Both are well under the follow loop's poll cadence, so the
+// marker costs the attach nothing measurable.
+const (
+	initPidPoll  = 20 * time.Millisecond
+	initGonePoll = 10 * time.Millisecond
+)
+
+// initPidPath is the sidecar file carrying the container init's pid for the
+// task logger. The binary-v2 logger is spawned by the shim at Create, before
+// the init exists, so argv/env cannot carry the pid (containerd builds the
+// logger's argv from the log URI's query map); a file next to the log is the
+// only channel that works, and it dies with the container's store dir.
+func initPidPath(logPath string) string {
+	return logPath + ".pid"
+}
+
+// writeInitPidFile records the container init's pid for the task logger.
+// Failure is not fatal: the marker then never appears and the follow loop's
+// timer fallback ends the stream as before.
+func writeInitPidFile(logPath string, pid int) {
+	if err := os.WriteFile(initPidPath(logPath), []byte(strconv.Itoa(pid)), 0o644); err != nil {
+		debugLog("write pid file %s: %v", initPidPath(logPath), err)
+	}
+}
+
+// watchPidFileForMarker ends the log with the eof marker when the container
+// init is gone: wait for the agent's pid file, watch the pid, then flush the
+// streams' pending partials and append the marker. A pid file that never
+// appears (task never started, or a pre-marker log) leaves the follow
+// loop's timers in charge — the same safety net as before.
+func watchPidFileForMarker(out io.Writer, logPath string) {
+	pidPath := initPidPath(logPath)
+	pid := 0
+	for {
+		b, err := os.ReadFile(pidPath)
+		if err == nil {
+			n, perr := strconv.Atoi(strings.TrimSpace(string(b)))
+			if perr == nil && n > 0 {
+				pid = n
+				break
+			}
+			// A malformed file never heals; give up on the marker.
+			debugLog("logger: bad pid file %s: %q", pidPath, b)
+			return
+		}
+		if !os.IsNotExist(err) {
+			debugLog("logger: read pid file %s: %v", pidPath, err)
+			return
+		}
+		time.Sleep(initPidPoll)
+	}
+	<-watchInitPid(pid, initGonePoll)
+	finalizeLogRecords(out)
+}
+
+// watchInitPid returns a channel that closes once the process no longer
+// exists.
+func watchInitPid(pid int, poll time.Duration) <-chan struct{} {
+	ch := make(chan struct{})
+	go func() {
+		defer close(ch)
+		for !initGone(pid) {
+			time.Sleep(poll)
+		}
+	}()
+	return ch
+}
+
+// initGone reports whether pid has exited and been reaped: kill(pid, 0)
+// answers ESRCH only then. A just-exited init is still a zombie until the
+// shim's reaper collects it — a few ms at most, still far inside the
+// follow loop's cadence.
+func initGone(pid int) bool {
+	return syscall.Kill(pid, 0) == syscall.ESRCH
+}
+
+// finalizeLogRecords writes the log's final records: the streams' pending
+// partial tails first (forced, both streams are done), then the eof marker.
+// A short second pass catches bytes that were still in flight in the pipe
+// when the init died — the reader goroutines are woken by data, not by the
+// exit, so this is microseconds, not a quiet window.
+func finalizeLogRecords(out io.Writer) {
+	flushQuietPartials(out, time.Now().Add(partialFlushAfter))
+	time.Sleep(5 * time.Millisecond)
+	flushQuietPartials(out, time.Now().Add(partialFlushAfter))
+	writeEOFMarker(out)
 }
 
 // partialFlushAfter is how long an unterminated tail may sit before it is
@@ -280,7 +393,11 @@ func writeStream(out io.Writer, stream string, r io.Reader) {
 
 // taskLogURI builds the binary-v2 log URI pointing at this binary with the
 // hidden logging subcommand. Query args become argv for the spawned logger.
-func taskLogURI(logPath string, rot logRotation) (*url.URL, error) {
+// eofMarker arms the logger's end-of-stream record; it is set for non-TTY
+// containers only — a TTY task's console copy starts when the init dies, so
+// marker-driven EOF would truncate its tail (builder-check resolution: TTY
+// keeps the stopQuiet timers end to end).
+func taskLogURI(logPath string, rot logRotation, eofMarker bool) (*url.URL, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("resolve agent path: %w", err)
@@ -290,6 +407,9 @@ func taskLogURI(logPath string, rot logRotation) (*url.URL, error) {
 	q.Set("--log-json", logPath)
 	q.Set("--max-size", strconv.FormatInt(rot.maxSize, 10))
 	q.Set("--max-file", strconv.Itoa(rot.maxFile))
+	if eofMarker {
+		q.Set("--eof-marker", "1")
+	}
 	u.RawQuery = q.Encode()
 	return u, nil
 }
