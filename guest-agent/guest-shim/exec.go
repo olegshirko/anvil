@@ -455,53 +455,29 @@ func globalPidOf(nsPid int) int {
 	return nsPid
 }
 
-// forkAndExecUser is forkAndExecInit without the init-spec indirection: the
-// exec spec's argv/env, gate fd from the exec layout.
+// forkAndExecUser is the exec trampoline: the shared forkExecUser with the
+// exec helper's gate/report fd layout. Returns once the execve landed
+// (confirm pipe EOF) or failed (message came through instead).
 func forkAndExecUser(pspec *specs.Process, gateFD int) (code int, pid int, detail string, err error) {
-	argv0, err := resolveExecPath(&specs.Spec{Process: pspec})
+	confirmR, childPid, detail, err := forkExecUser(pspec, gateFD, fdReport)
 	if err != nil {
-		return 127, 0, err.Error(), err
+		return 127, 0, detail, err
 	}
-	pathPtr, err := unix.BytePtrFromString(argv0)
-	if err != nil {
-		return 127, 0, "", err
-	}
-	argvPtrs, err := argvBytePtrs(pspec.Args)
-	if err != nil {
-		return 127, 0, "", err
-	}
-	envPtrs, err := envBytePtrs(pspec.Env)
-	if err != nil {
-		return 127, 0, "", err
-	}
-	args := pid0Args{
-		reportFD:   fdReport,
-		gateFD:     gateFD,
-		pathPtr:    pathPtr,
-		argvPtrs:   argvPtrs,
-		envPtrs:    envPtrs,
-		failMsg:    &failExecMessage[0],
-		failMsgLen: len(failExecMessage),
-	}
-	pid, errno := forkRaw()
-	if errno != 0 {
-		return 127, 0, "", fmt.Errorf("fork exec: %w", errno)
-	}
-	if pid == 0 {
-		pid0RawChild(args)
-		// unreached
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	defer unix.Close(confirmR) //nolint:errcheck
+	buf := make([]byte, 128)
+	n, rerr := unix.Read(confirmR, buf)
+	if rerr != nil || n > 0 {
+		msg := strings.TrimSpace(string(buf[:n]))
+		if msg == "" {
+			msg = "exec died before exec"
+		}
 		var ws unix.WaitStatus
-		wpid, werr := unix.Wait4(pid, &ws, unix.WNOHANG, nil)
-		if werr == nil && wpid == pid {
-			return 127, 0, fmt.Sprintf("exec died during start (code %d)", exitStatus(ws)), fmt.Errorf("exec failed")
+		wp, werr := unix.Wait4(childPid, &ws, 0, nil)
+		code = 127
+		if werr == nil && wp == childPid {
+			code = int(exitStatus(ws))
 		}
-		if werr != nil {
-			break
-		}
-		time.Sleep(time.Millisecond)
+		return code, 0, msg, fmt.Errorf("exec failed")
 	}
-	return 0, pid, "", nil
+	return 0, globalPidOf(childPid), "", nil
 }

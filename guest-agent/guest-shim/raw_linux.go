@@ -23,17 +23,21 @@ func forkRaw() (int, unix.Errno) {
 
 // pid0RawChild is everything the forked container init runs before it
 // becomes the user process: close the gate fd (never leak it into the
-// container) and execve. A failed execve is reported through the report fd
-// with a pre-built message and the child exits 127. Raw syscalls only.
+// container), mark the confirm fd close-on-exec (its closure IS the start
+// confirmation — the kernel does it as part of a successful execve) and
+// execve. A failed execve reports through the confirm fd with a pre-built
+// message and exits 127. Raw syscalls only.
 func pid0RawChild(a pid0Args) {
 	unix.RawSyscall(unix.SYS_CLOSE, uintptr(a.gateFD), 0, 0) //nolint:errcheck
+	// F_SETFD=2, FD_CLOEXEC=1: fcntl(confirmFD, F_SETFD, FD_CLOEXEC).
+	unix.RawSyscall(unix.SYS_FCNTL, uintptr(a.confirmFD), 2, 1) //nolint:errcheck
 	_, _, errno := unix.RawSyscall6(unix.SYS_EXECVE,
 		uintptr(unsafe.Pointer(a.pathPtr)),
 		uintptr(unsafe.Pointer(&a.argvPtrs[0])),
 		uintptr(unsafe.Pointer(&a.envPtrs[0])),
 		0, 0, 0)
 	if errno != 0 {
-		unix.RawSyscall(unix.SYS_WRITE, uintptr(a.reportFD),
+		unix.RawSyscall(unix.SYS_WRITE, uintptr(a.confirmFD),
 			uintptr(unsafe.Pointer(a.failMsg)), uintptr(a.failMsgLen))
 	}
 	unix.RawSyscall(unix.SYS_EXIT_GROUP, 127, 0, 0) //nolint:errcheck

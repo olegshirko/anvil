@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
@@ -471,29 +470,75 @@ func readSpecFile(path string) (*specs.Spec, error) {
 // forkAndExecInit creates the container init: a raw fork whose child
 // execve's the user process (PID 1 of the namespace). Between fork and
 // execve the child executes raw syscalls only — pointers prepared here —
-// the same discipline os/exec's forkAndExecInChild applies. A failed execve
-// is reported through the report fd by the child itself.
+// the same discipline os/exec's forkAndExecInChild applies.
+//
+// Start confirmation runs over a dedicated pipe: the child holds its write
+// end close-on-exec, so a SUCCESSFUL execve closes it instantly (EOF) and a
+// failed one reports the failure through it. Polling the child would race
+// containers whose whole life fits between fork and the first poll.
 func forkAndExecInit(spec *specs.Spec) (code int, pid int, detail string, err error) {
-	argv0, err := resolveExecPath(spec)
+	confirmR, pid, detail, err := forkExecUser(spec.Process, fdGate, fdReport)
 	if err != nil {
-		return 127, 0, err.Error(), err
+		return 127, 0, detail, err
+	}
+	defer unix.Close(confirmR) //nolint:errcheck
+
+	// EOF = the execve happened (the confirm fd closed at exec).
+	buf := make([]byte, 128)
+	n, rerr := unix.Read(confirmR, buf)
+	if rerr != nil || n > 0 {
+		// The child wrote the failure message (or died mid-report).
+		msg := strings.TrimSpace(string(buf[:n]))
+		if msg == "" {
+			msg = "init died before exec"
+		}
+		var ws unix.WaitStatus
+		wp, werr := unix.Wait4(pid, &ws, 0, nil)
+		code := 127
+		if werr == nil && wp == pid {
+			code = int(exitStatus(ws))
+		}
+		return code, 0, msg, fmt.Errorf("exec failed")
+	}
+	// Started: report the container init's global pid (procfs translates
+	// NSpid across the pid namespace boundary).
+	return 0, globalPidOf(pid), "", nil
+}
+
+// forkExecUser is the shared trampoline for the container init and exec
+// processes: applies nothing (attributes are the caller's, pre-fork),
+// forks, closes gateFD in the child, marks the confirm fd close-on-exec and
+// execve's. Returns the parent-side read end of the confirm pipe plus the
+// child pid; on exec failure the message comes back in detail.
+func forkExecUser(p *specs.Process, gateFD, reportFD int) (confirmR int, pid int, detail string, err error) {
+	argv0, err := resolveExecPath(&specs.Spec{Process: p})
+	if err != nil {
+		return -1, 0, err.Error(), err
 	}
 	// Pre-build every pointer the raw window needs: no allocation there.
 	pathPtr, err := unix.BytePtrFromString(argv0)
 	if err != nil {
-		return 127, 0, "", err
+		return -1, 0, "", err
 	}
-	argvPtrs, err := argvBytePtrs(spec.Process.Args)
+	argvPtrs, err := argvBytePtrs(p.Args)
 	if err != nil {
-		return 127, 0, "", err
+		return -1, 0, "", err
 	}
-	envPtrs, err := envBytePtrs(spec.Process.Env)
+	envPtrs, err := envBytePtrs(p.Env)
 	if err != nil {
-		return 127, 0, "", err
+		return -1, 0, "", err
 	}
+
+	// The confirm pipe: child's write end dies at a successful execve.
+	confirm := make([]int, 2)
+	if err := unix.Pipe(confirm); err != nil {
+		return -1, 0, "", fmt.Errorf("confirm pipe: %w", err)
+	}
+
 	args := pid0Args{
-		reportFD:   fdReport,
-		gateFD:     fdGate,
+		confirmFD:  confirm[1],
+		gateFD:     gateFD,
+		reportFD:   reportFD,
 		pathPtr:    pathPtr,
 		argvPtrs:   argvPtrs,
 		envPtrs:    envPtrs,
@@ -504,34 +549,23 @@ func forkAndExecInit(spec *specs.Spec) (code int, pid int, detail string, err er
 	// Raw fork. In the child only raw syscalls run (pid0RawChild).
 	pid, errno := forkRaw()
 	if errno != 0 {
-		return 127, 0, "", fmt.Errorf("fork init: %w", errno)
+		unix.Close(confirm[0])
+		unix.Close(confirm[1])
+		return -1, 0, "", fmt.Errorf("fork: %w", errno)
 	}
 	if pid == 0 {
 		pid0RawChild(args)
 		// unreached
 	}
-	// Parent: did the child get to execve? A death within the window is an
-	// exec failure (the child reports the generic detail itself; we surface
-	// the code).
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		var ws unix.WaitStatus
-		wpid, werr := unix.Wait4(pid, &ws, unix.WNOHANG, nil)
-		if werr == nil && wpid == pid {
-			return 127, 0, fmt.Sprintf("init exited during start (code %d)", exitStatus(ws)), fmt.Errorf("exec failed")
-		}
-		if werr != nil {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	return 0, pid, "", nil
+	unix.Close(confirm[1]) //nolint:errcheck — parent keeps the read end
+	return confirm[0], pid, "", nil
 }
 
 // pid0Args carries the pre-built pointers across the fork boundary.
 type pid0Args struct {
-	reportFD   int
+	confirmFD  int
 	gateFD     int
+	reportFD   int
 	pathPtr    *byte
 	argvPtrs   []*byte
 	envPtrs    []*byte
