@@ -483,8 +483,16 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	}
 
 	// Replay what exists — rotated files oldest first, then the live one —
-	// keeping only the last tail records when set.
+	// keeping only the last tail records when set. markerTail remembers
+	// whether the last complete record is the eof marker (the output is
+	// final: the container already ran to completion).
+	markerTail := false
 	liveSize, err := replayLog(logPath, opts.tail, func(raw []byte) {
+		if isEOFMarker(raw) {
+			markerTail = true
+			return
+		}
+		markerTail = false
 		var rec logLine
 		if json.Unmarshal(raw, &rec) == nil {
 			emitRecord(rec)
@@ -495,6 +503,14 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	}
 
 	if !opts.follow {
+		return nil
+	}
+	if markerTail {
+		// The replay already covered the container's whole output: the
+		// follow of an exited container ends here (`docker logs -f` /
+		// attach) instead of waiting on the stop timers. A marker mid-file
+		// (the previous run of a restarted container) does not trigger
+		// this — only a trailing one does.
 		return nil
 	}
 
@@ -528,9 +544,9 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	var quietSince time.Time
 	var stopDeadline time.Time
 	// A running container is followed indefinitely (docker logs -f must not
-	// end on a timer); the only bounded wait is for a log file that never
-	// appears while no stop condition can ever fire (callers without stop).
-	var fileSeen bool
+	// end on a timer); production callers always pass a stop condition
+	// (task exit, client disconnect). Only the stop-less mode — tests — is
+	// bounded by noStopWait.
 	var noStopDeadline time.Time
 	if opts.stop == nil {
 		wait := opts.noStopWait
@@ -553,7 +569,6 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 			ino = cur
 		}
 		if chunk, next, cerr := readLogFrom(logPath, off); cerr == nil {
-			fileSeen = true
 			if len(chunk) > 0 {
 				pending = append(pending, chunk...)
 				for {
@@ -563,6 +578,14 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 					}
 					var rec logLine
 					if json.Unmarshal(pending[:idx], &rec) == nil {
+						if rec.EOF {
+							// End-of-stream marker: the loggers write it
+							// once the container output is final, so the
+							// follow ends here — no debounce, no quiet
+							// window.
+							debugLog("follow %s: ended by eof marker", logPath)
+							return nil
+						}
 						emitRecord(rec)
 					}
 					pending = pending[idx+1:]
@@ -591,8 +614,8 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 				return nil
 			}
 		}
-		if !fileSeen && !noStopDeadline.IsZero() && time.Now().After(noStopDeadline) {
-			return nil // the task never started and no stop condition exists
+		if !noStopDeadline.IsZero() && time.Now().After(noStopDeadline) {
+			return nil // stop-less mode is bounded (tests; production sets stop)
 		}
 		if stopCount > 0 {
 			time.Sleep(50 * time.Millisecond) // exiting: finish promptly
