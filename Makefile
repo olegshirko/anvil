@@ -3,7 +3,7 @@
     service-install service-uninstall service-start service-stop service-restart service-status \
     service-debug service-debug-rebuild rebuild-all \
     dev-start dev-stop dev-rebuild dev-integration dev-validate \
-    docker-context-anvil docker-context-lima lima-restart colima-start colima-stop \
+    docker-context-anvil docker-context-lima colima-start colima-stop \
     boot boot-alpine boot-ubuntu boot-containerd \
     download-alpine extract-alpine-kernel \
     download-ubuntu ubuntu-modules \
@@ -121,13 +121,6 @@ docker-context-lima:
 docker-context-anvil:
 	@docker context use anvil
 	@echo "[anvil] docker context: anvil"
-
-# Restart the Lima VM used for initramfs builds and as a fallback docker backend.
-lima-restart:
-	@limactl stop $(LIMA_INSTANCE) 2>/dev/null || true
-	@limactl start $(LIMA_INSTANCE)
-	@docker context use $(LIMA_DOCKER_CONTEXT)
-	@echo "[anvil] Lima VM '$(LIMA_INSTANCE)' restarted, docker context: $(LIMA_DOCKER_CONTEXT)"
 
 # Start/stop Colima with settings close to anvil (VZ VM + virtiofs mounts).
 colima-start:
@@ -436,13 +429,13 @@ download-upx:
 	fi
 
 initramfs-containerd: download-alpine extract-alpine-kernel alpine-virt-modules guest-agent guest-shim container-tools alpine-iptables download-upx
-	@if command -v limactl >/dev/null 2>&1 && limactl list anvil --format '{{.Status}}' 2>/dev/null | grep -q Running; then \
-	    echo "Building initramfs inside Lima VM 'anvil'..."; \
-	    limactl shell anvil -- bash $(CURDIR)/scripts/build_initramfs_containerd.sh; \
-	else \
-	    echo "Lima VM 'anvil' not running; falling back to local Docker (requires Docker Desktop)."; \
-	    scripts/build_initramfs_containerd.sh; \
-	fi
+	@ANVIL_BUILD_CONTEXT=$${ANVIL_BUILD_CONTEXT:-anvil}; \
+	if ! docker --context "$$ANVIL_BUILD_CONTEXT" info >/dev/null 2>&1; then \
+	    echo "docker context '$$ANVIL_BUILD_CONTEXT' is not reachable - initramfs builds run on the anvil service; start it first (make service-start) or pass ANVIL_BUILD_CONTEXT=<ctx>."; \
+	    exit 1; \
+	fi; \
+	echo "Building initramfs in docker context '$$ANVIL_BUILD_CONTEXT'..."; \
+	ANVIL_BUILD_CONTEXT=$$ANVIL_BUILD_CONTEXT scripts/build_initramfs_containerd.sh
 
 # Default boot path does NOT rebuild the initramfs so that an existing snapshot's
 # config hash stays valid. Build the initramfs explicitly with
