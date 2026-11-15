@@ -200,8 +200,9 @@ func (s *taskService) State(ctx context.Context, r *taskAPI.StateRequest) (*task
 }
 
 // Wait blocks until the init (or exec) process exits. The exit code is
-// cached: waiters arriving after the exit still get it, like the agent's
-// exit-code cache does for its own bookkeeping.
+// cached: waiters arriving after the exit read it directly, and waiters
+// blocked on the channel re-read it once the exit lands (a code captured
+// before the exit would be a stale zero).
 func (s *taskService) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.WaitResponse, error) {
 	c, err := s.getContainer(r.ID)
 	if err != nil {
@@ -227,6 +228,14 @@ func (s *taskService) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAP
 	case <-ctx.Done():
 		return nil, errgrpc.ToGRPC(context.Canceled)
 	}
+	// The channel closed while we waited: pick up the final code.
+	s.mu.Lock()
+	if r.ExecID == "" {
+		code = c.exitCode
+	} else if e := c.execs[r.ExecID]; e != nil {
+		code = e.exitCode
+	}
+	s.mu.Unlock()
 	return &taskAPI.WaitResponse{ExitStatus: code}, nil
 }
 
