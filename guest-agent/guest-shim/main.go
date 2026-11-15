@@ -43,7 +43,30 @@ import (
 const shimName = "anvil-fast-shim"
 
 func main() {
-	shim.RunShim(context.Background(), NewManager(shimName))
+	// The helper processes exec this binary before the user process starts;
+	// they bypass the shim server flow entirely.
+	if isInitHelper() {
+		os.Exit(runInit(helperArg("id"), helperArg("bundle")))
+	}
+	if isExecHelper() {
+		os.Exit(runExecHelper(helperArg("initpid"), helperArg("bundle")))
+	}
+	// NoReaper: every child here (init helpers, exec helpers) is joined by
+	// its own exec.Cmd watcher; the shared reaper would steal the waitpid.
+	shim.RunShim(context.Background(), NewManager(shimName), func(cfg *shim.Config) {
+		cfg.NoReaper = true
+	})
+}
+
+// helperArg reads "-<name> value" from the helper invocation argv.
+func helperArg(name string) string {
+	args := os.Args[2:]
+	for i := 0; i+1 < len(args); i += 2 {
+		if args[i] == "-"+name {
+			return args[i+1]
+		}
+	}
+	return ""
 }
 
 // NewManager returns the shim manager (the process-level shim.Shim).

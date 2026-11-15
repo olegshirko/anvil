@@ -3,15 +3,20 @@ module github.com/olegshirko/anvil/guest-agent
 go 1.26.11
 
 require (
+	github.com/containerd/console v1.0.5
 	github.com/containerd/containerd/api v1.11.1
 	github.com/containerd/containerd/v2 v2.3.7
 	github.com/containerd/errdefs v1.0.0
+	github.com/containerd/errdefs/pkg v0.3.0
 	github.com/containerd/go-cni v1.1.14
 	github.com/containerd/log v0.2.0
 	github.com/containerd/platforms v1.0.0-rc.5
+	github.com/containerd/plugin v1.1.0
+	github.com/containerd/ttrpc v1.2.9
 	github.com/containerd/typeurl/v2 v2.3.0
 	github.com/containernetworking/cni v1.3.1
 	github.com/docker/cli v29.9.2+incompatible
+	github.com/elastic/go-seccomp-bpf v1.6.0
 	github.com/mdlayher/vsock v1.3.0
 	github.com/moby/buildkit v0.32.2
 	github.com/opencontainers/go-digest v1.0.0
@@ -29,12 +34,9 @@ require (
 	github.com/Microsoft/hcsshim v0.15.0-rc.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/containerd/cgroups/v3 v3.1.3 // indirect
-	github.com/containerd/console v1.0.5 // indirect
 	github.com/containerd/continuity v0.5.0 // indirect
-	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/fifo v1.1.0 // indirect
-	github.com/containerd/plugin v1.1.0 // indirect
-	github.com/containerd/ttrpc v1.2.9 // indirect
+	github.com/containerd/go-runc v1.1.0 // indirect
 	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/docker-credential-helpers v0.9.8 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect

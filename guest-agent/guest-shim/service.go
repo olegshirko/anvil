@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"os"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -63,8 +65,8 @@ type taskService struct {
 	closed     bool
 }
 
-// container is one task the shim supervises: its init process, io plumbing
-// and lifecycle state.
+// container is one task the shim supervises: its init helper process, io
+// plumbing and lifecycle state.
 type container struct {
 	id     string
 	bundle string
@@ -79,29 +81,43 @@ type container struct {
 	stderr    string
 	stdinOpen bool
 
-	// init process state.
+	// init process state. pid is 0 until the init helper reports the
+	// container init's creation at start (docker shows Pid 0 for created
+	// containers).
 	pid      int
 	status   task.Status
 	exitCode uint32
 	exitedAt time.Time
+	exited   bool
 
 	// waitCh is closed once the init exit is recorded; late waiters read
 	// exitCode directly (the code is cached, mirroring the agent's
 	// watchTaskExit semantics).
 	waitCh chan struct{}
 
-	// gateW is the release pipe: writing "s" execs the created init,
-	// closing it makes a created (never started) init exit.
-	gateW *os.File
-	// reportR is the init's report pipe: setup result at create, exec
-	// result at start (EOF = exec succeeded, the fd is CLOEXEC).
-	reportR *os.File
+	// cmd is the init helper process (stage 1); gateW releases it, the
+	// report pipe carries its progress ("R"/"S"/"X"/"D" lines).
+	cmd       *exec.Cmd
+	gateW     *os.File
+	reportR   *os.File
+	reportBuf *bufio.Reader
+	startedCh chan startMsg
+
+	// io is the parent-side stdio plumbing (logger process, fifo ends,
+	// console master).
+	io *stdioSet
 
 	// cgPath is the container's cgroup v2 path (absolute; empty when the
 	// spec places no cgroup).
 	cgPath string
 
 	execs map[string]*execProcess
+}
+
+// startMsg is the start outcome delivered over the report pipe.
+type startMsg struct {
+	pid int
+	err error
 }
 
 // execProcess is one `docker exec` process inside a container.
@@ -111,8 +127,13 @@ type execProcess struct {
 	status    task.Status
 	exitCode  uint32
 	exitedAt  time.Time
+	exited    bool
 	waitCh    chan struct{}
+	cmd       *exec.Cmd
+	gateW     *os.File
 	reportR   *os.File
+	reportBuf *bufio.Reader
+	io        *stdioSet
 	stdinOpen bool
 	term      bool
 }

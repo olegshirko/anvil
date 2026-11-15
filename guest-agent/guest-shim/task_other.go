@@ -17,6 +17,23 @@ import (
 // Non-Linux stand-ins: the shim only ever runs in the Linux guest, but the
 // package must build on the development Mac (go vet / go test ./...).
 
+// stdioSet is the io plumbing type; off Linux it is an empty shell.
+type stdioSet struct{}
+
+// isInitHelper / isExecHelper / runInit / runExecHelper are the Linux
+// helper entries; off Linux they never trigger.
+func isInitHelper() bool { return false }
+func isExecHelper() bool { return false }
+func runInit(id, bundle string) int {
+	_, _ = id, bundle
+	return 1
+}
+
+func runExecHelper(initpid, bundle string) int {
+	_, _ = initpid, bundle
+	return 1
+}
+
 // pidAlive reports whether the process is alive (Signal 0 probe).
 func pidAlive(pid int) bool {
 	if pid <= 0 {
