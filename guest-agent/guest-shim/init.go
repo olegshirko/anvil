@@ -169,6 +169,7 @@ func runInit(id, bundle string, ownCgroup bool) int {
 		reportLine(reportSetupPrefix + "spec has no process")
 		return 1
 	}
+	cgDir := -1
 	if ownCgroup {
 		cgPath, cerr := prepareCgroup(spec)
 		if cerr != nil {
@@ -177,10 +178,20 @@ func runInit(id, bundle string, ownCgroup bool) int {
 		}
 		helperTrace(id, "A-cgroup")
 		defer removeCgroup(cgPath)
+		// Keep the directory open for CLONE_INTO_CGROUP below.
+		if fd, oerr := unix.Open(cgPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0); oerr == nil {
+			cgDir = fd
+		}
 	}
-	if err := joinCgroup(id, spec); err != nil {
-		reportLine(reportSetupPrefix+"%v", err)
-		return 1
+	// With the cgroup directory open, stage B is born inside it directly:
+	// the post-hoc self-move (write to cgroup.procs) measured ~27 ms of pure
+	// wait on the dev guest, while the born-in placement costs ~0.1 ms. The
+	// move stays as the fallback for older kernels and for the shim path.
+	if cgDir < 0 {
+		if err := joinCgroup(id, spec); err != nil {
+			reportLine(reportSetupPrefix+"%v", err)
+			return 1
+		}
 	}
 	helperTrace(id, "A-join")
 
@@ -241,7 +252,11 @@ func runInit(id, bundle string, ownCgroup bool) int {
 		return 1
 	}
 	helperTrace(id, "A-confirm")
-	stageBGlobal, errno := cloneRawPid()
+	stageBGlobal, errno := cloneRawPidInto(cgDir)
+	if cgDir >= 0 {
+		unix.Close(cgDir) //nolint:errcheck — the child inherited the placement
+		cgDir = -1
+	}
 	if errno != 0 {
 		unix.Close(fdConfirm) //nolint:errcheck
 		reportLine(reportSetupPrefix+"clone stage B: %v", errno)
