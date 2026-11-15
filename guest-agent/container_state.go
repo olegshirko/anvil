@@ -188,6 +188,27 @@ func peekContainerExitCode(dockerID string) (int, bool) {
 	return code, ok
 }
 
+// removedExitCodeTTL is how long an --rm container's exit code stays readable
+// after the container is gone. docker run --rm arms /wait?condition=removed
+// before /start; with the direct path the run can complete and the container
+// be removed inside one wait-poll interval, so the wait may only ever observe
+// the removal. The code is what the CLI's exit status comes from.
+const removedExitCodeTTL = 30 * time.Second
+
+// keepExitCodeAfterRemoval re-caches an --rm container's exit code just after
+// removal and schedules its expiry. Removal clears the cache (forgetContainer
+// State), which raced late condition=removed waiters.
+func keepExitCodeAfterRemoval(dockerID string, code int) {
+	cacheContainerExitCode(dockerID, code)
+	time.AfterFunc(removedExitCodeTTL, func() {
+		containerExitCodes.mu.Lock()
+		if containerExitCodes.codes[dockerID] == code {
+			delete(containerExitCodes.codes, dockerID)
+		}
+		containerExitCodes.mu.Unlock()
+	})
+}
+
 // forgetContainerState drops every in-memory record kept per container.
 // Without it each removed container (CI loops, `docker run --rm`) left
 // entries behind in a dozen maps until the next cold boot.

@@ -70,10 +70,17 @@ func waitContainerTaskCond(ctx context.Context, ns, containerdID string, nextExi
 				// run can complete inside one poll interval — the removal is
 				// exactly the condition the client asked for, so answer it,
 				// with the cached exit code when the exit path recorded one.
-				if code, ok := peekContainerExitCode(dockerID(ns, containerdID)); ok {
-					return code, nil
+				// The remover re-seeds that code right after clearing it
+				// (keepExitCodeAfterRemoval), hence the short retry.
+				for attempt := 0; ; attempt++ {
+					if code, ok := peekContainerExitCode(dockerID(ns, containerdID)); ok {
+						return code, nil
+					}
+					if attempt >= 5 {
+						return 0, nil
+					}
+					time.Sleep(time.Millisecond)
 				}
-				return 0, nil
 			}
 		} else {
 			if _, terr := c.Task(nsCtx, nil); terr == nil {
@@ -687,8 +694,12 @@ func handleContainerWait(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	// Only a real exit is cached. `docker run -d` opens a /wait and drops
 	// it right after /start; caching that aborted wait's 0 made the next
-	// `docker wait <name>` return 0 immediately.
-	cacheContainerExitCode(did, exitCode)
+	// `docker wait <name>` return 0 immediately. A condition=removed wait
+	// answered after the container is gone needs no cache entry (it would
+	// outlive the container forever).
+	if cond != "removed" {
+		cacheContainerExitCode(did, exitCode)
+	}
 	if cond == "removed" {
 		// docker run --rm waits for the removal, so the name is free
 		// when the CLI returns.
@@ -711,12 +722,20 @@ func deleteDockerContainer(ctx context.Context, id string, force, removeVolumes 
 	}
 	did := dockerID(ns, containerdID)
 	attrs := containerEventAttrs(ns, containerdID) // gone after the delete
+	// docker run --rm's condition=removed wait may only see the container
+	// after it is gone: keep its exit code readable for a short grace period
+	// (forgetContainerState below clears the cache).
+	autoRemove := isAutoRemove(did)
+	exitCode, hadExitCode := peekContainerExitCode(did)
 	// Native delete: task + snapshot + CNI + netns + metadata cleanup.
 	if err := deleteNativeContainer(ctx, ns, containerdID, force, removeVolumes); err != nil {
 		return err
 	}
 	publishContainerEventAttrs("destroy", did, attrs, nil)
 	forgetContainerState(did)
+	if autoRemove && hadExitCode {
+		keepExitCodeAfterRemoval(did, exitCode)
+	}
 	execs.forgetContainer(ns, containerdID)
 	forgetContainerStdin(ns, containerdID)
 	return nil
