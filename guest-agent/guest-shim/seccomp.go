@@ -5,10 +5,12 @@ package main
 import (
 	"fmt"
 	"runtime"
+	"unsafe"
 
 	"github.com/elastic/go-seccomp-bpf"
 	"github.com/elastic/go-seccomp-bpf/arch"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/runtime-spec/specs-go"
+	bpf "golang.org/x/net/bpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -31,8 +33,46 @@ func applySeccomp(sc *specs.LinuxSeccomp) error {
 	if err != nil {
 		return err
 	}
-	filter.NoNewPrivs = true
-	if err := seccomp.LoadFilter(*filter); err != nil {
+	insts, err := filter.Policy.Assemble()
+	if err != nil {
+		return fmt.Errorf("assemble seccomp policy: %w", err)
+	}
+	// The module's Validate only whitelists the bare ActionErrno for the
+	// default action, but SECCOMP_RET_ERRNO with zero errno bits makes the
+	// kernel return 0 — a faked syscall success with an uninitialized
+	// result. The default deny is EPERM: rewrite the bare returns after
+	// assembly (per-syscall rules carry their own errno bits already, so
+	// only the bare form matches).
+	for i, inst := range insts {
+		if ret, ok := inst.(bpf.RetConstant); ok && ret.Val == uint32(seccomp.ActionErrno) {
+			insts[i] = bpf.RetConstant{Val: uint32(seccomp.ActionErrno) | uint32(unix.EPERM)}
+		}
+	}
+	raw, err := bpf.Assemble(insts)
+	if err != nil {
+		return fmt.Errorf("assemble seccomp bpf: %w", err)
+	}
+	sockFilter := make([]unix.SockFilter, 0, len(raw))
+	for _, instruction := range raw {
+		sockFilter = append(sockFilter, unix.SockFilter{
+			Code: instruction.Op,
+			Jt:   instruction.Jt,
+			Jf:   instruction.Jf,
+			K:    instruction.K,
+		})
+	}
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		return fmt.Errorf("set no_new_privs: %w", err)
+	}
+	// prctl(PR_SET_SECCOMP, SECCOMP_SET_MODE_FILTER, &fprog, flags, 0) —
+	// the same call the module's LoadFilter makes; here with the patched
+	// program. TSYNC keeps every helper thread inside the same filter.
+	fprog := &unix.SockFprog{
+		Len:    uint16(len(sockFilter)),
+		Filter: &sockFilter[0],
+	}
+	if err := unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_SET_MODE_FILTER,
+		uintptr(unsafe.Pointer(fprog)), uintptr(unix.SECCOMP_FILTER_FLAG_TSYNC), 0); err != nil {
 		return fmt.Errorf("load seccomp filter: %w", err)
 	}
 	return nil
