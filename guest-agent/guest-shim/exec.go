@@ -284,22 +284,23 @@ func isExecApply() bool {
 }
 
 // exec helper fd layout (ExtraFiles start at 3): gate, report, then stdio.
-// 200 carries the init's root fd into stage B (chroot), 201 the shim binary
-// (stage B's exec ran through it; stage B closes it on entry), 202 the
+// 60 carries the init's root fd into stage B (chroot), 61 the shim binary
+// (stage B's exec ran through it; stage B closes it on entry), 62 the
 // confirm pipe write end (its closure at the user exec is the start
-// signal), 203 the close-on-exec report duplicate for a failed user exec.
-// High numbers on purpose: the Go runtime allocates low fds during startup
-// (its netpoll epoll, its own-binary probe), and a dup onto those would
-// silently clobber live runtime state.
+// signal), 63 the close-on-exec report duplicate for a failed user exec.
+// Below 64 on purpose: the first dup onto a descriptor >= 64 expands the fd
+// table at 20-50 ms wall (NR_OPEN_DEFAULT), while the Go runtime's own low
+// fds (netpoll epoll, own-binary probe) live in 8-9 and must not be hit —
+// so the fixed fds sit just under the boundary.
 const (
 	fdExecGate      = 3
 	fdExecStdin     = 5
 	fdExecStdout    = 6
 	fdExecStderr    = 7
-	fdExecRoot      = 200
-	fdExecExe       = 201
-	fdExecConfirm   = 202
-	fdExecReportDup = 203
+	fdExecRoot      = 60
+	fdExecExe       = 61
+	fdExecConfirm   = 62
+	fdExecReportDup = 63
 )
 
 // runExecHelper is stage A of the exec helper. Join the namespaces that are
