@@ -171,21 +171,11 @@ func newDirectExec(ns, id string, t *directTask, pspec *specs.Process, terminal 
 
 // childStdio builds the helper's stdio fds (5/6/7) and the agent-side copies.
 func (p *directExecProcess) childStdio() (stdinF, stdoutF, stderrF *os.File, err error) {
-	if p.stdinSrc != nil {
-		r, w, perr := os.Pipe()
-		if perr != nil {
-			return nil, nil, nil, perr
-		}
-		p.stdinRead, p.stdinWrite = r, w
-		p.addCopy(func() {
-			io.Copy(w, p.stdinSrc) //nolint:errcheck
-			w.Close()
-		})
-		stdinF = r
-	} else if stdinF, err = os.Open("/dev/null"); err != nil {
-		return nil, nil, nil, err
-	}
 	if p.term {
+		// A terminal exec's child gets the pty slave as all three fds — its
+		// controlling terminal, which stage B's setsid+TIOCSCTTY takes. The
+		// agent-side copies run through the master; stdin is a copy into the
+		// master, not a child fd.
 		master, slavePath, cerr := console.NewPty()
 		if cerr != nil {
 			return nil, nil, nil, fmt.Errorf("openpty: %w", cerr)
@@ -208,7 +198,21 @@ func (p *directExecProcess) childStdio() (stdinF, stdoutF, stderrF *os.File, err
 			io.Copy(p.stdoutDst, master) //nolint:errcheck
 			master.Close()
 		})
-		return stdinF, slave, slave, nil
+		return slave, slave, slave, nil
+	}
+	if p.stdinSrc != nil {
+		r, w, perr := os.Pipe()
+		if perr != nil {
+			return nil, nil, nil, perr
+		}
+		p.stdinRead, p.stdinWrite = r, w
+		p.addCopy(func() {
+			io.Copy(w, p.stdinSrc) //nolint:errcheck
+			w.Close()
+		})
+		stdinF = r
+	} else if stdinF, err = os.Open("/dev/null"); err != nil {
+		return nil, nil, nil, err
 	}
 	outR, outW, perr := os.Pipe()
 	if perr != nil {
