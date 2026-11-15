@@ -686,6 +686,7 @@ func resolveExecPath(spec *specs.Spec) (string, error) {
 	if strings.ContainsRune(argv[0], '/') {
 		return argv[0], nil
 	}
+	var tried []string
 	for _, e := range spec.Process.Env {
 		if v, ok := strings.CutPrefix(e, "PATH="); ok {
 			for _, dir := range filepath.SplitList(v) {
@@ -696,11 +697,12 @@ func resolveExecPath(spec *specs.Spec) (string, error) {
 				if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
 					return p, nil
 				}
+				tried = append(tried, p)
 			}
 			break
 		}
 	}
-	return "", fmt.Errorf("exec %q: executable file not found in $PATH", argv[0])
+	return "", fmt.Errorf("exec %q: executable file not found in $PATH (tried %v)", argv[0], tried)
 }
 
 // argvBytePtrs / envBytePtrs build NUL-terminated pointer arrays for execve.
