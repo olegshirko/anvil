@@ -95,7 +95,14 @@ heuristics with a deterministic signal:
 
 ### Builder-check resolutions (2026-11-15)
 
-- Stage 2 shim gating: decided by Oleg (below).
+- Stage 2 shim gating (Oleg's call): **default-on with fallback**. The fast
+  shim is the default for eligible containers — not privileged, no custom
+  `--runtime`, no seccomp profile beyond the default, no `--pid container:`,
+  no subpath mounts, no secondary networks at stage-2 entry — and runc-shim
+  stays the fallback for everything else and on any fast-shim failure. An
+  env kill-switch (`ANVIL_FAST_SHIM=0`) disables it wholesale. Eligibility
+  is decided at NewTask time from the create request; falling back is never
+  an error the client sees.
 - CNI move: netns + veth pair are prepared at create (parallel with
   snapshot creation); the full CNI ADD (IP assignment, iptables, net.json,
   hosts files, connect events) stays at start with its existing
