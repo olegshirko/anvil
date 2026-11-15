@@ -61,11 +61,32 @@ func mountFlagOpts(opts []string) (int, []string) {
 func applySpecMounts(rootfs string, mounts []specs.Mount) error {
 	for i := range mounts {
 		m := &mounts[i]
+		// runc's mountpoint rule: a bind mount whose source is a regular
+		// file binds onto a file. The image usually ships one already
+		// (alpine's /etc/hosts), and mkdir-ing over it fails with
+		// ENOTDIR - create the target as a file in that case.
+		fileBind := false
+		if m.Type == "bind" {
+			if fi, serr := os.Stat(m.Source); serr == nil && !fi.IsDir() {
+				fileBind = true
+			}
+		}
 		dst, err := safeJoin(rootfs, m.Destination)
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(dst, 0o755); err != nil {
+		if fileBind {
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				return fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
+			}
+			if _, serr := os.Stat(dst); serr != nil {
+				f, ferr := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY, 0o644)
+				if ferr != nil {
+					return fmt.Errorf("create mountpoint file %s: %w", dst, ferr)
+				}
+				f.Close()
+			}
+		} else if err := os.MkdirAll(dst, 0o755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", dst, err)
 		}
 		flags, data := mountFlagOpts(m.Options)
