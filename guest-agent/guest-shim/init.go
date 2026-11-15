@@ -114,16 +114,23 @@ func waitGate() bool {
 // helperTrace appends one setup-phase timestamp for latency analysis of the
 // direct-creation path. It is off unless ANVIL_HELPER_TRACE is set (the agent
 // sets it in debug mode); the file lives on the shared .anvil-run directory.
+// The descriptor is opened once: a per-mark open on virtiofs costs tens of
+// milliseconds and would drown the measurement.
+var helperTraceOut *os.File
+
 func helperTrace(id, stage string) {
 	if os.Getenv("ANVIL_HELPER_TRACE") == "" {
 		return
 	}
-	f, err := os.OpenFile("/mnt/anvil/.anvil-run/direct-helper-trace.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return
+	ts := time.Now().UnixNano()
+	if helperTraceOut == nil {
+		f, err := os.OpenFile("/mnt/anvil/.anvil-run/direct-helper-trace.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return
+		}
+		helperTraceOut = f
 	}
-	defer f.Close()
-	fmt.Fprintf(f, "%s %s %d\n", id, stage, time.Now().UnixNano())
+	fmt.Fprintf(helperTraceOut, "%s %s %d\n", id, stage, ts)
 }
 
 // runInit is stage A. Returns the process exit code (stage B's exit code —
