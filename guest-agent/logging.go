@@ -505,12 +505,15 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	if !opts.follow {
 		return nil
 	}
-	if markerTail {
-		// The replay already covered the container's whole output: the
-		// follow of an exited container ends here (`docker logs -f` /
-		// attach) instead of waiting on the stop timers. A marker mid-file
-		// (the previous run of a restarted container) does not trigger
-		// this — only a trailing one does.
+	if markerTail && (opts.stop == nil || opts.stop()) {
+		// The replay already covered the container's whole output: the last
+		// complete record is the eof marker, so the container has run to
+		// completion and the follow ends here (`docker logs -f` / attach of
+		// an exited container) instead of waiting on the stop timers. A
+		// container that is only between runs — the previous run's marker
+		// at the tail, the next task not recreated yet (`docker start -a` —
+		// attach before start) — keeps the stream open via the stop
+		// condition, exactly as before the marker existed.
 		return nil
 	}
 
