@@ -418,18 +418,17 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 // (stage 5a) tasks, so port scanning and ephemeral-port allocation see both.
 func namespaceRunningTasks(nsCtx context.Context, cl *client.Client) map[string]uint32 {
 	out := map[string]uint32{}
-	if ns, err := namespaces.NamespaceRequired(nsCtx); err == nil {
-		for id, pid := range supervisor.runningTasks(ns) {
-			out[id] = pid
+	resp, err := cl.TaskService().List(nsCtx, &tasks.ListTasksRequest{})
+	if err == nil {
+		for _, p := range resp.Tasks {
+			if p.Status == tasktype.Status_RUNNING {
+				out[p.ID] = p.Pid
+			}
 		}
 	}
-	resp, err := cl.TaskService().List(nsCtx, &tasks.ListTasksRequest{})
-	if err != nil {
-		return out
-	}
-	for _, p := range resp.Tasks {
-		if p.Status == tasktype.Status_RUNNING {
-			out[p.ID] = p.Pid
+	if ns, nerr := namespaces.NamespaceRequired(nsCtx); nerr == nil {
+		for id, pid := range supervisor.runningTasks(ns) {
+			out[id] = pid
 		}
 	}
 	return out

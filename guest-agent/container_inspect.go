@@ -339,19 +339,20 @@ type taskSnapshot struct {
 // namespace, including the agent's direct (stage 5a) tasks.
 func namespaceTaskStates(nsCtx context.Context, cl *client.Client) (map[string]taskSnapshot, bool) {
 	out := map[string]taskSnapshot{}
-	if ns, err := namespaces.NamespaceRequired(nsCtx); err == nil {
+	resp, err := cl.TaskService().List(nsCtx, &tasks.ListTasksRequest{})
+	known := err == nil
+	if known {
+		for _, p := range resp.Tasks {
+			out[p.ID] = taskSnapshot{status: strings.ToLower(p.Status.String()), exitCode: int(p.ExitStatus)}
+		}
+	}
+	// The registry is authoritative for the containers it supervises.
+	if ns, nerr := namespaces.NamespaceRequired(nsCtx); nerr == nil {
 		for id, st := range supervisor.namespaceStates(ns) {
 			out[id] = st
 		}
 	}
-	resp, err := cl.TaskService().List(nsCtx, &tasks.ListTasksRequest{})
-	if err != nil {
-		return out, false
-	}
-	for _, p := range resp.Tasks {
-		out[p.ID] = taskSnapshot{status: strings.ToLower(p.Status.String()), exitCode: int(p.ExitStatus)}
-	}
-	return out, true
+	return out, known
 }
 
 // inspectDockerContainer returns a minimal inspect payload for a container.
