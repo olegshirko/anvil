@@ -91,7 +91,10 @@ func seccompFilter(sc *specs.LinuxSeccomp) (*seccomp.Filter, error) {
 		return nil, err
 	}
 	policy := seccomp.Policy{
-		DefaultAction: bpfAction(sc.DefaultAction, sc.DefaultErrnoRet),
+		// Bare ActionErrno: the module's Validate whitelists only known
+		// action values, so the EPERM bits cannot ride in here —
+		// applySeccomp patches them into the assembled program instead.
+		DefaultAction: bpfAction(sc.DefaultAction, nil),
 	}
 
 	for i := range sc.Syscalls {
