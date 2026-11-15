@@ -329,6 +329,7 @@ func startFifoLogger(ns, id, logPath string, rot logRotation, stdinPath string) 
 	}
 	cmd := exec.Command(self, "--log-json", logPath,
 		"--max-size", strconv.FormatInt(rot.maxSize, 10), "--max-file", strconv.Itoa(rot.maxFile),
+		"--eof-marker", "1", // FIFO mode serves non-TTY containers only
 		"--fifo-out", out, "--fifo-err", errp)
 	if err := cmd.Start(); err != nil {
 		return nil, nil, fmt.Errorf("start logger: %w", err)

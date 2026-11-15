@@ -187,6 +187,14 @@ func forgetTaskRuns(did string) {
 	taskRuns.Unlock()
 }
 
+// taskLogURIForContainer builds the task log URI for a created container,
+// arming the logger's eof marker for non-TTY tasks only (builder-check
+// resolution: a TTY task's console copy starts when the init dies, so the
+// marker would truncate its tail — TTY keeps the stopQuiet timers).
+func taskLogURIForContainer(ns, id string, rot logRotation) (*url.URL, error) {
+	return taskLogURI(containerLogPath(ns, id), rot, !getContainerTTY(dockerID(ns, id)))
+}
+
 // startNativeTask attaches CNI networking, creates the task with json-file
 // logging and starts it. A leftover stopped task from a previous run is
 // deleted first.
@@ -291,7 +299,7 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 			rot = r
 		}
 	}
-	uri, lerr := taskLogURI(containerLogPath(ns, id), rot)
+	uri, lerr := taskLogURIForContainer(ns, id, rot)
 	if lerr != nil {
 		err = lerr
 		return err
@@ -339,6 +347,10 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 			taskIO, stopLogger = fio, stop
 		}
 	}
+	// A previous run's pid file must not survive into this one: the new
+	// run's logger would watch the old (dead) pid and write its marker into
+	// the fresh log before this task ever ran.
+	os.Remove(initPidPath(containerLogPath(ns, id))) //nolint:errcheck — stale file only
 	task, terr := c.NewTask(nsCtx, func(string) (cio.IO, error) {
 		return taskIO, nil
 	})
@@ -349,6 +361,12 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 		}
 		err = fmt.Errorf("new task: %w", terr)
 		return err
+	}
+	// Post the init pid for the task logger's eof marker — the pid comes
+	// with the create RPC, before the init even runs (non-TTY only: TTY
+	// containers keep the timer-based follow end to end).
+	if !tty {
+		writeInitPidFile(containerLogPath(ns, id), int(task.Pid()))
 	}
 	if stdin != nil {
 		stdin.taskCreated() // the shim holds the FIFO now

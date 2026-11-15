@@ -160,11 +160,11 @@ type loggerFifos struct {
 // loggerArgs parses the logger's argv: containerd builds it from the
 // binary-v2 URI's query map, so the flag pairs come in any order.
 func loggerArgs(args []string) (path string, rot logRotation, ok bool) {
-	path, rot, _, ok = loggerArgsFifos(args)
+	path, rot, _, _, ok = loggerArgsFifos(args)
 	return path, rot, ok
 }
 
-func loggerArgsFifos(args []string) (path string, rot logRotation, fifos loggerFifos, ok bool) {
+func loggerArgsFifos(args []string) (path string, rot logRotation, fifos loggerFifos, marker bool, ok bool) {
 	rot = logRotation{maxSize: defaultLogMaxSize, maxFile: defaultLogMaxFile}
 	for i := 0; i+1 < len(args); i++ {
 		switch args[i] {
@@ -187,7 +187,10 @@ func loggerArgsFifos(args []string) (path string, rot logRotation, fifos loggerF
 				rot.maxFile = n
 			}
 			i++
+		case "--eof-marker":
+			marker = args[i+1] == "1"
+			i++
 		}
 	}
-	return path, rot, fifos, ok
+	return path, rot, fifos, marker, ok
 }
