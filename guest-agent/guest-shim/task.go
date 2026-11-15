@@ -188,12 +188,17 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 		io:        ioSet,
 		cmd:       cmd,
 		startedCh: make(chan startMsg, 1),
+		oomStop:   make(chan struct{}),
 		execs:     map[string]*execProcess{},
 	}
 
 	s.mu.Lock()
 	s.containers[r.ID] = c
 	s.mu.Unlock()
+
+	// TaskOOM parity with the runc shim: watch the cgroup's memory.events
+	// for oom_kill increases from here until delete.
+	go s.watchOOM(c)
 
 	s.send(&eventstypes.TaskCreate{
 		ContainerID: r.ID,
