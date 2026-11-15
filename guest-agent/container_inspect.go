@@ -336,9 +336,14 @@ type taskSnapshot struct {
 }
 
 // namespaceTaskStates maps containerd container ID -> task state for one
-// namespace.
+// namespace, including the agent's direct (stage 5a) tasks.
 func namespaceTaskStates(nsCtx context.Context, cl *client.Client) (map[string]taskSnapshot, bool) {
 	out := map[string]taskSnapshot{}
+	if ns, err := namespaces.NamespaceRequired(nsCtx); err == nil {
+		for id, st := range supervisor.namespaceStates(ns) {
+			out[id] = st
+		}
+	}
 	resp, err := cl.TaskService().List(nsCtx, &tasks.ListTasksRequest{})
 	if err != nil {
 		return out, false
@@ -393,18 +398,26 @@ func inspectDockerContainer(ctx context.Context, prefix string) (*dockerContaine
 			running := false
 			exitCode := 0
 			pid := 0
-			task, err := c.Task(nsCtx, nil)
-			// Only "not found" means no task: a transient containerd error
-			// must not show a running container as exited.
-			hasTask := err == nil || !errdefs.IsNotFound(err)
-			if err == nil {
-				if st, serr := task.Status(nsCtx); serr == nil {
-					status = dockerStatus(string(st.Status))
-					running = st.Status == "running"
-					if st.Status == "stopped" {
-						exitCode = int(st.ExitStatus)
+			hasTask := false
+			if dt, ok := supervisor.lookup(ns, c.ID()); ok {
+				hasTask = true
+				st, code, r, p := dt.inspect()
+				status = dockerStatus(st)
+				running, exitCode, pid = r, code, p
+			} else {
+				task, err := c.Task(nsCtx, nil)
+				// Only "not found" means no task: a transient containerd error
+				// must not show a running container as exited.
+				hasTask = err == nil || !errdefs.IsNotFound(err)
+				if err == nil {
+					if st, serr := task.Status(nsCtx); serr == nil {
+						status = dockerStatus(string(st.Status))
+						running = st.Status == "running"
+						if st.Status == "stopped" {
+							exitCode = int(st.ExitStatus)
+						}
+						pid = int(task.Pid())
 					}
-					pid = int(task.Pid())
 				}
 			}
 

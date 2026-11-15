@@ -44,6 +44,14 @@ func waitContainerTaskCond(ctx context.Context, ns, containerdID string, nextExi
 		}
 	}()
 	for {
+		if t, ok := supervisor.lookup(ns, containerdID); ok {
+			state, code, running := t.stateInfo()
+			if !nextExit && !running && state != directStateCreated {
+				return code, nil
+			}
+			wtr.mark("task-ready")
+			break
+		}
 		c, err := cl.LoadContainer(nsCtx, containerdID)
 		if err != nil {
 			// next-exit: a missing record can be the fast-shim fallback
@@ -87,6 +95,17 @@ func waitContainerTaskCond(ctx context.Context, ns, containerdID string, nextExi
 	// the mapped 137 from docker kill) wins over the task status, which
 	// reports 0 for signal deaths.
 	did := dockerID(ns, containerdID)
+	if t, ok := supervisor.lookup(ns, containerdID); ok {
+		exit, werr := t.wait(ctx)
+		if werr != nil {
+			debugLog("[docker-api] wait %s/%s: %v", ns, truncateID(containerdID), werr)
+			return 0, werr
+		}
+		if cached, ok := takeContainerExitCode(did); ok && cached != 0 {
+			return cached, nil
+		}
+		return exit, nil
+	}
 	c, err := cl.LoadContainer(nsCtx, containerdID)
 	if err != nil {
 		return 0, fmt.Errorf("load container: %w", err)
@@ -561,6 +580,9 @@ func taskRunning(ctx context.Context, ns, containerdID string) bool {
 // currentTaskStatus returns the container's task status ("stopped" when it
 // has no task); known is false when containerd could not be asked.
 func currentTaskStatus(ctx context.Context, ns, containerdID string) (status string, known bool) {
+	if state, _, _, ok := directStateOf(ns, containerdID); ok {
+		return string(state), true
+	}
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return "", false
@@ -741,6 +763,15 @@ func killDockerContainer(ctx context.Context, id string, signal string) error {
 	restarts.clear(dockerID(ns, containerdID))
 	markUserStopped(ns, containerdID, true)
 	// Native kill: signal the running task directly.
+	if t, ok := supervisor.lookup(ns, containerdID); ok {
+		if kerr := killDirectTask(ctx, ns, containerdID, t, signal); kerr != nil {
+			return kerr
+		}
+		if strings.EqualFold(signal, "SIGKILL") || signal == "9" || signal == "" {
+			cacheContainerExitCode(dockerID(ns, containerdID), 137)
+		}
+		return nil
+	}
 	{
 		cl, cerr := pc.get(ctx)
 		if cerr != nil {

@@ -414,9 +414,15 @@ func (s *portScanner) buildState(cl *client.Client) (PortMapState, error) {
 }
 
 // namespaceRunningTasks maps containerd container ID -> task pid for every
-// running task in one namespace.
+// running task in one namespace: containerd's tasks plus the agent's direct
+// (stage 5a) tasks, so port scanning and ephemeral-port allocation see both.
 func namespaceRunningTasks(nsCtx context.Context, cl *client.Client) map[string]uint32 {
 	out := map[string]uint32{}
+	if ns, err := namespaces.NamespaceRequired(nsCtx); err == nil {
+		for id, pid := range supervisor.runningTasks(ns) {
+			out[id] = pid
+		}
+	}
 	resp, err := cl.TaskService().List(nsCtx, &tasks.ListTasksRequest{})
 	if err != nil {
 		return out
