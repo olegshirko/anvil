@@ -50,12 +50,12 @@ func seccompFilter(sc *specs.LinuxSeccomp) (*seccomp.Filter, error) {
 		return nil, err
 	}
 	policy := seccomp.Policy{
-		DefaultAction: bpfAction(sc.DefaultAction),
+		DefaultAction: bpfAction(sc.DefaultAction, nil),
 	}
 
 	for i := range sc.Syscalls {
 		s := &sc.Syscalls[i]
-		action := bpfAction(s.Action)
+		action := bpfAction(s.Action, s.ErrnoRet)
 		var names []string
 		for _, name := range s.Names {
 			if _, ok := archInfo.SyscallNames[name]; ok {
@@ -99,8 +99,12 @@ func seccompFilter(sc *specs.LinuxSeccomp) (*seccomp.Filter, error) {
 	}, nil
 }
 
-// bpfAction maps OCI action strings to filter actions.
-func bpfAction(a specs.LinuxSeccompAction) seccomp.Action {
+// bpfAction maps OCI action strings to filter actions, carrying the
+// requested errno for ActErrno: the module emits the action value raw, so
+// SECCOMP_RET_ERRNO|errno reaches the kernel as-is. clone3 must answer
+// ENOSYS (glibc's clone3-to-clone fallback keys on ENOSYS specifically),
+// not a blanket EPERM.
+func bpfAction(a specs.LinuxSeccompAction, errnoRet *uint) seccomp.Action {
 	switch a {
 	case specs.ActKill, specs.ActKillThread:
 		return seccomp.ActionKillThread
@@ -109,6 +113,9 @@ func bpfAction(a specs.LinuxSeccompAction) seccomp.Action {
 	case specs.ActTrap:
 		return seccomp.ActionTrap
 	case specs.ActErrno:
+		if errnoRet != nil {
+			return seccomp.Action(uint32(seccomp.ActionErrno) | (uint32(*errnoRet) & 0xffff))
+		}
 		return seccomp.ActionErrno
 	case specs.ActTrace:
 		return seccomp.ActionTrace
