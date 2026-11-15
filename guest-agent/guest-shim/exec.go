@@ -187,11 +187,6 @@ func (s *taskService) startExec(ctx context.Context, r *taskAPI.StartRequest) (*
 	s.mu.Lock()
 	e.status = task.Status_RUNNING
 	s.mu.Unlock()
-	s.send(&eventstypes.TaskExecStarted{
-		ContainerID: c.id,
-		ExecID:      r.ExecID,
-		Pid:         uint32(msg.pid),
-	})
 	return &taskAPI.StartResponse{Pid: uint32(msg.pid)}, nil
 }
 
@@ -215,6 +210,14 @@ func (s *taskService) readExecReports(c *container, e *execProcess) {
 			e.pid = pid
 			started = true
 			e.startedCh <- startMsg{pid: pid}
+			// Queue the started event here, in report order: for an instant
+			// exec the D line follows immediately, and publishing from
+			// startExec would race the exit event ahead of it.
+			s.send(&eventstypes.TaskExecStarted{
+				ContainerID: c.id,
+				ExecID:      e.id,
+				Pid:         uint32(pid),
+			})
 		case strings.HasPrefix(line, reportStartPrefix), strings.HasPrefix(line, reportSetupPrefix):
 			detail := strings.TrimSpace(line[2:])
 			if !started {
