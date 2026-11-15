@@ -75,26 +75,32 @@ type dockerHostConfig struct {
 
 	// Resource knobs beyond Memory/NanoCpus. Zero values mean "unset" and are
 	// skipped; docker semantics for sentinel values (-1) are honored.
-	CpuShares         int64             `json:"CpuShares"`
-	CpuPeriod         int64             `json:"CpuPeriod"`
-	CpuQuota          int64             `json:"CpuQuota"`
-	CpusetCpus        string            `json:"CpusetCpus"`
-	CpusetMems        string            `json:"CpusetMems"`
-	MemorySwap        int64             `json:"MemorySwap"`
-	MemoryReservation int64             `json:"MemoryReservation"`
-	PidsLimit         *int64            `json:"PidsLimit"`
-	ShmSize           int64             `json:"ShmSize"`
-	OomScoreAdj       int               `json:"OomScoreAdj"`
-	SecurityOpt       []string          `json:"SecurityOpt"`
-	Ulimits           []dockerUlimit    `json:"Ulimits"`
-	GroupAdd          []string          `json:"GroupAdd"`
-	IpcMode           string            `json:"IpcMode"`
-	CgroupnsMode      string            `json:"CgroupnsMode"`
-	UsernsMode        string            `json:"UsernsMode"`
-	Init              *bool             `json:"Init"`
-	Annotations       map[string]string `json:"Annotations"`
-	UtsMode           string            `json:"UTSMode"`
-	LogConfig         dockerLogConfig   `json:"LogConfig"`
+	CpuShares         int64          `json:"CpuShares"`
+	CpuPeriod         int64          `json:"CpuPeriod"`
+	CpuQuota          int64          `json:"CpuQuota"`
+	CpusetCpus        string         `json:"CpusetCpus"`
+	CpusetMems        string         `json:"CpusetMems"`
+	MemorySwap        int64          `json:"MemorySwap"`
+	MemoryReservation int64          `json:"MemoryReservation"`
+	PidsLimit         *int64         `json:"PidsLimit"`
+	ShmSize           int64          `json:"ShmSize"`
+	OomScoreAdj       int            `json:"OomScoreAdj"`
+	SecurityOpt       []string       `json:"SecurityOpt"`
+	Ulimits           []dockerUlimit `json:"Ulimits"`
+	GroupAdd          []string       `json:"GroupAdd"`
+	IpcMode           string         `json:"IpcMode"`
+	CgroupnsMode      string         `json:"CgroupnsMode"`
+	UsernsMode        string         `json:"UsernsMode"`
+	// Runtime is --runtime. validateHostConfig refuses the field for now
+	// (the guest grew a second runtime since: the fast shim is selected by
+	// eligibility, not by this knob); the parsed value only feeds the
+	// fast-shim eligibility so an explicit runtime request never lands on
+	// the fast shim if the refusal ever loosens.
+	Runtime     string            `json:"Runtime"`
+	Init        *bool             `json:"Init"`
+	Annotations map[string]string `json:"Annotations"`
+	UtsMode     string            `json:"UTSMode"`
+	LogConfig   dockerLogConfig   `json:"LogConfig"`
 }
 
 type dockerLogConfig struct {
