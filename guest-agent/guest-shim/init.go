@@ -75,12 +75,6 @@ func isInitApply() bool {
 	return len(os.Args) >= 2 && os.Args[1] == "init-apply"
 }
 
-// isExecHelper reports whether this process runs as an exec helper
-// (second argument "exec-init").
-func isExecHelper() bool {
-	return len(os.Args) >= 2 && os.Args[1] == "exec-init"
-}
-
 // reportLine writes one line to the shim through the report fd.
 func reportLine(format string, args ...any) {
 	reportLineTo(fdReport, format, args...)
@@ -288,6 +282,12 @@ func runInitApply(id, bundle string) int {
 	unix.Close(fdStdin)  //nolint:errcheck
 	unix.Close(fdStdout) //nolint:errcheck
 	unix.Close(fdStderr) //nolint:errcheck
+	// dup copies the fd status flags, and the shim's io fifos are poller
+	// registered on its side (O_NONBLOCK). The user process must get plain
+	// blocking stdio — reads would EAGAIN past the first pipe buffer.
+	for fd := 0; fd <= 2; fd++ {
+		unix.SetNonblock(fd, false) //nolint:errcheck
+	}
 	// The confirm fd must die at the user exec (its closure is the start
 	// confirmation stage A waits for).
 	unix.CloseOnExec(fdConfirm)

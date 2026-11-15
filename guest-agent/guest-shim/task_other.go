@@ -24,6 +24,7 @@ type stdioSet struct{}
 func isInitHelper() bool { return false }
 func isInitApply() bool  { return false }
 func isExecHelper() bool { return false }
+func isExecApply() bool  { return false }
 func runInit(id, bundle string) int {
 	_, _ = id, bundle
 	return 1
@@ -38,6 +39,8 @@ func runExecHelper(initpid, bundle string) int {
 	_, _ = initpid, bundle
 	return 1
 }
+
+func runExecApply() int { return 1 }
 
 // pidAlive reports whether the process is alive (Signal 0 probe).
 func pidAlive(pid int) bool {
