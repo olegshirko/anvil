@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 	"unsafe"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -110,17 +111,34 @@ func waitGate() bool {
 	}
 }
 
+// helperTrace appends one setup-phase timestamp for latency analysis of the
+// direct-creation path. It is off unless ANVIL_HELPER_TRACE is set (the agent
+// sets it in debug mode); the file lives on the shared .anvil-run directory.
+func helperTrace(id, stage string) {
+	if os.Getenv("ANVIL_HELPER_TRACE") == "" {
+		return
+	}
+	f, err := os.OpenFile("/mnt/anvil/.anvil-run/direct-helper-trace.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s %s %d\n", id, stage, time.Now().UnixNano())
+}
+
 // runInit is stage A. Returns the process exit code (stage B's exit code —
 // the container init's). ownCgroup makes the helper create the container's
 // cgroup itself and remove it at exit: the direct-creation path (the agent
 // spawns this helper with no shim in between) has no shim to call
 // prepareCgroup, and keeping the cgroup code here keeps it in one place.
 func runInit(id, bundle string, ownCgroup bool) int {
+	helperTrace(id, "A-entry")
 	spec, err := readSpecFile(filepath.Join(bundle, "config.json"))
 	if err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
+	helperTrace(id, "A-spec")
 	if spec.Process == nil {
 		reportLine(reportSetupPrefix + "spec has no process")
 		return 1
@@ -131,12 +149,14 @@ func runInit(id, bundle string, ownCgroup bool) int {
 			reportLine(reportSetupPrefix+"%v", cerr)
 			return 1
 		}
+		helperTrace(id, "A-cgroup")
 		defer removeCgroup(cgPath)
 	}
 	if err := joinCgroup(spec); err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
+	helperTrace(id, "A-join")
 
 	// The confirm pipe: stage B holds the write end close-on-exec, so a
 	// successful execve of the user process closes it instantly (EOF =
@@ -191,12 +211,14 @@ func runInit(id, bundle string, ownCgroup bool) int {
 		reportLine(reportSetupPrefix+"dup confirm: %v", err)
 		return 1
 	}
+	helperTrace(id, "A-confirm")
 	stageBGlobal, errno := cloneRawPid()
 	if errno != 0 {
 		unix.Close(fdConfirm) //nolint:errcheck
 		reportLine(reportSetupPrefix+"clone stage B: %v", errno)
 		return 1
 	}
+	helperTrace(id, "A-clone")
 	if stageBGlobal == 0 {
 		// Raw window (born into the new pid namespace as its PID 1): no
 		// Go runtime calls, pre-built pointers only.
@@ -214,6 +236,7 @@ func runInit(id, bundle string, ownCgroup bool) int {
 	// answers with it — the same contract the runc shim's Create has —
 	// and kill/delete/state key off it before any start happens.
 	reportLine(reportInitPrefix+"%d", stageBGlobal)
+	helperTrace(id, "A-report")
 
 	// EOF = the user exec happened; a line is the failure the child wrote.
 	buf := make([]byte, 128)
@@ -262,11 +285,13 @@ func readConfirm(fd int, buf []byte) int {
 // PID namespace as its active one, so the procfs it mounts shows the
 // container's own processes and the exec'd user process is PID 1.
 func runInitApply(id, bundle string) int {
+	helperTrace(id, "B-entry")
 	spec, err := readSpecFile(filepath.Join(bundle, "config.json"))
 	if err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
+	helperTrace(id, "B-spec")
 	if spec.Process == nil {
 		reportLine(reportSetupPrefix + "spec has no process")
 		return 1
@@ -302,6 +327,7 @@ func runInitApply(id, bundle string) int {
 	// The confirm fd must die at the user exec (its closure is the start
 	// confirmation stage A waits for).
 	unix.CloseOnExec(fdConfirm)
+	helperTrace(id, "B-stdio")
 
 	rootfs := filepath.Join(bundle, "rootfs")
 
@@ -314,10 +340,12 @@ func runInitApply(id, bundle string) int {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
+	helperTrace(id, "B-ns")
 	if err := applySpecMounts(rootfs, spec.Mounts); err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
+	helperTrace(id, "B-mounts")
 	if err := setupDevices(rootfs, spec); err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
@@ -326,6 +354,8 @@ func runInitApply(id, bundle string) int {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
 	}
+	helperTrace(id, "B-devices")
+	helperTrace(id, "B-prepivot")
 	if err := pivotRoot(rootfs); err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
 		return 1
