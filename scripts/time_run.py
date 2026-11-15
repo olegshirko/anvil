@@ -24,7 +24,15 @@ import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-TRACE_LOG = PROJECT_ROOT / "guest-agent.log"
+
+
+def trace_log_for(context: str) -> Path:
+    """Named instances (anvil-dev, anvil-ci...) keep their share root in the
+    state dir; the plain instance shares the project directory."""
+    m = re.fullmatch(r"anvil-(\S+)", context)
+    if m:
+        return Path.home() / f".anvil-vz-{m.group(1)}" / ".anvil-run" / "guest-agent.log"
+    return PROJECT_ROOT / ".anvil-run" / "guest-agent.log"
 
 TRACE_RE = re.compile(
     r"\[start-trace\] (\S+) (\S+) (\S+) at=(\d+)(?: d=(\d+))?"
@@ -43,10 +51,10 @@ def run_once(context: str, image: str, cmd: str) -> float:
     return (time.perf_counter() - t0) * 1000.0
 
 
-def trace_lines_since(offset: int) -> list[str]:
-    if not TRACE_LOG.exists():
+def trace_lines_since(trace_log: Path, offset: int) -> list[str]:
+    if not trace_log.exists():
         return []
-    text = TRACE_LOG.read_text(errors="replace")
+    text = trace_log.read_text(errors="replace")
     return [l for l in text[offset:].splitlines() if "[start-trace]" in l]
 
 
@@ -61,7 +69,10 @@ def main() -> None:
     ap.add_argument("--image", default="alpine")
     ap.add_argument("--cmd", default="true")
     ap.add_argument("--context", default="anvil-dev")
+    ap.add_argument("--trace-log", type=Path, default=None,
+                    help="guest-agent.log to parse (default: resolved from --context)")
     args = ap.parse_args()
+    trace_log = args.trace_log or trace_log_for(args.context)
 
     # Verify the engine answers before timing anything.
     subprocess.run(
@@ -76,15 +87,15 @@ def main() -> None:
     phases: dict[str, list[float]] = {}  # phase -> [d in µs]
     exit_waits: list[float] = []
     for _ in range(args.runs):
-        offset = TRACE_LOG.stat().st_size if TRACE_LOG.exists() else 0
+        offset = trace_log.stat().st_size if trace_log.exists() else 0
         samples.append(run_once(args.context, args.image, args.cmd))
-        for line in trace_lines_since(offset):
+        for line in trace_lines_since(trace_log, offset):
             if m := TRACE_EXIT_RE.search(line):
-                exit_waits.append(int(m.group(2)) / 1000.0)
+                exit_waits.append(int(m.group(2)))
                 continue
             m = TRACE_RE.search(line)
             if m and m.group(5) is not None:
-                phases.setdefault(m.group(3), []).append(int(m.group(5)) / 1000.0)
+                phases.setdefault(m.group(3), []).append(int(m.group(5)))
 
     samples.sort()
     n = len(samples)
@@ -93,14 +104,14 @@ def main() -> None:
           f"max {samples[-1]:.1f} ms | p10 {samples[n // 10]:.1f} ms | p90 {samples[(9 * n) // 10]:.1f} ms")
 
     if exit_waits:
-        print(f"\n  /wait exit observed after: median {statistics.median(exit_waits):.1f} ms")
+        print(f"\n  /wait exit observed after: median {fmt_us(statistics.median(exit_waits))}")
 
     if phases:
         print("\n  guest-agent phases (median µs between marks, in call order):")
         for phase, vals in phases.items():
             print(f"    {phase:16s} {fmt_us(statistics.median(vals)):>10s}   (n={len(vals)})")
     else:
-        print("\n  no [start-trace] lines in guest-agent.log — cold-boot the dev "
+        print(f"\n  no [start-trace] lines in {trace_log} — cold-boot the dev "
               "instance with make dev-rebuild so ANVIL_DEBUG is on")
 
 
