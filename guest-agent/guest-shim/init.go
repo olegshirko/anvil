@@ -403,7 +403,11 @@ func utsNamespaceShared(spec *specs.Spec) bool {
 // joinNamespacesApply joins the non-pid namespaces of the spec in stage B:
 // pathed ones via setns (fds opened before any mount-ns switch), pathless
 // ones via unshare. The pid namespace is skipped (stage A's clone put this
-// process inside it — unsharing another would nest a second one).
+// process inside it — unsharing another would nest a second one). The cgroup
+// namespace is unshared here too: it roots at the caller's current cgroup,
+// which stage A already moved into the container's — so the spec mount of
+// the cgroup root exposes only the container's subtree, as runc's private
+// cgroup namespace does.
 func joinNamespacesApply(spec *specs.Spec) error {
 	if spec.Linux == nil {
 		return nil
@@ -423,8 +427,6 @@ func joinNamespacesApply(spec *specs.Spec) error {
 				return fmt.Errorf("pid namespace joined by path is not supported")
 			}
 			continue // already active
-		case specs.CgroupNamespace:
-			continue // joined with the cgroup switch in stage A's cgroup join
 		case specs.MountNamespace:
 			if ns.Path != "" {
 				return fmt.Errorf("mount namespace joined by path is not supported")

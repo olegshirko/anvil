@@ -88,10 +88,19 @@ func applySpecMounts(rootfs string, mounts []specs.Mount) error {
 				return fmt.Errorf("remount bind %s: %w", m.Destination, err)
 			}
 		case "cgroup":
-			// cgroup v2 single hierarchy: the private cgroup namespace
-			// makes this expose the container's own subtree.
-			if err := unix.Mount("cgroup2", dst, "cgroup", uintptr(flags), ""); err != nil {
-				return fmt.Errorf("mount cgroup2 %s: %w", m.Destination, err)
+			// cgroup v2: bind the guest's own cgroup2 mount, like runc
+			// does for the unified hierarchy. A fresh mount of the cgroup2
+			// (or the legacy "cgroup") filesystem fails with EBUSY here:
+			// the mount namespace is a copy of the guest's and already
+			// carries the hierarchy at /sys/fs/cgroup, and the kernel
+			// refuses a second mount of it under the legacy name. The
+			// private cgroup namespace (joined below, before this runs)
+			// restricts the bound view to the container's own subtree.
+			if err := unix.Mount("/sys/fs/cgroup", dst, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+				return fmt.Errorf("bind cgroup root to %s: %w", m.Destination, err)
+			}
+			if err := unix.Mount("", dst, "", uintptr(unix.MS_BIND|unix.MS_REC|unix.MS_REMOUNT|flags), ""); err != nil {
+				return fmt.Errorf("remount cgroup root %s: %w", m.Destination, err)
 			}
 		default:
 			src := m.Source
