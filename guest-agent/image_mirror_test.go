@@ -9,9 +9,9 @@ import (
 
 func TestSplitMirrorForcedRef(t *testing.T) {
 	cases := []struct {
-		ref      string
-		wantRef  string
-		wantOK   bool
+		ref     string
+		wantRef string
+		wantOK  bool
 	}{
 		{"mirror.anvil/postgres:15.5", "postgres:15.5", true},
 		{"mirror.anvil/library/nginx", "library/nginx", true},
@@ -19,8 +19,8 @@ func TestSplitMirrorForcedRef(t *testing.T) {
 		{"postgres:15.5", "", false},
 		{"docker.io/library/postgres:15.5", "", false},
 		{"myreg.io/postgres:15.5", "", false},
-		{"mirror.anvil", "", false},           // no image at all
-		{"mirror.anvil/", "", false},          // empty image
+		{"mirror.anvil", "", false},  // no image at all
+		{"mirror.anvil/", "", false}, // empty image
 	}
 	for _, tc := range cases {
 		got, ok := splitMirrorForcedRef(tc.ref)
