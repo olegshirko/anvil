@@ -37,6 +37,12 @@ func waitContainerTaskCond(ctx context.Context, ns, containerdID string, nextExi
 	// for as long as the client waits, as Docker does.
 	poll := 50 * time.Millisecond
 	began := time.Now()
+	wtr := newPhaseTrace("wait", truncateID(containerdID))
+	defer func() {
+		if wtr != nil {
+			log.Printf("[start-trace] wait %s exit after=%dus", wtr.id, time.Since(began).Microseconds())
+		}
+	}()
 	for {
 		c, err := cl.LoadContainer(nsCtx, containerdID)
 		if err != nil {
@@ -44,6 +50,7 @@ func waitContainerTaskCond(ctx context.Context, ns, containerdID string, nextExi
 		}
 		_, err = c.Task(nsCtx, nil)
 		if err == nil {
+			wtr.mark("task-ready")
 			break
 		}
 		// not-running: no task is not running. A created container
@@ -140,9 +147,11 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name, p
 	if name, ok := resolveImageID(ctx, req.Image); ok {
 		req.Image = name
 	}
+	tr := newPhaseTrace("create", req.Image)
 	if err := ensureImageInNamespace(ctx, req.Image, ns, platform, auth); err != nil {
 		return "", nil, err
 	}
+	tr.mark("image-ensure")
 	applyImageDefaults(ctx, &req)
 
 	if name == "" {
@@ -157,6 +166,7 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name, p
 	}
 
 	containerdID, warnings, err := createNativeContainer(ctx, ns, name, platform, req)
+	tr.mark("native-create")
 	if err == nil {
 		defer publishContainerEvent("create", ns, containerdID, nil)
 	}

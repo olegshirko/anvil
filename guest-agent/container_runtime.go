@@ -911,11 +911,13 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 	nsCtx := namespaces.WithNamespace(ctx, ns)
 
 	id := newContainerID()
+	tr := newPhaseTrace("native", id[:12])
 	imgRef := canonicalizeImageRef(req.Image)
 	img, err := cl.GetImage(nsCtx, imgRef)
 	if err != nil {
 		return "", nil, fmt.Errorf("image %s not found in namespace %s: %w", imgRef, ns, err)
 	}
+	tr.mark("get-image")
 	img = imageWithPlatform(nsCtx, cl, img, platform)
 	// The platform actually resolved (an amd64-only image under Rosetta
 	// with none requested included), for commit to pick the same subtree.
@@ -933,6 +935,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 	if uerr := img.Unpack(nsCtx, ""); uerr != nil {
 		return "", nil, fmt.Errorf("unpack %s: %w", imgRef, uerr)
 	}
+	tr.mark("unpack")
 
 	hostNet := usesHostNetwork(req)
 	// joinNetNS is the target's named netns for --network container:<x>.
@@ -958,6 +961,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 			return "", nil, fmt.Errorf("create netns: %w", nerr)
 		}
 	}
+	tr.mark("netns")
 	// Undo everything below on any failure. err is the named result, so
 	// every `return "", nil, …` counts — the per-step perr/merr/serr variables
 	// used to bypass the old cleanup and leak the bind-mounted netns.
@@ -979,6 +983,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 	if perr := prepareContainerRoot(ns, id, hostname, req.HostConfig); perr != nil {
 		return "", nil, perr
 	}
+	tr.mark("rootfs-prep")
 
 	mounts, vols, volMounts, subpaths, merr := computeContainerMounts(ns, id, req)
 	if merr != nil {
@@ -1072,6 +1077,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 	if serr := saveContainerMeta(meta); serr != nil {
 		return "", nil, serr
 	}
+	tr.mark("meta")
 
 	labels := map[string]string{}
 	for k, v := range req.Labels {
@@ -1097,6 +1103,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 	); cerr != nil {
 		return "", nil, fmt.Errorf("new container: %w", cerr)
 	}
+	tr.mark("new-container")
 	// Seed empty volumes with the image's content at their mount point, as
 	// Docker does on first mount. Best effort: the container exists now.
 	if len(volMounts) > 0 {

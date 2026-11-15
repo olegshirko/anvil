@@ -49,6 +49,40 @@ func debugLog(format string, v ...interface{}) {
 	}
 }
 
+// phaseTrace attributes container start latency to individual steps
+// (image lookup, unpack, snapshot creation, CNI attach, task start...).
+// Every mark lands in the log as
+//
+//	[start-trace] <op> <id> <phase> at=<µs since op entry> d=<µs since previous mark>
+//
+// Active only in debug mode; a nil trace (outside debug) makes every mark a
+// no-op, so call sites need no guards.
+type phaseTrace struct {
+	op   string
+	id   string
+	t0   time.Time
+	last time.Time
+}
+
+func newPhaseTrace(op, id string) *phaseTrace {
+	if !debugMode {
+		return nil
+	}
+	now := time.Now()
+	return &phaseTrace{op: op, id: id, t0: now, last: now}
+}
+
+func (p *phaseTrace) mark(phase string) {
+	if p == nil {
+		return
+	}
+	now := time.Now()
+	log.Printf("[start-trace] %s %s %s at=%d d=%d",
+		p.op, p.id, phase,
+		now.Sub(p.t0).Microseconds(), now.Sub(p.last).Microseconds())
+	p.last = now
+}
+
 // defaultString returns fallback if s is empty.
 func defaultString(s, fallback string) string {
 	if s == "" {
