@@ -94,7 +94,9 @@ func seccompFilter(sc *specs.LinuxSeccomp) (*seccomp.Filter, error) {
 		// Bare ActionErrno: the module's Validate whitelists only known
 		// action values, so the EPERM bits cannot ride in here —
 		// applySeccomp patches them into the assembled program instead.
-		DefaultAction: bpfAction(sc.DefaultAction, nil),
+		// bpfAction would stamp EPERM into an ActErrno value; the default
+		// must stay bare.
+		DefaultAction: defaultPolicyAction(sc),
 	}
 
 	for i := range sc.Syscalls {
