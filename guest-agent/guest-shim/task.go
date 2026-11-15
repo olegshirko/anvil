@@ -144,6 +144,9 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) 
 	cmd := exec.Command(self, "init", "-id", r.ID, "-bundle", bundle)
 	cmd.ExtraFiles = []*os.File{gateR, reportW, ioSet.childStdin, ioSet.childStdout, ioSet.childStderr}
 	cmd.Env = os.Environ()
+	// probe: helper stderr joins the shim's (containerd's log) so its
+	// init-profile timing prints are visible. Temporary diagnostics.
+	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		gateW.Close()
 		gateR.Close()
