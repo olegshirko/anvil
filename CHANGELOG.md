@@ -1,3 +1,10 @@
+## v1.9.13 (2026-11-15)
+
+### Added
+- 1464f40 feat(images): forced mirror pulls via mirror.anvil/ refs and anvil images push
+
+### Internal
+- 9f3cfc1 style: gofmt image_mirror_test.go
 ## v1.9.12 (2026-11-13)
 
 ### Added
