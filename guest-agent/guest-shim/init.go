@@ -124,9 +124,11 @@ func waitGate() bool {
 var probeT0 = time.Now()
 
 // probeStep prints one init-profile timing line to stderr (the shim's
-// stderr, i.e. containerd's log). Temporary diagnostics.
+// stderr, i.e. containerd's log): relative ms plus the absolute monotonic
+// clock so the stages can be correlated across the helper and the shim.
 func probeStep(stage string) {
-	fmt.Fprintf(os.Stderr, "init-profile %s=%.1fms\n", stage, time.Since(probeT0).Seconds()*1000)
+	fmt.Fprintf(os.Stderr, "init-profile %s=%.1fms mono=%d\n", stage,
+		time.Since(probeT0).Seconds()*1000, time.Now().UnixNano())
 }
 
 func runInit(id, bundle string) int {
@@ -155,6 +157,7 @@ func runInit(id, bundle string) int {
 		reportLine(reportSetupPrefix+"confirm pipe: %v", err)
 		return 1
 	}
+	probeStep("A-pipe")
 	// The original write end must not leak into stage B (or the exec'd
 	// user process) — its LAST closure is what produces the start
 	// confirmation EOF. The fixed-fd dup below clears the flag on the
@@ -177,6 +180,7 @@ func runInit(id, bundle string) int {
 		reportLine(reportSetupPrefix+"resolve self: %v", err)
 		return 1
 	}
+	probeStep("A-self")
 	argv := []string{self, "init-apply", "-id", id, "-bundle", bundle}
 	argvPtrs, err := argvBytePtrs(argv)
 	if err != nil {
@@ -200,6 +204,7 @@ func runInit(id, bundle string) int {
 		reportLine(reportSetupPrefix+"dup confirm: %v", err)
 		return 1
 	}
+	probeStep("A-dup")
 	stageBGlobal, errno := cloneRawPid()
 	probeStep("A-cloned")
 	if errno != 0 {
@@ -522,7 +527,10 @@ func joinCgroup(spec *specs.Spec) error {
 		return nil
 	}
 	procs := filepath.Join(cgroupAbsPath(spec.Linux.CgroupsPath), "cgroup.procs")
-	return os.WriteFile(procs, []byte(strconv.Itoa(os.Getpid())), 0o600)
+	probeStep("A-cg-open")
+	err := os.WriteFile(procs, []byte(strconv.Itoa(os.Getpid())), 0o600)
+	probeStep("A-cg-wrote")
+	return err
 }
 
 // prSetOomScoreAdj is PR_SET_OOM_SCORE_ADJ (not in x/sys).
