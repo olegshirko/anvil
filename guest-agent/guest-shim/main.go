@@ -55,6 +55,9 @@ func main() {
 	if isExecHelper() {
 		os.Exit(runExecHelper(helperArg("initpid"), helperArg("bundle")))
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "secprobe" {
+		os.Exit(runSecProbe(os.Args[2:]))
+	}
 	// NoReaper: every child here (init helpers, exec helpers) is joined by
 	// its own exec.Cmd watcher; the shared reaper would steal the waitpid.
 	shim.RunShim(context.Background(), NewManager(shimName), func(cfg *shim.Config) {

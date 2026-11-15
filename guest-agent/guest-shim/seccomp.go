@@ -29,6 +29,25 @@ import (
 // set has no CAP_SYS_ADMIN, and seccomp requires one or the other (runc
 // does the same for its default-caps containers).
 func applySeccomp(sc *specs.LinuxSeccomp) error {
+	// TSYNC keeps every thread of this (Go, multi-threaded) process inside
+	// the same filter. The probe passes 0 instead to bisect whether this
+	// cross-thread sync is what freezes the process between the load and
+	// the exec.
+	return applySeccompFlagged(sc, unix.SECCOMP_FILTER_FLAG_TSYNC)
+}
+
+// applySeccompFlagged loads the assembled filter with the given seccomp(2)
+// flags. The probe passes 0 to bisect whether the cross-thread sync is what
+// freezes the process.
+//
+// The filter installs through the seccomp(2) syscall, NOT prctl: the
+// SECCOMP_SET_MODE_* values are seccomp(2) operation codes and collide with
+// the prctl SECCOMP_MODE_* values — prctl(PR_SET_SECCOMP, 1) would arm
+// SECCOMP_MODE_STRICT (read/write/exit only, everything else SIGKILL), which
+// silently killed every filtered container. seccomp(2) also carries the
+// TSYNC flag, which the prctl path ignores.
+
+func applySeccompFlagged(sc *specs.LinuxSeccomp, flags uintptr) error {
 	filter, err := seccompFilter(sc)
 	if err != nil {
 		return err
@@ -64,16 +83,17 @@ func applySeccomp(sc *specs.LinuxSeccomp) error {
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		return fmt.Errorf("set no_new_privs: %w", err)
 	}
-	// prctl(PR_SET_SECCOMP, SECCOMP_SET_MODE_FILTER, &fprog, flags, 0) —
-	// the same call the module's LoadFilter makes; here with the patched
-	// program. TSYNC keeps every helper thread inside the same filter.
+	// seccomp(SECCOMP_SET_MODE_FILTER, flags, &fprog) with the patched
+	// program. The operation code is the seccomp(2) one: passing it to
+	// prctl(PR_SET_SECCOMP) instead collides with SECCOMP_MODE_STRICT
+	// (= 1 on the prctl interface) and arms strict mode.
 	fprog := &unix.SockFprog{
 		Len:    uint16(len(sockFilter)),
 		Filter: &sockFilter[0],
 	}
-	if err := unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_SET_MODE_FILTER,
-		uintptr(unsafe.Pointer(fprog)), uintptr(unix.SECCOMP_FILTER_FLAG_TSYNC), 0); err != nil {
-		return fmt.Errorf("load seccomp filter: %w", err)
+	if _, _, errno := unix.RawSyscall6(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER,
+		flags, uintptr(unsafe.Pointer(fprog)), 0, 0, 0); errno != 0 {
+		return fmt.Errorf("load seccomp filter: %w", errno)
 	}
 	return nil
 }
