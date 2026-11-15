@@ -275,6 +275,32 @@ func TestExecResizeUnknownExec(t *testing.T) {
 	decodeAPIError(t, resp)
 }
 
+// Builder-check resolution pin: TTY containers must not get the eof marker
+// in their log URI. The marker fires when the init pid dies — which is when
+// the shim *begins* copying the console — so marker-driven EOF would
+// truncate the TTY tail; TTY tasks keep the stopQuiet timers end to end.
+func TestTTYTasksGetNoMarkerArgs(t *testing.T) {
+	rot := logRotation{maxSize: defaultLogMaxSize, maxFile: defaultLogMaxFile}
+	setContainerTTY(dockerID("default", "pin-tty-container"), true)
+	u, err := taskLogURIForContainer("default", "pin-tty-container", rot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := u.Query()["--eof-marker"]; ok {
+		t.Error("TTY container URI carries --eof-marker, want none")
+	}
+
+	// A plain (non-TTY) container arms the marker.
+	setContainerTTY(dockerID("default", "pin-nontty-container"), false)
+	u, err = taskLogURIForContainer("default", "pin-nontty-container", rot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Query().Get("--eof-marker") != "1" {
+		t.Error("non-TTY container URI missing --eof-marker=1")
+	}
+}
+
 func TestUnknownPathIs404(t *testing.T) {
 	srv := newTestAPIServer(t)
 	resp, err := http.Get(srv.URL + "/widgets/json")
