@@ -47,7 +47,7 @@ func main() {
 	// The helper processes exec this binary before the user process starts;
 	// they bypass the shim server flow entirely.
 	if isInitHelper() {
-		os.Exit(runInit(helperArg("id"), helperArg("bundle")))
+		os.Exit(runInit(helperArg("id"), helperArg("bundle"), helperFlag("cgroup")))
 	}
 	if isInitApply() {
 		os.Exit(runInitApply(helperArg("id"), helperArg("bundle")))
@@ -77,6 +77,18 @@ func helperArg(name string) string {
 		}
 	}
 	return ""
+}
+
+// helperFlag reports whether "-<name>" is present in the helper argv (no
+// value). It is scanned independently of helperArg's pairs so flags can be
+// appended after the valued arguments.
+func helperFlag(name string) bool {
+	for _, a := range os.Args[2:] {
+		if a == "-"+name {
+			return true
+		}
+	}
+	return false
 }
 
 // NewManager returns the shim manager (the process-level shim.Shim).

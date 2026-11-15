@@ -111,8 +111,11 @@ func waitGate() bool {
 }
 
 // runInit is stage A. Returns the process exit code (stage B's exit code —
-// the container init's).
-func runInit(id, bundle string) int {
+// the container init's). ownCgroup makes the helper create the container's
+// cgroup itself and remove it at exit: the direct-creation path (the agent
+// spawns this helper with no shim in between) has no shim to call
+// prepareCgroup, and keeping the cgroup code here keeps it in one place.
+func runInit(id, bundle string, ownCgroup bool) int {
 	spec, err := readSpecFile(filepath.Join(bundle, "config.json"))
 	if err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
@@ -121,6 +124,14 @@ func runInit(id, bundle string) int {
 	if spec.Process == nil {
 		reportLine(reportSetupPrefix + "spec has no process")
 		return 1
+	}
+	if ownCgroup {
+		cgPath, cerr := prepareCgroup(spec)
+		if cerr != nil {
+			reportLine(reportSetupPrefix+"%v", cerr)
+			return 1
+		}
+		defer removeCgroup(cgPath)
 	}
 	if err := joinCgroup(spec); err != nil {
 		reportLine(reportSetupPrefix+"%v", err)

@@ -25,8 +25,8 @@ func isInitHelper() bool { return false }
 func isInitApply() bool  { return false }
 func isExecHelper() bool { return false }
 func isExecApply() bool  { return false }
-func runInit(id, bundle string) int {
-	_, _ = id, bundle
+func runInit(id, bundle string, ownCgroup bool) int {
+	_, _, _ = id, bundle, ownCgroup
 	return 1
 }
 
