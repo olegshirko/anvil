@@ -75,14 +75,14 @@ func seccompFilter(sc *specs.LinuxSeccomp) (*seccomp.Filter, error) {
 		}
 		conds := make(seccomp.ArgumentConditions, 0, len(s.Args))
 		for _, arg := range s.Args {
-			op, ok := bpfOp(arg.Op)
+			op, val, ok := bpfCondition(arg)
 			if !ok {
 				return nil, fmt.Errorf("seccomp: unsupported operator %v", arg.Op)
 			}
 			conds = append(conds, seccomp.Condition{
 				Argument:  uint32(arg.Index),
 				Operation: op,
-				Value:     arg.Value,
+				Value:     val,
 			})
 		}
 		for _, name := range names {
@@ -97,22 +97,6 @@ func seccompFilter(sc *specs.LinuxSeccomp) (*seccomp.Filter, error) {
 	return &seccomp.Filter{
 		Policy: policy,
 	}, nil
-}
-
-// validateSeccompOps rejects profiles with argument operators the single
-// value converter cannot express faithfully (masked compares and multi-value
-// ops); the agent's eligibility excludes custom profiles, so this only ever
-// fires on a misconfiguration — and Create failing beats silently allowing
-// syscalls the profile intended to restrict.
-func validateSeccompOps(sc *specs.LinuxSeccomp) error {
-	for i := range sc.Syscalls {
-		for _, arg := range sc.Syscalls[i].Args {
-			if _, ok := bpfOp(arg.Op); !ok {
-				return fmt.Errorf("seccomp: unsupported operator %v for %s", arg.Op, sc.Syscalls[i].Names)
-			}
-		}
-	}
-	return nil
 }
 
 // bpfAction maps OCI action strings to filter actions.
@@ -135,27 +119,6 @@ func bpfAction(a specs.LinuxSeccompAction) seccomp.Action {
 	default:
 		return seccomp.ActionAllow
 	}
-}
-
-// bpfOp maps OCI comparison operators to the filter's single-value ops.
-// MASKED_EQ and friends cannot round-trip through them and are rejected by
-// validateSeccompOps.
-func bpfOp(op specs.LinuxSeccompOperator) (seccomp.Operation, bool) {
-	switch op {
-	case specs.OpEqualTo:
-		return seccomp.Equal, true
-	case specs.OpNotEqual:
-		return seccomp.NotEqual, true
-	case specs.OpLessThan:
-		return seccomp.LessThan, true
-	case specs.OpLessEqual:
-		return seccomp.LessOrEqual, true
-	case specs.OpGreaterThan:
-		return seccomp.GreaterThan, true
-	case specs.OpGreaterEqual:
-		return seccomp.GreaterOrEqual, true
-	}
-	return "", false
 }
 
 // archForOCI resolves an OCI SCMP_ARCH_* value to filter arch info.
