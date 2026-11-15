@@ -9,6 +9,7 @@ import (
 	"github.com/elastic/go-seccomp-bpf"
 	"github.com/elastic/go-seccomp-bpf/arch"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 )
 
 // OCI seccomp profile -> BPF program. The agent applies containerd's default
@@ -50,7 +51,7 @@ func seccompFilter(sc *specs.LinuxSeccomp) (*seccomp.Filter, error) {
 		return nil, err
 	}
 	policy := seccomp.Policy{
-		DefaultAction: bpfAction(sc.DefaultAction, nil),
+		DefaultAction: bpfAction(sc.DefaultAction, sc.DefaultErrnoRet),
 	}
 
 	for i := range sc.Syscalls {
@@ -99,11 +100,13 @@ func seccompFilter(sc *specs.LinuxSeccomp) (*seccomp.Filter, error) {
 	}, nil
 }
 
-// bpfAction maps OCI action strings to filter actions, carrying the
-// requested errno for ActErrno: the module emits the action value raw, so
-// SECCOMP_RET_ERRNO|errno reaches the kernel as-is. clone3 must answer
-// ENOSYS (glibc's clone3-to-clone fallback keys on ENOSYS specifically),
-// not a blanket EPERM.
+// bpfAction maps OCI action strings to filter actions, carrying the errno
+// for ActErrno: the module emits the action value raw, and SECCOMP_RET_ERRNO
+// with zero errno bits makes the kernel return 0 — a faked success with an
+// uninitialized result — so a bare ActionErrno must never be emitted. The
+// OCI errno wins (clone3 must answer ENOSYS: glibc's clone3-to-clone
+// fallback keys on ENOSYS specifically); without one the default is EPERM,
+// matching libseccomp/runc's SCMP_ACT_ERRNO default.
 func bpfAction(a specs.LinuxSeccompAction, errnoRet *uint) seccomp.Action {
 	switch a {
 	case specs.ActKill, specs.ActKillThread:
@@ -113,10 +116,11 @@ func bpfAction(a specs.LinuxSeccompAction, errnoRet *uint) seccomp.Action {
 	case specs.ActTrap:
 		return seccomp.ActionTrap
 	case specs.ActErrno:
+		errno := uint32(unix.EPERM)
 		if errnoRet != nil {
-			return seccomp.Action(uint32(seccomp.ActionErrno) | (uint32(*errnoRet) & 0xffff))
+			errno = uint32(*errnoRet) & 0xffff
 		}
-		return seccomp.ActionErrno
+		return seccomp.Action(uint32(seccomp.ActionErrno) | errno)
 	case specs.ActTrace:
 		return seccomp.ActionTrace
 	case specs.ActNotify:
