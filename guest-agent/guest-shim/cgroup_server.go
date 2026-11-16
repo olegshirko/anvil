@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+
+	"github.com/olegshirko/anvil/guest-agent/internal/cgroupv2"
 )
 
 // The shim server's cgroup operations (Task Update/Freeze/Kill). They live
@@ -19,7 +21,7 @@ func updateCgroup(cgPath string, res *specs.LinuxResources) error {
 	if cgPath == "" || res == nil {
 		return nil
 	}
-	return writeResourceLimits(cgPath, res)
+	return cgroupv2.WriteResourceLimits(cgPath, res)
 }
 
 // freezeCgroup pauses/unpauses every process in the container (cgroup v2
