@@ -533,6 +533,17 @@ func runExecApply() int {
 		return 1
 	}
 
+	// The exec's working directory, resolved inside the container's rootfs
+	// (docker exec -w, and the container's own Cwd when the exec spec
+	// carries none). runc's exec chdir's before applying the user and the
+	// filter, and so must this one: without it every exec started in "/".
+	if pspec.Cwd != "" {
+		if err := unix.Chdir(pspec.Cwd); err != nil {
+			reportLine(reportSetupPrefix+"chdir %s: %v", pspec.Cwd, err)
+			return 1
+		}
+	}
+
 	// The confirm fd must die at the user exec (its closure is the start
 	// confirmation stage A waits for).
 	unix.CloseOnExec(fdExecConfirm)
