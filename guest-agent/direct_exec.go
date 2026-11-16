@@ -206,7 +206,9 @@ func (p *directExecProcess) childStdio() (stdinF, stdoutF, stderrF *os.File, err
 			return nil, nil, nil, perr
 		}
 		p.stdinRead, p.stdinWrite = r, w
+		p.stdinDone = make(chan struct{})
 		p.addCopy(func() {
+			defer close(p.stdinDone)
 			io.Copy(w, p.stdinSrc) //nolint:errcheck
 			w.Close()
 		})
@@ -427,9 +429,19 @@ func (p *directExecProcess) Kill(ctx context.Context, sig syscall.Signal, _ ...c
 	return nil
 }
 
+// CloseIO ends the exec's stdin: the client half-closed, so the process must
+// see EOF. The copy goroutine already closes the write end after the last
+// byte, so waiting for it — rather than closing the pipe here — is what makes
+// a large `docker save | docker exec -i` complete: closing the write end
+// while the copy was still draining dropped the tail (a 50 MB stream lost
+// its last 32 KB).
 func (p *directExecProcess) CloseIO(ctx context.Context, _ ...client.IOCloserOpts) error {
-	if p.stdinWrite != nil {
-		return p.stdinWrite.Close()
+	if p.stdinWrite == nil || p.stdinDone == nil {
+		return nil
+	}
+	select {
+	case <-p.stdinDone:
+	case <-ctx.Done():
 	}
 	return nil
 }
@@ -475,6 +487,7 @@ type directExecProcess struct {
 	consoleSlave *os.File
 	stdinRead    *os.File
 	stdinWrite   *os.File
+	stdinDone    chan struct{} // closed when the stdin copy drained
 	stdoutRead   *os.File
 	stderrRead   *os.File
 
