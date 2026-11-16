@@ -116,7 +116,7 @@ func applyProcessAttrsNoSeccomp(spec *specs.Spec) error {
 		spec.Linux.Seccomp = nil
 		defer func() { spec.Linux.Seccomp = saved }()
 	}
-	return applyProcessAttrs(spec)
+	return applyProcessAttrs("", spec)
 }
 
 // applySeccompNoTSync is applySeccomp without SECCOMP_FILTER_FLAG_TSYNC —

@@ -338,7 +338,7 @@ func runExecApply() int {
 	// rlimits and oom score) plus the container's seccomp filter — the
 	// filter is inherited only from the parent, and this process is a fresh
 	// child of the shim, so it must install it explicitly.
-	if err := applyProcessAttrs(&specs.Spec{Process: &pspec, Linux: initSpec.Linux}); err != nil {
+	if err := applyProcessAttrs("", &specs.Spec{Process: &pspec, Linux: initSpec.Linux}); err != nil {
 		reportLine(reportStartPrefix+"%v", err)
 		return 126
 	}
