@@ -176,27 +176,45 @@ func (p *directExecProcess) childStdio() (stdinF, stdoutF, stderrF *os.File, err
 		// controlling terminal, which stage B's setsid+TIOCSCTTY takes. The
 		// agent-side copies run through the master; stdin is a copy into the
 		// master, not a child fd.
-		master, slavePath, cerr := console.NewPty()
-		if cerr != nil {
-			return nil, nil, nil, fmt.Errorf("openpty: %w", cerr)
+		//
+		// The pty must belong to the CONTAINER's devpts instance: a pty
+		// from the agent's own instance (console.NewPty) is a valid tty,
+		// but ttyname(3) inside the container cannot name it, so
+		// `docker exec -t c tty` reported "not a tty".
+		master, slave, cerr := openContainerPty(p.initPid)
+		var con console.Console
+		if cerr == nil {
+			con, cerr = console.ConsoleFromFile(master)
 		}
-		slave, cerr := os.OpenFile(slavePath, os.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
 		if cerr != nil {
-			master.Close()
-			return nil, nil, nil, fmt.Errorf("open console slave: %w", cerr)
+			if master != nil {
+				master.Close() //nolint:errcheck
+				slave.Close()  //nolint:errcheck
+			}
+			debugLog("[exec] %s: pty in the container's devpts failed (%v); using the agent's devpts", p.id, cerr)
+			m, slavePath, perr := console.NewPty()
+			if perr != nil {
+				return nil, nil, nil, fmt.Errorf("openpty: %w", perr)
+			}
+			s, perr := os.OpenFile(slavePath, os.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
+			if perr != nil {
+				m.Close()
+				return nil, nil, nil, fmt.Errorf("open console slave: %w", perr)
+			}
+			con, slave = m, s
 		}
-		p.console = master
+		p.console = con
 		p.consoleSlave = slave
 		if p.stdinSrc != nil {
 			// Input copy: not awaited by IO().Wait (a client that keeps its
 			// stdin open after the process exits must not delay the exec).
 			go func() {
-				io.Copy(master, p.stdinSrc) //nolint:errcheck
+				io.Copy(con, p.stdinSrc) //nolint:errcheck
 			}()
 		}
 		p.addOutCopy(func() {
-			io.Copy(p.stdoutDst, master) //nolint:errcheck
-			master.Close()
+			io.Copy(p.stdoutDst, con) //nolint:errcheck
+			con.Close()
 		})
 		return slave, slave, slave, nil
 	}
