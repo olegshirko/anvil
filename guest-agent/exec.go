@@ -48,9 +48,10 @@ type execSpec struct {
 	// finished is when the exec exited; finished execs are pruned from the
 	// store after execRetention.
 	finished time.Time
-	// proc is the containerd exec process while it runs; kept for TTY resize
-	// (POST /exec/{id}/resize) between start and exit.
-	proc client.Process
+	// proc is the live exec process while it runs (containerd's or the direct
+	// helper's); kept for TTY resize (POST /exec/{id}/resize) between start
+	// and exit.
+	proc containerProcess
 	// pid is the exec process's pid (kept after exit, as Docker does).
 	pid uint32
 }
@@ -79,8 +80,8 @@ func (s *execSpec) releaseStart() {
 	s.running = false
 }
 
-// setProcess records (or clears with nil) the live containerd exec process.
-func (s *execSpec) setProcess(p client.Process) {
+// setProcess records (or clears with nil) the live exec process.
+func (s *execSpec) setProcess(p containerProcess) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.proc = p
@@ -90,7 +91,7 @@ func (s *execSpec) setProcess(p client.Process) {
 }
 
 // currentProcess returns the live exec process, or nil when not running.
-func (s *execSpec) currentProcess() client.Process {
+func (s *execSpec) currentProcess() containerProcess {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.proc
@@ -336,10 +337,12 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		spec.setExit(126)
 	}
 
-	// Native exec: task.Exec inside the container's task, with the hijacked
-	// connection wired to the process stdio. Docker's hijacked attach
-	// protocol sends client stdin as a raw byte stream in both TTY and
-	// non-TTY modes (only the output direction is multiplexed).
+	// Native exec: an exec process inside the container's task — containerd's
+	// task.Exec for shim containers, the helper's exec mode for direct (stage
+	// 5a) ones — with the hijacked connection wired to the process stdio.
+	// Docker's hijacked attach protocol sends client stdin as a raw byte
+	// stream in both TTY and non-TTY modes (only the output direction is
+	// multiplexed).
 	cl, cerr := pc.get(context.Background())
 	if cerr != nil {
 		failExec("containerd", cerr)
@@ -351,10 +354,24 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		failExec("load container", lerr)
 		return
 	}
-	task, terr := container.Task(nsCtx, nil)
-	if terr != nil {
-		failExec("container is not running", terr)
-		return
+	var task client.Task
+	direct, isDirect := supervisor.lookup(spec.Namespace, spec.ContainerdID)
+	execPid := 0
+	if isDirect {
+		pid, running := direct.pidFor()
+		if !running {
+			failExec("container is not running", fmt.Errorf("no running direct task"))
+			return
+		}
+		execPid = pid
+	} else {
+		var terr error
+		task, terr = container.Task(nsCtx, nil)
+		if terr != nil {
+			failExec("container is not running", terr)
+			return
+		}
+		execPid = int(task.Pid())
 	}
 
 	stdoutR, stdoutW, perr := os.Pipe()
@@ -376,7 +393,7 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 	// returns: the stdin copier needs the process for CloseIO.
 	started, finished := make(chan struct{}), make(chan struct{})
 	defer close(finished)
-	var proc client.Process
+	var proc containerProcess
 
 	// Every early return after this point must close the stdio pipes: a
 	// leaked pair is two fds and two blocked stream readers per failed
@@ -433,7 +450,7 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		}()
 	}
 
-	user, uerr := execUserFor(nsCtx, container, task, spec.User)
+	user, uerr := execUserFor(nsCtx, container, execPid, spec.User)
 	if uerr != nil {
 		closePipes()
 		failExec("exec", uerr)
@@ -448,16 +465,22 @@ func handleExecStart(w http.ResponseWriter, r *http.Request, id string) {
 		Terminal: spec.Tty,
 	}
 
-	execID := newExecID()
-	// A TTY exec needs Terminal in the IO config as well as in the spec:
-	// only then does the shim hand runc a console socket and allocate the
-	// pty. With the spec flag alone runc started the process on plain pipes
-	// (`docker exec -it` shells reported "not a tty").
-	ioOpts := []cio.Opt{cio.WithStreams(stdinR, stdoutW, stderrW)}
-	if spec.Tty {
-		ioOpts = append(ioOpts, cio.WithTerminal)
+	var process containerProcess
+	var xerr error
+	if isDirect {
+		process, xerr = newDirectExec(spec.Namespace, spec.ContainerdID, direct, pspec, spec.Tty, stdinR, stdoutW, stderrW)
+	} else {
+		execID := newExecID()
+		// A TTY exec needs Terminal in the IO config as well as in the spec:
+		// only then does the shim hand runc a console socket and allocate the
+		// pty. With the spec flag alone runc started the process on plain
+		// pipes (`docker exec -it` shells reported "not a tty").
+		ioOpts := []cio.Opt{cio.WithStreams(stdinR, stdoutW, stderrW)}
+		if spec.Tty {
+			ioOpts = append(ioOpts, cio.WithTerminal)
+		}
+		process, xerr = task.Exec(nsCtx, execID, pspec, cio.NewCreator(ioOpts...))
 	}
-	process, xerr := task.Exec(nsCtx, execID, pspec, cio.NewCreator(ioOpts...))
 	if xerr != nil {
 		closePipes()
 		failExec("exec", xerr)

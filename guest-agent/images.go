@@ -14,6 +14,7 @@ import (
 
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	digest "github.com/opencontainers/go-digest"
 
 	"github.com/containerd/errdefs"
 )
@@ -383,6 +384,21 @@ func removeDockerImageImpl(ctx context.Context, name string, force bool) error {
 	if len(nss) == 0 {
 		nss = []string{"default"}
 	}
+	// Collect the digests before the records go away: the create-path memo is
+	// keyed by digest and must not outlive the image it describes. An image
+	// named by ID has no record under that name, hence imageRecordsByID.
+	doomed := map[digest.Digest]bool{}
+	if _, id := imageRecordsByID(ctx, name); id != "" {
+		doomed[digest.Digest(id)] = true
+	}
+	for _, ns := range nss {
+		nsCtx := namespaces.WithNamespace(ctx, ns)
+		for _, candidate := range dedupeStrings([]string{canonical, name}) {
+			if img, gerr := cl.GetImage(nsCtx, candidate); gerr == nil {
+				doomed[img.Target().Digest] = true
+			}
+		}
+	}
 	removed, lastErr := 0, error(nil)
 	for _, ns := range nss {
 		nsCtx := namespaces.WithNamespace(ctx, ns)
@@ -405,6 +421,17 @@ func removeDockerImageImpl(ctx context.Context, name string, force bool) error {
 		if deletedOne {
 			log.Printf("[images] rmi %q ns=%q force=%v", name, ns, force)
 			removed++
+		}
+	}
+	// The records are gone (or the delete failed and the next create
+	// re-derives anyway): drop every memo answer about these images.
+	for d := range doomed {
+		imageMemo.forgetImage(d)
+	}
+	for _, ns := range nss {
+		imageMemo.forgetRef(ns, canonical)
+		if name != canonical {
+			imageMemo.forgetRef(ns, name)
 		}
 	}
 	if removed == 0 && lastErr != nil {

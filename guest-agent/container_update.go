@@ -74,7 +74,15 @@ func updateDockerContainer(ctx context.Context, ref string, req dockerUpdateRequ
 		if err := applyResourceUpdate(spec.Linux.Resources, req); err != nil {
 			return nil, err
 		}
-		if task, terr := c.Task(nsCtx, nil); terr == nil {
+		// A live direct task has no containerd task to update: its limits
+		// live in the agent-owned cgroup (stage 5a).
+		if t, ok := supervisor.lookup(ns, cid); ok {
+			if _, running := t.pidFor(); running {
+				if err := updateDirectCgroup(t.cgroupPath, spec.Linux.Resources); err != nil {
+					return nil, fmt.Errorf("update running container: %w", err)
+				}
+			}
+		} else if task, terr := c.Task(nsCtx, nil); terr == nil {
 			if st, serr := task.Status(nsCtx); serr == nil && (st.Status == client.Running || st.Status == client.Paused) {
 				if err := task.Update(nsCtx, client.WithResources(spec.Linux.Resources)); err != nil {
 					return nil, fmt.Errorf("update running container: %w", err)

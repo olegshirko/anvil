@@ -347,7 +347,7 @@ func disconnectContainerNetwork(ctx context.Context, networkRef, container strin
 			// is left without a primary until it restarts, when the next
 			// network in the list becomes eth0.
 			dctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-			err := detachPrimaryLive(dctx, network, id, netnsPathFor(id), meta.Ports)
+			err := detachPrimaryLive(dctx, network, ns, id, netnsPathFor(id), meta.Ports)
 			cancel()
 			if err != nil {
 				return fmt.Errorf("disconnect %s: %w", network, err)

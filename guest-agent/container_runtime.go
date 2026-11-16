@@ -911,28 +911,41 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 	nsCtx := namespaces.WithNamespace(ctx, ns)
 
 	id := newContainerID()
+	tr := newPhaseTrace("native", id[:12])
 	imgRef := canonicalizeImageRef(req.Image)
 	img, err := cl.GetImage(nsCtx, imgRef)
 	if err != nil {
 		return "", nil, fmt.Errorf("image %s not found in namespace %s: %w", imgRef, ns, err)
 	}
-	img = imageWithPlatform(nsCtx, cl, img, platform)
+	tr.mark("get-image")
+	// Resolve the platform and read the config once per (digest, platform):
+	// the platform content probes and the config blob read do not change
+	// between creates of the same image.
+	img, inf := resolveImageInfo(nsCtx, cl, img, platform)
 	// The platform actually resolved (an amd64-only image under Rosetta
 	// with none requested included), for commit to pick the same subtree.
-	actualPlatform := imagePlatform(nsCtx, img)
+	actualPlatform := inf.platform
 	if actualPlatform == "" {
 		actualPlatform = platform
 	}
-	if platform == "" {
-		if w := emulatedPlatformWarning(nsCtx, img); w != "" {
-			warnings = append(warnings, w)
-		}
+	if platform == "" && inf.warning != "" {
+		warnings = append(warnings, inf.warning)
 	}
 
-	// The rootfs snapshot requires unpacked layers.
-	if uerr := img.Unpack(nsCtx, ""); uerr != nil {
+	// The rootfs snapshot requires unpacked layers. Whether they are
+	// unpacked is memoized per (digest, platform); containerd's GC can drop
+	// the snapshots later without telling us, so NewContainer below re-checks
+	// a memo hit and heals it if the chain is gone.
+	imgDigest := img.Target().Digest
+	unpackMemoized := imageMemo.isUnpacked(imgDigest, platform)
+	if unpackMemoized {
+		debugLog("create %s: layers of %s already unpacked (memo)", truncateID(id), imgRef)
+	} else if uerr := img.Unpack(nsCtx, ""); uerr != nil {
 		return "", nil, fmt.Errorf("unpack %s: %w", imgRef, uerr)
+	} else {
+		imageMemo.markUnpacked(imgDigest, platform)
 	}
+	tr.mark("unpack")
 
 	hostNet := usesHostNetwork(req)
 	// joinNetNS is the target's named netns for --network container:<x>.
@@ -958,6 +971,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 			return "", nil, fmt.Errorf("create netns: %w", nerr)
 		}
 	}
+	tr.mark("netns")
 	// Undo everything below on any failure. err is the named result, so
 	// every `return "", nil, …` counts — the per-step perr/merr/serr variables
 	// used to bypass the old cleanup and leak the bind-mounted netns.
@@ -979,6 +993,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 	if perr := prepareContainerRoot(ns, id, hostname, req.HostConfig); perr != nil {
 		return "", nil, perr
 	}
+	tr.mark("rootfs-prep")
 
 	mounts, vols, volMounts, subpaths, merr := computeContainerMounts(ns, id, req)
 	if merr != nil {
@@ -997,10 +1012,10 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 
 	var imgCfg *ocispecImageConfig
 	var imgExposed map[string]struct{}
-	if spec, serr := img.Spec(nsCtx); serr == nil {
+	if cfg := inf.config; cfg != nil {
 		// The image's VOLUME paths not mounted otherwise get an anonymous
 		// volume each (after --volumes-from, which takes precedence).
-		imgVols, imgMounts, ierr := imageVolumeMounts(ns, spec.Config.Volumes, mounts)
+		imgVols, imgMounts, ierr := imageVolumeMounts(ns, cfg.Volumes, mounts)
 		if ierr != nil {
 			return "", nil, ierr
 		}
@@ -1009,13 +1024,13 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 			mounts = append(mounts, specs.Mount{Type: "bind", Source: vm.dir, Destination: vm.dst, Options: []string{"rbind"}})
 		}
 		volMounts = append(volMounts, imgMounts...)
-		imgExposed = spec.Config.ExposedPorts
+		imgExposed = cfg.ExposedPorts
 		imgCfg = &ocispecImageConfig{
-			Entrypoint: spec.Config.Entrypoint,
-			Cmd:        spec.Config.Cmd,
-			Env:        spec.Config.Env,
-			User:       spec.Config.User,
-			WorkingDir: spec.Config.WorkingDir,
+			Entrypoint: cfg.Entrypoint,
+			Cmd:        cfg.Cmd,
+			Env:        cfg.Env,
+			User:       cfg.User,
+			WorkingDir: cfg.WorkingDir,
 		}
 	}
 
@@ -1072,6 +1087,7 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 	if serr := saveContainerMeta(meta); serr != nil {
 		return "", nil, serr
 	}
+	tr.mark("meta")
 
 	labels := map[string]string{}
 	for k, v := range req.Labels {
@@ -1089,14 +1105,37 @@ func createNativeContainer(ctx context.Context, ns, name, platform string, req d
 		labels[labelPorts] = string(portsJSON)
 	}
 
-	if _, cerr := cl.NewContainer(nsCtx, id,
+	newContainerOpts := []client.NewContainerOpts{
 		client.WithNewSnapshot(id, img),
 		client.WithImage(img),
 		client.WithContainerLabels(labels),
 		client.WithNewSpec(specOpts...),
-	); cerr != nil {
+	}
+	// Fast-shim containers are decided here: the runtime is a property of
+	// the container record. A fast-shim failure at start still falls back to
+	// the default runtime (startNativeTask), invisibly to the client.
+	if fastShimEligible(req, meta) {
+		newContainerOpts = append(newContainerOpts, withFastShim())
+	}
+	_, cerr := cl.NewContainer(nsCtx, id, newContainerOpts...)
+	if cerr != nil && unpackMemoized && missingUnpackedLayers(cerr) {
+		// The memo said the layers were unpacked, but the snapshot chain is
+		// gone (containerd's GC removes unpacked snapshots asynchronously).
+		// Heal instead of failing: drop the memo entry, unpack once and retry.
+		// The stale-state error never reaches the client.
+		log.Printf("[docker-api] create %s: unpacked-state memo stale (%v), re-unpacking", truncateID(id), cerr)
+		imageMemo.forgetUnpacked(imgDigest, platform)
+		if uerr := img.Unpack(nsCtx, ""); uerr != nil {
+			return "", nil, fmt.Errorf("unpack %s: %w", imgRef, uerr)
+		}
+		imageMemo.markUnpacked(imgDigest, platform)
+		tr.mark("unpack-heal")
+		_, cerr = cl.NewContainer(nsCtx, id, newContainerOpts...)
+	}
+	if cerr != nil {
 		return "", nil, fmt.Errorf("new container: %w", cerr)
 	}
+	tr.mark("new-container")
 	// Seed empty volumes with the image's content at their mount point, as
 	// Docker does on first mount. Best effort: the container exists now.
 	if len(volMounts) > 0 {

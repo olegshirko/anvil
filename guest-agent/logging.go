@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -32,16 +33,48 @@ import (
 
 const logReadyFD = 5
 
-// logLine mirrors Docker's json-file record shape.
+// logLine mirrors Docker's json-file record shape. EOF marks the
+// end-of-stream record the loggers append when the container output is final
+// (Task: deterministic attach EOF); it is never surfaced as output.
 type logLine struct {
 	Log    string    `json:"log"`
 	Stream string    `json:"stream"`
 	Time   time.Time `json:"time"`
+	EOF    bool      `json:"eof,omitempty"`
+}
+
+// eofMarker is the end-of-stream record: the follow loop in readTaskLog ends
+// the stream as soon as it reads one, replay emitters skip it. It still goes
+// through the rotation policy like any record, so replay readers of old logs
+// (and other engines' json-file readers) see a well-formed line.
+func eofMarker() logLine {
+	return logLine{EOF: true, Time: time.Now().UTC()}
+}
+
+// writeEOFMarker appends the end-of-stream record to out.
+func writeEOFMarker(out io.Writer) {
+	rec, err := json.Marshal(eofMarker())
+	if err != nil {
+		return
+	}
+	out.Write(append(rec, '\n'))
+}
+
+// isEOFMarker reports whether a raw log line is the end-of-stream record.
+// The `"eof":true` substring cannot appear inside a real record (quotes in
+// the log payload are JSON-escaped), so it is a safe prefilter before the
+// decode.
+func isEOFMarker(raw []byte) bool {
+	if !bytes.Contains(raw, []byte(`"eof":true`)) {
+		return false
+	}
+	var rec logLine
+	return json.Unmarshal(raw, &rec) == nil && rec.EOF
 }
 
 // runJSONLogger implements the `guest-agent --log-json <path>` logging
 // subcommand. It never returns until both input streams are closed.
-func runJSONLogger(path string, rot logRotation) error {
+func runJSONLogger(path string, rot logRotation, marker bool) error {
 	out, err := openRotatingLog(path, rot)
 	if err != nil {
 		return err
@@ -55,6 +88,21 @@ func runJSONLogger(path string, rot logRotation) error {
 		ready.Close()
 	}
 
+	var stdout, stderr io.Reader
+	if f := os.NewFile(3, "CONTAINER_stdout"); f != nil {
+		stdout = f
+	}
+	if f := os.NewFile(4, "CONTAINER_stderr"); f != nil {
+		stderr = f
+	}
+	return runStreamLogger(out, path, marker, stdout, stderr)
+}
+
+// runStreamLogger is the logger body shared by the shim-spawned (fd3/fd4)
+// and FIFO-mode loggers: split both streams into records, and — when the
+// eof marker is armed — end the log with the marker once the container
+// output is final. It returns when both readers are exhausted.
+func runStreamLogger(out *rotatingLog, logPath string, marker bool, stdout, stderr io.Reader) error {
 	// The shim never closes the stream fds, so the readers never see EOF
 	// while the task record exists — a trailing partial line (printf
 	// without newline, `... | head -c N`) would be lost forever. Partials
@@ -62,23 +110,26 @@ func runJSONLogger(path string, rot logRotation) error {
 	// stream immediately.
 	startPartialFlusher(out)
 
+	if marker {
+		go watchPidFileForMarker(out, logPath)
+	}
+
 	var wg sync.WaitGroup
 	for _, s := range []struct {
 		name string
-		fd   uintptr
+		r    io.Reader
 	}{
-		{"stdout", 3},
-		{"stderr", 4},
+		{"stdout", stdout},
+		{"stderr", stderr},
 	} {
+		if s.r == nil {
+			continue
+		}
 		wg.Add(1)
-		go func(name string, fd uintptr) {
+		go func(name string, r io.Reader) {
 			defer wg.Done()
-			f := os.NewFile(fd, "CONTAINER_"+name)
-			if f == nil {
-				return
-			}
-			writeStream(out, name, f)
-		}(s.name, s.fd)
+			writeStream(out, name, r)
+		}(s.name, s.r)
 	}
 	wg.Wait()
 	return nil
@@ -86,8 +137,9 @@ func runJSONLogger(path string, rot logRotation) error {
 
 // runFifoJSONLogger is the logger for a task the shim runs in FIFO mode
 // (stdin-attached, non-TTY containers): it reads the stream FIFOs by path and
-// exits when the shim closes them at the process exit.
-func runFifoJSONLogger(path string, rot logRotation, fifos loggerFifos) error {
+// exits when the shim closes them at the process exit. That natural EOF is
+// the output being final, so the log ends with the eof marker.
+func runFifoJSONLogger(path string, rot logRotation, fifos loggerFifos, marker bool) error {
 	out, err := openRotatingLog(path, rot)
 	if err != nil {
 		return err
@@ -109,7 +161,100 @@ func runFifoJSONLogger(path string, rot logRotation, fifos loggerFifos) error {
 		}(name, p)
 	}
 	wg.Wait()
+	if marker {
+		finalizeLogRecords(out)
+	}
 	return nil
+}
+
+// initPidPoll and initGonePoll pace the logger's two waits: for the agent's
+// pid file (written right after the task starts) and for the init process
+// to disappear. Both are well under the follow loop's poll cadence, so the
+// marker costs the attach nothing measurable.
+const (
+	initPidPoll  = 20 * time.Millisecond
+	initGonePoll = 10 * time.Millisecond
+)
+
+// initPidPath is the sidecar file carrying the container init's pid for the
+// task logger. The binary-v2 logger is spawned by the shim at Create, before
+// the init exists, so argv/env cannot carry the pid (containerd builds the
+// logger's argv from the log URI's query map); a file next to the log is the
+// only channel that works, and it dies with the container's store dir.
+func initPidPath(logPath string) string {
+	return logPath + ".pid"
+}
+
+// writeInitPidFile records the container init's pid for the task logger.
+// Failure is not fatal: the marker then never appears and the follow loop's
+// timer fallback ends the stream as before.
+func writeInitPidFile(logPath string, pid int) {
+	if err := os.WriteFile(initPidPath(logPath), []byte(strconv.Itoa(pid)), 0o644); err != nil {
+		debugLog("write pid file %s: %v", initPidPath(logPath), err)
+	}
+}
+
+// watchPidFileForMarker ends the log with the eof marker when the container
+// init is gone: wait for the agent's pid file, watch the pid, then flush the
+// streams' pending partials and append the marker. A pid file that never
+// appears (task never started, or a pre-marker log) leaves the follow
+// loop's timers in charge — the same safety net as before.
+func watchPidFileForMarker(out io.Writer, logPath string) {
+	pidPath := initPidPath(logPath)
+	pid := 0
+	for {
+		b, err := os.ReadFile(pidPath)
+		if err == nil {
+			n, perr := strconv.Atoi(strings.TrimSpace(string(b)))
+			if perr == nil && n > 0 {
+				pid = n
+				break
+			}
+			// A malformed file never heals; give up on the marker.
+			debugLog("logger: bad pid file %s: %q", pidPath, b)
+			return
+		}
+		if !os.IsNotExist(err) {
+			debugLog("logger: read pid file %s: %v", pidPath, err)
+			return
+		}
+		time.Sleep(initPidPoll)
+	}
+	<-watchInitPid(pid, initGonePoll)
+	finalizeLogRecords(out)
+}
+
+// watchInitPid returns a channel that closes once the process no longer
+// exists.
+func watchInitPid(pid int, poll time.Duration) <-chan struct{} {
+	ch := make(chan struct{})
+	go func() {
+		defer close(ch)
+		for !initGone(pid) {
+			time.Sleep(poll)
+		}
+	}()
+	return ch
+}
+
+// initGone reports whether pid has exited and been reaped: kill(pid, 0)
+// answers ESRCH only then. A just-exited init is still a zombie until the
+// shim's reaper collects it — a few ms at most, still far inside the
+// follow loop's cadence.
+func initGone(pid int) bool {
+	return syscall.Kill(pid, 0) == syscall.ESRCH
+}
+
+// finalizeLogRecords writes the log's final records: the streams' pending
+// partial tails first (forced, both streams are done), then the eof marker.
+// A short second pass catches bytes that were still in flight in the pipe
+// when the init died — the reader goroutines are woken by data, not by the
+// exit, so this is microseconds, not a quiet window.
+func finalizeLogRecords(out io.Writer) {
+	flushQuietPartials(out, time.Now().Add(partialFlushAfter))
+	time.Sleep(5 * time.Millisecond)
+	flushQuietPartials(out, time.Now().Add(partialFlushAfter))
+	writeEOFMarker(out)
 }
 
 // partialFlushAfter is how long an unterminated tail may sit before it is
@@ -248,7 +393,11 @@ func writeStream(out io.Writer, stream string, r io.Reader) {
 
 // taskLogURI builds the binary-v2 log URI pointing at this binary with the
 // hidden logging subcommand. Query args become argv for the spawned logger.
-func taskLogURI(logPath string, rot logRotation) (*url.URL, error) {
+// eofMarker arms the logger's end-of-stream record; it is set for non-TTY
+// containers only — a TTY task's console copy starts when the init dies, so
+// marker-driven EOF would truncate its tail (builder-check resolution: TTY
+// keeps the stopQuiet timers end to end).
+func taskLogURI(logPath string, rot logRotation, eofMarker bool) (*url.URL, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("resolve agent path: %w", err)
@@ -258,6 +407,9 @@ func taskLogURI(logPath string, rot logRotation) (*url.URL, error) {
 	q.Set("--log-json", logPath)
 	q.Set("--max-size", strconv.FormatInt(rot.maxSize, 10))
 	q.Set("--max-file", strconv.Itoa(rot.maxFile))
+	if eofMarker {
+		q.Set("--eof-marker", "1")
+	}
 	u.RawQuery = q.Encode()
 	return u, nil
 }
@@ -290,6 +442,11 @@ type logReadOptions struct {
 const (
 	stopQuietDefault = 2 * partialFlushAfter
 	stopQuietTTY     = 500 * time.Millisecond
+	// followLogPoll is the follow loop's log-file cadence. The eof marker
+	// is read straight off the file, so it is seen this long after the
+	// logger writes it; the stop condition is throttled separately (it is
+	// a containerd round-trip, not a file read).
+	followLogPoll = 5 * time.Millisecond
 )
 
 // readTaskLog replays the container's json-file log. Each decoded record is
@@ -308,6 +465,9 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 		}
 	}
 	emitRecord := func(rec logLine) {
+		if rec.EOF {
+			return // end-of-stream marker: never output, no since/until either
+		}
 		if !opts.since.IsZero() && rec.Time.Before(opts.since) {
 			return
 		}
@@ -328,8 +488,16 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	}
 
 	// Replay what exists — rotated files oldest first, then the live one —
-	// keeping only the last tail records when set.
+	// keeping only the last tail records when set. markerTail remembers
+	// whether the last complete record is the eof marker (the output is
+	// final: the container already ran to completion).
+	markerTail := false
 	liveSize, err := replayLog(logPath, opts.tail, func(raw []byte) {
+		if isEOFMarker(raw) {
+			markerTail = true
+			return
+		}
+		markerTail = false
 		var rec logLine
 		if json.Unmarshal(raw, &rec) == nil {
 			emitRecord(rec)
@@ -340,6 +508,17 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	}
 
 	if !opts.follow {
+		return nil
+	}
+	if markerTail && (opts.stop == nil || opts.stop()) {
+		// The replay already covered the container's whole output: the last
+		// complete record is the eof marker, so the container has run to
+		// completion and the follow ends here (`docker logs -f` / attach of
+		// an exited container) instead of waiting on the stop timers. A
+		// container that is only between runs — the previous run's marker
+		// at the tail, the next task not recreated yet (`docker start -a` —
+		// attach before start) — keeps the stream open via the stop
+		// condition, exactly as before the marker existed.
 		return nil
 	}
 
@@ -372,10 +551,17 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 	ino := logInode(logPath)
 	var quietSince time.Time
 	var stopDeadline time.Time
+	// The eof marker is checked on every read (a stat + size compare), so
+	// the log is polled fast: the marker lands within ~10 ms of the init's
+	// death and `docker run` returns on it, exactly the deterministic end
+	// Stage 1 promised. The stop condition, in contrast, costs a containerd
+	// state round-trip per call (taskExitedStopper) — it keeps the coarse
+	// cadence below, quiet logic included.
+	var lastStopEval time.Time
 	// A running container is followed indefinitely (docker logs -f must not
-	// end on a timer); the only bounded wait is for a log file that never
-	// appears while no stop condition can ever fire (callers without stop).
-	var fileSeen bool
+	// end on a timer); production callers always pass a stop condition
+	// (task exit, client disconnect). Only the stop-less mode — tests — is
+	// bounded by noStopWait.
 	var noStopDeadline time.Time
 	if opts.stop == nil {
 		wait := opts.noStopWait
@@ -398,7 +584,6 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 			ino = cur
 		}
 		if chunk, next, cerr := readLogFrom(logPath, off); cerr == nil {
-			fileSeen = true
 			if len(chunk) > 0 {
 				pending = append(pending, chunk...)
 				for {
@@ -408,6 +593,14 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 					}
 					var rec logLine
 					if json.Unmarshal(pending[:idx], &rec) == nil {
+						if rec.EOF {
+							// End-of-stream marker: the loggers write it
+							// once the container output is final, so the
+							// follow ends here — no debounce, no quiet
+							// window.
+							debugLog("follow %s: ended by eof marker", logPath)
+							return nil
+						}
 						emitRecord(rec)
 					}
 					pending = pending[idx+1:]
@@ -416,34 +609,37 @@ func readTaskLog(logPath string, opts logReadOptions, emit func(stream byte, lin
 				quietSince = time.Time{} // fresh bytes: restart the quiet clock
 			}
 		}
-		if stopFired() {
-			if stopDeadline.IsZero() {
-				stopDeadline = time.Now().Add(5 * time.Second)
-			}
-			if quietSince.IsZero() {
-				quietSince = time.Now()
-			}
-			// The logging binary's final flush can land after the task
-			// exit is observable; end only once no new bytes arrived for
-			// a second (or the hard stop deadline passes).
-			quiet := opts.stopQuiet
-			if quiet <= 0 {
-				quiet = stopQuietDefault
-			}
-			if time.Since(quietSince) >= quiet || time.Now().After(stopDeadline) {
-				debugLog("follow %s: ended by stop condition (quiet %v, hard deadline %v)",
-					logPath, time.Since(quietSince) >= quiet, time.Now().After(stopDeadline))
-				return nil
-			}
-		}
-		if !fileSeen && !noStopDeadline.IsZero() && time.Now().After(noStopDeadline) {
-			return nil // the task never started and no stop condition exists
-		}
+		stopEvalEvery := 100 * time.Millisecond
 		if stopCount > 0 {
-			time.Sleep(50 * time.Millisecond) // exiting: finish promptly
-		} else {
-			time.Sleep(100 * time.Millisecond)
+			stopEvalEvery = 50 * time.Millisecond // exiting: finish promptly
 		}
+		if lastStopEval.IsZero() || time.Since(lastStopEval) >= stopEvalEvery {
+			lastStopEval = time.Now()
+			if stopFired() {
+				if stopDeadline.IsZero() {
+					stopDeadline = time.Now().Add(5 * time.Second)
+				}
+				if quietSince.IsZero() {
+					quietSince = time.Now()
+				}
+				// The logging binary's final flush can land after the task
+				// exit is observable; end only once no new bytes arrived for
+				// a second (or the hard stop deadline passes).
+				quiet := opts.stopQuiet
+				if quiet <= 0 {
+					quiet = stopQuietDefault
+				}
+				if time.Since(quietSince) >= quiet || time.Now().After(stopDeadline) {
+					debugLog("follow %s: ended by stop condition (quiet %v, hard deadline %v)",
+						logPath, time.Since(quietSince) >= quiet, time.Now().After(stopDeadline))
+					return nil
+				}
+			}
+		}
+		if !noStopDeadline.IsZero() && time.Now().After(noStopDeadline) {
+			return nil // stop-less mode is bounded (tests; production sets stop)
+		}
+		time.Sleep(followLogPoll)
 	}
 }
 
@@ -545,7 +741,7 @@ func completeLogEnd(logPath string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_, end, err := lastLogLines(f, fi.Size(), 1)
+	_, end, err := lastLogLines(f, fi.Size(), 1, nil)
 	return end, err
 }
 
@@ -567,7 +763,7 @@ func replayLogTail(files []string, logPath string, n int, emit func(raw []byte))
 			f.Close()
 			return 0, err
 		}
-		lines, completeEnd, err := lastLogLines(f, fi.Size(), n-len(newestFirst))
+		lines, completeEnd, err := lastLogLines(f, fi.Size(), n-len(newestFirst), isEOFMarker)
 		f.Close()
 		if err != nil {
 			return 0, err
@@ -584,8 +780,10 @@ func replayLogTail(files []string, logPath string, n int, emit func(raw []byte))
 }
 
 // lastLogLines returns up to want complete lines (without '\n') from the end
-// of f, newest first, plus the offset after the file's last '\n'.
-func lastLogLines(f io.ReaderAt, size int64, want int) ([][]byte, int64, error) {
+// of f, newest first, plus the offset after the file's last '\n'. Lines the
+// skip predicate rejects (eof markers) do not count toward want and are not
+// returned — scanning continues further back to fill the window.
+func lastLogLines(f io.ReaderAt, size int64, want int, skip func([]byte) bool) ([][]byte, int64, error) {
 	const block = 64 << 10
 	var out [][]byte
 	var carry []byte // the not yet split bytes in [pos, completeEnd)
@@ -618,12 +816,16 @@ func lastLogLines(f io.ReaderAt, size int64, want int) ([][]byte, int64, error) 
 			if idx < 0 {
 				break
 			}
-			out = append(out, append([]byte(nil), body[idx+1:]...))
+			if line := body[idx+1:]; skip == nil || !skip(line) {
+				out = append(out, append([]byte(nil), line...))
+			}
 			carry = carry[:idx+1]
 		}
 	}
 	if pos == 0 && completeEnd >= 0 && len(out) < want && len(carry) > 0 {
-		out = append(out, append([]byte(nil), carry[:len(carry)-1]...)) // the file's first line
+		if first := carry[:len(carry)-1]; skip == nil || !skip(first) {
+			out = append(out, append([]byte(nil), first...)) // the file's first line
+		}
 	}
 	if completeEnd < 0 {
 		completeEnd = 0

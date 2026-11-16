@@ -182,6 +182,12 @@ func deleteImageTree(cl *client.Client, nsCtx context.Context, name string, targ
 		}
 	}
 	walk(target)
+	// The record and its visible blobs are gone: no memo answer about them
+	// may survive (the next create re-checks from containerd).
+	if ns, ok := namespaces.Namespace(nsCtx); ok {
+		imageMemo.forgetRef(ns, name)
+	}
+	imageMemo.forgetImage(target.Digest)
 }
 
 // saveScratchNs stages images for docker save so every blob sits in a
