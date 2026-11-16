@@ -160,3 +160,31 @@ rung accounting); exact parity needs a leaner request path (6e) and, at the
 extreme, replacing containerd's image bookkeeping with our own (6b taken
 all the way).** Every rung above is independently shippable and gated by the
 integration suite; none of them risks container semantics.
+
+## 6d measured (2026-11-16)
+
+Three timers, each on the hot path, each costing 50–100 ms per run:
+
+| where | was | now | what it did |
+|---|---|---|---|
+| `/wait?condition=removed` (what `docker run --rm` blocks on) | 100 ms | 5 ms | polled for the container to disappear |
+| `/wait` before the task exists (armed before `/start`) | 50 ms + a containerd call per tick | 2 ms (containerd 20 ms) | polled for the task to appear |
+| `waitForAttachDrain` before the auto-remove | 100 ms | 5 ms | waited for the client's attach stream to close |
+
+Per-step medians of the API flow (`scripts/time_api_steps.py`, 20 runs):
+
+    create 10.9 · attach-open 0.0 · wait-headers 3.9 · start 12.7
+    attach-eof 1.3 · wait-exit 0.0 · inspect 3.6 · rm 4.6   TOTAL 59.7 ms (min 32.4)
+
+- CLI: 192 → **114.8 ms** (min 50.3, p10 51.1) — bimodal on a loaded host.
+- API: 141 → **59.7 ms** (min 32.4).
+- Integration: 149 passed / 4 skipped / 1 failed (`k3s cluster: 'pod "probe"
+  deleted'`), and that test passes standalone; a second full run is the
+  discriminator between a k8s timing flake and an ordering dependency.
+
+### The lesson worth keeping
+
+On this path, latency was not in syscalls or container work — it was in
+**poll intervals**. Three sleeps of 50–100 ms accounted for ~180 ms of a
+~200 ms CLI run. Before optimising any phase, grep the hot path for
+`time.Sleep`; each one is a latency floor for whoever waits behind it.
