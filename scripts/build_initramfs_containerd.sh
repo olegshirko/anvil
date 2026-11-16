@@ -90,6 +90,7 @@ IPTABLES_DIR="$DOWNLOAD_DIR/alpine-iptables"
 ALPINE_INITRD="$ALPINE_DIR/initramfs-virt"
 AGENT_BIN="$ALPINE_DIR/guest-agent"
 SHIM_BIN="$ALPINE_DIR/anvil-fast-shim"
+SHIM_HELPER_BIN="$ALPINE_DIR/anvil-init"
 VIRT_APK="$ALPINE_DIR/linux-virt.apk"
 OUT="${OUT:-$DOWNLOAD_DIR/ubuntu/initramfs-containerd}"
 
@@ -103,6 +104,10 @@ if [[ ! -f "$AGENT_BIN" ]]; then
 fi
 if [[ ! -f "$SHIM_BIN" ]]; then
     echo "anvil-fast-shim not found; run 'make guest-shim' first"
+    exit 1
+fi
+if [[ ! -f "$SHIM_HELPER_BIN" ]]; then
+    echo "anvil-init not found; run 'make anvil-init' first"
     exit 1
 fi
 if [[ ! -d "$ALPINE_DIR/linux-virt-pkg/lib/modules" ]]; then
@@ -154,6 +159,13 @@ chmod +x bin/guest-agent
 # WithRuntime with this absolute path). Unpacked: it is on the start hot path.
 cp "$SHIM_BIN" bin/anvil-fast-shim
 chmod +x bin/anvil-fast-shim
+
+# Helper-only build of the same package: the per-container init/exec helpers
+# the agent and the shim server spawn once per container. It carries no ttrpc
+# server or containerd API and is the binary on the start hot path; unpacked
+# like the shim.
+cp "$SHIM_HELPER_BIN" bin/anvil-init
+chmod +x bin/anvil-init
 
 # Container tools.
 mkdir -p opt/containerd/bin

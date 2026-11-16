@@ -7,7 +7,7 @@
     boot boot-alpine boot-ubuntu boot-containerd \
     download-alpine extract-alpine-kernel \
     download-ubuntu ubuntu-modules \
-    guest-agent initramfs-agent initramfs-ubuntu initramfs-containerd \
+    guest-agent guest-shim anvil-init initramfs-agent initramfs-ubuntu initramfs-containerd \
     boot-containerd-fresh alpine-virt-modules alpine-iptables download-upx \
     container-tools time-boot time-service validate doctor unit-tests integration smoke ci-vm \
     harness harness-prepull harness-tests harness-all bench-all \
@@ -290,10 +290,19 @@ guest-agent:
 # The fast shim (runtime-v2 ttrpc shim without runc; the agent selects it per
 # container via WithRuntime). Same module as guest-agent, own main package;
 # stays unpacked in the initramfs like the other hot-path binaries.
+# The shimserver tag adds the ttrpc server, the plugin graph and the
+# containerd API — everything containerd needs to run a task.
 SHIM_BIN := $(ALPINE_DIR)/anvil-fast-shim
+# The helper-only build of the same package: the per-container init/exec
+# helpers the agent and the shim server spawn on the start hot path. Without
+# the tag it drops the ttrpc server and the containerd API (~13.4 MB -> ~3 MB).
+SHIM_HELPER_BIN := $(ALPINE_DIR)/anvil-init
 
 guest-shim:
-	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o ../$(SHIM_BIN) ./guest-shim
+	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags shimserver -ldflags="-s -w" -o ../$(SHIM_BIN) ./guest-shim
+
+anvil-init:
+	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../$(SHIM_HELPER_BIN) ./guest-shim
 
 initramfs-agent: extract-alpine-kernel guest-agent
 	scripts/build_initramfs.sh
@@ -428,7 +437,7 @@ download-upx:
 	    rm -f /tmp/anvil-upx.tar.xz; \
 	fi
 
-initramfs-containerd: download-alpine extract-alpine-kernel alpine-virt-modules guest-agent guest-shim container-tools alpine-iptables download-upx
+initramfs-containerd: download-alpine extract-alpine-kernel alpine-virt-modules guest-agent guest-shim anvil-init container-tools alpine-iptables download-upx
 	@ANVIL_BUILD_CONTEXT=$${ANVIL_BUILD_CONTEXT:-anvil}; \
 	if ! docker --context "$$ANVIL_BUILD_CONTEXT" info >/dev/null 2>&1; then \
 	    echo "docker context '$$ANVIL_BUILD_CONTEXT' is not reachable - initramfs builds run on the anvil service; start it first (make service-start) or pass ANVIL_BUILD_CONTEXT=<ctx>."; \

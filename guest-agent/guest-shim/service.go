@@ -1,3 +1,5 @@
+//go:build shimserver
+
 package main
 
 import (
