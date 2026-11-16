@@ -44,7 +44,9 @@ func fastShimDisabled() bool {
 //     the fast shim; validateHostConfig refuses unknown runtimes outright),
 //   - non-default seccomp profile (the built-in default and unconfined are
 //     fine; a client-supplied JSON profile is not),
-//   - --pid container: (namespace paths rewritten at start; not create),
+//   - --pid host and --pid container: (the init helper always creates a
+//     fresh pid namespace for the container init; a host namespace cannot
+//     be joined by the two-stage clone),
 //   - subpath volume mounts (staging mountpoints re-armed per start),
 //   - secondary networks (extra CNI endpoints beyond the first one).
 func fastShimEligible(req dockerCreateRequest, meta *containerMeta) bool {
@@ -63,7 +65,12 @@ func fastShimEligible(req dockerCreateRequest, meta *containerMeta) bool {
 	if customSeccompProfile(hc.SecurityOpt) {
 		return false
 	}
-	if strings.HasPrefix(hc.PidMode, "container:") {
+	// The init helper is born inside a fresh pid namespace unconditionally
+	// (clone(CLONE_NEWPID) is how the container init becomes PID 1), so any
+	// pid-namespace-sharing mode must take the runc path: --pid host would
+	// silently get a private namespace, --pid container: a new one instead
+	// of the peer's.
+	if hc.PidMode == "host" || strings.HasPrefix(hc.PidMode, "container:") {
 		return false
 	}
 	if len(meta.SubpathMounts) > 0 {
