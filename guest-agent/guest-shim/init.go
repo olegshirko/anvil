@@ -626,14 +626,35 @@ func applyProcessAttrs(spec *specs.Spec) error {
 			return fmt.Errorf("no new privs: %w", err)
 		}
 	}
-	if u := p.User; u.UID != 0 || u.GID != 0 || len(u.AdditionalGids) > 0 {
-		if err := applyUser(u); err != nil {
+	// Credentials and capabilities are interdependent: a setuid to a
+	// non-root user clears the effective set, after which the bounding-set
+	// drops fail with EPERM (every `-u <user>` start/exec hit this). Do the
+	// bounding drops while still root, carry the permitted set across the
+	// setuid with PR_SET_KEEPCAPS, then install the spec's sets. runc's
+	// init does the same (Setkeepcaps before setuid, caps in
+	// finalizeNamespace, ClearKeepCaps last).
+	nonRoot := p.User.UID != 0 || p.User.GID != 0 || len(p.User.AdditionalGids) > 0
+	if p.Capabilities != nil && nonRoot {
+		if err := dropBoundingCaps(p.Capabilities); err != nil {
+			return err
+		}
+		if err := unix.Prctl(unix.PR_SET_KEEPCAPS, 1, 0, 0, 0); err != nil {
+			return fmt.Errorf("keep caps: %w", err)
+		}
+	}
+	if nonRoot {
+		if err := applyUser(p.User); err != nil {
 			return err
 		}
 	}
 	if p.Capabilities != nil {
-		if err := applyCapabilities(p.Capabilities); err != nil {
+		if err := applyCapabilities(p.Capabilities, nonRoot); err != nil {
 			return err
+		}
+	}
+	if p.Capabilities != nil && nonRoot {
+		if err := unix.Prctl(unix.PR_SET_KEEPCAPS, 0, 0, 0, 0); err != nil {
+			return fmt.Errorf("clear keep caps: %w", err)
 		}
 	}
 	if spec.Linux != nil && spec.Linux.Seccomp != nil {
@@ -667,11 +688,28 @@ func applyUser(u specs.User) error {
 // capVersion3 is LINUX_CAPABILITY_VERSION_3.
 const capVersion3 = 0x20080522
 
-// applyCapabilities installs the spec's capability sets: bounding via
-// PR_CAPBSET_DROP, the classic sets via capset (V3: two words per set) and
-// ambient via PR_CAP_AMBIENT — the same sequence runc's capabilities_linux
-// applies, so --user images keep their file caps working.
-func applyCapabilities(caps *specs.LinuxCapabilities) error {
+// dropBoundingCaps removes every capability outside the spec's bounding set.
+// It must run while the caller still has CAP_SETPCAP effective — before a
+// setuid to a non-root user, not after.
+func dropBoundingCaps(caps *specs.LinuxCapabilities) error {
+	bound := capBits(caps.Bounding)
+	for c := 0; c < 64; c++ {
+		if bound&(1<<c) == 0 {
+			if err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(c), 0, 0, 0); err != nil && err != unix.EINVAL {
+				return fmt.Errorf("drop bounding cap %d: %w", c, err)
+			}
+		}
+	}
+	return nil
+}
+
+// applyCapabilities installs the spec's capability sets: the classic sets via
+// capset (V3: two words per set) and ambient via PR_CAP_AMBIENT — the same
+// sequence runc's capabilities_linux applies, so --user images keep their
+// file caps working. afterSetuid means a PR_SET_KEEPCAPS setuid already ran:
+// the permitted set survived but the effective one is empty, so it is raised
+// first (ambient raises and the final capset need it).
+func applyCapabilities(caps *specs.LinuxCapabilities, afterSetuid bool) error {
 	perm := capBits(caps.Permitted)
 	if perm == 0 {
 		perm = capBits(caps.Bounding) // runc: fall back to bounding
@@ -682,19 +720,22 @@ func applyCapabilities(caps *specs.LinuxCapabilities) error {
 	}
 	inh := capBits(caps.Inheritable)
 	amb := capBits(caps.Ambient)
-	bound := capBits(caps.Bounding)
 
-	for c := 0; c < 64; c++ {
-		if bound&(1<<c) == 0 {
-			if err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(c), 0, 0, 0); err != nil && err != unix.EINVAL {
-				return fmt.Errorf("drop bounding cap %d: %w", c, err)
-			}
-		}
-	}
 	hdr := unix.CapUserHeader{Version: capVersion3, Pid: 0}
 	data := []unix.CapUserData{
 		{Effective: uint32(eff), Permitted: uint32(perm), Inheritable: uint32(inh)},
 		{Effective: uint32(eff >> 32), Permitted: uint32(perm >> 32), Inheritable: uint32(inh >> 32)},
+	}
+	if afterSetuid {
+		raised := []unix.CapUserData{
+			{Effective: uint32(perm), Permitted: uint32(perm), Inheritable: uint32(inh)},
+			{Effective: uint32(perm >> 32), Permitted: uint32(perm >> 32), Inheritable: uint32(inh >> 32)},
+		}
+		if err := unix.Capset(&hdr, &raised[0]); err != nil {
+			return fmt.Errorf("capset (raise): %w", err)
+		}
+	} else if err := dropBoundingCaps(caps); err != nil {
+		return err
 	}
 	if err := unix.Capset(&hdr, &data[0]); err != nil {
 		return fmt.Errorf("capset: %w", err)
