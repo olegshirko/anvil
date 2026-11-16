@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -58,6 +59,7 @@ func debugLog(format string, v ...interface{}) {
 // Active only in debug mode; a nil trace (outside debug) makes every mark a
 // no-op, so call sites need no guards.
 type phaseTrace struct {
+	mu   sync.Mutex // marks may come from a concurrent phase (CNI attach)
 	op   string
 	id   string
 	t0   time.Time
@@ -77,6 +79,8 @@ func (p *phaseTrace) mark(phase string) {
 		return
 	}
 	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	log.Printf("[start-trace] %s %s %s at=%d d=%d",
 		p.op, p.id, phase,
 		now.Sub(p.t0).Microseconds(), now.Sub(p.last).Microseconds())
