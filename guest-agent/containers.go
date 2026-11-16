@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
@@ -212,7 +213,7 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name, p
 		return "", nil, err
 	}
 	tr.mark("image-ensure")
-	applyImageDefaults(ctx, &req)
+	applyImageDefaults(ctx, ns, platform, &req)
 
 	if name == "" {
 		name = generateContainerName(ctx, ns)
@@ -897,19 +898,27 @@ func stopTimeoutFor(ns, containerdID string, requested *int) int {
 
 // applyImageDefaults fills what a container inherits from its image config
 // the way Docker does: HEALTHCHECK (a partial --health-* / compose override
-// keeps the image's test), STOPSIGNAL and LABEL.
-func applyImageDefaults(ctx context.Context, req *dockerCreateRequest) {
-	img, nsCtx, err := lookupDockerImage(ctx, req.Image)
+// keeps the image's test), STOPSIGNAL and LABEL. The config facts come from
+// the create-path memo, so the image config blob is read once per digest
+// instead of once per create (and the cross-namespace scan is skipped when
+// the record is where the create just ensured it).
+func applyImageDefaults(ctx context.Context, ns, platform string, req *dockerCreateRequest) {
+	img, nsCtx := imageInNamespace(ctx, ns, req.Image)
+	if img == nil {
+		return
+	}
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return
 	}
-	if spec, serr := img.Spec(nsCtx); serr == nil {
+	_, inf := resolveImageInfo(nsCtx, cl, img, platform)
+	if cfg := inf.config; cfg != nil {
 		if req.StopSignal == "" {
-			req.StopSignal = spec.Config.StopSignal
+			req.StopSignal = cfg.StopSignal
 		}
-		if len(spec.Config.Labels) > 0 {
-			merged := make(map[string]string, len(spec.Config.Labels)+len(req.Labels))
-			for k, v := range spec.Config.Labels {
+		if len(cfg.Labels) > 0 {
+			merged := make(map[string]string, len(cfg.Labels)+len(req.Labels))
+			for k, v := range cfg.Labels {
 				// containerd caps a container label at 4096 bytes; image
 				// labels are not capped (Buildpacks metadata runs far over),
 				// and one of them must not make the create fail.
@@ -924,13 +933,34 @@ func applyImageDefaults(ctx context.Context, req *dockerCreateRequest) {
 		}
 	}
 	var imgHC *dockerHealthcheck
-	if raw, ok := dockerConfigExtensions(nsCtx, img)["Healthcheck"]; ok {
+	if raw, ok := inf.extensions["Healthcheck"]; ok {
 		var hc dockerHealthcheck
 		if json.Unmarshal(raw, &hc) == nil && len(hc.Test) > 0 {
 			imgHC = &hc
 		}
 	}
 	req.Healthcheck = mergeHealthcheck(req.Healthcheck, imgHC)
+}
+
+// imageInNamespace returns the image record as the create path just ensured
+// it in ns. It falls back to the cross-namespace lookup for records stored
+// under a raw (unnormalized) name.
+func imageInNamespace(ctx context.Context, ns, name string) (client.Image, context.Context) {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return nil, ctx
+	}
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	for _, n := range []string{canonicalizeImageRef(name), name} {
+		if img, gerr := cl.GetImage(nsCtx, n); gerr == nil {
+			return img, nsCtx
+		}
+	}
+	img, nsCtx, lerr := lookupDockerImage(ctx, name)
+	if lerr != nil {
+		return nil, ctx
+	}
+	return img, nsCtx
 }
 
 // mergeHealthcheck is Docker's merge of a container healthcheck over the

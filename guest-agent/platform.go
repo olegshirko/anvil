@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"os"
@@ -126,46 +125,6 @@ func platformContentPresent(ctx context.Context, cs content.Store, target ocispe
 		}
 	}
 	return true
-}
-
-// emulatedPlatformWarning is Docker's create warning for an image whose
-// platform differs from the host's when none was requested.
-func emulatedPlatformWarning(ctx context.Context, img client.Image) string {
-	var cfg struct {
-		OS           string `json:"os"`
-		Architecture string `json:"architecture"`
-		Variant      string `json:"variant"`
-	}
-	desc, err := img.Config(ctx)
-	if err != nil {
-		return ""
-	}
-	blob, err := content.ReadBlob(ctx, img.ContentStore(), desc)
-	if err != nil || json.Unmarshal(blob, &cfg) != nil || cfg.Architecture == "" || cfg.Architecture == "arm64" {
-		return ""
-	}
-	p := platforms.Format(ocispec.Platform{OS: cfg.OS, Architecture: cfg.Architecture, Variant: cfg.Variant})
-	return fmt.Sprintf("The requested image's platform (%s) does not match the detected host platform (%s) and no specific platform was requested",
-		p, platforms.Format(hostPlatform))
-}
-
-// imagePlatform is the platform of the image's config ("linux/amd64"), or
-// "" when it cannot be read.
-func imagePlatform(ctx context.Context, img client.Image) string {
-	var cfg struct {
-		OS           string `json:"os"`
-		Architecture string `json:"architecture"`
-		Variant      string `json:"variant"`
-	}
-	desc, err := img.Config(ctx)
-	if err != nil {
-		return ""
-	}
-	blob, err := content.ReadBlob(ctx, img.ContentStore(), desc)
-	if err != nil || json.Unmarshal(blob, &cfg) != nil || cfg.Architecture == "" {
-		return ""
-	}
-	return platforms.Format(platforms.Normalize(ocispec.Platform{OS: cfg.OS, Architecture: cfg.Architecture, Variant: cfg.Variant}))
 }
 
 // rosettaCacheSocket is where Rosetta (configured by vz-runner) looks for
