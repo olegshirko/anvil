@@ -980,7 +980,8 @@ func updateDirectCgroup(dir string, res *specs.LinuxResources) error {
 	return nil
 }
 
-// pauseDirectTask freezes/unfreezes a direct container through its cgroup v2// freezer — the same mechanism the fast shim's Pause/Resume use.
+// pauseDirectTask freezes/unfreezes a direct container through its cgroup v2
+// freezer — the same mechanism the fast shim's Pause/Resume use.
 func pauseDirectTask(ns, id string, t *directTask, pause bool) error {
 	state, _, _ := t.stateInfo()
 	switch {
