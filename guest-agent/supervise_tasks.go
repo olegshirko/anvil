@@ -62,7 +62,6 @@ type directTask struct {
 	exitCode  int
 	waitErr   error
 	waitCh    chan struct{}
-	started   bool // the start event has been published
 	exitedAt  time.Time
 	exited    bool
 	startedCh chan struct{}
@@ -237,28 +236,6 @@ func (t *directTask) markStarted(pid int) {
 	t.mu.Unlock()
 }
 
-// waitStarted waits for the helper's started report.
-func (t *directTask) waitStarted(ctx context.Context) error {
-	t.mu.Lock()
-	ch := t.startedCh
-	if ch == nil {
-		t.mu.Unlock()
-		return nil
-	}
-	if t.waitErr != nil {
-		err := t.waitErr
-		t.mu.Unlock()
-		return err
-	}
-	t.mu.Unlock()
-	select {
-	case <-ch:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
 // signal delivers sig to the container init (PID 1 of its namespaces).
 func (t *directTask) signal(sig syscall.Signal) error {
 	t.mu.Lock()
@@ -316,13 +293,6 @@ func (t *directTask) failStart(err error) {
 	t.state = directStateStopped
 	close(t.waitCh)
 	t.mu.Unlock()
-}
-
-// exitedAtTime returns the exit time (zero while running).
-func (t *directTask) exitedAtTime() time.Time {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.exitedAt
 }
 
 // waitExitWithTimeout polls the registry until the task exits or timeout.

@@ -192,36 +192,3 @@ func bpfAction(a specs.LinuxSeccompAction, errnoRet *uint) seccomp.Action {
 		return seccomp.ActionAllow
 	}
 }
-
-// archForOCI resolves an OCI SCMP_ARCH_* value to filter arch info.
-func archForOCI(a specs.Arch) (*arch.Info, error) {
-	switch a {
-	case specs.ArchX86_64, specs.ArchX32, specs.ArchX86:
-		return arch.GetInfo("x86_64")
-	case specs.ArchARM:
-		return arch.GetInfo("arm")
-	case specs.ArchAARCH64:
-		return arch.GetInfo("aarch64")
-	case specs.ArchMIPS:
-		return arch.GetInfo("mips")
-	case specs.ArchMIPS64:
-		return arch.GetInfo("mips64")
-	case specs.ArchMIPS64N32:
-		return arch.GetInfo("mips64n32")
-	case specs.ArchMIPSEL:
-		return arch.GetInfo("mipsle")
-	case specs.ArchMIPSEL64:
-		return arch.GetInfo("mipsel64")
-	case specs.ArchMIPSEL64N32:
-		return arch.GetInfo("mipsel64n32")
-	case specs.ArchPPC64:
-		return arch.GetInfo("ppc64")
-	case specs.ArchPPC64LE:
-		return arch.GetInfo("ppc64le")
-	case specs.ArchS390:
-		return arch.GetInfo("s390")
-	case specs.ArchS390X:
-		return arch.GetInfo("s390x")
-	}
-	return nil, fmt.Errorf("unsupported seccomp arch %v", a)
-}

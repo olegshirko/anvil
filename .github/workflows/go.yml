@@ -80,7 +80,11 @@ jobs:
         # Installed for the host, then pointed at the linux/arm64 build.
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@2026.2.1
+          # Both build configurations: half of guest-shim (the ttrpc server)
+          # sits behind the shimserver tag, so one pass reports its symbols as
+          # unused.
           GOOS=linux GOARCH=arm64 "$(go env GOPATH)/bin/staticcheck" ./...
+          GOOS=linux GOARCH=arm64 "$(go env GOPATH)/bin/staticcheck" -tags shimserver ./...
 
       - name: govulncheck (linux/arm64)
         working-directory: guest-agent
