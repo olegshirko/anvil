@@ -111,9 +111,34 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 	if ierr != nil {
 		return ierr
 	}
-	netName, ports, detachNet, nerr := startContainerNetwork(ctx, ns, id, meta, tr)
-	if nerr != nil {
-		return nerr
+	// The CNI ADD (~13 ms) is independent of the helper setup below, so it
+	// runs alongside it: the container's network must be attached before the
+	// init is released at its gate, not before the helper is spawned. Every
+	// error path detaches through detachWhenReady, which waits for the
+	// concurrent attach first.
+	type netResult struct {
+		netName string
+		ports   []cniPortMapping
+		detach  func()
+		err     error
+	}
+	netCh := make(chan netResult, 1)
+	go func() {
+		n, p, d, err := startContainerNetwork(ctx, ns, id, meta, tr)
+		netCh <- netResult{netName: n, ports: p, detach: d, err: err}
+	}()
+	var (
+		netOnce sync.Once
+		netRes  netResult
+	)
+	awaitNet := func() netResult {
+		netOnce.Do(func() { netRes = <-netCh })
+		return netRes
+	}
+	detachNet := func() {
+		if r := awaitNet(); r.err == nil && r.detach != nil {
+			r.detach()
+		}
 	}
 
 	did := dockerID(ns, id)
@@ -331,6 +356,15 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 	// The helper is holding the container at its gate, rootfs mounted and
 	// cgroup prepared. Register before releasing it: /wait may already be
 	// polling, and an instant container must find its record.
+	// The network must be attached before the init is released: join the
+	// concurrent CNI attach here (it has had the whole helper setup to run).
+	if nr := awaitNet(); nr.err != nil {
+		cmd.Process.Kill() //nolint:errcheck
+		release()
+		return nr.err
+	}
+	netName, ports := netRes.netName, netRes.ports
+
 	supervisor.put(task)
 	if stdin != nil {
 		stdin.taskCreated()
