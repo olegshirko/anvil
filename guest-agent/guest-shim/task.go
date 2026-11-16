@@ -26,6 +26,11 @@ import (
 	"github.com/containerd/log"
 )
 
+// gateStartLine is the gate release message (written by the shim at start).
+// The helper only reads the gate, so the constant belongs to the server
+// build.
+const gateStartLine = "s\n"
+
 // Task lifecycle: Create mounts the rootfs snapshots, prepares the cgroup,
 // wires the io and starts the init helper (a fresh process: plain fork+exec,
 // the only fork shape that is safe around a Go runtime). The helper joins

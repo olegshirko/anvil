@@ -69,9 +69,6 @@ const (
 	fdConfirm = 60
 )
 
-// gateStartLine is the gate release message (written by the shim at start).
-const gateStartLine = "s\n"
-
 // isInitHelper reports whether this process runs as stage A of the
 // container init helper.
 func isInitHelper() bool {
