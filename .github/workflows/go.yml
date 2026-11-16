@@ -179,7 +179,7 @@ jobs:
       # copy that a version bump could silently skip. upx comes from apk in
       # the build container below, so download-upx is not needed here.
       - name: Download assets and build guest-agent
-        run: make download-alpine extract-alpine-kernel guest-agent container-tools alpine-iptables
+        run: make download-alpine extract-alpine-kernel guest-agent guest-shim anvil-init container-tools alpine-iptables
 
       - name: Build initramfs-containerd
         run: |
