@@ -69,3 +69,26 @@ CNI attach 10–60 ms → **≤2 ms**; API flow ~130 → ~110 ms, and the tail (
 - No change to the host-side publishing path.
 - No new external binaries in the guest (no `nft`, no `ip`).
 - A created-but-not-started container still holds no IP.
+
+## Measured result (2026-11-16)
+
+- `cni-attach` in the guest trace: 12.67 ms (plugin path) → **1.26 ms** (native,
+  p90 1.49); no plugin processes in the hot path (82 samples during 6 starts:
+  none, positive control with `ANVIL_CNI=plugin` shows all four).
+- API-shaped flow: 130 → **82.8 ms** median (min 75.5).
+- CLI: median ~198 ms, min 192 — the CLI path now carries ~115 ms that the API
+  flow does not; that is the next target (see 6d).
+- `make dev-integration`: **150 passed / 4 skipped / 0 failed** (verified twice
+  by the main session, once on a clean single-instance environment).
+
+### Environment trap worth remembering
+
+Two anvil VMs on the shared VZ NAT can be handed the **same guest IP**
+(`192.168.64.2`): the guest runs `udhcpc -q` once at boot and never renews,
+while the vmnet DHCP re-leases a live address to a newer VM. The Mac's ARP
+entry then flaps between their MACs and *everything* network-related fails
+intermittently — published ports, UDP relay, compose, egress, k8s pulls —
+while the guest's own state (addresses, routes, nft rules) is correct.
+Diagnosis: compare `ip -4 addr show eth0` across instances and the host ARP
+entry; fix: stop the duplicate instance, and as a product fix keep the DHCP
+lease alive (drop `-q`, add renewal) and warn on a duplicate address.
