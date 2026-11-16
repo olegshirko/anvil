@@ -178,9 +178,11 @@ Per-step medians of the API flow (`scripts/time_api_steps.py`, 20 runs):
 
 - CLI: 192 → **114.8 ms** (min 50.3, p10 51.1) — bimodal on a loaded host.
 - API: 141 → **59.7 ms** (min 32.4).
-- Integration: 149 passed / 4 skipped / 1 failed (`k3s cluster: 'pod "probe"
-  deleted'`), and that test passes standalone; a second full run is the
-  discriminator between a k8s timing flake and an ordering dependency.
+- Integration: first full run 149 passed / 1 failed (`k3s cluster`, a k8s
+  timing flake — it passes standalone), second full run **150 passed / 4
+  skipped / 0 failed**.
+- Best measurement on a quiet moment: CLI median 92.0 ms (min 50.6, p10 58.2),
+  API flow min 31.1 ms.
 
 ### The lesson worth keeping
 
