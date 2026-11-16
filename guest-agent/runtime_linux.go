@@ -204,6 +204,23 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 	if netName == noneNetwork {
 		return cniAddrs{}, attachLoopbackOnly(ctx, id, netnsPath)
 	}
+	// Rung 6a.1: the default bridge network, IPv4, no static address — done
+	// in-process (directnet_linux.go). Everything else, and any failure in
+	// auto mode, carries on to the plugin path below unchanged.
+	if spec, meta, ok := nativeEligible(netName, ns, id); ok {
+		addrs, nerr := attachNetworkNative(ctx, spec, meta, ns, id, netnsPath, ports)
+		if nerr == nil {
+			rememberIP(ns, id, netName, addrs.IP)
+			return addrs, nil
+		}
+		if cniMode() == "native" {
+			return cniAddrs{}, fmt.Errorf("native cni setup %s: %w", netName, nerr)
+		}
+		log.G(ctx).WithError(nerr).Warnf("[cni] native attach for %s failed; using the plugin path", netName)
+	}
+	// The endpoint is about to be made by the plugins; a marker left by an
+	// earlier native run would make teardown take the wrong path.
+	removeNativeMarker(ns, id)
 	conflist, err := findConflistForNetwork(netName)
 	if err != nil {
 		return cniAddrs{}, err
@@ -279,6 +296,11 @@ func attachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports
 func detachNetwork(ctx context.Context, netName, ns, id, netnsPath string, ports []cniPortMapping) error {
 	if netName == noneNetwork {
 		return detachLoopbackOnly(ctx, id, netnsPath)
+	}
+	// The marker written by the native attach picks the matching teardown:
+	// the plugin DEL cannot see an in-process endpoint and vice versa.
+	if ep, ok := loadNativeMarker(ns, id); ok && ep.Network == netName {
+		return detachNetworkNative(ctx, netName, ns, id, netnsPath, ports)
 	}
 	conflist, err := findConflistForNetwork(netName)
 	if err != nil {
@@ -405,7 +427,10 @@ func withoutLoopback(list *cnilibrary.NetworkConfigList) *cnilibrary.NetworkConf
 // detachPrimaryLive removes a running container's primary endpoint (eth0
 // and its published ports) and leaves lo and the other endpoints alone —
 // a live `docker network disconnect` from the primary network.
-func detachPrimaryLive(ctx context.Context, netName, id, netnsPath string, ports []cniPortMapping) error {
+func detachPrimaryLive(ctx context.Context, netName, ns, id, netnsPath string, ports []cniPortMapping) error {
+	if ep, ok := loadNativeMarker(ns, id); ok && ep.Network == netName {
+		return detachNetworkNative(ctx, netName, ns, id, netnsPath, ports)
+	}
 	conflist, err := findConflistForNetwork(netName)
 	if err != nil {
 		return err
@@ -567,6 +592,7 @@ func ensureNetworkMasquerade(netName string) error {
 
 // removeNetworkMasquerade drops the rules when the network goes away.
 func removeNetworkMasquerade(netName string) {
+	removeNativeMasq(netName)
 	cl, err := readNetworkConflist(netName)
 	if err != nil {
 		return

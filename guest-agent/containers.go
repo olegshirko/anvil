@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
@@ -34,26 +35,82 @@ func waitContainerTaskCond(ctx context.Context, ns, containerdID string, nextExi
 	nsCtx := namespaces.WithNamespace(ctx, ns)
 
 	// next-exit: poll until the task exists (/wait comes before /start)
-	// for as long as the client waits, as Docker does.
-	poll := 50 * time.Millisecond
+	// for as long as the client waits, as Docker does. The registry probe is
+	// in-memory and runs at a fine cadence — `docker run` arms this wait a
+	// few milliseconds before the start, and a coarse poll here was ~37 ms of
+	// the run's latency. The containerd probe (a round trip) stays at 20 ms.
+	poll := 2 * time.Millisecond
+	probeEvery := 20 * time.Millisecond
+	var lastProbe time.Time
 	began := time.Now()
-	for {
-		c, err := cl.LoadContainer(nsCtx, containerdID)
-		if err != nil {
-			return 0, fmt.Errorf("load container: %w", err)
+	wtr := newPhaseTrace("wait", truncateID(containerdID))
+	defer func() {
+		if wtr != nil {
+			log.Printf("[start-trace] wait %s exit after=%dus", wtr.id, time.Since(began).Microseconds())
 		}
-		_, err = c.Task(nsCtx, nil)
-		if err == nil {
+	}()
+	for {
+		if t, ok := supervisor.lookup(ns, containerdID); ok {
+			state, code, running := t.stateInfo()
+			if !nextExit && !running && state != directStateCreated {
+				return code, nil
+			}
+			wtr.mark("task-ready")
 			break
 		}
-		// not-running: no task is not running. A created container
-		// answers 0, one that exited (before a cold boot took its task,
-		// too) the code in its metadata.
-		if !nextExit {
-			if meta, merr := loadContainerMeta(ns, containerdID); merr == nil && !meta.StartedAt.IsZero() {
-				return meta.ExitCode, nil
+		if time.Since(lastProbe) < probeEvery {
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-time.After(poll):
 			}
-			return 0, nil
+			continue
+		}
+		lastProbe = time.Now()
+		c, err := cl.LoadContainer(nsCtx, containerdID)
+		if err != nil {
+			// next-exit: a missing record can be the fast-shim fallback
+			// recreating the container mid-start (the runtime is immutable,
+			// so the fallback deletes and re-registers the record). Poll
+			// through the gap while the agent still owns the container
+			// (metadata present), exactly like the not-yet-created task
+			// poll below. A container the agent no longer knows is real.
+			if !nextExit {
+				return 0, fmt.Errorf("load container: %w", err)
+			}
+			if _, merr := loadContainerMeta(ns, containerdID); merr != nil {
+				// Both the record and its metadata are gone: the container
+				// was removed while this wait was polling. `docker run --rm`
+				// arms /wait?condition=removed before /start, and the whole
+				// run can complete inside one poll interval — the removal is
+				// exactly the condition the client asked for, so answer it,
+				// with the cached exit code when the exit path recorded one.
+				// The remover re-seeds that code right after clearing it
+				// (keepExitCodeAfterRemoval), hence the short retry.
+				for attempt := 0; ; attempt++ {
+					if code, ok := peekContainerExitCode(dockerID(ns, containerdID)); ok {
+						return code, nil
+					}
+					if attempt >= 5 {
+						return 0, nil
+					}
+					time.Sleep(time.Millisecond)
+				}
+			}
+		} else {
+			if _, terr := c.Task(nsCtx, nil); terr == nil {
+				wtr.mark("task-ready")
+				break
+			}
+			// not-running: no task is not running. A created container
+			// answers 0, one that exited (before a cold boot took its task,
+			// too) the code in its metadata.
+			if !nextExit {
+				if meta, merr := loadContainerMeta(ns, containerdID); merr == nil && !meta.StartedAt.IsZero() {
+					return meta.ExitCode, nil
+				}
+				return 0, nil
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -69,6 +126,17 @@ func waitContainerTaskCond(ctx context.Context, ns, containerdID string, nextExi
 	// the mapped 137 from docker kill) wins over the task status, which
 	// reports 0 for signal deaths.
 	did := dockerID(ns, containerdID)
+	if t, ok := supervisor.lookup(ns, containerdID); ok {
+		exit, werr := t.wait(ctx)
+		if werr != nil {
+			debugLog("[docker-api] wait %s/%s: %v", ns, truncateID(containerdID), werr)
+			return 0, werr
+		}
+		if cached, ok := takeContainerExitCode(did); ok && cached != 0 {
+			return cached, nil
+		}
+		return exit, nil
+	}
 	c, err := cl.LoadContainer(nsCtx, containerdID)
 	if err != nil {
 		return 0, fmt.Errorf("load container: %w", err)
@@ -140,10 +208,12 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name, p
 	if name, ok := resolveImageID(ctx, req.Image); ok {
 		req.Image = name
 	}
+	tr := newPhaseTrace("create", req.Image)
 	if err := ensureImageInNamespace(ctx, req.Image, ns, platform, auth); err != nil {
 		return "", nil, err
 	}
-	applyImageDefaults(ctx, &req)
+	tr.mark("image-ensure")
+	applyImageDefaults(ctx, ns, platform, &req)
 
 	if name == "" {
 		name = generateContainerName(ctx, ns)
@@ -157,6 +227,7 @@ func createDockerContainer(ctx context.Context, req dockerCreateRequest, name, p
 	}
 
 	containerdID, warnings, err := createNativeContainer(ctx, ns, name, platform, req)
+	tr.mark("native-create")
 	if err == nil {
 		defer publishContainerEvent("create", ns, containerdID, nil)
 	}
@@ -540,6 +611,9 @@ func taskRunning(ctx context.Context, ns, containerdID string) bool {
 // currentTaskStatus returns the container's task status ("stopped" when it
 // has no task); known is false when containerd could not be asked.
 func currentTaskStatus(ctx context.Context, ns, containerdID string) (status string, known bool) {
+	if state, _, _, ok := directStateOf(ns, containerdID); ok {
+		return string(state), true
+	}
 	cl, err := pc.get(ctx)
 	if err != nil {
 		return "", false
@@ -635,16 +709,23 @@ func handleContainerWait(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	// Only a real exit is cached. `docker run -d` opens a /wait and drops
 	// it right after /start; caching that aborted wait's 0 made the next
-	// `docker wait <name>` return 0 immediately.
-	cacheContainerExitCode(did, exitCode)
+	// `docker wait <name>` return 0 immediately. A condition=removed wait
+	// answered after the container is gone needs no cache entry (it would
+	// outlive the container forever).
+	if cond != "removed" {
+		cacheContainerExitCode(did, exitCode)
+	}
 	if cond == "removed" {
 		// docker run --rm waits for the removal, so the name is free
-		// when the CLI returns.
+		// when the CLI returns. The poll is what the CLI sits on, so it
+		// runs fine-grained: 100 ms here was ~50 ms of the CLI's latency
+		// (the removal itself lands within a few ms of the exit). Polling
+		// rather than a notification keeps every removal path covered.
 		for ctx.Err() == nil {
 			if _, _, _, rerr := resolveDockerID(ctx, did); rerr != nil {
 				break
 			}
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(5 * time.Millisecond)
 		}
 	}
 	log.Printf("[docker-api] wait %s returning StatusCode=%d", id, exitCode)
@@ -659,12 +740,20 @@ func deleteDockerContainer(ctx context.Context, id string, force, removeVolumes 
 	}
 	did := dockerID(ns, containerdID)
 	attrs := containerEventAttrs(ns, containerdID) // gone after the delete
+	// docker run --rm's condition=removed wait may only see the container
+	// after it is gone: keep its exit code readable for a short grace period
+	// (forgetContainerState below clears the cache).
+	autoRemove := isAutoRemove(did)
+	exitCode, hadExitCode := peekContainerExitCode(did)
 	// Native delete: task + snapshot + CNI + netns + metadata cleanup.
 	if err := deleteNativeContainer(ctx, ns, containerdID, force, removeVolumes); err != nil {
 		return err
 	}
 	publishContainerEventAttrs("destroy", did, attrs, nil)
 	forgetContainerState(did)
+	if autoRemove && hadExitCode {
+		keepExitCodeAfterRemoval(did, exitCode)
+	}
 	execs.forgetContainer(ns, containerdID)
 	forgetContainerStdin(ns, containerdID)
 	return nil
@@ -720,6 +809,15 @@ func killDockerContainer(ctx context.Context, id string, signal string) error {
 	restarts.clear(dockerID(ns, containerdID))
 	markUserStopped(ns, containerdID, true)
 	// Native kill: signal the running task directly.
+	if t, ok := supervisor.lookup(ns, containerdID); ok {
+		if kerr := killDirectTask(ctx, ns, containerdID, t, signal); kerr != nil {
+			return kerr
+		}
+		if strings.EqualFold(signal, "SIGKILL") || signal == "9" || signal == "" {
+			cacheContainerExitCode(dockerID(ns, containerdID), 137)
+		}
+		return nil
+	}
 	{
 		cl, cerr := pc.get(ctx)
 		if cerr != nil {
@@ -800,19 +898,27 @@ func stopTimeoutFor(ns, containerdID string, requested *int) int {
 
 // applyImageDefaults fills what a container inherits from its image config
 // the way Docker does: HEALTHCHECK (a partial --health-* / compose override
-// keeps the image's test), STOPSIGNAL and LABEL.
-func applyImageDefaults(ctx context.Context, req *dockerCreateRequest) {
-	img, nsCtx, err := lookupDockerImage(ctx, req.Image)
+// keeps the image's test), STOPSIGNAL and LABEL. The config facts come from
+// the create-path memo, so the image config blob is read once per digest
+// instead of once per create (and the cross-namespace scan is skipped when
+// the record is where the create just ensured it).
+func applyImageDefaults(ctx context.Context, ns, platform string, req *dockerCreateRequest) {
+	img, nsCtx := imageInNamespace(ctx, ns, req.Image)
+	if img == nil {
+		return
+	}
+	cl, err := pc.get(ctx)
 	if err != nil {
 		return
 	}
-	if spec, serr := img.Spec(nsCtx); serr == nil {
+	_, inf := resolveImageInfo(nsCtx, cl, img, platform)
+	if cfg := inf.config; cfg != nil {
 		if req.StopSignal == "" {
-			req.StopSignal = spec.Config.StopSignal
+			req.StopSignal = cfg.StopSignal
 		}
-		if len(spec.Config.Labels) > 0 {
-			merged := make(map[string]string, len(spec.Config.Labels)+len(req.Labels))
-			for k, v := range spec.Config.Labels {
+		if len(cfg.Labels) > 0 {
+			merged := make(map[string]string, len(cfg.Labels)+len(req.Labels))
+			for k, v := range cfg.Labels {
 				// containerd caps a container label at 4096 bytes; image
 				// labels are not capped (Buildpacks metadata runs far over),
 				// and one of them must not make the create fail.
@@ -827,13 +933,34 @@ func applyImageDefaults(ctx context.Context, req *dockerCreateRequest) {
 		}
 	}
 	var imgHC *dockerHealthcheck
-	if raw, ok := dockerConfigExtensions(nsCtx, img)["Healthcheck"]; ok {
+	if raw, ok := inf.extensions["Healthcheck"]; ok {
 		var hc dockerHealthcheck
 		if json.Unmarshal(raw, &hc) == nil && len(hc.Test) > 0 {
 			imgHC = &hc
 		}
 	}
 	req.Healthcheck = mergeHealthcheck(req.Healthcheck, imgHC)
+}
+
+// imageInNamespace returns the image record as the create path just ensured
+// it in ns. It falls back to the cross-namespace lookup for records stored
+// under a raw (unnormalized) name.
+func imageInNamespace(ctx context.Context, ns, name string) (client.Image, context.Context) {
+	cl, err := pc.get(ctx)
+	if err != nil {
+		return nil, ctx
+	}
+	nsCtx := namespaces.WithNamespace(ctx, ns)
+	for _, n := range []string{canonicalizeImageRef(name), name} {
+		if img, gerr := cl.GetImage(nsCtx, n); gerr == nil {
+			return img, nsCtx
+		}
+	}
+	img, nsCtx, lerr := lookupDockerImage(ctx, name)
+	if lerr != nil {
+		return nil, ctx
+	}
+	return img, nsCtx
 }
 
 // mergeHealthcheck is Docker's merge of a container healthcheck over the

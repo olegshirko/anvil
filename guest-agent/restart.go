@@ -56,6 +56,13 @@ var restarts = &restartMonitor{
 	where:    make(map[string]containerRef),
 }
 
+// Direct (stage 5a) container exits trigger the monitor at once — the exit is
+// known exactly, no containerd poll lag. The one-second poll below stays as
+// the fallback for containerd-supervised containers.
+func init() {
+	supervisor.onExit(func(*directTask) { go maybeRestartContainers() })
+}
+
 // register records the requested policy at create time: active policies go
 // to the monitor loop, every spec is kept for inspect fidelity.
 func (m *restartMonitor) register(dockerID, name string, max int) {
@@ -305,6 +312,15 @@ func (m *restartMonitor) paceNextLocked(dockerID string) {
 // running, and the real exit code,
 // and whether the state could be determined at all.
 func taskExitState(cl *client.Client, ns, containerdID string) (running bool, exit int, ok bool) {
+	if state, code, _, found := directStateOf(ns, containerdID); found {
+		switch state {
+		case directStateRunning, directStatePaused:
+			return true, 0, true
+		case directStateStopped:
+			return false, code, true
+		}
+		return false, 0, false // created / start in progress
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	ctx = namespaces.WithNamespace(ctx, ns)

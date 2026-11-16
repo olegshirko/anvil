@@ -80,7 +80,11 @@ jobs:
         # Installed for the host, then pointed at the linux/arm64 build.
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@2026.2.1
+          # Both build configurations: half of guest-shim (the ttrpc server)
+          # sits behind the shimserver tag, so one pass reports its symbols as
+          # unused.
           GOOS=linux GOARCH=arm64 "$(go env GOPATH)/bin/staticcheck" ./...
+          GOOS=linux GOARCH=arm64 "$(go env GOPATH)/bin/staticcheck" -tags shimserver ./...
 
       - name: govulncheck (linux/arm64)
         working-directory: guest-agent
@@ -175,7 +179,7 @@ jobs:
       # copy that a version bump could silently skip. upx comes from apk in
       # the build container below, so download-upx is not needed here.
       - name: Download assets and build guest-agent
-        run: make download-alpine extract-alpine-kernel guest-agent container-tools alpine-iptables
+        run: make download-alpine extract-alpine-kernel guest-agent guest-shim anvil-init container-tools alpine-iptables
 
       - name: Build initramfs-containerd
         run: |

@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -34,11 +35,17 @@ func runBootFinalize() {
 	defer scheduleDiskTrim()
 
 	// Kill unreachable shims from a crashed previous session first — trying
-	// to delete their tasks through containerd would hang.
+	// to delete their tasks through containerd would hang. The fast shim's
+	// server and both helper binaries join the list: a leftover server keeps
+	// its ttrpc socket serving a task record containerd no longer knows
+	// about, and a leftover init/exec helper holds container namespaces and
+	// pipes.
 	if out, err := exec.Command("/bin/sh", "-c", `
 killed=0
 killall -9 containerd-shim-runc-v2 2>/dev/null && killed=1
 killall -9 runc 2>/dev/null && killed=1
+killall -9 anvil-fast-shim 2>/dev/null && killed=1
+killall -9 anvil-init 2>/dev/null && killed=1
 [ "$killed" = 1 ] && sleep 1
 `).CombinedOutput(); err != nil {
 		log.Printf("[boot] stale process kill failed: %v: %s", err, out)
@@ -57,6 +64,7 @@ killall -9 runc 2>/dev/null && killed=1
 		time.Sleep(50 * time.Millisecond)
 	}
 
+	sweepStaleShimSockets()
 	cleanupStaleContainers()
 	pruneStaleContainerMeta()
 
@@ -106,6 +114,37 @@ func waitForNetfilter() {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// shimSocketRoot is containerd's shim-socket directory: one hash-named unix
+// socket per running shim task (runc and fast shims alike).
+const shimSocketRoot = "/run/containerd/s"
+
+// sweepStaleShimSockets removes the shim socket files of a previous session.
+// Nothing serves them at this point: a VM restart killed every process and
+// the kill above handles a crashed session, while containerd (fresh) only
+// binds sockets as new tasks appear. A stale socket would make a leftover
+// task's delete dial a dead endpoint before taking the respawn-cleanup
+// path; clearing them keeps the boot cleanup on the fast route and lets a
+// same-id task bind its socket cleanly. The runc-shim cleanup path itself
+// is unchanged: its processes are killed above exactly as before.
+func sweepStaleShimSockets() {
+	entries, err := os.ReadDir(shimSocketRoot)
+	if err != nil {
+		return // no socket root yet: nothing stale
+	}
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if os.Remove(filepath.Join(shimSocketRoot, e.Name())) == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		log.Printf("[boot] cleared %d stale shim socket(s)", removed)
 	}
 }
 

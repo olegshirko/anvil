@@ -31,6 +31,14 @@ func liveRootfsPath(ns, containerdID string) string {
 // withContainerRootfs calls fn with the container's merged rootfs: the live
 // task mount when a task holds it, otherwise a temporary snapshot mount.
 func withContainerRootfs(ctx context.Context, ns, containerdID string, fn func(root string) error) error {
+	if t, ok := supervisor.lookup(ns, containerdID); ok {
+		if _, _, running := t.stateInfo(); running {
+			// A direct (stage 5a) run mounts its rootfs in the agent's bundle.
+			if _, err := os.Stat(t.rootfs); err == nil {
+				return fn(t.rootfs)
+			}
+		}
+	}
 	if running, status, ok := containerTaskState(ctx, ns, containerdID); ok && (running || status == "paused") {
 		if _, err := os.Stat(liveRootfsPath(ns, containerdID)); err == nil {
 			return fn(liveRootfsPath(ns, containerdID))

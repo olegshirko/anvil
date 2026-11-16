@@ -3,11 +3,11 @@
     service-install service-uninstall service-start service-stop service-restart service-status \
     service-debug service-debug-rebuild rebuild-all \
     dev-start dev-stop dev-rebuild dev-integration dev-validate \
-    docker-context-anvil docker-context-lima lima-restart colima-start colima-stop \
+    docker-context-anvil docker-context-lima colima-start colima-stop \
     boot boot-alpine boot-ubuntu boot-containerd \
     download-alpine extract-alpine-kernel \
     download-ubuntu ubuntu-modules \
-    guest-agent initramfs-agent initramfs-ubuntu initramfs-containerd \
+    guest-agent guest-shim anvil-init initramfs-agent initramfs-ubuntu initramfs-containerd \
     boot-containerd-fresh alpine-virt-modules alpine-iptables download-upx \
     container-tools time-boot time-service validate doctor unit-tests integration smoke ci-vm \
     harness harness-prepull harness-tests harness-all bench-all \
@@ -122,13 +122,6 @@ docker-context-anvil:
 	@docker context use anvil
 	@echo "[anvil] docker context: anvil"
 
-# Restart the Lima VM used for initramfs builds and as a fallback docker backend.
-lima-restart:
-	@limactl stop $(LIMA_INSTANCE) 2>/dev/null || true
-	@limactl start $(LIMA_INSTANCE)
-	@docker context use $(LIMA_DOCKER_CONTEXT)
-	@echo "[anvil] Lima VM '$(LIMA_INSTANCE)' restarted, docker context: $(LIMA_DOCKER_CONTEXT)"
-
 # Start/stop Colima with settings close to anvil (VZ VM + virtiofs mounts).
 colima-start:
 	@colima start --vm-type=vz --mount-type=virtiofs
@@ -198,7 +191,7 @@ ci-checks:
 	cd guest-agent && GOTOOLCHAIN=$(CI_GO) go mod tidy -diff
 	cd guest-agent && GOTOOLCHAIN=$(CI_GO) GOOS=linux GOARCH=arm64 go vet ./...
 	cd guest-agent && GOTOOLCHAIN=$(CI_GO) go test -race ./...
-	cd guest-agent && GOTOOLCHAIN=$(CI_GO) go install honnef.co/go/tools/cmd/staticcheck@2026.2.1 && GOTOOLCHAIN=$(CI_GO) GOOS=linux GOARCH=arm64 "$$(go env GOPATH)/bin/staticcheck" ./...
+	cd guest-agent && GOTOOLCHAIN=$(CI_GO) go install honnef.co/go/tools/cmd/staticcheck@2026.2.1 && GOTOOLCHAIN=$(CI_GO) GOOS=linux GOARCH=arm64 "$$(go env GOPATH)/bin/staticcheck" ./... && GOTOOLCHAIN=$(CI_GO) GOOS=linux GOARCH=arm64 "$$(go env GOPATH)/bin/staticcheck" -tags shimserver ./...
 	cd guest-agent && GOTOOLCHAIN=$(CI_GO) go install golang.org/x/vuln/cmd/govulncheck@v1.8.0 && GOTOOLCHAIN=$(CI_GO) GOOS=linux GOARCH=arm64 "$$(go env GOPATH)/bin/govulncheck" ./...
 	cd guest-agent && GOTOOLCHAIN=$(CI_GO) go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 	"$$(go env GOPATH)/bin/actionlint" -color
@@ -293,6 +286,23 @@ ubuntu-modules: $(UBUNTU_DIR)
 # tidiness with `go mod tidy -diff`).
 guest-agent:
 	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.anvilVersion=$(BUILD_VERSION)" -o ../$(AGENT_BIN) .
+
+# The fast shim (runtime-v2 ttrpc shim without runc; the agent selects it per
+# container via WithRuntime). Same module as guest-agent, own main package;
+# stays unpacked in the initramfs like the other hot-path binaries.
+# The shimserver tag adds the ttrpc server, the plugin graph and the
+# containerd API — everything containerd needs to run a task.
+SHIM_BIN := $(ALPINE_DIR)/anvil-fast-shim
+# The helper-only build of the same package: the per-container init/exec
+# helpers the agent and the shim server spawn on the start hot path. Without
+# the tag it drops the ttrpc server and the containerd API (~13.4 MB -> ~3 MB).
+SHIM_HELPER_BIN := $(ALPINE_DIR)/anvil-init
+
+guest-shim:
+	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags shimserver -ldflags="-s -w" -o ../$(SHIM_BIN) ./guest-shim
+
+anvil-init:
+	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../$(SHIM_HELPER_BIN) ./guest-shim
 
 initramfs-agent: extract-alpine-kernel guest-agent
 	scripts/build_initramfs.sh
@@ -427,14 +437,14 @@ download-upx:
 	    rm -f /tmp/anvil-upx.tar.xz; \
 	fi
 
-initramfs-containerd: download-alpine extract-alpine-kernel alpine-virt-modules guest-agent container-tools alpine-iptables download-upx
-	@if command -v limactl >/dev/null 2>&1 && limactl list anvil --format '{{.Status}}' 2>/dev/null | grep -q Running; then \
-	    echo "Building initramfs inside Lima VM 'anvil'..."; \
-	    limactl shell anvil -- bash $(CURDIR)/scripts/build_initramfs_containerd.sh; \
-	else \
-	    echo "Lima VM 'anvil' not running; falling back to local Docker (requires Docker Desktop)."; \
-	    scripts/build_initramfs_containerd.sh; \
-	fi
+initramfs-containerd: download-alpine extract-alpine-kernel alpine-virt-modules guest-agent guest-shim anvil-init container-tools alpine-iptables download-upx
+	@ANVIL_BUILD_CONTEXT=$${ANVIL_BUILD_CONTEXT:-anvil}; \
+	if ! docker --context "$$ANVIL_BUILD_CONTEXT" info >/dev/null 2>&1; then \
+	    echo "docker context '$$ANVIL_BUILD_CONTEXT' is not reachable - initramfs builds run on the anvil service; start it first (make service-start) or pass ANVIL_BUILD_CONTEXT=<ctx>."; \
+	    exit 1; \
+	fi; \
+	echo "Building initramfs in docker context '$$ANVIL_BUILD_CONTEXT'..."; \
+	ANVIL_BUILD_CONTEXT=$$ANVIL_BUILD_CONTEXT scripts/build_initramfs_containerd.sh
 
 # Default boot path does NOT rebuild the initramfs so that an existing snapshot's
 # config hash stays valid. Build the initramfs explicitly with

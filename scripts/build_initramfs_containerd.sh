@@ -43,7 +43,7 @@ if [[ -z "${IN_CONTAINER:-}" ]]; then
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
             alpine:3.20 \
-            sh -c 'apk add --no-cache bash cpio zstd binutils upx && exec bash /scripts/build_initramfs_containerd.sh'
+            sh -c 'for i in 1 2 3 4; do apk add --no-cache bash cpio zstd binutils upx && break; [ "$i" = 4 ] && exit 1; echo "apk add failed (attempt $i), retrying in $((i*5))s..." >&2; sleep $((i*5)); done && exec bash /scripts/build_initramfs_containerd.sh'
         exit 0
     fi
 fi
@@ -61,7 +61,20 @@ command -v cpio >/dev/null 2>&1 || need_pkgs="$need_pkgs cpio"
 command -v zstd >/dev/null 2>&1 || need_pkgs="$need_pkgs zstd"
 command -v objdump >/dev/null 2>&1 || need_pkgs="$need_pkgs binutils"
 if [[ -n "$need_pkgs" ]]; then
-    apk add --no-cache $need_pkgs
+    # The CDN intermittently answers "temporary error (try again later)",
+    # which fails the whole build on a transient network blip. Retry with
+    # backoff before giving up.
+    for attempt in 1 2 3 4; do
+        if apk add --no-cache $need_pkgs; then
+            break
+        fi
+        if [[ "$attempt" == 4 ]]; then
+            echo "apk add failed after $attempt attempts (CDN unreachable?)" >&2
+            exit 1
+        fi
+        echo "apk add failed (attempt $attempt), retrying in $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+    done
 fi
 
 # BUILD_DIR points at the shared download directory: /build/download inside
@@ -76,6 +89,8 @@ IPTABLES_DIR="$DOWNLOAD_DIR/alpine-iptables"
 
 ALPINE_INITRD="$ALPINE_DIR/initramfs-virt"
 AGENT_BIN="$ALPINE_DIR/guest-agent"
+SHIM_BIN="$ALPINE_DIR/anvil-fast-shim"
+SHIM_HELPER_BIN="$ALPINE_DIR/anvil-init"
 VIRT_APK="$ALPINE_DIR/linux-virt.apk"
 OUT="${OUT:-$DOWNLOAD_DIR/ubuntu/initramfs-containerd}"
 
@@ -85,6 +100,14 @@ if [[ ! -f "$ALPINE_INITRD" ]]; then
 fi
 if [[ ! -f "$AGENT_BIN" ]]; then
     echo "guest-agent not found; run 'make guest-agent' first"
+    exit 1
+fi
+if [[ ! -f "$SHIM_BIN" ]]; then
+    echo "anvil-fast-shim not found; run 'make guest-shim' first"
+    exit 1
+fi
+if [[ ! -f "$SHIM_HELPER_BIN" ]]; then
+    echo "anvil-init not found; run 'make anvil-init' first"
     exit 1
 fi
 if [[ ! -d "$ALPINE_DIR/linux-virt-pkg/lib/modules" ]]; then
@@ -131,6 +154,18 @@ cp /usr/bin/zstd bin/zstd
 # Inject guest agent.
 cp "$AGENT_BIN" bin/guest-agent
 chmod +x bin/guest-agent
+
+# Fast shim (containerd runtime-v2; the agent picks it per container via
+# WithRuntime with this absolute path). Unpacked: it is on the start hot path.
+cp "$SHIM_BIN" bin/anvil-fast-shim
+chmod +x bin/anvil-fast-shim
+
+# Helper-only build of the same package: the per-container init/exec helpers
+# the agent and the shim server spawn once per container. It carries no ttrpc
+# server or containerd API and is the binary on the start hot path; unpacked
+# like the shim.
+cp "$SHIM_HELPER_BIN" bin/anvil-init
+chmod +x bin/anvil-init
 
 # Container tools.
 mkdir -p opt/containerd/bin
@@ -870,6 +905,12 @@ fi
 # Start guest agent in foreground.
 echo "[stage2] starting guest-agent"
 bmark agent_start
+# The native CNI path can be forced from the host (plugin parity runs), the
+# way .anvil-debug turns debug logging on: a plain file on the share.
+if [ -f /mnt/anvil/.anvil-cni ]; then
+    export ANVIL_CNI="$(cat /mnt/anvil/.anvil-cni)"
+    echo "[stage2] guest-agent CNI mode: $ANVIL_CNI"
+fi
 if [ -f /mnt/anvil/.anvil-debug ]; then
     echo "[stage2] enabling guest-agent debug mode"
     export ANVIL_DEBUG=1
