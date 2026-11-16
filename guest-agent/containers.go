@@ -702,12 +702,15 @@ func handleContainerWait(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	if cond == "removed" {
 		// docker run --rm waits for the removal, so the name is free
-		// when the CLI returns.
+		// when the CLI returns. The poll is what the CLI sits on, so it
+		// runs fine-grained: 100 ms here was ~50 ms of the CLI's latency
+		// (the removal itself lands within a few ms of the exit). Polling
+		// rather than a notification keeps every removal path covered.
 		for ctx.Err() == nil {
 			if _, _, _, rerr := resolveDockerID(ctx, did); rerr != nil {
 				break
 			}
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(5 * time.Millisecond)
 		}
 	}
 	log.Printf("[docker-api] wait %s returning StatusCode=%d", id, exitCode)
