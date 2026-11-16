@@ -14,6 +14,8 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+
+	"github.com/olegshirko/anvil/guest-agent/internal/specutil"
 )
 
 // The init helper, in two stages (the same shape as runc's nsexec + init):
@@ -435,7 +437,7 @@ func runInitApply(id, bundle string) int {
 			return 1
 		}
 	}
-	if spec.Hostname != "" && !utsNamespaceShared(spec) {
+	if spec.Hostname != "" && !specutil.UTSNamespaceShared(spec) {
 		if err := unix.Sethostname([]byte(spec.Hostname)); err != nil {
 			reportLine(reportSetupPrefix+"sethostname: %v", err)
 			return 1
@@ -503,20 +505,6 @@ func runInitApply(id, bundle string) int {
 	return 0 // unreached
 }
 
-// utsNamespaceShared reports a UTS namespace joined by path (host uts or
-// container:<x>): the hostname is shared, so it must not be set.
-func utsNamespaceShared(spec *specs.Spec) bool {
-	if spec.Linux == nil {
-		return false
-	}
-	for _, ns := range spec.Linux.Namespaces {
-		if ns.Type == specs.UTSNamespace && ns.Path != "" {
-			return true
-		}
-	}
-	return false
-}
-
 // joinNamespacesApply joins the non-pid namespaces of the spec in stage B:
 // pathed ones via setns (fds opened before any mount-ns switch), pathless
 // ones via unshare. The pid namespace is skipped (stage A's clone put this
@@ -553,7 +541,7 @@ func joinNamespacesApply(spec *specs.Spec) error {
 			pathed = append(pathed, nsEntry{ns.Type, ns.Path})
 			continue
 		}
-		f, ok := namespaceCloneFlag(ns.Type)
+		f, ok := specutil.NamespaceCloneFlag(ns.Type)
 		if !ok {
 			return fmt.Errorf("unsupported namespace %q", ns.Type)
 		}
@@ -641,7 +629,7 @@ func applyProcessAttrs(id string, spec *specs.Spec) error {
 		}
 	}
 	for _, rl := range p.Rlimits {
-		if err := unix.Setrlimit(rlimitFromName(rl.Type), &unix.Rlimit{Cur: rl.Soft, Max: rl.Hard}); err != nil {
+		if err := unix.Setrlimit(specutil.RlimitFromName(rl.Type), &unix.Rlimit{Cur: rl.Soft, Max: rl.Hard}); err != nil {
 			return fmt.Errorf("rlimit %s: %w", rl.Type, err)
 		}
 	}
@@ -717,7 +705,7 @@ const capVersion3 = 0x20080522
 // It must run while the caller still has CAP_SETPCAP effective — before a
 // setuid to a non-root user, not after.
 func dropBoundingCaps(caps *specs.LinuxCapabilities) error {
-	bound := capBits(caps.Bounding)
+	bound := specutil.CapabilityBits(caps.Bounding)
 	for c := 0; c < 64; c++ {
 		if bound&(1<<c) == 0 {
 			if err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(c), 0, 0, 0); err != nil && err != unix.EINVAL {
@@ -735,16 +723,16 @@ func dropBoundingCaps(caps *specs.LinuxCapabilities) error {
 // the permitted set survived but the effective one is empty, so it is raised
 // first (ambient raises and the final capset need it).
 func applyCapabilities(caps *specs.LinuxCapabilities, afterSetuid bool) error {
-	perm := capBits(caps.Permitted)
+	perm := specutil.CapabilityBits(caps.Permitted)
 	if perm == 0 {
-		perm = capBits(caps.Bounding) // runc: fall back to bounding
+		perm = specutil.CapabilityBits(caps.Bounding) // runc: fall back to bounding
 	}
-	eff := capBits(caps.Effective)
+	eff := specutil.CapabilityBits(caps.Effective)
 	if eff == 0 {
 		eff = perm
 	}
-	inh := capBits(caps.Inheritable)
-	amb := capBits(caps.Ambient)
+	inh := specutil.CapabilityBits(caps.Inheritable)
+	amb := specutil.CapabilityBits(caps.Ambient)
 
 	hdr := unix.CapUserHeader{Version: capVersion3, Pid: 0}
 	data := []unix.CapUserData{
@@ -775,26 +763,6 @@ func applyCapabilities(caps *specs.LinuxCapabilities, afterSetuid bool) error {
 	return nil
 }
 
-// capBits converts a ["CAP_SYS_ADMIN", ...] name list into a bitmask.
-func capBits(names []string) uint64 {
-	var out uint64
-	for _, n := range names {
-		if idx, ok := capabilityIndex[n]; ok && idx < 64 {
-			out |= 1 << idx
-		}
-	}
-	return out
-}
-
-// rlimitFromName converts an OCI rlimit type ("RLIMIT_NOFILE") to a constant.
-func rlimitFromName(t string) int {
-	name := strings.TrimPrefix(strings.ToUpper(t), "RLIMIT_")
-	if idx, ok := rlimitIndex[name]; ok {
-		return idx
-	}
-	return 0
-}
-
 // readSpecFile parses the bundle's config.json.
 func readSpecFile(path string) (*specs.Spec, error) {
 	data, err := os.ReadFile(path)
@@ -815,35 +783,6 @@ func exitStatus(ws unix.WaitStatus) uint32 {
 		return uint32(128 + int(ws.Signal()))
 	}
 	return uint32(ws.ExitStatus())
-}
-
-// capabilityIndex maps OCI capability names to their kernel bit numbers
-// (CAP_* constants; the list is stable).
-var capabilityIndex = map[string]int{
-	"CAP_CHOWN": 0, "CAP_DAC_OVERRIDE": 1, "CAP_DAC_READ_SEARCH": 2,
-	"CAP_FOWNER": 3, "CAP_FSETID": 4, "CAP_KILL": 5, "CAP_SETGID": 6,
-	"CAP_SETUID": 7, "CAP_SETPCAP": 8, "CAP_LINUX_IMMUTABLE": 9,
-	"CAP_NET_BIND_SERVICE": 10, "CAP_NET_BROADCAST": 11, "CAP_NET_ADMIN": 12,
-	"CAP_NET_RAW": 13, "CAP_IPC_LOCK": 14, "CAP_IPC_OWNER": 15,
-	"CAP_SYS_MODULE": 16, "CAP_SYS_RAWIO": 17, "CAP_SYS_CHROOT": 18,
-	"CAP_SYS_PTRACE": 19, "CAP_SYS_PACCT": 20, "CAP_SYS_ADMIN": 21,
-	"CAP_SYS_BOOT": 22, "CAP_SYS_NICE": 23, "CAP_SYS_RESOURCE": 24,
-	"CAP_SYS_TIME": 25, "CAP_SYS_TTY_CONFIG": 26, "CAP_MKNOD": 27,
-	"CAP_LEASE": 28, "CAP_AUDIT_WRITE": 29, "CAP_AUDIT_CONTROL": 30,
-	"CAP_SETFCAP": 31, "CAP_MAC_OVERRIDE": 32, "CAP_MAC_ADMIN": 33,
-	"CAP_SYSLOG": 34, "CAP_WAKE_ALARM": 35, "CAP_BLOCK_SUSPEND": 36,
-	"CAP_AUDIT_READ": 37, "CAP_PERFMON": 38, "CAP_BPF": 39,
-	"CAP_CHECKPOINT_RESTORE": 40,
-}
-
-// rlimitIndex maps OCI rlimit names to resource constants.
-var rlimitIndex = map[string]int{
-	"CPU": unix.RLIMIT_CPU, "FSIZE": unix.RLIMIT_FSIZE, "DATA": unix.RLIMIT_DATA,
-	"STACK": unix.RLIMIT_STACK, "CORE": unix.RLIMIT_CORE, "RSS": unix.RLIMIT_RSS,
-	"NPROC": unix.RLIMIT_NPROC, "NOFILE": unix.RLIMIT_NOFILE, "MEMLOCK": unix.RLIMIT_MEMLOCK,
-	"AS": unix.RLIMIT_AS, "LOCKS": unix.RLIMIT_LOCKS, "SIGPENDING": unix.RLIMIT_SIGPENDING,
-	"MSGQUEUE": unix.RLIMIT_MSGQUEUE, "NICE": unix.RLIMIT_NICE, "RTPRIO": unix.RLIMIT_RTPRIO,
-	"RTTIME": unix.RLIMIT_RTTIME,
 }
 
 // resolveExecPath resolves argv[0] against the container's PATH (post-pivot
