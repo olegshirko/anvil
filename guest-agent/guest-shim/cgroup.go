@@ -54,18 +54,30 @@ func cgroupAbsPath(cgroupsPath string) string {
 	return filepath.Join(cgroupRoot, strings.TrimPrefix(cgroupsPath, "/"))
 }
 
-// enableControllers turns on every available controller down to dir.
+// enableControllers turns on every available controller from the cgroup root
+// down to the parent of dir — top-down, not bottom-up. A cgroup's
+// cgroup.controllers file lists only the controllers already enabled in its
+// parent's subtree_control, so on a cold boot (root subtree_control empty) a
+// bottom-up walk found nothing to enable at the namespace cgroup and only
+// enabled the root afterwards: the first container after a boot had no
+// memory.max, cpu.max or pids.max, while every later one did.
 func enableControllers(dir string) error {
-	for {
-		parent := filepath.Dir(dir)
-		if err := enableAt(parent); err != nil {
+	if dir == cgroupRoot || !strings.HasPrefix(dir, cgroupRoot+"/") {
+		return nil
+	}
+	var chain []string
+	for d := filepath.Dir(dir); strings.HasPrefix(d, cgroupRoot); d = filepath.Dir(d) {
+		chain = append(chain, d)
+		if d == cgroupRoot {
+			break
+		}
+	}
+	for i := len(chain) - 1; i >= 0; i-- {
+		if err := enableAt(chain[i]); err != nil {
 			return err
 		}
-		if parent == cgroupRoot || parent == "/" {
-			return nil
-		}
-		dir = parent
 	}
+	return nil
 }
 
 func enableAt(dir string) error {
