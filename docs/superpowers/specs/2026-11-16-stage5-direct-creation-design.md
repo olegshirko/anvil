@@ -182,3 +182,48 @@ measured at a realistic 2–3 ms gain for the highest risk in the ladder — it
 is not the route to the target. Remaining order, cheapest first: CNI
 pre-allocation at create (−13 ms of start), create-path trims (snapshot
 memo), and the exit-path CNI teardown competing with inspect.
+
+## Correctness pass (post-5a)
+
+The first integration run after 5a found 13 regressions in the direct path
+(137 passed / 13 failed vs 150 / 0 before). All are fixed (b9ec423..35a0e3a)
+and the suite is green — 150 passed, 4 skipped, 0 failed, twice, one of the
+runs verified independently. Root causes worth remembering, because each is
+behaviour containerd used to provide for free:
+
+- **cgroup view**: the container's `/sys/fs/cgroup` was a bind of the guest
+  hierarchy; a bind keeps the superblock root, so the private cgroup
+  namespace never restricted it and `--memory`/`--cpus` were invisible to
+  the workload. A private cgroup namespace needs a *fresh* cgroup2 mount.
+- **controller enabling** walked bottom-up; `cgroup.controllers` only lists
+  what the parent's `subtree_control` already enables, so the first
+  container after every boot saw no limit files. Walk root→namespace.
+- **`--memory-swap`** is the combined total; `memory.swap.max` takes the
+  swap-only remainder.
+- **`--pid host`** was eligible for a path that always clones a new pid
+  namespace — eligibility must exclude every host-namespace-sharing flag.
+- **credentials before capabilities** cleared the effective set, so the
+  bounding-set drops failed with EPERM; runc's order (drop while root,
+  PR_SET_KEEPCAPS, setuid, install sets, clear) is required.
+- **exec** needed `chdir` after `chroot`, a `CloseIO` that waits for the
+  stdin copier (else the last chunk is truncated), and a pty taken from the
+  container's own devpts (TIOCSPTLCK(0) then TIOCGPTPEER), not the agent's.
+- **live `docker update`** must write the direct task's cgroup v2 files
+  (`pids.max` takes `max`, not -1).
+
+One unreproduced flake: a single `long name hostname` mismatch (the guest's
+hostname leaked) in the first full run; not reproducible in 25 sequence,
+60 standalone, 200-exec or two full-suite iterations. Debug diagnostics were
+added at direct start/exec (spec hostname, UTS namespace identity) so a
+recurrence is attributable without another rebuild.
+
+## Final measured state (2026-11-16)
+
+- CLI `docker run --rm alpine true`: **556 → 194 ms** (min 140, p10 187).
+- API-shaped flow: **495 → 147 ms** (min 92).
+- Integration: 150 passed / 4 skipped / 0 failed.
+- Remaining, largest first: CNI attach ~13 ms inside start, create ~15 ms
+  (snapshot/unpack through containerd), removal teardown ~40–90 ms (now off
+  the response path but still competing with inspect on the guest), and the
+  helper's residual start work (~25 ms after the fd and cgroup waits were
+  removed).
