@@ -241,8 +241,37 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 		return perr
 	}
 
-	cmd := exec.Command(fastShimHelperName, "init", "-id", id, "-bundle", bundle, "-cgroup")
+	// The native helper executes an init plan precomputed here; the Go helper
+	// parses the bundle's config.json. Any plan the native path cannot express
+	// falls back to the Go helper for this container.
+	initArgv, cgroupFile, nativeInit, ierr := newDirectInitCommand(id, bundle, spec)
+	tr.mark("init-cmd")
+	if ierr != nil {
+		closeFile(childStdin)
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
+		gateR.Close()
+		gateW.Close()
+		reportR.Close()
+		reportW.Close()
+		sink.close()
+		if cgroupFile != nil {
+			cgroupFile.Close()
+		}
+		if nativeInit {
+			os.RemoveAll(directCgroupPath(spec)) //nolint:errcheck — best effort
+		}
+		return ierr
+	}
+	cmd := exec.Command(initArgv[0], initArgv[1:]...)
 	cmd.ExtraFiles = []*os.File{gateR, reportW, childStdin, stdoutW, stderrW}
+	if cgroupFile != nil {
+		// fd 8: the cgroup directory the child is born into
+		// (CLONE_INTO_CGROUP). Close-on-exec is cleared by os/exec.
+		cmd.ExtraFiles = append(cmd.ExtraFiles, cgroupFile)
+	}
 	cmd.Env = os.Environ()
 	if debugMode {
 		// Debug builds record the helper's setup phases for `docker run`
@@ -268,6 +297,12 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 		reportR.Close()
 		reportW.Close()
 		sink.close()
+		if cgroupFile != nil {
+			cgroupFile.Close()
+		}
+		if nativeInit {
+			os.RemoveAll(directCgroupPath(spec)) //nolint:errcheck — the helper never ran
+		}
 		return fmt.Errorf("start init helper: %w", serr)
 	}
 	// The child holds its copies now (it inherits them across exec); the
@@ -277,6 +312,9 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 	stdoutW.Close()
 	stderrW.Close()
 	closeFile(childStdin)
+	if cgroupFile != nil {
+		cgroupFile.Close()
+	}
 
 	task := &directTask{
 		ns: ns, id: id, did: did, run: run,
