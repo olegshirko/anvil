@@ -1,4 +1,4 @@
-package main
+package specutil
 
 // Alias resolution for OCI seccomp names against the module's per-arch
 // syscall tables (pure table work; runs on darwin like seccomp_cond_test).

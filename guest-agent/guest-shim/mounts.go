@@ -11,6 +11,8 @@ import (
 	"github.com/containerd/log"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+
+	"github.com/olegshirko/anvil/guest-agent/internal/specutil"
 )
 
 // rootfs setup, running inside the init helper (already in the container's
@@ -18,44 +20,9 @@ import (
 // nodes created, masked/read-only paths enforced, then pivot_root. The
 // algorithm follows runc's rootfs_linux step by step; destinations are
 // resolved against the rootfs while still outside, so relative binds keep
-// working after the switch.
-
-// mountFlagOpts maps fstab-style mount options to syscall flags and mount
-// data. bind options are extracted separately.
-func mountFlagOpts(opts []string) (int, []string) {
-	var flags int
-	var data []string
-	for _, o := range opts {
-		switch o {
-		case "ro":
-			flags |= unix.MS_RDONLY
-		case "rw":
-		case "nosuid":
-			flags |= unix.MS_NOSUID
-		case "nodev":
-			flags |= unix.MS_NODEV
-		case "noexec":
-			flags |= unix.MS_NOEXEC
-		case "relatime":
-			flags |= unix.MS_RELATIME
-		case "noatime":
-			flags |= unix.MS_NOATIME
-		case "nodiratime":
-			flags |= unix.MS_NODIRATIME
-		case "strictatime":
-			flags |= unix.MS_STRICTATIME
-		case "suid", "dev", "exec", "atime", "diratime", "lazytime":
-			if o == "lazytime" {
-				flags |= unix.MS_LAZYTIME
-			}
-		case "bind", "rbind", "rprivate", "rslave", "rshared", "private", "slave", "shared", "unbindable", "runbindable", "recursive", "norecursive", "copy=sloppy":
-			// mount topology handled separately; nothing here
-		default:
-			data = append(data, o)
-		}
-	}
-	return flags, data
-}
+// working after the switch. The pure helpers (flag mapping, safe join, device
+// table) live in specutil so the agent's init-plan builder uses the same
+// definitions.
 
 // applySpecMounts mounts every spec mount onto the rootfs (pre-pivot).
 func applySpecMounts(rootfs string, spec *specs.Spec) error {
@@ -71,7 +38,7 @@ func applySpecMounts(rootfs string, spec *specs.Spec) error {
 				fileBind = true
 			}
 		}
-		dst, err := safeJoin(rootfs, m.Destination)
+		dst, err := specutil.SafeJoin(rootfs, m.Destination)
 		if err != nil {
 			return err
 		}
@@ -89,7 +56,7 @@ func applySpecMounts(rootfs string, spec *specs.Spec) error {
 		} else if err := os.MkdirAll(dst, 0o755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", dst, err)
 		}
-		flags, data := mountFlagOpts(m.Options)
+		flags, data := specutil.MountFlagOpts(m.Options)
 		dataStr := strings.Join(data, ",")
 
 		switch m.Type {
@@ -120,7 +87,7 @@ func applySpecMounts(rootfs string, spec *specs.Spec) error {
 			// an already-mounted view, so memory.max/cpu.max/pids.max
 			// were absent. With a shared cgroup namespace (--cgroupns
 			// host) runc binds the guest root, and so do we.
-			if !cgroupNamespacePrivate(spec) {
+			if !specutil.CgroupNamespacePrivate(spec) {
 				if err := unix.Mount("/sys/fs/cgroup", dst, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
 					return fmt.Errorf("bind cgroup root to %s: %w", m.Destination, err)
 				}
@@ -145,58 +112,14 @@ func applySpecMounts(rootfs string, spec *specs.Spec) error {
 	return nil
 }
 
-// cgroupNamespacePrivate reports whether the spec gives the container its own
-// cgroup namespace (a pathless CgroupNamespace entry). That is what makes a
-// freshly mounted cgroup2 hierarchy root at the container's cgroup; a shared
-// namespace (--cgroupns host: no entry) keeps the guest-wide view.
-func cgroupNamespacePrivate(spec *specs.Spec) bool {
-	if spec.Linux == nil {
-		return false
-	}
-	for _, ns := range spec.Linux.Namespaces {
-		if ns.Type == specs.CgroupNamespace {
-			return ns.Path == ""
-		}
-	}
-	return false
-}
-
-// safeJoin joins dest under root, refusing escapes.
-func safeJoin(root, dest string) (string, error) {
-	p := filepath.Join(root, filepath.Clean("/"+dest))
-	if p != root && !strings.HasPrefix(p, root+string(os.PathSeparator)) {
-		return "", fmt.Errorf("mount destination %q escapes rootfs", dest)
-	}
-	return p, nil
-}
-
-// standardDevices are created inside the container's /dev unless already
-// present (runc's createDevices).
-var standardDevices = []struct {
-	path string
-	mode uint32
-	dev  uint64
-}{
-	{"null", 0o666, mkdev(1, 3)},
-	{"zero", 0o666, mkdev(1, 5)},
-	{"full", 0o666, mkdev(1, 7)},
-	{"random", 0o666, mkdev(1, 8)},
-	{"urandom", 0o666, mkdev(1, 9)},
-	{"tty", 0o666, mkdev(5, 0)},
-}
-
-func mkdev(major, minor uint64) uint64 {
-	return minor | (major << 8) // glibc's makedev for <256 majors
-}
-
 // setupDevices creates the standard and spec-requested device nodes plus
 // the usual /dev symlinks, inside the freshly mounted tmpfs /dev.
 func setupDevices(rootfs string, spec *specs.Spec) error {
 	devDir := filepath.Join(rootfs, "dev")
-	for _, d := range standardDevices {
-		p := filepath.Join(devDir, d.path)
-		if err := unix.Mknod(p, unix.S_IFCHR|d.mode, int(d.dev)); err != nil && !os.IsExist(err) {
-			return fmt.Errorf("mknod /dev/%s: %w", d.path, err)
+	for _, d := range specutil.StandardDevices {
+		p := filepath.Join(devDir, d.Path)
+		if err := unix.Mknod(p, unix.S_IFCHR|d.Mode, int(d.Dev)); err != nil && !os.IsExist(err) {
+			return fmt.Errorf("mknod /dev/%s: %w", d.Path, err)
 		}
 	}
 	// Devices requested with --device (spec.Linux.Devices).
@@ -215,7 +138,7 @@ func setupDevices(rootfs string, spec *specs.Spec) error {
 				typ = unix.S_IFIFO
 			case "u", "c", "":
 			}
-			dev := int(mkdev(uint64(d.Major), uint64(d.Minor)))
+			dev := int(specutil.Mkdev(uint64(d.Major), uint64(d.Minor)))
 			if err := unix.Mknod(p, uint32(typ)|mode, dev); err != nil && !os.IsExist(err) {
 				log.L.WithField("path", d.Path).Warnf("mknod requested device: %v", err)
 			}
@@ -246,7 +169,7 @@ func applyMaskedAndReadonly(rootfs string, spec *specs.Spec) error {
 		return nil
 	}
 	for _, p := range spec.Linux.MaskedPaths {
-		dst, err := safeJoin(rootfs, p)
+		dst, err := specutil.SafeJoin(rootfs, p)
 		if err != nil {
 			continue
 		}
@@ -258,7 +181,7 @@ func applyMaskedAndReadonly(rootfs string, spec *specs.Spec) error {
 		}
 	}
 	for _, p := range spec.Linux.ReadonlyPaths {
-		dst, err := safeJoin(rootfs, p)
+		dst, err := specutil.SafeJoin(rootfs, p)
 		if err != nil {
 			continue
 		}
