@@ -86,6 +86,24 @@ func newDirectExec(ns, id string, t *directTask, pspec *specs.Process, terminal 
 	}
 	merged := mergeDirectExecProcess(initSpec, pspec)
 	merged.Terminal = terminal
+	if debugMode {
+		// Namespace diagnostics: an exec that sees the guest's UTS ("anvil")
+		// instead of the container's hostname is either a start whose spec
+		// lost its UTS namespace (specUTS=false / hostname empty) or an exec
+		// joining the wrong init pid (uts == guestUTS).
+		uts, _ := os.Readlink(fmt.Sprintf("/proc/%d/ns/uts", initPid))
+		guestUTS, _ := os.Readlink("/proc/1/ns/uts")
+		hasUTS, utsPath := false, ""
+		if initSpec.Linux != nil {
+			for _, n := range initSpec.Linux.Namespaces {
+				if n.Type == specs.UTSNamespace {
+					hasUTS, utsPath = true, n.Path
+				}
+			}
+		}
+		debugLog("[exec] %s: initpid=%d specHostname=%q specUTS=%v path=%q initUTS=%s guestUTS=%s",
+			truncateID(id), initPid, initSpec.Hostname, hasUTS, utsPath, uts, guestUTS)
+	}
 	specJSON, err := json.Marshal(merged)
 	if err != nil {
 		return nil, err

@@ -135,6 +135,17 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 		return fmt.Errorf("container spec: %w", serr)
 	}
 	tr.mark("spec")
+	if debugMode {
+		hasUTS, utsPath := false, ""
+		if spec.Linux != nil {
+			for _, n := range spec.Linux.Namespaces {
+				if n.Type == specs.UTSNamespace {
+					hasUTS, utsPath = true, n.Path
+				}
+			}
+		}
+		debugLog("[direct] %s: spec hostname=%q utsns=%v path=%q utsmode=%q", truncateID(id), spec.Hostname, hasUTS, utsPath, meta.HostConfig.UtsMode)
+	}
 
 	bundle, rootfs := directBundleDir(ns, id), directRootfsPath(ns, id)
 	if merr := os.MkdirAll(rootfs, 0o711); merr != nil {
