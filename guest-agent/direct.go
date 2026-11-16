@@ -24,7 +24,7 @@ import (
 
 // Stage 5a: the direct start path for eligible containers. The agent itself
 // is the supervisor: it prepares the snapshot rootfs, writes the bundle, does
-// the CNI attach, spawns the proven init helper (/bin/anvil-fast-shim init)
+// the CNI attach, spawns the proven init helper (/bin/anvil-init init)
 // once — no containerd task, no ttrpc shim server, so no task-create exec
 // chain and no socket handshake — and joins its exit with cmd.Wait. The
 // helper's namespace/mount/cgroup/seccomp code is unchanged; only who creates
@@ -241,7 +241,7 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 		return perr
 	}
 
-	cmd := exec.Command(fastShimRuntimeName, "init", "-id", id, "-bundle", bundle, "-cgroup")
+	cmd := exec.Command(fastShimHelperName, "init", "-id", id, "-bundle", bundle, "-cgroup")
 	cmd.ExtraFiles = []*os.File{gateR, reportW, childStdin, stdoutW, stderrW}
 	cmd.Env = os.Environ()
 	if debugMode {

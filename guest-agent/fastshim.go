@@ -26,6 +26,14 @@ import (
 // as the shim binary directly (the initramfs installs it there).
 const fastShimRuntimeName = "/bin/anvil-fast-shim"
 
+// fastShimHelperName is the helper-only build of the same package, installed
+// next to the shim. The agent spawns it for the per-container helper modes
+// (init, exec-init); it carries no ttrpc server or containerd API, so it is
+// a fraction of the shim's size and cheaper to exec on the start hot path.
+// The containerd runtime must keep pointing at fastShimRuntimeName, which is
+// the only binary containerd may start.
+const fastShimHelperName = "/bin/anvil-init"
+
 // fastShimDisabled reports the wholesale kill switch: ANVIL_FAST_SHIM=0
 // (or false/off) makes every container ineligible again.
 func fastShimDisabled() bool {

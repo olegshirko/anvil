@@ -36,14 +36,16 @@ func runBootFinalize() {
 
 	// Kill unreachable shims from a crashed previous session first — trying
 	// to delete their tasks through containerd would hang. The fast shim's
-	// server (and its init helpers, same binary) joins the list: a leftover
-	// server keeps its ttrpc socket serving a task record containerd no
-	// longer knows about.
+	// server and both helper binaries join the list: a leftover server keeps
+	// its ttrpc socket serving a task record containerd no longer knows
+	// about, and a leftover init/exec helper holds container namespaces and
+	// pipes.
 	if out, err := exec.Command("/bin/sh", "-c", `
 killed=0
 killall -9 containerd-shim-runc-v2 2>/dev/null && killed=1
 killall -9 runc 2>/dev/null && killed=1
 killall -9 anvil-fast-shim 2>/dev/null && killed=1
+killall -9 anvil-init 2>/dev/null && killed=1
 [ "$killed" = 1 ] && sleep 1
 `).CombinedOutput(); err != nil {
 		log.Printf("[boot] stale process kill failed: %v: %s", err, out)
