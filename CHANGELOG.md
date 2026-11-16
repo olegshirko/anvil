@@ -1,3 +1,117 @@
+## v1.10.0 (2026-11-16)
+
+### Added
+- 1464f40 feat(images): forced mirror pulls via mirror.anvil/ refs and anvil images push
+
+### Docs
+- 57d3092 docs: 6b.1 measured — create 9.7 -> 4.6 ms; 6b.2 a no-go
+- fbc95e2 docs: 6d green — 150/0 integration, CLI median 92 ms (min 50.6)
+- ef86c99 docs: 6d measured — three poll intervals were ~180 ms of the CLI run
+- 00afaa3 docs: 6a measured result (cni-attach 12.7 -> 1.26 ms, API 82.8 ms) and the duplicate-IP trap
+- b723530 docs: 6a design — native networking for the default bridge hot path
+- 1e9cc4a docs: what a kiri-style Rust rewrite would and would not buy
+- dad1ec2 docs: rust decision note — targeted init only, after the architectural rungs
+- 2fa85be docs: review the external optimization guide against our measurements
+- 7fd62fa docs: rewrite stage 6 against kiri's published budget
+- 54f10cc docs: stage 6 plan (networking without the CNI plugin, lean create, optional no-exec init)
+- b6c8690 docs: stage 5 correctness pass and final measured state
+- f9d764e docs: stage 5 measured rungs (CLI 556 -> 192 ms, API 495 -> 128 ms)
+- 8eaa3ff docs: stage 5a measured results
+- 50dbda7 docs: stage 5 design (direct container creation, no shim in the hot path)
+- 1626c89 docs: stage 4 in scope; implementation plans for stages 1-3 and stage 4
+- 9c679bd docs: stage 2 shim gating: default-on with fallback (Oleg's call)
+- 9f8a823 docs: resolve builder-check questions in latency design
+- 76cb349 docs: design spec for container start latency stages
+
+### Internal
+- 69f5669 ci: build the shim binaries the initramfs now needs
+- 116b316 build: keep server-only shim code behind the shimserver tag
+- a7678ac build: retry apk installs in the initramfs build
+- cca0eee build: initramfs always builds on the anvil docker context
+- 9f3cfc1 style: gofmt image_mirror_test.go
+
+### Other
+- 490efef agent: memoize the image facts every create re-derived
+- a8a2be2 agent: drain the attach at a fine cadence before removing
+- 20229d4 agent: probe the registry finely while /wait polls for a start
+- 69501ea agent: poll the removal finely on the --rm wait
+- a089922 initramfs: let the host pick the guest CNI mode
+- f1634e0 agent: create the default bridge endpoint in-process
+- 5be9f90 agent: spawn the helper-only binary for the direct start path
+- 9741ff1 shim: build the helper modes without the ttrpc server
+- ac16c06 Revert "agent: attach the network alongside the helper setup"
+- 5669dbc agent: attach the network alongside the helper setup
+- 35a0e3a agent: log a direct container's namespace identity in debug builds
+- 5eb4f9e agent: cover the direct cgroup update with a test
+- bd89098 shim: enable cgroup controllers top-down
+- 8ba70a0 agent: unlock the exec pty before opening its slave
+- e1e0ac2 shim: write the swap-only value to memory.swap.max
+- 00834e4 agent: apply docker update limits to a direct task's cgroup
+- 8e89a78 agent: drop a stale direct record when a start takes the containerd path
+- 7341182 agent: allocate an exec pty in the container's devpts
+- 98b6728 agent: let an exec's stdin drain before signalling EOF
+- cee050a shim: keep capabilities across a non-root user change
+- a760959 shim: honor the exec working directory
+- 60e2cdd shim: keep --pid host containers off the fast and direct paths
+- b9ec423 shim: mount the container's own cgroup subtree in a private cgroup namespace
+- a2db6f7 shim: birth stage B into its cgroup (clone3 CLONE_INTO_CGROUP)
+- 72476cb shim: keep every fixed fd below NR_OPEN_DEFAULT
+- ee0a8da guest-shim: split the helper trace into per-step wall and CPU marks
+- 480a172 agent: detach the endpoint off the DELETE response path
+- 5419a97 agent: move the helper trace to tmpfs, copied out after setup
+- 03f46c7 agent: give a direct TTY exec the pty slave as its stdin
+- 0c75e09 agent: keep an --rm container's exit code readable after its removal
+- fa054ea agent: answer a removed container's next-exit wait instead of erroring
+- 76d6f8c agent: end attach on the deterministic stream end, not a 100 ms linger
+- 8d808ee agent: trace the direct init's setup phases; keep healthchecks and cgroup cleanup on fallback
+- 8cca9b8 agent: start eligible containers directly, no containerd task or shim
+- ca8872b agent: direct-task registry for agent-supervised containers
+- 1d7e4ef shim: let the init helper create and remove its own cgroup (-cgroup)
+- a37bedd shim: hold TaskExit until TaskStart is published
+- 3337257 shim: exec two-stage ns join in a raw window, stage B applies the attrs
+- e47c998 shim: report setns failures from the raw exec window
+- d759ab6 shim: chroot the exec helper into the init's root
+- 89d868f shim: resolve the exec path before the filter in exec helpers
+- 44d4b6a shim: drop the create/start timing probes (temporary diagnostics)
+- b92b56e shim: finer init-helper probes with absolute mono clocks (temporary)
+- 128c84e shim: init helper stage timing prints (temporary)
+- 9c6a5f3 shim: create/start phase timing probes (temporary)
+- dd72273 logging: follow reads the eof marker promptly, stop condition throttled
+- cf852c6 shim: install seccomp via seccomp(2); secprobe diagnostic subcommand
+- 4f92196 boot: sweep stray fast-shim processes and dead shim sockets at boot
+- edabcda shim: drop the seccomp install probes (temporary diagnostics)
+- 237f8ea shim: resolve the exec path before the user attributes (and the filter)
+- 708e759 shim: debug probes around the seccomp install (temporary)
+- a03684c shim: the default action maps to the bare value, not the EPERM-carrying one
+- a9b763b shim: the policy carries the bare default action; the patch adds EPERM
+- a823928 shim: assemble the seccomp program in the shim; default deny is EPERM
+- c1df7c0 shim: ActErrno defaults to EPERM - a bare RET_ERRNO fakes success
+- 8223a4a shim: the exec-not-found diagnostic reports each stat error and mode
+- 80ca42b shim: the exec-not-found error names the paths the helper tried
+- 31d2353 shim: carry the requested errno on ActErrno (clone3 must answer ENOSYS)
+- c81a3bf shim: map SCMP_CMP_MASKED_EQ to bit conditions; unbreak the default profile
+- 0f77cf8 shim: file bind mounts bind onto files, like runc
+- 442ee59 shim: the next-exit wait polls through the fast-shim fallback gap
+- 6905dcc shim: bind the cgroup root like runc; join the private cgroup namespace
+- d96fca8 shim: publish TaskOOM from the cgroup oom_kill counter
+- 5a7ce28 shim: default-on eligibility with silent runc fallback
+- 3b558b9 shim: publish TaskStart on init start; report lines at debug level
+- b160c80 shim: queue TaskExecStarted in report order, not start-rpc order
+- 5d8ce42 shim: Wait re-reads the exit code once the wait channel closes
+- 84eef42 shim: detached io hands /dev/null to the helper's fixed-fd trio
+- 2d50650 shim: review fixes: real pids in create/exec, fifo sinks close at init exit, exec fd hygiene
+- 6e94120 shim: two-stage init: stage B born in the pid namespace via raw clone
+- 81229a6 shim: start confirmation via close-on-exec pipe
+- f4acae2 shim: wait/kill/delete/exec/stats with io parity
+- 075b1e3 shim: create/start via trampoline, mounts, cgroups
+- 6dc7e62 logging: trailing eof marker ends the follow only when the stop condition agrees
+- de3c80c shim: anvil-fast-shim skeleton (runtime-v2 ttrpc service)
+- ce969cc logging: pin tty opt-out from eof marker
+- f36d5c5 logging: follow ends deterministically on eof marker
+- 9b3d71d logging: deterministic eof marker from pid watch / stream eof
+- 35ff1f2 logging: eof marker record, skipped by replay
+- 627d1e3 bench: CLI-shaped API op timing with step breakdown
+- 94aeb77 bench: per-phase container start latency tracing (debug builds)
 ## v1.9.12 (2026-11-13)
 
 ### Added
