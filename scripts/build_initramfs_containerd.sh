@@ -594,11 +594,30 @@ printf '127.0.0.1\tlocalhost\n::1\t\tlocalhost\n' > /etc/hosts
 # /usr/share, which is NOT copied into the tmpfs root, so stage2's background
 # udhcpc would obtain a lease without ever applying it to eth0. /etc is
 # copied, so the script lives here.
+#
+# Every lease event is also made visible, because the failure this guards
+# against (a lease silently moving or being lost) used to show up only as
+# mysterious network timeouts:
+#   - one console line per event (console.log is what a user reads), and
+#   - /run/anvil-lease, "<ip> <netmask> <router>", which the guest-agent
+#     polls to ARP-probe the address for a duplicate claim. /run is the tmpfs
+#     runtime directory stage2 already uses for its markers, so it is always
+#     present in the initramfs root (an Alpine /var/run symlink is not).
 cat > /etc/udhcpc-script <<'UDHEOF'
 #!/bin/sh
+LEASE_FILE=/run/anvil-lease
+say() { echo "[net] $*" >/dev/console; }
+
+# The address from the previous lease, if one is currently applied. Used to
+# report a move and to distinguish a real lease loss from udhcpc's startup
+# deconfig (which runs before the first bound and has nothing to lose).
+prev_ip=""
+if [ -f "$LEASE_FILE" ]; then read -r prev_ip _ < "$LEASE_FILE"; fi
+
 case "$1" in
 bound|renew)
-    ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}" ${broadcast:+broadcast $broadcast} up
+    mask="${subnet:-255.255.255.0}"
+    ifconfig "$interface" "$ip" netmask "$mask" ${broadcast:+broadcast $broadcast} up
     # busybox in this initramfs has no `route` applet; `ip route` is present.
     for r in $router; do ip route replace default via "$r" dev "$interface"; done
     # Public resolvers FIRST, the NAT gateway's forwarder LAST: Go's pure
@@ -613,9 +632,26 @@ bound|renew)
     echo "nameserver 1.1.1.1" >> /etc/resolv.conf
     for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done
     echo "options timeout:1 attempts:2" >> /etc/resolv.conf
+    # Atomic replace: the agent must never read a half-written line. Only the
+    # first router is stored: busybox joins a multi-router option 3 with
+    # spaces, and the agent's parser expects "<ip> <netmask> <router>".
+    printf '%s %s %s\n' "$ip" "$mask" "${router%% *}" > "$LEASE_FILE.tmp" &&
+        mv "$LEASE_FILE.tmp" "$LEASE_FILE"
+    say "lease $ip/$mask${router:+ via $router}"
+    if [ -n "$prev_ip" ] && [ "$prev_ip" != "$ip" ]; then
+        say "lease changed $prev_ip -> $ip"
+    fi
     ;;
-deconfig)
+deconfig|nak|leasefail)
+    # Zero the address on any loss of lease state, including a NAK: udhcpc
+    # then goes back to discover and a new bound applies the new address,
+    # instead of this guest silently keeping (and answering ARP for) an
+    # address the NAT has already handed to another VM.
     ifconfig "$interface" 0.0.0.0 up
+    if [ -f "$LEASE_FILE" ]; then
+        rm -f "$LEASE_FILE"
+        say "lease lost"
+    fi
     ;;
 esac
 exit 0
@@ -681,14 +717,31 @@ bmark stage2_start
 # not survive switch_root.
 ( ntpd -nq -p pool.ntp.org >/dev/null 2>&1 || true ) &
 
-# Obtain the eth0 DHCP lease off the boot critical path: nothing until the
-# first container (CNI) or an outbound connection needs it. The VZ NAT
-# DHCP server occasionally drops the first discover, so retry the whole
-# client a few times before giving up (and say so on the console).
+# Obtain and then KEEP the eth0 DHCP lease, off the boot critical path:
+# nothing until the first container (CNI) or an outbound connection needs it.
+#
+# udhcpc runs as a resident client, not one-shot: `-q` used to make it exit
+# as soon as the lease was bound, so nothing renewed it. When the vmnet DHCP
+# server later handed the same address to another VM, this guest silently
+# kept answering ARP for it and every network operation flapped. Without
+# `-q` the client renews at T1, rebinds at T2 and goes back to discover after
+# a NAK/lease fail (the event script zeroes the address on those).
+#
+# The flags keep a dead DHCP server from spinning forever or blocking boot:
+#   -f  stay in this background subshell (do not daemonize): a bound client
+#       remains its child, so the start stays observable and off the boot
+#       path, and a failed attempt is seen by the retry loop below;
+#   -n  end an attempt that never got a lease after -t tries, so the loop can
+#       retry a bounded number of times instead of hanging;
+#   -t 3 -T 2  three discover probes two seconds apart (~6 s per attempt):
+#       the NAT's DHCP occasionally drops the first discover, which the
+#       five attempts below absorb.
+# After the first bound the `-n` abort is cleared by udhcpc itself: a later
+# renewal failure returns to discover instead of exiting.
 ( ifconfig eth0 up 2>/dev/null || true
   lease=1
   for attempt in 1 2 3 4 5; do
-    if udhcpc -i eth0 -n -q -t 3 -T 2 -s /etc/udhcpc-script >>/tmp/udhcpc.log 2>&1; then
+    if udhcpc -f -i eth0 -n -t 3 -T 2 -s /etc/udhcpc-script >>/tmp/udhcpc.log 2>&1; then
       lease=0
       break
     fi
