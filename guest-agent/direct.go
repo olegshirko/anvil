@@ -250,6 +250,13 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 		cmd.Env = append(cmd.Env, "ANVIL_HELPER_TRACE=1")
 	}
 	tr.mark("spawn")
+	// The helper's trace records wall time marks in the same guest clock; the
+	// spawn instant is written next to them so "process creation + Go runtime
+	// init" (spawn -> the helper's first mark) is attributable.
+	var spawnWall int64
+	if debugMode {
+		spawnWall = time.Now().UnixNano()
+	}
 	if serr := cmd.Start(); serr != nil {
 		closeFile(childStdin)
 		stdoutR.Close()
@@ -302,7 +309,7 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 				tr.mark("init-born")
 			case 'R':
 				tr.mark("init-ready")
-				copyHelperTrace(id)
+				copyHelperTrace(id, spawnWall)
 				ready = true
 			case 'E':
 				setupErr = fmt.Errorf("%s", ev.detail)
@@ -354,6 +361,7 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 	// Wait for the started report: the helper confirms the user exec landed.
 	startCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	perr = waitDirectStarted(startCtx, events, task, tr)
+	startedWall := time.Now().UnixNano()
 	cancel()
 	if perr != nil {
 		sink.close()
@@ -365,6 +373,10 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 		}
 		return fmt.Errorf("start: %w", perr)
 	}
+	// Post-gate helper marks (gate wait, attributes, exec) are copied off the
+	// start path: the diagnostics write must not inflate the latency it
+	// measures. agent-started is when this side saw "S" (the exec landed).
+	go copyHelperTraceLate(id, startedWall)
 	tr.mark("task-start")
 
 	updateContainerMeta(ns, id, func(m *containerMeta) { //nolint:errcheck
@@ -391,16 +403,40 @@ func startDirectContainer(ctx context.Context, ns, id string, c client.Container
 // tmpfs into the shared .anvil-run directory (debug builds only). The helper
 // writes to tmpfs so the marks themselves cost microseconds; a virtiofs write
 // there can block for tens of milliseconds and distort the phases.
-func copyHelperTrace(id string) {
+func copyHelperTrace(id string, spawnWall int64) {
 	if !debugMode {
 		return
 	}
-	src := "/tmp/anvil-helper-trace-" + id
-	data, err := os.ReadFile(src)
+	data, err := os.ReadFile("/tmp/anvil-helper-trace-" + id)
 	if err != nil {
 		return
 	}
-	os.Remove(src) //nolint:errcheck — best effort
+	os.Remove("/tmp/anvil-helper-trace-" + id) //nolint:errcheck — diagnostics only
+	if spawnWall > 0 {
+		data = append([]byte(fmt.Sprintf("%s agent-spawn %d -1\n", id, spawnWall)), data...)
+	}
+	appendHelperTrace(data)
+}
+
+// copyHelperTraceLate copies the marks written after the ready report (gate
+// wait, attributes, exec). It runs from a goroutine at "S" so the virtiofs
+// append never sits on the start path.
+func copyHelperTraceLate(id string, startedWall int64) {
+	if !debugMode {
+		return
+	}
+	data, err := os.ReadFile("/tmp/anvil-helper-trace-late-" + id)
+	if err != nil {
+		return
+	}
+	os.Remove("/tmp/anvil-helper-trace-late-" + id) //nolint:errcheck — diagnostics only
+	if startedWall > 0 {
+		data = append(data, []byte(fmt.Sprintf("%s agent-started %d -1\n", id, startedWall))...)
+	}
+	appendHelperTrace(data)
+}
+
+func appendHelperTrace(data []byte) {
 	f, err := os.OpenFile(filepath.Join(anvilRunDir, "direct-helper-trace.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return

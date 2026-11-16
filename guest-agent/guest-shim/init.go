@@ -121,10 +121,21 @@ func waitGate() bool {
 // unless ANVIL_HELPER_TRACE is set (the agent sets it in debug mode); the file
 // lives on tmpfs. The descriptor is opened once: a per-mark open on virtiofs
 // costs tens of milliseconds and would drown the measurement.
-var helperTraceOut *os.File
+var helperTraceOut, helperTraceLateOut *os.File
 
-func helperTrace(id, stage string) {
-	if os.Getenv("ANVIL_HELPER_TRACE") == "" {
+// helperTraceLate records a mark after the ready report. Those marks land in a
+// second file: the agent copies the setup file when it receives "R" (before it
+// releases the gate), while the gate/attrs/exec marks are only written later.
+// The agent copies this file asynchronously at "S", so the copy never sits on
+// the start path.
+func helperTraceLate(id, stage string) { helperTraceAt(id, stage, true) }
+
+func helperTrace(id, stage string) { helperTraceAt(id, stage, false) }
+
+func helperTraceAt(id, stage string, late bool) {
+	// The exec and secprobe paths reuse applyProcessAttrs without a container
+	// id: they have no per-container trace of their own.
+	if id == "" || os.Getenv("ANVIL_HELPER_TRACE") == "" {
 		return
 	}
 	// Wall time alone cannot tell a slow syscall from time spent waiting
@@ -136,17 +147,23 @@ func helperTrace(id, stage string) {
 	if err := unix.ClockGettime(unix.CLOCK_THREAD_CPUTIME_ID, &cpuTs); err == nil {
 		cpu = cpuTs.Nano()
 	}
-	if helperTraceOut == nil {
+	prefix := ""
+	out := &helperTraceOut
+	if late {
+		prefix = "late-"
+		out = &helperTraceLateOut
+	}
+	if *out == nil {
 		// tmpfs, not the shared virtiofs directory: a share write can block
 		// tens of milliseconds and would distort the very phases it records.
 		// The agent copies the per-container file out when setup completes.
-		f, err := os.OpenFile("/tmp/anvil-helper-trace-"+id, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		f, err := os.OpenFile("/tmp/anvil-helper-trace-"+prefix+id, os.O_CREATE|os.O_WRONLY|os.O_APPEND|unix.O_CLOEXEC, 0o644)
 		if err != nil {
 			return
 		}
-		helperTraceOut = f
+		*out = f
 	}
-	fmt.Fprintf(helperTraceOut, "%s %s %d %d\n", id, stage, ts, cpu)
+	fmt.Fprintf(*out, "%s %s %d %d\n", id, stage, ts, cpu)
 }
 
 // runInit is stage A. Returns the process exit code (stage B's exit code —
@@ -327,6 +344,11 @@ func readConfirm(fd int, buf []byte) int {
 // container's own processes and the exec'd user process is PID 1.
 func runInitApply(id, bundle string) int {
 	helperTrace(id, "B-entry")
+	// Open the late-trace file before any namespace or mount work: its marks
+	// are written after pivot_root, when "/tmp" is the container's own (and
+	// may be missing or read-only). O_CLOEXEC keeps the descriptor out of the
+	// user process.
+	helperTraceLate(id, "B-entry")
 	spec, err := readSpecFile(filepath.Join(bundle, "config.json"))
 	if err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
@@ -425,6 +447,7 @@ func runInitApply(id, bundle string) int {
 			return 1
 		}
 	}
+	helperTraceLate(id, "B-ready")
 	reportLine(reportReady)
 
 	// Hold at the gate. EOF without a start: the task was deleted (or the
@@ -432,6 +455,7 @@ func runInitApply(id, bundle string) int {
 	if !waitGate() {
 		return 0
 	}
+	helperTraceLate(id, "B-gate")
 	// The gate is consumed; its read end must not leak into the user
 	// process (runc's init execs with exactly 0/1/2).
 	unix.Close(fdGate) //nolint:errcheck
@@ -447,13 +471,15 @@ func runInitApply(id, bundle string) int {
 		reportLine(reportStartPrefix+"%v", err)
 		return 127
 	}
+	helperTraceLate(id, "B-resolve")
 
 	// Everything the user process must already carry is applied to this
 	// process before the exec: the exec'd init inherits it all.
-	if err := applyProcessAttrs(spec); err != nil {
+	if err := applyProcessAttrs(id, spec); err != nil {
 		reportLine(reportStartPrefix+"%v", err)
 		return 126
 	}
+	helperTraceLate(id, "B-attrs")
 
 	// The report fd closes before the exec too (a live write end in the
 	// user process would hold the shim's report-EOF fallback open until
@@ -469,6 +495,7 @@ func runInitApply(id, bundle string) int {
 		return 126
 	}
 	unix.Close(fdReport) //nolint:errcheck — dup'ed above
+	helperTraceLate(id, "B-exec")
 	if err := unix.Exec(argv0, spec.Process.Args, spec.Process.Env); err != nil {
 		reportLineTo(fdReportFinal, reportStartPrefix+"exec %s: %v", argv0, err)
 		return 127
@@ -606,7 +633,7 @@ const prSetOomScoreAdj = 36
 // and (last) the seccomp filter. Order matters: credentials before caps,
 // seccomp strictly last — the filter also applies to this process, and the
 // exec'd user process inherits it across the exec.
-func applyProcessAttrs(spec *specs.Spec) error {
+func applyProcessAttrs(id string, spec *specs.Spec) error {
 	p := spec.Process
 	if p.OOMScoreAdj != nil {
 		if err := unix.Prctl(prSetOomScoreAdj, uintptr(*p.OOMScoreAdj), 0, 0, 0); err != nil {
@@ -655,6 +682,7 @@ func applyProcessAttrs(spec *specs.Spec) error {
 		}
 	}
 	if spec.Linux != nil && spec.Linux.Seccomp != nil {
+		helperTraceLate(id, "B-seccomp")
 		if err := applySeccomp(spec.Linux.Seccomp); err != nil {
 			return err
 		}
