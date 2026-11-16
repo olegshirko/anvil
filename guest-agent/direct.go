@@ -907,7 +907,16 @@ func updateDirectCgroup(dir string, res *specs.LinuxResources) error {
 		if m.Swap != nil {
 			val := "max"
 			if *m.Swap > 0 {
-				val = strconv.FormatInt(*m.Swap, 10)
+				// Docker's --memory-swap is memory+swap; cgroup v2 wants the
+				// swap-only value (runc's v1->v2 conversion).
+				swap := *m.Swap
+				if m.Limit != nil && *m.Limit > 0 {
+					swap -= *m.Limit
+					if swap < 0 {
+						swap = 0
+					}
+				}
+				val = strconv.FormatInt(swap, 10)
 			}
 			if err := write("memory.swap.max", val); err != nil {
 				return err
