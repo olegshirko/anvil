@@ -60,11 +60,11 @@ func TestFastShimEligibility(t *testing.T) {
 		}
 	})
 
-	t.Run("pid host is", func(t *testing.T) {
+	t.Run("pid host is not", func(t *testing.T) {
 		req, meta := plain()
 		req.HostConfig.PidMode = "host"
-		if !fastShimEligible(req, meta) {
-			t.Fatal("--pid host must be eligible")
+		if fastShimEligible(req, meta) {
+			t.Fatal("--pid host must not be eligible: the init is always born in a new pid namespace")
 		}
 	})
 
