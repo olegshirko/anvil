@@ -151,7 +151,11 @@ func waitForAttachDrain(dockerID string, timeout time.Duration) {
 		if n == 0 {
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		// `docker run --rm` blocks on the removal, and the removal blocks
+		// here until the client's attach stream closes (which happens the
+		// moment the output ends). A 100 ms poll put ~100 ms of pure
+		// polling into every --rm run.
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
