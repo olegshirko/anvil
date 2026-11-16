@@ -308,3 +308,178 @@ platform) and call `snapshotter.Prepare` directly instead of
 `client.WithNewSnapshot` (or reuse the image object across creates), so every
 consumer above keeps working unchanged. Not implemented here; the create
 target was met without it.
+
+## 6c measured (2026-11-16)
+
+### The helper's cost, split (30 runs, `alpine true`, debug trace)
+
+Per-phase medians of the Go init helper from the agent's spawn to the user
+exec's "S" report, wall and calling-thread CPU (µs):
+
+| phase | wall | CPU |
+|---|---|---|
+| process create + execve + Go runtime (stage A) | 512 | — |
+| spec read (`config.json` JSON parse) | 201 | 201 |
+| cgroup create + limits | 64 | 64 |
+| confirm pipe, `os.Executable`, argv/env ptrs, dup confirm, report P | 32 | 31 |
+| clone3 (new pid ns + `CLONE_INTO_CGROUP`) | 46 | 46 |
+| **stage B execve + Go runtime** | **424** | — |
+| stage B spec read (the same JSON parsed again) | 175 | 175 |
+| stdio + namespaces | 30 | 30 |
+| spec mounts | 110 | 110 |
+| devices + masked/read-only paths | 75 | 72 |
+| pivot + read-only root + sysctls + hostname + cwd | 44 | 42 |
+| report R + gate release (agent side) | 333 | 9 |
+| PATH resolution | 32 | 32 |
+| oom, rlimits, credentials, capabilities | 25 | 23 |
+| **seccomp assemble + install** | **332** | 332 |
+| report fd dup | 3 | 2 |
+| **execve + user process start + S report** | **236** | — |
+| **sum** | **2672** | |
+
+How much is process + Go runtime and how much is container work:
+
+- **process + Go runtime: 936 µs (35%)** — two execs of a 2.8 MB static Go
+  binary: 512 µs for stage A, 424 µs for the stage-B re-exec inside the new
+  pid namespace.
+- **spec parsing: 376 µs (14%)** — the same `config.json` read and parsed by
+  both stages.
+- **seccomp: 332 µs (12%)** — ~65 µs assembling the default profile's BPF
+  program, ~265 µs in the kernel loading it (the load cost is paid by any
+  implementation).
+- **container work: ~660 µs** — namespaces 30, mounts 110, devices/masking
+  75, pivot/sysctls/hostname 44, cgroup 64, clone 46, credentials/caps 25,
+  PATH 32, execve 236.
+- the 333 µs gate phase is the agent's own work (supervisor registration, the
+  release write, and in this debug build the tmpfs→virtiofs trace copy), not
+  the helper.
+
+### Route chosen: a native (C) init helper fed by a precomputed plan
+
+The numbers make the dominant removable terms, in order: the two Go runtime
+execs (936 µs), the double JSON parse (376 µs), the seccomp assembly (65 µs
+plus the ability to cache it), and the Go work itself.
+
+- **Route A (raw child forked from the agent, no exec)** removes the last
+  exec too (~145 µs) but puts the mount/pivot/credentials/seccomp work in a
+  forked child of the multithreaded Go agent, where only raw syscalls are
+  legal — the risk the `2026-11-16-rust-decision.md` analysis already called
+  the highest in the ladder.
+- **Route B (a tiny non-Go helper)** removes the Go runtime from both
+  stages, replaces both JSON parses with one binary plan read, and lets the
+  agent assemble and cache the seccomp program. It keeps the existing fd and
+  report protocol unchanged, and the fallback stays trivial.
+
+Route B was chosen: the measured saving is ~1.4 ms of the helper's 2.7 ms,
+and the implementation is single-threaded C with no runtime constraints.
+
+### What changed
+
+- The agent builds **one init plan** per native start from the OCI spec
+  (`guest-agent/init_plan_linux.go`): namespaces, mount syscalls with their
+  precomputed flags/data, device nodes, masked/read-only paths, pivot,
+  sysctls, hostname, cwd, argv/env, credentials, capabilities and the
+  assembled seccomp BPF program. The plan is written to the bundle (tmpfs)
+  and is the helper's only input, so the helper needs no JSON parser, no
+  capability/rlimit tables and no seccomp assembler.
+- **`/bin/anvil-init-native`** (`guest-agent/guest-shim/native/anvil-init.c`,
+  ~65 KB static musl) executes the plan. Stage A clones stage B with
+  `CLONE_NEWPID|CLONE_INTO_CGROUP` (the cgroup directory comes in as fd 8)
+  and reports `P`/`S`/`D` exactly like the Go helper; stage B is a plain
+  `clone(2)` child, **not a re-exec**, so the process that becomes the
+  container's PID 1 is the user program. It joins the namespaces, runs the
+  op list, reports `R`, waits at the gate, applies the attributes (seccomp
+  strictly last) and execve's. The only runtime loop is PATH resolution.
+- **Fallback**: `ANVIL_INIT_IMPL=go|native` pins the implementation (the
+  guest's stage2 also reads `/mnt/anvil/.anvil-init-impl` from the share, so
+  A/B runs need no rebuild). In auto mode (the default) the agent runs a
+  **capability probe** once — clone3 with `CLONE_INTO_CGROUP`, a new pid
+  namespace, private mount/uts namespaces, tmpfs/proc mounts, pivot_root,
+  sethostname, no-new-privs and a seccomp load — and uses the native helper
+  only when the probe passes **and** the plan is expressible for that
+  container; otherwise the Go helper runs. A native start that fails after
+  the probe falls back to the containerd task path like any direct-start
+  failure. The Go helper stays in the initramfs and keeps the containerd
+  fast-shim path (TTY, custom seccomp profiles, ...).
+- The pure OCI helpers (capability/rlimit tables, mount-option mapping,
+  safeJoin, standard devices, namespace flags, seccomp assembly) moved to
+  `guest-agent/internal/specutil`, and cgroup creation/limit translation to
+  `guest-agent/internal/cgroupv2`, so the agent and the helper share one
+  copy of each.
+
+### Two bugs the instrumentation found (both fixed)
+
+1. **`dup3` returns the new descriptor, not 0.** The C helper's failure check
+   treated success as an error, reported a stale `EINVAL`, and every start
+   fell back to containerd. Go's wrapper hides this; raw syscalls do not.
+2. **`open(O_CREAT|O_WRONLY)` on an existing lower-layer file triggers an
+   overlayfs copy-up.** The Go helper only opens the mountpoint file when
+   `os.Stat` says it is missing; the first C version opened it
+   unconditionally, copying up every bind-mounted file (measured 0.4–0.7 ms
+   each). After the fix the whole op list costs ~0.24 ms.
+
+### After (30 runs, same host, native helper)
+
+| phase | wall | CPU |
+|---|---|---|
+| process create + execve + libc startup | 147 | — |
+| plan read (binary) | 23 | 22 |
+| pipes + clone + born handshake + P report | 53 | — |
+| stdio + namespaces | 39 | 38 |
+| mounts + devices + masked/readonly + pivot + sysctls + hostname + cwd | 237 | 225 |
+| report R + gate release | 302 | 6 |
+| PATH resolution | 26 | 26 |
+| oom, rlimits, credentials, capabilities, seccomp install | 284 | 278 |
+| report fd dup | 3 | 2 |
+| execve + user process start + S report | 191 | — |
+| **sum** | **1306** | |
+
+The agent now also spends **260 µs** building the plan and preparing the
+cgroup before the spawn (the Go helper did the cgroup work itself; the plan
+build and write are new).
+
+### Before / after (back-to-back cold boots, 40 runs each)
+
+| measurement | Go helper | native | Δ |
+|---|---|---|---|
+| helper spawn → user exec (`S`) | 2.729 ms | 1.306 ms | **−1.42 ms** |
+| guest direct start (agent trace) | 6.13 ms | 4.52 ms | **−1.61 ms** |
+| API `/start` step (40 runs) | 12.7 ms | 11.2 ms | **−1.5 ms** |
+| API sum of step medians | 30.5 ms | 28.6 ms | −1.9 ms |
+| API flow, per-run median / min | 49.4 / 25.9 ms | 55.7 / 25.7 ms | tail-dominated, see note |
+| CLI `docker run --rm alpine true`, median / min | 91.3 / 46.1 ms | 90.9 / 45.3 ms | −0.4 / −0.8 ms |
+
+The per-run API total is dominated by unrelated tail events on this host
+(p90 250–290 ms; the `attach-eof` step alone swung 0.1→3.4 ms between
+samples), so the `/start` step and the guest trace are the meaningful
+comparisons: both show the expected 1.4–1.6 ms. The CLI number is dominated
+by fixed costs (CLI startup, the `/wait` exit tail at 33–34 ms, attach).
+
+### Verification
+
+- Behaviour, on the dev instance with the native helper in use: `run`/`ls`,
+  PATH exec, `echo hi | run -i`, `run -t` (containerd fast-shim path),
+  `exec` and `exec -u nobody`, `exec -t`, `--memory 64m --cpus 0.5`
+  (`memory.max` 67108864, `cpu.max` 50000 100000 inside), default seccomp
+  profile (`Seccomp: 2`, `NoNewPrivs: 1`), `-u nobody` (`CapEff: 0`),
+  masked/read-only paths (`/proc/keys`, `/proc/timer_list` are `/dev/null`;
+  `/proc/sys` read-only), `--pid host` (containerd path), `--read-only`
+  root, restart policy (`on-failure:2` → `RestartCount=2`, exit 7), port
+  publishing (HTTP answer through the forwarded port), stop/rm, `inspect`,
+  `top`. No stale per-container cgroups after exit.
+- `make dev-integration`: **150 passed / 4 skipped / 0 failed**, with the
+  native helper selected for the direct-eligible containers and the Go
+  helper still serving TTY/non-eligible ones. The only direct-start
+  fallbacks in the run are the two pre-existing cases below (a sysctl
+  container and a dangling `/etc/localtime` bind), and both fail the same
+  way in the Go helper.
+- `cd guest-agent && go test ./...` and `go vet ./...` pass; `go vet -tags
+  shimserver ./...` passes; `staticcheck` (CI toolchain, linux/arm64, both
+  tag sets) is clean. The init-plan serializer has unit tests that decode
+  the plan the way the C helper does, run on linux/arm64.
+- Known pre-existing quirks, unchanged: a container with `--sysctl` fails the
+  direct path with `EROFS` writing `/proc/sys/...` (the spec's read-only
+  `/proc/sys` bind is applied before the sysctl writes, in both helpers), and
+  a container whose `/etc/localtime` bind source is a dangling symlink fails
+  at the mountpoint creation; both fall through containerd's fast shim to
+  runc, exactly as the Go helper does.
