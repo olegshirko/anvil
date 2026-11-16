@@ -905,6 +905,12 @@ fi
 # Start guest agent in foreground.
 echo "[stage2] starting guest-agent"
 bmark agent_start
+# The native CNI path can be forced from the host (plugin parity runs), the
+# way .anvil-debug turns debug logging on: a plain file on the share.
+if [ -f /mnt/anvil/.anvil-cni ]; then
+    export ANVIL_CNI="$(cat /mnt/anvil/.anvil-cni)"
+    echo "[stage2] guest-agent CNI mode: $ANVIL_CNI"
+fi
 if [ -f /mnt/anvil/.anvil-debug ]; then
     echo "[stage2] enabling guest-agent debug mode"
     export ANVIL_DEBUG=1
