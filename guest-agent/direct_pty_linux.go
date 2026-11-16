@@ -21,6 +21,14 @@ func openContainerPty(initPid int) (master, slave *os.File, err error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("open container ptmx: %w", err)
 	}
+	// A Unix98 slave is locked until the master says otherwise, and an open
+	// of a locked slave fails with EIO: unlock it first (openpty(3)'s
+	// unlockpt step; grantpt is a no-op on devpts, owner and mode are set at
+	// creation).
+	if err := unix.IoctlSetPointerInt(int(ptmx.Fd()), unix.TIOCSPTLCK, 0); err != nil {
+		ptmx.Close() //nolint:errcheck
+		return nil, nil, fmt.Errorf("unlock container pty: %w", err)
+	}
 	var peer uintptr
 	for {
 		r, _, errno := unix.Syscall(unix.SYS_IOCTL, ptmx.Fd(), unix.TIOCGPTPEER,
