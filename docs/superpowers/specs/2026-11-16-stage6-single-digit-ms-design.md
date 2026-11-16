@@ -190,3 +190,121 @@ On this path, latency was not in syscalls or container work — it was in
 **poll intervals**. Three sleeps of 50–100 ms accounted for ~180 ms of a
 ~200 ms CLI run. Before optimising any phase, grep the hot path for
 `time.Sleep`; each one is a latency floor for whoever waits behind it.
+
+## 6b.1 measured (2026-11-16)
+
+Every create asked containerd the same three questions about the same image.
+The answers only change when the image does, so they are memoized:
+
+| guest phase (`create`/`native` trace) | was | after | what it was |
+|---|---|---|---|
+| `image-ensure` | 1.43 ms | **0.12 ms** | `findImageLocally` walking the descriptor tree to prove the record is healthy in this namespace |
+| `unpack` | 2.94 ms | **0.17 ms** | `img.Unpack` asking the snapshotter whether the layer chain is applied |
+| `meta` | 0.55 ms | **0.12 ms** | `img.Spec` + `dockerConfigExtensions` re-reading the image config blob |
+| `new-container` | 1.51 ms | 2.65 ms | unchanged code: it now pays the manifest/config reads that the skipped `img.Unpack` used to cache on the image object |
+| **API `create` step** | **9.7 ms** | **4.6 ms** | |
+
+What is memoized and where:
+
+- **unpacked** per (image digest, requested platform) — persisted in
+  `/var/lib/anvil/image-memo.json`, since it describes snapshots on the
+  persistent disk and survives resume/restart;
+- **present** per (namespace, canonical ref, platform) — persisted the same
+  way; the stored digest is compared with one `GetImage` on every hit, so a
+  tag move or a re-pull that changed the digest misses instead of skipping a
+  check;
+- **config facts** per (digest, platform) — in memory only: config,
+  platform, emulated-platform warning and the Docker-only extensions
+  (`Healthcheck`/`OnBuild`/`Shell`). The config blob is read once instead of
+  four times per create.
+
+Invalidation: `docker rmi`, image prune, system prune, pulls, and dangling-tree
+refreshes drop the affected entries. containerd's GC can also remove unpacked
+snapshots asynchronously without telling anyone, so a memo hit is never a
+correctness dependency: `NewContainer` failing with a missing parent snapshot
+clears the entry, unpacks once and retries, and the client never sees that
+failure.
+
+- API flow (`scripts/time_api_steps.py --runs 20`): create **4.6 ms**, total
+  49.2 ms median (min 26.0). Second sample: create 5.0, total 60.3 (min 28.5).
+- CLI (`scripts/time_run.py --runs 20`): median **92.0 ms**, **min 43.8 ms**
+  (was median 92.0 / min 50.6) — no regression, and the floor moved down.
+- Restart: after `make service-restart` the first create logged
+  `layers of docker.io/library/alpine:3.19 already unpacked (memo)`, i.e. the
+  persisted file was reused, not re-derived.
+- Correctness: pull → run → rmi → run (re-pulls and works); `docker commit`,
+  `docker save`, `docker export`, `docker system df`, `docker image prune`,
+  and a container after `docker system prune` all pass.
+- `make dev-integration`: **150 passed / 4 skipped / 0 failed**.
+
+Known pre-existing quirk observed while verifying (not introduced here):
+`docker image prune` reports dangling IDs as `deleted` but the records survive
+because the prune path passes a digest to `canonicalizeImageRef`. It is
+unrelated to this rung; the memo invalidation on that path is conservative.
+
+## 6b.2 — direct rootfs mounting: no-go
+
+### How the layer directories would be discovered
+
+The chain-ID → on-disk mapping is owned by the **metadata snapshotter**, not
+the content store. For every unpacked layer the metadata layer allocates a
+backend key
+
+    <namespace>/<sequence>/<chainID>
+
+(`createKey` in `core/metadata/snapshot.go`) and the overlay backend stores
+that layer's diff under
+
+    /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<namespace>/<sequence>/<chainID>/fs
+
+with `work/` beside it (the overlay snapshotter's `upperPath`/`workPath`). A
+chain ID is `identity.ChainID(diffIDs[:i+1])` for the image's i-th diff ID;
+the top layer's chain ID is the rootfs chain ID set in the image config blob's
+`containerd.io/gc.ref.snapshot.overlayfs` label. The mapping itself lives in
+containerd's metadata bolt database
+(`/var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db`, bucket
+`v1/<namespace>/snapshots/overlayfs/<snapshot key>`), which containerd holds
+with bolt's exclusive lock. So "discover the layer dirs without the
+snapshotter" means either reading containerd's private, locked state (copying
+the DB while GC may be rewriting it) or asking the snapshotter API — the round
+trip this rung wanted to remove.
+
+### What depends on the per-container snapshot record
+
+- **start**: `direct.go` mounts the rootfs from
+  `snapshotter.Mounts(info.SnapshotKey)`;
+- **`docker commit`**: `rootfs.CreateDiff` over the container's SnapshotKey +
+  snapshotter (`image_commit.go`);
+- **`docker export`, `docker cp`, `docker diff`**: `archive.go` and
+  `container_fs.go` call `snapshotter.Mounts(SnapshotKey)` and
+  `overlayLayers` parses the returned `upperdir=`/`lowerdir=` options;
+- **fast shim**: creates the task with
+  `client.WithSnapshotter`/`client.WithSnapshot` (`fastshim.go`);
+- **`docker system df` / `docker ps -s`**: `snapshotter.Usage(SnapshotKey)`
+  for the writable-layer size (`systemdf.go`);
+- **delete**: `client.WithSnapshotCleanup` removes the container snapshot
+  (`container_ops.go`, `bootfinalize.go`);
+- **GC**: while a container exists, its snapshot record (and parent chain) is
+  what pins the image's layer snapshots. `docker rmi` removes the image record
+  and its `gc.ref.snapshot` label; without a container snapshot an rmi would
+  let GC sweep the lowerdirs under a running container unless we added a
+  separate pin (a lease or a dummy snapshot record — i.e. kept the record).
+
+Only `docker save` is independent (it exports content-store blobs).
+
+### Verdict
+
+Mounting the rootfs directly would rework commit, export/cp/diff, system df,
+fast-shim task creation, container deletion and GC pinning — seven consumers
+across six files — with GC-race risk, to remove part of a ~1.5 ms
+`new-container` phase whose spec build (`WithNewSpec`) remains either way.
+**No-go. Keeping the snapshot record is the right outcome.**
+
+A cheap follow-up stays available inside 6b.1's design, and now has a concrete
+target: the ~1 ms of manifest/config reads that moved from `unpack` into
+`new-container` when the unpack memo began skipping the call that populated
+the image object's RootFS cache. Cache the rootfs diff IDs per (digest,
+platform) and call `snapshotter.Prepare` directly instead of
+`client.WithNewSnapshot` (or reuse the image object across creates), so every
+consumer above keeps working unchanged. Not implemented here; the create
+target was met without it.
