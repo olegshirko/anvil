@@ -77,6 +77,10 @@ masquerade rule, and its cost swings 10→60 ms under load.
   scanner's contract, `connect`/`disconnect` events).
 - **veth delete stays async** (18.9 ms in Kiri's own measurement) and is
   already off our response path.
+- **Warm veth pool** (from the external-guide review): pre-create pairs and
+  move one end into the container's netns at start, refilling the pool
+  asynchronously. Constraint: a created-not-started container must still
+  hold no IP, so the address is assigned at start, not at pool creation.
 - Parity gate: run the whole networking part of the suite with
   `ANVIL_CNI=plugin` and with the new path, and require identical observable
   state (IPs, `-p` on all interfaces, `127.0.0.1:` bindings, DNS by
@@ -92,6 +96,8 @@ creating a snapshot, plus 1.7 ms of image lookups.
   into the bundle's rootfs; keep the content store as the source of layers.
 - Memoize image → (layer paths, config, exposed ports) in the agent,
   invalidated on pull/remove/GC.
+- Cache the default seccomp BPF program (keyed by the capability set — the
+  profile is capability-aware) instead of assembling it per container.
 - Keep `docker commit`, `docker save`, `system df` and GC working: they read
   the snapshotter today, so either keep a snapshot record per container or
   move those readers to the same layer source (decide by what they need:
