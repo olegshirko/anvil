@@ -24,7 +24,7 @@ import (
 
 // docker exec / healthchecks on direct (stage 5a) containers. There is no
 // containerd task to exec through, so the agent runs the same helper the shim
-// uses for execs — `anvil-fast-shim exec-init -initpid <init> -bundle
+// uses for execs — `anvil-init exec-init -initpid <init> -bundle
 // <bundle>` with the exec spec in ANVIL_EXEC_SPEC — against the registry's
 // init pid. The helper's namespace join, raw fork window and attribute
 // application are unchanged; only the process that owns its gate/report/io
@@ -142,7 +142,7 @@ func newDirectExec(ns, id string, t *directTask, pspec *specs.Process, terminal 
 		p.closeStdio()
 		return nil, err
 	}
-	cmd := exec.Command(fastShimRuntimeName, "exec-init", "-initpid", strconv.Itoa(initPid), "-bundle", t.bundle)
+	cmd := exec.Command(fastShimHelperName, "exec-init", "-initpid", strconv.Itoa(initPid), "-bundle", t.bundle)
 	cmd.ExtraFiles = []*os.File{gateR, reportW, stdinF, stdoutF, stderrF}
 	cmd.Env = append(os.Environ(), "ANVIL_EXEC_SPEC="+string(specJSON))
 	if err := cmd.Start(); err != nil {
