@@ -7,7 +7,7 @@
     boot boot-alpine boot-ubuntu boot-containerd \
     download-alpine extract-alpine-kernel \
     download-ubuntu ubuntu-modules \
-    guest-agent guest-shim anvil-init initramfs-agent initramfs-ubuntu initramfs-containerd \
+    guest-agent guest-shim anvil-init anvil-init-native initramfs-agent initramfs-ubuntu initramfs-containerd \
     boot-containerd-fresh alpine-virt-modules alpine-iptables download-upx \
     container-tools time-boot time-service validate doctor unit-tests integration smoke ci-vm \
     harness harness-prepull harness-tests harness-all bench-all \
@@ -303,6 +303,32 @@ guest-shim:
 
 anvil-init:
 	cd guest-agent && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../$(SHIM_HELPER_BIN) ./guest-shim
+
+# The native container-init helper (stage 6c): a small static C binary that
+# executes an init plan precomputed by the agent, so the per-container init is
+# not a Go runtime. The initramfs build compiles it in the same Linux container
+# it assembles everything else in (works on the macOS host and in CI); this
+# target is the quick standalone compile check for iterating on the source.
+NATIVE_HELPER_BIN := $(ALPINE_DIR)/anvil-init-native
+NATIVE_HELPER_SRC := $(CURDIR)/guest-agent/guest-shim/native/anvil-init.c
+NATIVE_BUILD_IMAGE := anvil-init-cc:3.20
+
+anvil-init-native:
+	@ANVIL_BUILD_CONTEXT=$${ANVIL_BUILD_CONTEXT:-anvil}; \
+	if ! docker --context "$$ANVIL_BUILD_CONTEXT" info >/dev/null 2>&1; then \
+	    echo "docker context '$$ANVIL_BUILD_CONTEXT' is not reachable - the native init helper is compiled in a Linux container (start the anvil service or pass ANVIL_BUILD_CONTEXT=<ctx>)."; \
+	    exit 1; \
+	fi; \
+	if ! docker --context "$$ANVIL_BUILD_CONTEXT" image inspect $(NATIVE_BUILD_IMAGE) >/dev/null 2>&1; then \
+	    printf 'FROM alpine:3.20\nRUN apk add --no-cache gcc musl-dev\n' | \
+	        docker --context "$$ANVIL_BUILD_CONTEXT" build -t $(NATIVE_BUILD_IMAGE) - || exit 1; \
+	fi; \
+	docker --context "$$ANVIL_BUILD_CONTEXT" run --rm --platform linux/arm64 \
+	    -v "$(NATIVE_HELPER_SRC):/src/anvil-init.c:ro" \
+	    -v "$(CURDIR)/$(ALPINE_DIR):/out" \
+	    $(NATIVE_BUILD_IMAGE) \
+	    sh -c 'gcc -static -Os -s -Wall -Wextra -Werror -fno-stack-protector -fno-asynchronous-unwind-tables -o /out/anvil-init-native /src/anvil-init.c' || exit 1; \
+	echo "[anvil] native init helper: $(NATIVE_HELPER_BIN)"
 
 initramfs-agent: extract-alpine-kernel guest-agent
 	scripts/build_initramfs.sh
