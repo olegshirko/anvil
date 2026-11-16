@@ -243,6 +243,15 @@ func startNativeTask(ctx context.Context, ns, id string) error {
 	}
 	// Start-time CNI attach (shared with the direct start path). detachNet
 	// undoes it if the start fails after this point.
+	// A previous run may have been direct while this start is not (a
+	// container that gained a secondary network, or any other change that
+	// makes it ineligible): drop the registry record before the containerd
+	// task exists. Otherwise the exited direct record shadows the new task
+	// in /wait, exec, inspect and stop — "container is not running" on a
+	// container that is.
+	if old := supervisor.remove(ns, id); old != nil {
+		old.release()
+	}
 	netName, ports, detachNet, nerr := startContainerNetwork(ctx, ns, id, meta, tr)
 	if nerr != nil {
 		err = nerr
