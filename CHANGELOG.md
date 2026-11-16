@@ -1,3 +1,18 @@
+## v1.10.1 (2026-11-16)
+
+### Changed
+- 5ee1f99 refactor: share the pure OCI helpers between the helper and the agent
+
+### Docs
+- 44fb08a docs: stage 6c measured — native init helper
+
+### Internal
+- b2e726d ci: skip the Swift build when the change cannot affect it
+
+### Other
+- f4005d8 guest-agent: run the container init from a precomputed plan
+- 0f1fe78 guest-agent: share the cgroup v2 helpers with the agent
+- 72b5a2a guest-agent: trace the helper's gate, attrs and exec phases
 ## v1.10.0 (2026-11-16)
 
 ### Added
