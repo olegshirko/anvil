@@ -119,8 +119,48 @@ jobs:
         working-directory: guest-agent
         run: go test -race ./...
 
+  # Whether the Swift side needs building at all. The macOS runner is the
+  # scarce resource here: a Go-only change used to sit in its queue for
+  # 15 minutes and hold the whole run. A release tag, a manual run and the
+  # nightly always build, so a Swift break cannot reach a release through a
+  # skipped job; so does anything under Sources/, Package.* or the
+  # entitlements. Unknown base (new branch, first push) counts as changed.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      swift: ${{ steps.diff.outputs.swift }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: diff
+        name: Did the Swift side change?
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request) base="${{ github.event.pull_request.base.sha }}" ;;
+            push)         base="${{ github.event.before }}" ;;
+            *)            echo "swift=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          if [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "swift=true" >> "$GITHUB_OUTPUT"   # unknowable base: build
+            exit 0
+          fi
+          if git diff --name-only "$base" HEAD -- \
+               Sources Package.swift Package.resolved entitlements.plist | grep -q .; then
+            echo "swift=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "swift=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
-    needs: checks
+    needs: [checks, changes]
+    # Skipped for changes that cannot affect it; always built for a release
+    # tag, a manual run and the nightly.
+    if: >
+      needs.changes.outputs.swift == 'true' ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

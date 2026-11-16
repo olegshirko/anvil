@@ -9,6 +9,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Where the native init helper's source lives: mounted at /guest-agent by both
+# the build container below and CI, or straight from the checkout (Lima path).
+NATIVE_HELPER_SRC_GUEST="/guest-agent/guest-shim/native/anvil-init.c"
+NATIVE_HELPER_SRC_HOST="$ROOT/guest-agent/guest-shim/native/anvil-init.c"
 
 # If we are not already inside a Linux build environment, re-run this script
 # in a docker container.
@@ -38,6 +42,7 @@ if [[ -z "${IN_CONTAINER:-}" ]]; then
             ${proxy_env[@]+"${proxy_env[@]}"} \
             -v "$ROOT/.download:/build/download" \
             -v "$SCRIPT_DIR:/scripts:ro" \
+            -v "$ROOT/guest-agent:/guest-agent:ro" \
             -e IN_CONTAINER=1 \
             -e OUT=/build/download/ubuntu/initramfs-containerd \
             -e HOST_UID="$(id -u)" \
@@ -60,6 +65,20 @@ need_pkgs=""
 command -v cpio >/dev/null 2>&1 || need_pkgs="$need_pkgs cpio"
 command -v zstd >/dev/null 2>&1 || need_pkgs="$need_pkgs zstd"
 command -v objdump >/dev/null 2>&1 || need_pkgs="$need_pkgs binutils"
+
+# The native container-init helper (C) is compiled here, not on the host: the
+# macOS host has no aarch64-linux linker and CI builds this initramfs without
+# any prebuilt artifact. The source is mounted at /guest-agent in both the
+# container path and CI; the Lima path reads it from the checkout.
+NATIVE_HELPER_SRC="$NATIVE_HELPER_SRC_GUEST"
+if [[ ! -f "$NATIVE_HELPER_SRC" ]]; then
+    NATIVE_HELPER_SRC="$NATIVE_HELPER_SRC_HOST"
+fi
+if [[ ! -f "$NATIVE_HELPER_SRC" ]]; then
+    echo "native init helper source not found (looked in /guest-agent and $ROOT/guest-agent)"
+    exit 1
+fi
+command -v gcc >/dev/null 2>&1 || need_pkgs="$need_pkgs gcc musl-dev"
 if [[ -n "$need_pkgs" ]]; then
     # The CDN intermittently answers "temporary error (try again later)",
     # which fails the whole build on a transient network blip. Retry with
@@ -166,6 +185,13 @@ chmod +x bin/anvil-fast-shim
 # like the shim.
 cp "$SHIM_HELPER_BIN" bin/anvil-init
 chmod +x bin/anvil-init
+
+# Native container-init helper (static C, executes the agent's precomputed
+# init plan). The agent picks it per container and keeps anvil-init as the
+# fallback.
+gcc -static -Os -s -Wall -Wextra -Werror -fno-stack-protector \
+    -fno-asynchronous-unwind-tables -o bin/anvil-init-native "$NATIVE_HELPER_SRC"
+chmod +x bin/anvil-init-native
 
 # Container tools.
 mkdir -p opt/containerd/bin
@@ -910,6 +936,13 @@ bmark agent_start
 if [ -f /mnt/anvil/.anvil-cni ]; then
     export ANVIL_CNI="$(cat /mnt/anvil/.anvil-cni)"
     echo "[stage2] guest-agent CNI mode: $ANVIL_CNI"
+fi
+# Container-init implementation: go | native. The agent defaults to auto
+# (native when its probe passes); the file pins one implementation for A/B
+# measurements, like .anvil-debug pins logging.
+if [ -f /mnt/anvil/.anvil-init-impl ]; then
+    export ANVIL_INIT_IMPL="$(cat /mnt/anvil/.anvil-init-impl)"
+    echo "[stage2] guest-agent container init: $ANVIL_INIT_IMPL"
 fi
 if [ -f /mnt/anvil/.anvil-debug ]; then
     echo "[stage2] enabling guest-agent debug mode"

@@ -14,6 +14,8 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+
+	"github.com/olegshirko/anvil/guest-agent/internal/specutil"
 )
 
 // The init helper, in two stages (the same shape as runc's nsexec + init):
@@ -121,10 +123,21 @@ func waitGate() bool {
 // unless ANVIL_HELPER_TRACE is set (the agent sets it in debug mode); the file
 // lives on tmpfs. The descriptor is opened once: a per-mark open on virtiofs
 // costs tens of milliseconds and would drown the measurement.
-var helperTraceOut *os.File
+var helperTraceOut, helperTraceLateOut *os.File
 
-func helperTrace(id, stage string) {
-	if os.Getenv("ANVIL_HELPER_TRACE") == "" {
+// helperTraceLate records a mark after the ready report. Those marks land in a
+// second file: the agent copies the setup file when it receives "R" (before it
+// releases the gate), while the gate/attrs/exec marks are only written later.
+// The agent copies this file asynchronously at "S", so the copy never sits on
+// the start path.
+func helperTraceLate(id, stage string) { helperTraceAt(id, stage, true) }
+
+func helperTrace(id, stage string) { helperTraceAt(id, stage, false) }
+
+func helperTraceAt(id, stage string, late bool) {
+	// The exec and secprobe paths reuse applyProcessAttrs without a container
+	// id: they have no per-container trace of their own.
+	if id == "" || os.Getenv("ANVIL_HELPER_TRACE") == "" {
 		return
 	}
 	// Wall time alone cannot tell a slow syscall from time spent waiting
@@ -136,17 +149,23 @@ func helperTrace(id, stage string) {
 	if err := unix.ClockGettime(unix.CLOCK_THREAD_CPUTIME_ID, &cpuTs); err == nil {
 		cpu = cpuTs.Nano()
 	}
-	if helperTraceOut == nil {
+	prefix := ""
+	out := &helperTraceOut
+	if late {
+		prefix = "late-"
+		out = &helperTraceLateOut
+	}
+	if *out == nil {
 		// tmpfs, not the shared virtiofs directory: a share write can block
 		// tens of milliseconds and would distort the very phases it records.
 		// The agent copies the per-container file out when setup completes.
-		f, err := os.OpenFile("/tmp/anvil-helper-trace-"+id, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		f, err := os.OpenFile("/tmp/anvil-helper-trace-"+prefix+id, os.O_CREATE|os.O_WRONLY|os.O_APPEND|unix.O_CLOEXEC, 0o644)
 		if err != nil {
 			return
 		}
-		helperTraceOut = f
+		*out = f
 	}
-	fmt.Fprintf(helperTraceOut, "%s %s %d %d\n", id, stage, ts, cpu)
+	fmt.Fprintf(*out, "%s %s %d %d\n", id, stage, ts, cpu)
 }
 
 // runInit is stage A. Returns the process exit code (stage B's exit code —
@@ -327,6 +346,11 @@ func readConfirm(fd int, buf []byte) int {
 // container's own processes and the exec'd user process is PID 1.
 func runInitApply(id, bundle string) int {
 	helperTrace(id, "B-entry")
+	// Open the late-trace file before any namespace or mount work: its marks
+	// are written after pivot_root, when "/tmp" is the container's own (and
+	// may be missing or read-only). O_CLOEXEC keeps the descriptor out of the
+	// user process.
+	helperTraceLate(id, "B-entry")
 	spec, err := readSpecFile(filepath.Join(bundle, "config.json"))
 	if err != nil {
 		reportLine(reportSetupPrefix+"%v", err)
@@ -413,7 +437,7 @@ func runInitApply(id, bundle string) int {
 			return 1
 		}
 	}
-	if spec.Hostname != "" && !utsNamespaceShared(spec) {
+	if spec.Hostname != "" && !specutil.UTSNamespaceShared(spec) {
 		if err := unix.Sethostname([]byte(spec.Hostname)); err != nil {
 			reportLine(reportSetupPrefix+"sethostname: %v", err)
 			return 1
@@ -425,6 +449,7 @@ func runInitApply(id, bundle string) int {
 			return 1
 		}
 	}
+	helperTraceLate(id, "B-ready")
 	reportLine(reportReady)
 
 	// Hold at the gate. EOF without a start: the task was deleted (or the
@@ -432,6 +457,7 @@ func runInitApply(id, bundle string) int {
 	if !waitGate() {
 		return 0
 	}
+	helperTraceLate(id, "B-gate")
 	// The gate is consumed; its read end must not leak into the user
 	// process (runc's init execs with exactly 0/1/2).
 	unix.Close(fdGate) //nolint:errcheck
@@ -447,13 +473,15 @@ func runInitApply(id, bundle string) int {
 		reportLine(reportStartPrefix+"%v", err)
 		return 127
 	}
+	helperTraceLate(id, "B-resolve")
 
 	// Everything the user process must already carry is applied to this
 	// process before the exec: the exec'd init inherits it all.
-	if err := applyProcessAttrs(spec); err != nil {
+	if err := applyProcessAttrs(id, spec); err != nil {
 		reportLine(reportStartPrefix+"%v", err)
 		return 126
 	}
+	helperTraceLate(id, "B-attrs")
 
 	// The report fd closes before the exec too (a live write end in the
 	// user process would hold the shim's report-EOF fallback open until
@@ -469,25 +497,12 @@ func runInitApply(id, bundle string) int {
 		return 126
 	}
 	unix.Close(fdReport) //nolint:errcheck — dup'ed above
+	helperTraceLate(id, "B-exec")
 	if err := unix.Exec(argv0, spec.Process.Args, spec.Process.Env); err != nil {
 		reportLineTo(fdReportFinal, reportStartPrefix+"exec %s: %v", argv0, err)
 		return 127
 	}
 	return 0 // unreached
-}
-
-// utsNamespaceShared reports a UTS namespace joined by path (host uts or
-// container:<x>): the hostname is shared, so it must not be set.
-func utsNamespaceShared(spec *specs.Spec) bool {
-	if spec.Linux == nil {
-		return false
-	}
-	for _, ns := range spec.Linux.Namespaces {
-		if ns.Type == specs.UTSNamespace && ns.Path != "" {
-			return true
-		}
-	}
-	return false
 }
 
 // joinNamespacesApply joins the non-pid namespaces of the spec in stage B:
@@ -526,7 +541,7 @@ func joinNamespacesApply(spec *specs.Spec) error {
 			pathed = append(pathed, nsEntry{ns.Type, ns.Path})
 			continue
 		}
-		f, ok := namespaceCloneFlag(ns.Type)
+		f, ok := specutil.NamespaceCloneFlag(ns.Type)
 		if !ok {
 			return fmt.Errorf("unsupported namespace %q", ns.Type)
 		}
@@ -606,7 +621,7 @@ const prSetOomScoreAdj = 36
 // and (last) the seccomp filter. Order matters: credentials before caps,
 // seccomp strictly last — the filter also applies to this process, and the
 // exec'd user process inherits it across the exec.
-func applyProcessAttrs(spec *specs.Spec) error {
+func applyProcessAttrs(id string, spec *specs.Spec) error {
 	p := spec.Process
 	if p.OOMScoreAdj != nil {
 		if err := unix.Prctl(prSetOomScoreAdj, uintptr(*p.OOMScoreAdj), 0, 0, 0); err != nil {
@@ -614,7 +629,7 @@ func applyProcessAttrs(spec *specs.Spec) error {
 		}
 	}
 	for _, rl := range p.Rlimits {
-		if err := unix.Setrlimit(rlimitFromName(rl.Type), &unix.Rlimit{Cur: rl.Soft, Max: rl.Hard}); err != nil {
+		if err := unix.Setrlimit(specutil.RlimitFromName(rl.Type), &unix.Rlimit{Cur: rl.Soft, Max: rl.Hard}); err != nil {
 			return fmt.Errorf("rlimit %s: %w", rl.Type, err)
 		}
 	}
@@ -655,6 +670,7 @@ func applyProcessAttrs(spec *specs.Spec) error {
 		}
 	}
 	if spec.Linux != nil && spec.Linux.Seccomp != nil {
+		helperTraceLate(id, "B-seccomp")
 		if err := applySeccomp(spec.Linux.Seccomp); err != nil {
 			return err
 		}
@@ -689,7 +705,7 @@ const capVersion3 = 0x20080522
 // It must run while the caller still has CAP_SETPCAP effective — before a
 // setuid to a non-root user, not after.
 func dropBoundingCaps(caps *specs.LinuxCapabilities) error {
-	bound := capBits(caps.Bounding)
+	bound := specutil.CapabilityBits(caps.Bounding)
 	for c := 0; c < 64; c++ {
 		if bound&(1<<c) == 0 {
 			if err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(c), 0, 0, 0); err != nil && err != unix.EINVAL {
@@ -707,16 +723,16 @@ func dropBoundingCaps(caps *specs.LinuxCapabilities) error {
 // the permitted set survived but the effective one is empty, so it is raised
 // first (ambient raises and the final capset need it).
 func applyCapabilities(caps *specs.LinuxCapabilities, afterSetuid bool) error {
-	perm := capBits(caps.Permitted)
+	perm := specutil.CapabilityBits(caps.Permitted)
 	if perm == 0 {
-		perm = capBits(caps.Bounding) // runc: fall back to bounding
+		perm = specutil.CapabilityBits(caps.Bounding) // runc: fall back to bounding
 	}
-	eff := capBits(caps.Effective)
+	eff := specutil.CapabilityBits(caps.Effective)
 	if eff == 0 {
 		eff = perm
 	}
-	inh := capBits(caps.Inheritable)
-	amb := capBits(caps.Ambient)
+	inh := specutil.CapabilityBits(caps.Inheritable)
+	amb := specutil.CapabilityBits(caps.Ambient)
 
 	hdr := unix.CapUserHeader{Version: capVersion3, Pid: 0}
 	data := []unix.CapUserData{
@@ -747,26 +763,6 @@ func applyCapabilities(caps *specs.LinuxCapabilities, afterSetuid bool) error {
 	return nil
 }
 
-// capBits converts a ["CAP_SYS_ADMIN", ...] name list into a bitmask.
-func capBits(names []string) uint64 {
-	var out uint64
-	for _, n := range names {
-		if idx, ok := capabilityIndex[n]; ok && idx < 64 {
-			out |= 1 << idx
-		}
-	}
-	return out
-}
-
-// rlimitFromName converts an OCI rlimit type ("RLIMIT_NOFILE") to a constant.
-func rlimitFromName(t string) int {
-	name := strings.TrimPrefix(strings.ToUpper(t), "RLIMIT_")
-	if idx, ok := rlimitIndex[name]; ok {
-		return idx
-	}
-	return 0
-}
-
 // readSpecFile parses the bundle's config.json.
 func readSpecFile(path string) (*specs.Spec, error) {
 	data, err := os.ReadFile(path)
@@ -787,35 +783,6 @@ func exitStatus(ws unix.WaitStatus) uint32 {
 		return uint32(128 + int(ws.Signal()))
 	}
 	return uint32(ws.ExitStatus())
-}
-
-// capabilityIndex maps OCI capability names to their kernel bit numbers
-// (CAP_* constants; the list is stable).
-var capabilityIndex = map[string]int{
-	"CAP_CHOWN": 0, "CAP_DAC_OVERRIDE": 1, "CAP_DAC_READ_SEARCH": 2,
-	"CAP_FOWNER": 3, "CAP_FSETID": 4, "CAP_KILL": 5, "CAP_SETGID": 6,
-	"CAP_SETUID": 7, "CAP_SETPCAP": 8, "CAP_LINUX_IMMUTABLE": 9,
-	"CAP_NET_BIND_SERVICE": 10, "CAP_NET_BROADCAST": 11, "CAP_NET_ADMIN": 12,
-	"CAP_NET_RAW": 13, "CAP_IPC_LOCK": 14, "CAP_IPC_OWNER": 15,
-	"CAP_SYS_MODULE": 16, "CAP_SYS_RAWIO": 17, "CAP_SYS_CHROOT": 18,
-	"CAP_SYS_PTRACE": 19, "CAP_SYS_PACCT": 20, "CAP_SYS_ADMIN": 21,
-	"CAP_SYS_BOOT": 22, "CAP_SYS_NICE": 23, "CAP_SYS_RESOURCE": 24,
-	"CAP_SYS_TIME": 25, "CAP_SYS_TTY_CONFIG": 26, "CAP_MKNOD": 27,
-	"CAP_LEASE": 28, "CAP_AUDIT_WRITE": 29, "CAP_AUDIT_CONTROL": 30,
-	"CAP_SETFCAP": 31, "CAP_MAC_OVERRIDE": 32, "CAP_MAC_ADMIN": 33,
-	"CAP_SYSLOG": 34, "CAP_WAKE_ALARM": 35, "CAP_BLOCK_SUSPEND": 36,
-	"CAP_AUDIT_READ": 37, "CAP_PERFMON": 38, "CAP_BPF": 39,
-	"CAP_CHECKPOINT_RESTORE": 40,
-}
-
-// rlimitIndex maps OCI rlimit names to resource constants.
-var rlimitIndex = map[string]int{
-	"CPU": unix.RLIMIT_CPU, "FSIZE": unix.RLIMIT_FSIZE, "DATA": unix.RLIMIT_DATA,
-	"STACK": unix.RLIMIT_STACK, "CORE": unix.RLIMIT_CORE, "RSS": unix.RLIMIT_RSS,
-	"NPROC": unix.RLIMIT_NPROC, "NOFILE": unix.RLIMIT_NOFILE, "MEMLOCK": unix.RLIMIT_MEMLOCK,
-	"AS": unix.RLIMIT_AS, "LOCKS": unix.RLIMIT_LOCKS, "SIGPENDING": unix.RLIMIT_SIGPENDING,
-	"MSGQUEUE": unix.RLIMIT_MSGQUEUE, "NICE": unix.RLIMIT_NICE, "RTPRIO": unix.RLIMIT_RTPRIO,
-	"RTTIME": unix.RLIMIT_RTTIME,
 }
 
 // resolveExecPath resolves argv[0] against the container's PATH (post-pivot

@@ -1,4 +1,9 @@
-package main
+package specutil
+
+// OCI-to-BPF seccomp condition mapping. Portable (pure table work), so the
+// tests run on the dev Mac; the linux-tagged seccomp_linux.go assembles the
+// filter. Shared by the Go init helper (which installs it) and the agent
+// (which serializes the assembled program into the native helper's plan).
 
 import (
 	"fmt"
@@ -8,12 +13,9 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-// OCI-to-BPF seccomp condition mapping. Portable (pure table work), so the
-// tests run on the dev Mac; the linux-tagged seccomp.go assembles the filter.
-
 // defaultPolicyAction maps the OCI default action to the module's bare
 // action value. ActErrno maps to the bare ActionErrno (no errno bits): the
-// module's Validate whitelists action values, and applySeccomp rewrites the
+// module's Validate whitelists action values, and the assembler rewrites the
 // assembled bare returns to EPERM — which is the OCI default errno anyway
 // (the default profile carries no per-default errno of its own).
 func defaultPolicyAction(sc *specs.LinuxSeccomp) seccomp.Action {
