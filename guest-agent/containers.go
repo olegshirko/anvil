@@ -34,8 +34,13 @@ func waitContainerTaskCond(ctx context.Context, ns, containerdID string, nextExi
 	nsCtx := namespaces.WithNamespace(ctx, ns)
 
 	// next-exit: poll until the task exists (/wait comes before /start)
-	// for as long as the client waits, as Docker does.
-	poll := 50 * time.Millisecond
+	// for as long as the client waits, as Docker does. The registry probe is
+	// in-memory and runs at a fine cadence — `docker run` arms this wait a
+	// few milliseconds before the start, and a coarse poll here was ~37 ms of
+	// the run's latency. The containerd probe (a round trip) stays at 20 ms.
+	poll := 2 * time.Millisecond
+	probeEvery := 20 * time.Millisecond
+	var lastProbe time.Time
 	began := time.Now()
 	wtr := newPhaseTrace("wait", truncateID(containerdID))
 	defer func() {
@@ -52,6 +57,15 @@ func waitContainerTaskCond(ctx context.Context, ns, containerdID string, nextExi
 			wtr.mark("task-ready")
 			break
 		}
+		if time.Since(lastProbe) < probeEvery {
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-time.After(poll):
+			}
+			continue
+		}
+		lastProbe = time.Now()
 		c, err := cl.LoadContainer(nsCtx, containerdID)
 		if err != nil {
 			// next-exit: a missing record can be the fast-shim fallback
