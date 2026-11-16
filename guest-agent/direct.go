@@ -878,8 +878,100 @@ func waitDone(wg *sync.WaitGroup, d time.Duration) {
 	}
 }
 
-// pauseDirectTask freezes/unfreezes a direct container through its cgroup v2
-// freezer — the same mechanism the fast shim's Pause/Resume use.
+// updateDirectCgroup applies a live `docker update` to a direct task's cgroup
+// v2 directory. The init helper owns the creation-time translation
+// (guest-shim/cgroup.go writeResourceLimits); with no containerd task there is
+// no task.Update, so the same v2 files are written here. A missing file means
+// the controller is not enabled for this cgroup: skipped, like the helper.
+func updateDirectCgroup(dir string, res *specs.LinuxResources) error {
+	if dir == "" || res == nil {
+		return nil
+	}
+	write := func(file, val string) error {
+		p := filepath.Join(dir, file)
+		if _, err := os.Stat(p); err != nil {
+			return nil
+		}
+		return os.WriteFile(p, []byte(val), 0o600)
+	}
+	if m := res.Memory; m != nil {
+		if m.Limit != nil {
+			val := "max"
+			if *m.Limit > 0 {
+				val = strconv.FormatInt(*m.Limit, 10)
+			}
+			if err := write("memory.max", val); err != nil {
+				return err
+			}
+		}
+		if m.Swap != nil {
+			val := "max"
+			if *m.Swap > 0 {
+				val = strconv.FormatInt(*m.Swap, 10)
+			}
+			if err := write("memory.swap.max", val); err != nil {
+				return err
+			}
+		}
+		if m.Reservation != nil && *m.Reservation > 0 {
+			if err := write("memory.low", strconv.FormatInt(*m.Reservation, 10)); err != nil {
+				return err
+			}
+		}
+	}
+	if c := res.CPU; c != nil {
+		period, quota := uint64(100000), int64(0)
+		if c.Period != nil && *c.Period != 0 {
+			period = *c.Period
+		}
+		if c.Quota != nil {
+			quota = *c.Quota
+		}
+		cpuMax := "max " + strconv.FormatUint(period, 10)
+		if quota > 0 {
+			cpuMax = strconv.FormatInt(quota, 10) + " " + strconv.FormatUint(period, 10)
+		}
+		if err := write("cpu.max", cpuMax); err != nil {
+			return err
+		}
+		if c.Shares != nil && *c.Shares > 0 {
+			// runc's shares(2..262144) -> weight(1..10000) conversion.
+			weight := 1 + (((*c.Shares - 2) * 9999) / 262142)
+			if err := write("cpu.weight", strconv.FormatUint(weight, 10)); err != nil {
+				return err
+			}
+		}
+		if c.Cpus != "" {
+			if err := write("cpuset.cpus", c.Cpus); err != nil {
+				return err
+			}
+		}
+		if c.Mems != "" {
+			if err := write("cpuset.mems", c.Mems); err != nil {
+				return err
+			}
+		}
+	}
+	if p := res.Pids; p != nil && p.Limit != nil {
+		// docker's -1 means unlimited: pids.max = max (the creation path
+		// skips -1 because "max" is the default, an update must write it).
+		val := "max"
+		if *p.Limit > 0 {
+			val = strconv.FormatInt(*p.Limit, 10)
+		}
+		if err := write("pids.max", val); err != nil {
+			return err
+		}
+	}
+	for k, v := range res.Unified {
+		if err := write(k, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pauseDirectTask freezes/unfreezes a direct container through its cgroup v2// freezer — the same mechanism the fast shim's Pause/Resume use.
 func pauseDirectTask(ns, id string, t *directTask, pause bool) error {
 	state, _, _ := t.stateInfo()
 	switch {
