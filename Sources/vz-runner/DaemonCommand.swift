@@ -313,9 +313,21 @@ enum DaemonCommand {
             // is a no-op, but dropping caches shrinks the memory snapshot.
             // Run off the main queue so the run loop keeps the control server
             // alive for the guest exec calls.
+            //
+            // When the adaptive policy will skip the save, the cache drop and
+            // trim are pointless (they only shrink a snapshot) and both talk
+            // to the guest, which can stall on a vsock reset right after a
+            // restore — so only flush the filesystem, bounded.
+            let saving = manager.snapshotSavePlanned
             DispatchQueue.global().async { [weak self] in
-                self?.cacheManager?.sync()
-                GuestCacheDropper.dropCaches()
+                guard let self = self else { return }
+                if saving {
+                    self.cacheManager?.sync()
+                    GuestCacheDropper.dropCaches()
+                } else {
+                    self.cacheManager?.sync(timeout: 5)
+                    GuestCacheDropper.syncGuest(timeout: 5)
+                }
                 DispatchQueue.main.async { [weak self] in
                     guard let self = self else { return }
                     self.server?.stop()

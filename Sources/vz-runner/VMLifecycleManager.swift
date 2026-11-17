@@ -77,6 +77,10 @@ final class VMLifecycleManager: NSObject {
             memoryGiB: args.memoryGiB)
     }
 
+    /// Whether the next stop/idle pause will save a snapshot. The daemon
+    /// skips the guest-side cache work that only exists to shrink a save.
+    var snapshotSavePlanned: Bool { shouldSaveSnapshot }
+
     /// The VM is paused and can be stopped to give its memory back: its
     /// snapshot is saved, or the policy decided that saving one would not
     /// be worth it (the next client cold-boots then). Main queue.
@@ -700,6 +704,7 @@ final class VMLifecycleManager: NSObject {
                     userInfo: [NSLocalizedDescriptionKey: "guest agent did not become ready within 120 s"]))
                 return
             }
+            let attemptStarted = Date()
             device.connect(toPort: controlPort) { [weak self] result in
                 guard let self = self else { return }
                 switch result {
@@ -719,6 +724,10 @@ final class VMLifecycleManager: NSObject {
                     // so an inline save only delayed first use.
                     self.notifyReady()
                 case .failure:
+                    if self.args.debug {
+                        let elapsed = Date().timeIntervalSince(attemptStarted)
+                        print("[anvil] agent connect attempt failed after \(String(format: "%.3f", elapsed))s; retrying")
+                    }
                     // Fine-grained: the agent is typically up within a second
                     // of vm.start completing, so a coarse poll interval adds
                     // hundreds of ms of pure slack to cold-boot readiness.
