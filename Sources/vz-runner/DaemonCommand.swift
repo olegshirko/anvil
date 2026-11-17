@@ -212,7 +212,7 @@ enum DaemonCommand {
             let natRecovery = NATRecovery(manager: manager)
             natRecovery.start()
             self.natRecovery = natRecovery
-            let guestAddressMonitor = GuestAddressMonitor()
+            let guestAddressMonitor = GuestAddressMonitor(isActive: { [weak manager] in manager?.isVMRunning ?? false })
             guestAddressMonitor.start()
             self.guestAddressMonitor = guestAddressMonitor
             manager.delegate = self
@@ -342,6 +342,7 @@ enum DaemonCommand {
             guestUnreachableStrikes = 0
             becameReadyAt = Date()
             natRecovery?.vmBecameReady()
+            guestAddressMonitor?.checkAfterReady()
 
             // Host-port availability endpoint for the guest-agent is now
             // attached inside manager.start() before start/restore (its

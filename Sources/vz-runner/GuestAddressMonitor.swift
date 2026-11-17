@@ -21,6 +21,11 @@ final class GuestAddressMonitor {
     private let interval: TimeInterval
     private let snapshot: SnapshotManager
     private let procPath: String
+    /// Whether the VM is awake. An internal request deliberately does not wake
+    /// a paused VM (that would defeat idling), so the check only runs while the
+    /// VM is running — a conflict matters exactly then, and a ready hook
+    /// catches the other end of the idle cycle.
+    private let isActive: () -> Bool
     private var timer: Timer?
     /// The last reported "ip mac" pair: one warning per distinct claim, not
     /// one a minute while the other VM holds the address.
@@ -28,14 +33,17 @@ final class GuestAddressMonitor {
 
     init(interval: TimeInterval = 60,
          snapshot: SnapshotManager = SnapshotManager(),
-         procPath: String = "/usr/sbin/arp") {
+         procPath: String = "/usr/sbin/arp",
+         isActive: @escaping () -> Bool = { true }) {
         self.interval = interval
         self.snapshot = snapshot
         self.procPath = procPath
+        self.isActive = isActive
     }
 
     func start() {
         guard timer == nil else { return }
+        debugLog("started, every \(Int(interval))s")
         let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.check()
         }
@@ -49,15 +57,47 @@ final class GuestAddressMonitor {
         lastReported = nil
     }
 
-    /// One check. Visible for the daemon's own verification path.
+    /// A check shortly after the VM became ready: the lease lands right after
+    /// the guest's network comes up, so a conflict is caught at wake rather
+    /// than up to a minute later.
+    func checkAfterReady(after delay: TimeInterval = 4) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.check()
+        }
+    }
+
+    /// One check. The VM-state question is a main-queue property, but the
+    /// control request blocks (vsock connect, up to its own timeout), so it
+    /// runs off the main thread: a synchronous request from a main-run-loop
+    /// timer stalls the daemon, including the code that services the VM.
     func check() {
-        guard let mac = snapshot.loadNetworkConfig()?.macAddresses.first else { return }
-        guard let ip = try? ControlClient.requestInternal("status").guestIP, !ip.isEmpty else {
-            return // no lease yet, or the VM is paused
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard self.isActive() else {
+                self.debugLog("vm not running")
+                return
+            }
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                self?.performCheck()
+            }
+        }
+    }
+
+    private func performCheck() {
+        guard let mac = snapshot.loadNetworkConfig()?.macAddresses.first else {
+            debugLog("no network config")
+            return
+        }
+        let resp = try? ControlClient.requestInternal("status")
+        guard let ip = resp?.guestIP, !ip.isEmpty else {
+            debugLog("no guest IP (status=\(resp?.status ?? "-") error=\(resp?.error ?? "-"))")
+            return
         }
         guard let arpMAC = Self.mac(for: ip, using: procPath) else {
+            debugLog("ip=\(ip) mine=\(mac) arp=unresolved")
             return // not in the table (never contacted) — nothing to compare
         }
+        debugLog("ip=\(ip) mine=\(mac) arp=\(arpMAC) same=\(Self.macEquals(arpMAC, mac))")
         if Self.macEquals(arpMAC, mac) {
             lastReported = nil
             return
@@ -78,6 +118,13 @@ final class GuestAddressMonitor {
     }
 
     // MARK: - ARP table
+
+    /// Diagnostics for the daemon's own verification
+    /// (ANVIL_ADDRESS_MONITOR_DEBUG=1).
+    private func debugLog(_ message: String) {
+        guard ProcessInfo.processInfo.environment["ANVIL_ADDRESS_MONITOR_DEBUG"] == "1" else { return }
+        FileHandle.standardError.write(Data("[anvil] monitor: \(message)\n".utf8))
+    }
 
     /// The MAC the Mac's ARP table has for `ip`, or nil when the address is
     /// not resolved yet (`(incomplete)`) or the lookup fails.
