@@ -9,7 +9,8 @@ enum GuestCacheDropper {
     /// sparse disk image gives the space back to the Mac. The guest's daily
     /// fstrim ticker rarely fires: its clock stops while the VM is paused,
     /// which is most of an idle VM's life.
-    static func dropCaches(trim: Bool = false) {
+    static func dropCaches(trim: Bool = false, timeout: TimeInterval? = nil) {
+        let limit = timeout ?? (trim ? 120 : 30)
         guard let executableURL = Bundle.main.executableURL ?? fallbackExecutableURL() else {
             print("[guest-cache-drop] unable to locate anvil executable")
             return
@@ -24,7 +25,7 @@ enum GuestCacheDropper {
             try process.run()
             // Bounded: a wedged guest must not hold up the snapshot save
             // (and the idle pause) forever.
-            guard waitForExit(process, timeout: trim ? 120 : 30) else {
+            guard waitForExit(process, timeout: limit) else {
                 print("[guest-cache-drop] timed out; continuing without it")
                 return
             }

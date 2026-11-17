@@ -322,8 +322,13 @@ enum DaemonCommand {
             DispatchQueue.global().async { [weak self] in
                 guard let self = self else { return }
                 if saving {
-                    self.cacheManager?.sync()
-                    GuestCacheDropper.dropCaches()
+                    // Bounded: a guest exec that stalls (rare, seen right
+                    // after a boot/restore) must not hold the daemon open
+                    // until the service wrapper kills it. The snapshot save
+                    // itself preserves containerd state, so a timed-out cache
+                    // sync only costs a cold boot's image cache.
+                    self.cacheManager?.sync(timeout: 15)
+                    GuestCacheDropper.dropCaches(timeout: 15)
                 } else {
                     self.cacheManager?.sync(timeout: 5)
                     GuestCacheDropper.syncGuest(timeout: 5)
