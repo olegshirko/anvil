@@ -466,6 +466,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 	case <-time.After(10 * time.Second):
 		log.Printf("[docker-api] boot finalize timeout, serving anyway")
 	}
+	bootMark("docker_api_boot")
 
 	srv := &http.Server{Handler: mux}
 	// The same API inside the VM, for containers that mount the Docker
@@ -488,6 +489,7 @@ func runDockerAPIServer(containerdReady <-chan struct{}) {
 	}
 	defer l.Close() // a restart after a panic binds again
 	log.Printf("[docker-api] listening on vsock port %d", dockerAPIPort)
+	bootMark("docker_api_listen")
 	if err := srv.Serve(l); err != nil {
 		log.Printf("[docker-api] serve: %v", err)
 	}

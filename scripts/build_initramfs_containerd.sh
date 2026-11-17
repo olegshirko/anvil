@@ -607,6 +607,9 @@ cat > /etc/udhcpc-script <<'UDHEOF'
 #!/bin/sh
 LEASE_FILE=/run/anvil-lease
 say() { echo "[net] $*" >/dev/console; }
+# Kernel-relative boot marker (same format as myinit/stage2), so the DHCP
+# lease time appears in the boot breakdown.
+bmark() { read -r up _ < /proc/uptime; echo "[boot] $1 up=$up" >/dev/console; }
 
 # The address from the previous lease, if one is currently applied. Used to
 # report a move and to distinguish a real lease loss from udhcpc's startup
@@ -640,6 +643,11 @@ bound|renew)
     say "lease $ip/$mask${router:+ via $router}"
     if [ -n "$prev_ip" ] && [ "$prev_ip" != "$ip" ]; then
         say "lease changed $prev_ip -> $ip"
+    fi
+    # One marker per boot: renewals would otherwise repeat it.
+    if [ ! -f /run/anvil-lease-bound-once ]; then
+        bmark lease_bound
+        : > /run/anvil-lease-bound-once
     fi
     ;;
 deconfig|nak|leasefail)
@@ -675,6 +683,7 @@ CTREOF
 echo "[myinit] preparing tmpfs root"
 mkdir -p /newroot
 mount -t tmpfs tmpfs /newroot
+bmark tmpfs_copy_start
 # Copy the rootfs contents; bind mounts keep us on rootfs, which breaks
 # pivot_root. The trees are independent, so copy them in parallel: the
 # memory-to-memory copy of ~250-300 MB is myinit's longest step.
@@ -849,6 +858,7 @@ mountpoint -q /var/lib || {
 
 # If no block disk is available, persist on the virtiofs host share.
 if mountpoint -q /var/lib; then
+    bmark varlib_mounted
     # Tune the virtio-blk device for low-latency metadata-heavy workload.
     # The host-side APFS/virtio stack already batches requests, so disable
     # guest-level merging/scheduler overhead and keep queues short.
@@ -862,6 +872,7 @@ if mountpoint -q /var/lib; then
         fi
     done
 fi
+bmark varlib_tuned
 
 if ! mountpoint -q /var/lib; then
     mkdir -p /mnt/anvil/.anvil-run/var-lib
@@ -908,6 +919,7 @@ mkdir -p /var/lib/containerd /var/lib/anvil /var/lib/cni
 # path needs it: the rules matter only when the first container installs its
 # CNI port mappings, and guest-agent's boot finalize waits for this marker
 # before opening the Docker API (container starts are gated on it).
+bmark netfilter_start
 (
 # Load netfilter modules so CNI bridge/portmap/firewall and iptables-nft work.
 # modprobe resolves dependency order itself; crc32c_generic must come first
