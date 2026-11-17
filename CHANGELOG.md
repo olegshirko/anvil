@@ -1,3 +1,13 @@
+## v1.10.2 (2026-11-17)
+
+### Docs
+- 25a0a78 docs(changelog): drop entries whose text is internal
+
+### Other
+- 00660ed host: run the address check off the main thread
+- 0ba0af6 host: warn when a guest address is claimed by another MAC
+- 0072650 net: ARP-probe the leased address for a duplicate claim
+- 04c59e0 net: renew the guest DHCP lease instead of exiting after it
 ## v1.10.1 (2026-11-16)
 
 ### Changed
