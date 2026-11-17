@@ -856,12 +856,16 @@ mountpoint -q /var/lib || {
     done
 }
 
-# If no block disk is available, persist on the virtiofs host share.
-if mountpoint -q /var/lib; then
-    bmark varlib_mounted
-    # Tune the virtio-blk device for low-latency metadata-heavy workload.
-    # The host-side APFS/virtio stack already batches requests, so disable
-    # guest-level merging/scheduler overhead and keep queues short.
+# Tune the virtio-blk device for low-latency metadata-heavy workload. The
+# host-side APFS/virtio stack already batches requests, so disable
+# guest-level merging/scheduler overhead and keep queues short.
+#
+# These queue-sysfs writes cost ~100 ms on the boot critical path (measured
+# with the varlib_mounted/varlib_tuned markers) and only shape I/O when the
+# first container runs: do them in the background, in parallel with
+# containerd and the guest-agent starting.
+bmark varlib_mounted
+( if mountpoint -q /var/lib; then
     for dev in vda vdb vdc; do
         if [ -b "/dev/$dev" ]; then
             echo none > /sys/block/$dev/queue/scheduler 2>/dev/null || true
@@ -871,8 +875,9 @@ if mountpoint -q /var/lib; then
             echo "[stage2] tuned /dev/$dev"
         fi
     done
-fi
-bmark varlib_tuned
+  fi
+  bmark varlib_tuned
+) &
 
 if ! mountpoint -q /var/lib; then
     mkdir -p /mnt/anvil/.anvil-run/var-lib
