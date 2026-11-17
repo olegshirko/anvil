@@ -84,6 +84,12 @@ killall -9 anvil-init 2>/dev/null && killed=1
 		time.Sleep(100 * time.Millisecond)
 	}
 
+	// Networking is up: ARP-probe the leased address and watch for lease
+	// events (a second VM handed the same address makes both answer ARP for
+	// it — the outage this exists to make visible). Detection only, and a
+	// goroutine, so boot latency is unchanged.
+	goSafe("lease-monitor", startLeaseMonitor)
+
 	// stage2 loads the netfilter modules and installs the CNI masquerade
 	// rule in the background, in parallel with containerd and this agent
 	// starting. setupHostLoopback below needs those modules, and the first

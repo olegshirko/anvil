@@ -48,6 +48,10 @@ struct ControlResponse: Codable {
     let exitCode: Int?
     let error: String?
     let status: String?
+    /// The guest's current DHCP lease address, answered on `status` only.
+    /// GuestAddressMonitor compares the Mac's ARP entry for it with this VM's
+    /// MAC: a foreign MAC means a second instance was handed the same address.
+    var guestIP: String? = nil
 }
 
 func encodeLengthPrefixed<T: Encodable>(_ value: T) throws -> Data {
