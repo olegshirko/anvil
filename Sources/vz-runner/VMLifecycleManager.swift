@@ -63,6 +63,28 @@ final class VMLifecycleManager: NSObject {
 
     private let phaseTimer: BootPhaseTimer
 
+    /// ANVIL_SNAPSHOT and the measurements the auto mode decides from.
+    private let snapshotMode = SnapshotMode.configured()
+    private let timingsStore = SnapshotTimingsStore()
+
+    /// Whether a stop or idle pause should spend time saving a snapshot.
+    /// True while the measurements are unknown, so the first cycle records
+    /// them.
+    private var shouldSaveSnapshot: Bool {
+        SnapshotPolicy.saveSnapshot(
+            mode: snapshotMode,
+            timings: timingsStore.load(),
+            memoryGiB: args.memoryGiB)
+    }
+
+    /// The VM is paused and can be stopped to give its memory back: its
+    /// snapshot is saved, or the policy decided that saving one would not
+    /// be worth it (the next client cold-boots then). Main queue.
+    var canReleasePausedMemory: Bool {
+        guard let vm = vm, vm.state == .paused else { return false }
+        return snapshot.hasSnapshot || !shouldSaveSnapshot
+    }
+
     /// Optional host-port availability endpoint; attached to the VM's socket
     /// device before every start/restore. Set by the daemon only.
     var portCheckServer: PortCheckServer?
@@ -176,12 +198,6 @@ final class VMLifecycleManager: NSObject {
         }
     }
 
-    /// The VM is paused and its committed snapshot already holds exactly
-    /// this state (the snapshot is deleted before every resume). Main queue.
-    var isPausedWithSavedSnapshot: Bool {
-        vm?.state == .paused && snapshot.hasSnapshot
-    }
-
     /// The VM is running (not paused, released or between restarts). Main queue.
     var isVMRunning: Bool {
         vm?.state == .running
@@ -214,7 +230,8 @@ final class VMLifecycleManager: NSObject {
     /// stays paused. The next client restores it from the snapshot.
     func releaseMemory() {
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, let vm = self.vm, self.isPausedWithSavedSnapshot, vm.canStop else { return }
+            guard let self = self, let vm = self.vm, self.canReleasePausedMemory, vm.canStop else { return }
+            let hasSnapshot = self.snapshot.hasSnapshot
             vm.delegate = nil // intentional: not a crash
             self.releasing = true
             vm.stop { [weak self] error in
@@ -230,7 +247,9 @@ final class VMLifecycleManager: NSObject {
                 self.vm = nil
                 self.released = true
                 self.stopHostTimeRefresher()
-                print("[anvil] idle VM stopped to free its memory; the next client restores it")
+                print(hasSnapshot
+                      ? "[anvil] idle VM stopped to free its memory; the next client restores it"
+                      : "[anvil] idle VM stopped to free its memory; the next client cold-boots it")
             }
         }
     }
@@ -369,6 +388,8 @@ final class VMLifecycleManager: NSObject {
             completion()
             return
         }
+        // The adaptive policy may skip the save itself (see saveSnapshot);
+        // pausing first still gives the guest a clean stop.
         pause { [weak self] pauseResult in
             guard let self = self else {
                 completion()
@@ -386,9 +407,28 @@ final class VMLifecycleManager: NSObject {
         }
     }
 
+    /// One line with the numbers behind a skipped save (ANVIL_SNAPSHOT or
+    /// the measured restore-vs-boot comparison).
+    private func logSnapshotSaveSkip() {
+        if snapshotMode == .never {
+            print("[anvil] snapshot not saved: ANVIL_SNAPSHOT=never")
+            return
+        }
+        if let timings = timingsStore.load(), timings.matches(memoryGiB: args.memoryGiB) {
+            print("[anvil] " + SnapshotPolicy.describeSaveSkip(timings: timings, memoryGiB: args.memoryGiB))
+        } else {
+            print("[anvil] snapshot not saved")
+        }
+    }
+
     /// Save the current VM state to snapshot (assumes VM is paused).
     func saveSnapshot(completion: ((Error?) -> Void)? = nil) {
         guard let vm = vm else {
+            completion?(nil)
+            return
+        }
+        guard shouldSaveSnapshot else {
+            logSnapshotSaveSkip()
             completion?(nil)
             return
         }
@@ -508,6 +548,22 @@ final class VMLifecycleManager: NSObject {
                 self.snapshot.removeSnapshot()
             }
 
+            // Adaptive policy: a saved snapshot that takes longer to restore
+            // than this VM takes to boot is not worth keeping. The numbers
+            // are per memory size; while they are unknown the snapshot is
+            // used, so the first cycle can measure.
+            let timings = self.timingsStore.load()
+            if canRestore && !SnapshotPolicy.useSnapshot(
+                mode: self.snapshotMode, timings: timings, memoryGiB: self.args.memoryGiB) {
+                if self.snapshotMode == .never {
+                    print("[anvil] snapshot not restored: ANVIL_SNAPSHOT=never; discarding it and cold booting")
+                } else if let timings = timings, timings.matches(memoryGiB: self.args.memoryGiB) {
+                    print("[anvil] " + SnapshotPolicy.describeRestoreSkip(
+                        timings: timings, memoryGiB: self.args.memoryGiB))
+                }
+                self.snapshot.removeSnapshotStatePreservingSidecars()
+            }
+
             let (machineIdentifier, networkConfig) = self.prepareSidecars(
                 canRestore: &canRestore
             )
@@ -574,6 +630,7 @@ final class VMLifecycleManager: NSObject {
                     self.coldBoot(vm: vm)
                 } else {
                     print("[anvil] VM restored in \(String(format: "%.3f", restoreDuration))s, resuming...")
+                    self.timingsStore.recordRestore(restoreDuration, memoryGiB: self.args.memoryGiB)
                     self.phaseTimer.mark("vm_restore")
                     self.snapshot.invalidateBeforeResume()
                     let resumeStart = Date()
@@ -649,7 +706,9 @@ final class VMLifecycleManager: NSObject {
                 case .success(let conn):
                     conn.close()
                     if let start = self.coldBootStart {
-                        print("[anvil] guest agent ready \(String(format: "%.3f", Date().timeIntervalSince(start)))s after VM start")
+                        let bootDuration = Date().timeIntervalSince(start)
+                        print("[anvil] guest agent ready \(String(format: "%.3f", bootDuration))s after VM start")
+                        self.timingsStore.recordColdBoot(bootDuration, memoryGiB: self.args.memoryGiB)
                     } else {
                         print("[anvil] guest agent ready")
                     }

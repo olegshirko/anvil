@@ -289,16 +289,17 @@ enum DaemonCommand {
             idleTimer?.invalidate()
             natRecovery?.stop()
             guestAddressMonitor?.stop()
-            // Idle-paused with the snapshot saved: there is nothing to save.
-            // The cache sync below runs `anvil exec`, whose control
+            // Idle-paused with the snapshot saved (or with nothing worth
+            // saving, per the adaptive policy): there is nothing to sync or
+            // save. The cache sync below runs `anvil exec`, whose control
             // connection would resume the VM (deleting the snapshot) only
             // to pause and save it again — and a kill in that window turned
             // the next start into a cold boot.
             // Released (or being released) to free memory: the snapshot is
             // saved too, and waking it to save again could, on a locked Mac,
             // lose it to the cold-boot fallback.
-            if manager.isPausedWithSavedSnapshot || manager.released || manager.releasing {
-                print("[anvil] VM already paused and saved; exiting")
+            if manager.canReleasePausedMemory || manager.released || manager.releasing {
+                print("[anvil] VM already paused; exiting")
                 server?.stop()
                 dockerProxyServer?.stop()
                 buildkitProxyServer?.stop()
@@ -615,7 +616,9 @@ enum DaemonCommand {
         }
 
         /// Stop the idle-paused VM after a while: paused, it still holds all
-        /// of its memory. Only if nothing woke it in between.
+        /// of its memory. Only if nothing woke it in between. The policy may
+        /// have skipped the snapshot save; the VM is then stopped anyway and
+        /// the next client cold-boots it.
         private func scheduleMemoryRelease() {
             releaseTimer?.invalidate()
             releaseTimer = nil
@@ -623,7 +626,7 @@ enum DaemonCommand {
             releaseTimer = Timer.scheduledTimer(withTimeInterval: idleReleaseSeconds, repeats: false) { [weak self] _ in
                 guard let self = self else { return }
                 self.releaseTimer = nil
-                guard !self.isShuttingDown, self.isIdleNow(), self.manager.isPausedWithSavedSnapshot else { return }
+                guard !self.isShuttingDown, self.isIdleNow(), self.manager.canReleasePausedMemory else { return }
                 self.manager.releaseMemory()
             }
         }
