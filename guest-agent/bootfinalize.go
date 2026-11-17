@@ -22,6 +22,20 @@ import (
 // bounded, so early requests cannot race a boot still in flight.
 var bootFinalized = make(chan struct{})
 
+// bootMark logs one boot-phase marker with seconds since kernel start, in
+// the same "[boot] <name> up=<seconds>" format stage2 uses. It lands on the
+// console (-> console.log on the host) and is parsed by
+// scripts/time_boot.py, so a boot's phases can be compared before/after.
+func bootMark(name string) {
+	up := "?"
+	if data, err := os.ReadFile("/proc/uptime"); err == nil {
+		if fields := strings.Fields(string(data)); len(fields) > 0 {
+			up = fields[0]
+		}
+	}
+	log.Printf("[boot] %s up=%s", name, up)
+}
+
 // runBootFinalize performs the boot tail that stage2 used to run before
 // exec'ing the agent: waiting for the containerd socket, removing stale
 // container metadata left by an unclean shutdown, and waiting for the DHCP
@@ -33,6 +47,7 @@ func runBootFinalize() {
 	defer close(bootFinalized)
 	// Deletes of the previous session may predate this boot's timer.
 	defer scheduleDiskTrim()
+	bootMark("finalize_start")
 
 	// Kill unreachable shims from a crashed previous session first — trying
 	// to delete their tasks through containerd would hang. The fast shim's
@@ -50,6 +65,7 @@ killall -9 anvil-init 2>/dev/null && killed=1
 `).CombinedOutput(); err != nil {
 		log.Printf("[boot] stale process kill failed: %v: %s", err, out)
 	}
+	bootMark("finalize_kill")
 
 	const sock = "/run/containerd/containerd.sock"
 	deadline := time.Now().Add(8 * time.Second)
@@ -59,14 +75,17 @@ killall -9 anvil-init 2>/dev/null && killed=1
 		}
 		if time.Now().After(deadline) {
 			log.Printf("[boot] containerd socket did not appear, skipping stale cleanup")
+			bootMark("containerd_socket")
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	bootMark("containerd_socket")
 
 	sweepStaleShimSockets()
 	cleanupStaleContainers()
 	pruneStaleContainerMeta()
+	bootMark("stale_cleanup")
 
 	// Wait for the DHCP lease: pulls and DNS through the NAT gateway fail
 	// with "network is unreachable" until a default route exists, and image
@@ -83,6 +102,7 @@ killall -9 anvil-init 2>/dev/null && killed=1
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	bootMark("dhcp_ready")
 
 	// Networking is up: ARP-probe the leased address and watch for lease
 	// events (a second VM handed the same address makes both answer ARP for
@@ -95,12 +115,14 @@ killall -9 anvil-init 2>/dev/null && killed=1
 	// starting. setupHostLoopback below needs those modules, and the first
 	// container needs the port-mapping rules.
 	waitForNetfilter()
+	bootMark("netfilter_ready")
 
 	ensureGuestZoneinfo()
 
 	// host.docker.internal -> the Mac's localhost. Before the Docker API
 	// opens, so every container's /etc/hosts gets the redirect address.
 	setupHostLoopback()
+	bootMark("finalize_done")
 }
 
 // waitForNetfilter waits for stage2's background netfilter setup (module

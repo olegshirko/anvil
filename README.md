@@ -203,6 +203,7 @@ size changes the snapshot key, so the next start is a cold boot.
 | `ANVIL_DOMAINS` | off | `1` serves `http://<container>.anvil.localhost` (and `<service>.<project>.anvil.localhost`) |
 | `ANVIL_DOMAINS_PORT` | `80` | Loopback port of the domains proxy |
 | `ANVIL_IDLE_RELEASE` | `900` | Seconds the VM stays idle-paused before it is stopped to give its memory back to macOS (the next Docker command restores it from the snapshot in ~0.5 s); `0` keeps it paused |
+| `ANVIL_SNAPSHOT` | `auto` | Snapshot policy. `auto` restores a snapshot only when its last measured restore was not slower than a cold boot (restore ≤ boot × 1.15) and skips the save when it would not be restored — at large RAM (e.g. 16 GiB) restoring is slower than booting, so starts cold-boot and stops are fast; at 2–8 GiB behaviour is unchanged. `always` saves and restores unconditionally (the old behaviour); `never` does neither. The first save/restore cycle always happens so `auto` has numbers to compare; the measurements are keyed by VM RAM, so changing `ANVIL_MEMORY` invalidates them |
 | `ANVIL_ROSETTA` | `0` | Set to `1` to run `linux/amd64` containers through Rosetta (needs `softwareupdate --install-rosetta`; changing it forces one cold boot) |
 | `DEBUG` | — | `1` enables host-side debug logs; the guest-agent debug log (`guest-agent.log` on the share) needs a cold boot (`make service-debug`), a resumed VM keeps its old setting |
 

@@ -128,6 +128,7 @@ func main() {
 	}
 
 	log.Printf("listening on vsock port %d", listenPort)
+	bootMark("agent_main")
 
 	// guest-agent is PID 1 inside the VM. Orphaned children reparent to PID 1,
 	// and containerd/runc may create short-lived hook/helper processes. Reap
@@ -152,7 +153,9 @@ func main() {
 	// the first container, and subscribe_ports re-syncs the clock anyway.
 	goSafe("restore-networks", func() {
 		restoreNetworkConfigs()
+		bootMark("networks_restored")
 		syncClockFromShare()
+		bootMark("clock_synced")
 	})
 
 	// Stale anvil metadata is pruned once, in runBootFinalize, before the
@@ -183,6 +186,7 @@ func main() {
 	// Docker API server on a separate vsock port so the existing control
 	// channel stays untouched.
 	loadEventLog()
+	bootMark("event_log")
 	goLoop("event-recorder", startEventRecorder)
 	goLoop("docker-api", func() { runDockerAPIServer(bootFinalized) })
 
@@ -193,7 +197,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
+	bootMark("agent_listen")
 	defer l.Close()
+
+	// Virtio-blk queue tuning: after the listener (the host's readiness
+	// probe) and the first connect have had time to land, but well before
+	// the Docker API opens for the first container.
+	goSafe("disk-tune", func() {
+		time.Sleep(500 * time.Millisecond)
+		tuneBlockDevices()
+	})
 
 	for {
 		conn, err := l.Accept()

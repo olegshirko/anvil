@@ -23,7 +23,7 @@ final class ContainerdCacheManager {
 
     /// Sync the containerd cache to the host share. Blocks until the guest-side
     /// sync script finishes or fails.
-    func sync() {
+    func sync(timeout: TimeInterval = 600) {
         let process = Process()
         process.executableURL = executableURL
         process.arguments = ["exec", "anvil-sync-containerd", guestArchivePath]
@@ -34,7 +34,7 @@ final class ContainerdCacheManager {
 
         do {
             try process.run()
-            guard waitForExit(process, timeout: 600) else {
+            guard waitForExit(process, timeout: timeout) else {
                 print("[containerd-cache] sync timed out")
                 return
             }

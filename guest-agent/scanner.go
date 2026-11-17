@@ -125,6 +125,7 @@ func (s *portScanner) run() {
 			c, err := client.New(containerdSocket)
 			if err == nil {
 				log.Printf("[scanner] connected to containerd")
+				bootMark("scanner_containerd")
 				return c
 			}
 			log.Printf("[scanner] waiting for containerd: %v", err)
