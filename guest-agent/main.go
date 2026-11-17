@@ -200,6 +200,14 @@ func main() {
 	bootMark("agent_listen")
 	defer l.Close()
 
+	// Virtio-blk queue tuning: after the listener (the host's readiness
+	// probe) and the first connect have had time to land, but well before
+	// the Docker API opens for the first container.
+	goSafe("disk-tune", func() {
+		time.Sleep(500 * time.Millisecond)
+		tuneBlockDevices()
+	})
+
 	for {
 		conn, err := l.Accept()
 		if err != nil {

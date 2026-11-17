@@ -856,28 +856,12 @@ mountpoint -q /var/lib || {
     done
 }
 
-# Tune the virtio-blk device for low-latency metadata-heavy workload. The
-# host-side APFS/virtio stack already batches requests, so disable
-# guest-level merging/scheduler overhead and keep queues short.
-#
-# These queue-sysfs writes cost ~100 ms on the boot critical path (measured
-# with the varlib_mounted/varlib_tuned markers) and only shape I/O when the
-# first container runs: do them in the background, in parallel with
-# containerd and the guest-agent starting.
+# The virtio-blk queue tuning lives in guest-agent (tuneBlockDevices): the
+# queue-sysfs writes cost ~100 ms of guest uptime, and doing them here (even
+# in a background subshell) still competed with the agent's startup. The
+# agent applies them after its control listener is up, where they overlap
+# containerd's own startup instead.
 bmark varlib_mounted
-( if mountpoint -q /var/lib; then
-    for dev in vda vdb vdc; do
-        if [ -b "/dev/$dev" ]; then
-            echo none > /sys/block/$dev/queue/scheduler 2>/dev/null || true
-            echo 256 > /sys/block/$dev/queue/read_ahead_kb 2>/dev/null || true
-            echo 256 > /sys/block/$dev/queue/nr_requests 2>/dev/null || true
-            echo 2 > /sys/block/$dev/queue/nomerges 2>/dev/null || true
-            echo "[stage2] tuned /dev/$dev"
-        fi
-    done
-  fi
-  bmark varlib_tuned
-) &
 
 if ! mountpoint -q /var/lib; then
     mkdir -p /mnt/anvil/.anvil-run/var-lib
@@ -903,6 +887,7 @@ fi
 bmark varlib_mount
 
 mkdir -p /var/lib/containerd /var/lib/anvil /var/lib/cni
+bmark varlib_dirs
 
 # Build-only binaries (buildkitd/buildctl/qemu) ship as /opt/buildkit.tar.zst
 # and live on the persistent disk: unpack once in the background (they are
@@ -918,6 +903,7 @@ mkdir -p /var/lib/containerd /var/lib/anvil /var/lib/cni
   ln -sf /var/lib/buildkit/bin/buildkit-qemu-arm    /opt/containerd/bin/buildkit-qemu-arm
   ln -sf /opt/containerd/bin/runc                   /opt/containerd/bin/buildkit-runc
 ) &
+bmark buildkit_bg
 
 # Netfilter setup used to run here, before containerd and the guest-agent,
 # and cost ~100 ms of the boot critical path. Nothing on the status/health
@@ -962,6 +948,7 @@ bmark netfilter
 
 # Start containerd in background.
 echo "[stage2] starting containerd"
+bmark containerd_echo
 # Append mode: guest-agent truncates the log in place when it grows.
 /opt/containerd/bin/containerd >> /tmp/containerd.log 2>&1 &
 bmark containerd_started
