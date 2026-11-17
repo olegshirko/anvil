@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"strings"
 )
 
@@ -40,6 +41,28 @@ type netLease struct {
 	IP     net.IP
 	Mask   net.IPMask
 	Router net.IP
+}
+
+// leaseFilePath is written by the initramfs udhcpc event script on every
+// bound/renew and removed on deconfig/nak/leasefail. /run is the tmpfs runtime
+// directory stage2 already uses for its markers. Portable (not linux-only):
+// the `status` reply reports it and the darwin build compiles this file.
+// var, not const: the status test points it at a temp file.
+var leaseFilePath = "/run/anvil-lease"
+
+// currentGuestIP returns the leased IPv4 address, or "" when there is no
+// lease file (boot before DHCP, or a lost lease). It is what `status` reports
+// to the host for the duplicate-address check.
+func currentGuestIP() string {
+	data, err := os.ReadFile(leaseFilePath)
+	if err != nil {
+		return ""
+	}
+	lease, err := parseLease(data)
+	if err != nil {
+		return ""
+	}
+	return lease.IP.String()
 }
 
 // parseLease parses "<ip> <netmask> <router>"; the router is optional (a

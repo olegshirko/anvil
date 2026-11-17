@@ -37,6 +37,11 @@ type Response struct {
 	ExitCode int    `json:"exit_code"`
 	Error    string `json:"error,omitempty"`
 	Status   string `json:"status,omitempty"`
+	// GuestIP is the current DHCP lease address, on `status` only. The host
+	// daemon uses it to check the Mac's ARP entry for that address against
+	// this VM's MAC: two instances that were handed the same address show up
+	// as a foreign MAC there (guests cannot see each other across the VZ NAT).
+	GuestIP string `json:"guestIP,omitempty"`
 }
 
 // PortMapping describes a single exposed container port.
@@ -329,8 +334,12 @@ func periodicClockSync() {
 
 func dispatch(req *Request) Response {
 	switch req.Cmd {
-	case "health", "status":
+	case "health":
+		// The wake path: no file reads, the daemon polls it often.
 		return Response{Status: "ok"}
+	case "status":
+		// The lease goes on `status` only; see Response.GuestIP.
+		return Response{Status: "ok", GuestIP: currentGuestIP()}
 	case "exec":
 		return runExec(req.Args)
 	case "egress":

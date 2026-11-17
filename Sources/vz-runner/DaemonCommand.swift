@@ -201,6 +201,8 @@ enum DaemonCommand {
         private var clientTracker: ClientTracker?
         /// Reconnects the VM's NAT when the Mac's network changes under it.
         private var natRecovery: NATRecovery?
+        /// Warns when another instance is handed this VM's guest address.
+        private var guestAddressMonitor: GuestAddressMonitor?
 
         init(manager: VMLifecycleManager, idleSeconds: TimeInterval, phaseTimer: BootPhaseTimer) {
             self.manager = manager
@@ -210,6 +212,9 @@ enum DaemonCommand {
             let natRecovery = NATRecovery(manager: manager)
             natRecovery.start()
             self.natRecovery = natRecovery
+            let guestAddressMonitor = GuestAddressMonitor()
+            guestAddressMonitor.start()
+            self.guestAddressMonitor = guestAddressMonitor
             manager.delegate = self
             manager.portCheckServer = PortCheckServer { [weak self] port in
                 // The domains proxy holds its loopback port too; a
@@ -283,6 +288,7 @@ enum DaemonCommand {
             isShuttingDown = true
             idleTimer?.invalidate()
             natRecovery?.stop()
+            guestAddressMonitor?.stop()
             // Idle-paused with the snapshot saved: there is nothing to save.
             // The cache sync below runs `anvil exec`, whose control
             // connection would resume the VM (deleting the snapshot) only

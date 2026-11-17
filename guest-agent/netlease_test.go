@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"net"
+	"os"
 	"testing"
 )
 
@@ -170,4 +171,36 @@ func TestARPClaimSource(t *testing.T) {
 			t.Fatal("a truncated frame was parsed")
 		}
 	})
+}
+
+// The host's duplicate-address check gets the guest's address from `status`;
+// an absent, unleased or malformed file must answer "" so the host skips the
+// ARP comparison instead of warning about a stale address.
+func TestCurrentGuestIP(t *testing.T) {
+	dir := t.TempDir()
+	orig := leaseFilePath
+	leaseFilePath = dir + "/anvil-lease"
+	t.Cleanup(func() { leaseFilePath = orig })
+
+	if got := currentGuestIP(); got != "" {
+		t.Fatalf("missing file: got %q, want empty", got)
+	}
+	if err := os.WriteFile(leaseFilePath, []byte("192.168.64.2 255.255.255.0 192.168.64.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := currentGuestIP(); got != "192.168.64.2" {
+		t.Fatalf("leased: got %q", got)
+	}
+	if err := os.WriteFile(leaseFilePath, []byte("192.168.64.2 255.255.255.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := currentGuestIP(); got != "192.168.64.2" {
+		t.Fatalf("router-less lease: got %q", got)
+	}
+	if err := os.WriteFile(leaseFilePath, []byte("garbage\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := currentGuestIP(); got != "" {
+		t.Fatalf("malformed: got %q, want empty", got)
+	}
 }

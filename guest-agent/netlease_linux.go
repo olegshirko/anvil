@@ -18,10 +18,6 @@ import (
 )
 
 const (
-	// leaseFilePath is written by the initramfs udhcpc event script on every
-	// bound/renew and removed on deconfig/nak/leasefail. /run is the tmpfs
-	// runtime directory stage2 already uses for its markers.
-	leaseFilePath = "/run/anvil-lease"
 	// leasePollInterval bounds how long after a renew the duplicate probe
 	// runs; a stat on tmpfs twice a second is negligible.
 	leasePollInterval = 2 * time.Second
