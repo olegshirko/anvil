@@ -113,8 +113,8 @@ SHIM_HELPER_BIN="$ALPINE_DIR/anvil-init"
 VIRT_APK="$ALPINE_DIR/linux-virt.apk"
 OUT="${OUT:-$DOWNLOAD_DIR/ubuntu/initramfs-containerd}"
 # Buildkit is a separate host asset, not part of the initramfs (see the
-# buildkit section below): the kernel used to decompress its 54 MB tarball on
-# every boot, ~150 ms of the boot path.
+# buildkit section below): the kernel unpacked its 54 MB tarball on every
+# boot.
 BUILDKIT_OUT="${BUILDKIT_OUT:-$UBUNTU_DIR/buildkit.tar.zst}"
 
 if [[ ! -f "$ALPINE_INITRD" ]]; then

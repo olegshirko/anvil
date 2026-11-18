@@ -61,7 +61,6 @@ func dialGuestWithRetry(grace: TimeInterval = guestDialGrace,
     }
 }
 
-
 struct PortMapping: Codable, Hashable {
     let namespace: String
     let containerID: String
