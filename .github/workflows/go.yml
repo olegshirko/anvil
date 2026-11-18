@@ -245,13 +245,27 @@ jobs:
           file sbin/mkfs.ext4
           file -b bin/tar | grep -qiE 'aarch64|arm64' || { echo "ERROR: bin/tar is not ARM64"; exit 1; }
 
-      - name: Upload kernel + initramfs
+      # buildkit is a separate asset now, not part of the initramfs: the
+      # release job ships it beside the kernel/initrd and the guest unpacks
+      # it from the share. It must exist, contain buildkitd and be ARM64.
+      - name: Verify buildkit asset
+        run: |
+          test -s .download/ubuntu/buildkit.tar.zst || { echo "ERROR: buildkit.tar.zst missing"; exit 1; }
+          mkdir -p /tmp/buildkit-check
+          zstd -dc .download/ubuntu/buildkit.tar.zst | tar -xf - -C /tmp/buildkit-check
+          for b in buildkitd buildctl; do
+            test -x "/tmp/buildkit-check/$b" || { echo "ERROR: $b missing from buildkit.tar.zst"; exit 1; }
+            file -b "/tmp/buildkit-check/$b" | grep -qiE 'aarch64|arm64' || { echo "ERROR: $b is not ARM64"; exit 1; }
+          done
+
+      - name: Upload kernel + initramfs + buildkit
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifact-linux-arm64
           path: |
             .download/alpine/vmlinuz-raw
             .download/ubuntu/initramfs-containerd
+            .download/ubuntu/buildkit.tar.zst
           retention-days: 1
 
   validate:
@@ -382,13 +396,17 @@ jobs:
           # upload-artifact strips the common .download/ ancestor; flatten.
           cp alpine/vmlinuz-raw .
           cp ubuntu/initramfs-containerd .
+          # buildkit lives outside the initramfs (54 MB the kernel used to
+          # decompress on every boot); the service script puts it on the VM
+          # share and the guest unpacks it once.
+          cp ubuntu/buildkit.tar.zst .
           # Ship the kernel gzipped (~10 MB instead of ~34 MB raw);
           # anvil-service.sh unpacks it once on first start.
           gzip -9 -n -c vmlinuz-raw > vmlinuz-raw.gz
           # GZIP=-n makes the tarball deterministic so the Homebrew sha256 matches.
           GZIP=-n tar czf anvil-darwin-arm64.tar.gz \
             vz-runner-darwin-arm64 \
-            vmlinuz-raw.gz initramfs-containerd \
+            vmlinuz-raw.gz initramfs-containerd buildkit.tar.zst \
             anvil-service.sh com.olegshirko.anvil.plist
           shasum -a 256 anvil-darwin-arm64.tar.gz | awk '{print $1}' > anvil-darwin-arm64.tar.gz.sha256sum
       # Release smoke: the shipped checksums must match what is actually
@@ -402,7 +420,7 @@ jobs:
           # digests themselves instead of sha256sum -c's path resolution.
           grep -q "$(sha256sum vz-runner-darwin-arm64 | cut -d" " -f1)" vz-runner-darwin-arm64.sha256sum
           grep -q "$(sha256sum anvil-darwin-arm64.tar.gz | cut -d" " -f1)" anvil-darwin-arm64.tar.gz.sha256sum
-          for f in vz-runner-darwin-arm64 vmlinuz-raw.gz initramfs-containerd anvil-service.sh com.olegshirko.anvil.plist; do
+          for f in vz-runner-darwin-arm64 vmlinuz-raw.gz initramfs-containerd buildkit.tar.zst anvil-service.sh com.olegshirko.anvil.plist; do
             test -s "$f" || { echo "missing or empty: $f"; exit 1; }
             tar tzf anvil-darwin-arm64.tar.gz | grep -qx "$f" || { echo "not in tarball: $f"; exit 1; }
           done

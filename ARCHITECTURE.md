@@ -496,12 +496,16 @@ The base is the Alpine initramfs-virt. Inside a Linux container
   veth, netfilter/xt/nft modules;
 - iptables + libmnl/libnftnl/libxtables;
 - GNU tar + libacl/libattr for `docker cp` (archive extract/import);
-- buildkitd/buildctl/qemu emulators as a single `/opt/buildkit.tar.zst`:
-  build-only binaries do not ride through kernel initramfs unpack and the
-  tmpfs-root copy on every boot. stage2 extracts the tarball to the
-  persistent `/var/lib/buildkit` once (in the background) and symlinks the
-  binaries into `/opt/containerd/bin`; the agent's lazy buildkitd start
-  waits for the symlink, bounded.
+- NOT buildkitd/buildctl/qemu emulators: they are a separate host asset
+  (`buildkit.tar.zst`, ~54 MB compressed, written next to the kernel and
+  initramfs by the initramfs build). Putting them in the image made the
+  kernel decompress those 54 MB on every boot. The service script copies
+  the tarball onto the VM share; stage2 extracts it to the persistent
+  `/var/lib/buildkit` once (in the background) and symlinks the binaries
+  into `/opt/containerd/bin`; the agent's lazy buildkitd start waits for
+  the symlink, bounded, and reports a missing asset instead of failing on
+  exec. Without the tarball the VM boots and containers run; only
+  `docker build` is unavailable.
 
 ### 5.2 Why switch_root, not bind/pivot
 

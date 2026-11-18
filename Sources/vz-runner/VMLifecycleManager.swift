@@ -131,6 +131,12 @@ final class VMLifecycleManager: NSObject {
         dropWakeWaiters(NSError(domain: "anvil", code: 105,
                                 userInfo: [NSLocalizedDescriptionKey: "VM restarted"]))
         forceFreshBoot = fresh
+        // buildkit ships outside the initramfs; stage2 unpacks it from the
+        // share on a VM that has never done so. Every start path (daemon,
+        // `anvil start`, direct `boot`) goes through here.
+        if let share = args.sharePath, !share.isEmpty {
+            provisionBuildkitAsset(share: share)
+        }
         writeHostTimeFile()
         startHostTimeRefresher()
         configureAndCreateVM { [weak self] result in

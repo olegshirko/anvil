@@ -84,7 +84,7 @@ not done it, so no extra steps are needed.
 ```sh
 git clone https://github.com/olegshirko/anvil.git
 cd anvil
-make rebuild-all      # vz-runner (signed) + guest-agent + initramfs
+make rebuild-all      # vz-runner (signed) + guest-agent + initramfs + buildkit asset
 make service-start    # background daemon + docker context
 ```
 

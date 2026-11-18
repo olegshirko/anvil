@@ -112,6 +112,10 @@ SHIM_BIN="$ALPINE_DIR/anvil-fast-shim"
 SHIM_HELPER_BIN="$ALPINE_DIR/anvil-init"
 VIRT_APK="$ALPINE_DIR/linux-virt.apk"
 OUT="${OUT:-$DOWNLOAD_DIR/ubuntu/initramfs-containerd}"
+# Buildkit is a separate host asset, not part of the initramfs (see the
+# buildkit section below): the kernel unpacked its 54 MB tarball on every
+# boot.
+BUILDKIT_OUT="${BUILDKIT_OUT:-$UBUNTU_DIR/buildkit.tar.zst}"
 
 if [[ ! -f "$ALPINE_INITRD" ]]; then
     echo "Alpine initramfs not found; run 'make download-alpine' first"
@@ -206,11 +210,12 @@ fi
 cp "$TOOLS_DIR/tini" opt/containerd/bin/docker-init
 chmod +x opt/containerd/bin/docker-init
 # buildkitd + buildctl for `docker build` (the agent calls buildkitd via gRPC). These
-# build-only binaries (~150 MB unpacked, the largest part of the initramfs)
-# are packed as ONE compressed tarball in /opt instead of loose rootfs
-# files: loose files ride through kernel initramfs decompress AND the tmpfs
-# root copy on every boot; the tarball is extracted to the persistent
-# /var/lib/buildkit once (stage2, background) and symlinked into place.
+# build-only binaries (~150 MB unpacked) are shipped as their OWN host asset
+# rather than inside the initramfs: packed in /opt they were 54.5 MB of the
+# image, which the kernel decompressed on every boot. The tarball is written
+# next to the other host assets; the service script puts it on the share and
+# stage2 extracts it to the persistent /var/lib/buildkit once (background)
+# and symlinks it into place.
 BUILDKIT_STAGE="$(mktemp -d)"
 tar -xzf "$TOOLS_DIR/buildkit.tgz" -C "$BUILDKIT_STAGE" --strip-components=1 2>/dev/null || true
 # Drop unused containerd tools (~19 MB): stress tester and rootless helpers.
@@ -266,10 +271,11 @@ if [[ -n "$UPX_BIN" ]]; then
 else
     echo "WARNING: upx not found, shipping unpacked buildkit binaries" >&2
 fi
-# Single tarball in /opt: stage2 extracts it to /var/lib/buildkit once.
-mkdir -p opt
+# Single tarball, written as a host asset: stage2 extracts it to
+# /var/lib/buildkit once, from the share.
+mkdir -p "$(dirname "$BUILDKIT_OUT")"
 tar -C "$BUILDKIT_STAGE" -cf - buildkitd buildctl buildkit-qemu-x86_64 buildkit-qemu-arm \
-    | zstd -q -o opt/buildkit.tar.zst
+    | zstd -q -o "$BUILDKIT_OUT"
 rm -rf "$BUILDKIT_STAGE"
 ln -sf /opt/containerd/bin/ctr bin/ctr
 ln -sf /opt/containerd/bin/buildctl bin/buildctl
@@ -889,13 +895,20 @@ bmark varlib_mount
 mkdir -p /var/lib/containerd /var/lib/anvil /var/lib/cni
 bmark varlib_dirs
 
-# Build-only binaries (buildkitd/buildctl/qemu) ship as /opt/buildkit.tar.zst
-# and live on the persistent disk: unpack once in the background (they are
-# needed only on the first `docker build`) and symlink into the PATH location
-# guest-agent starts buildkitd from.
-( if [ ! -x /var/lib/buildkit/bin/buildkitd ] && [ -f /opt/buildkit.tar.zst ]; then
-      mkdir -p /var/lib/buildkit/bin
-      /bin/zstd -dc /opt/buildkit.tar.zst | tar -x -C /var/lib/buildkit/bin
+# Build-only binaries (buildkitd/buildctl/qemu) are a separate host asset,
+# not part of this initramfs. The service script puts buildkit.tar.zst on
+# the share; the persistent disk keeps the unpacked copy, so this runs once.
+# Unpack in the background (needed only on the first `docker build`) and
+# symlink into the PATH location guest-agent starts buildkitd from. Without
+# the tarball the VM still boots and runs containers: only `docker build` is
+# unavailable, and guest-agent says so when a build tries to start it.
+( if [ ! -x /var/lib/buildkit/bin/buildkitd ]; then
+      if [ -f /mnt/anvil/.anvil-run/buildkit.tar.zst ]; then
+          mkdir -p /var/lib/buildkit/bin
+          /bin/zstd -dc /mnt/anvil/.anvil-run/buildkit.tar.zst | tar -x -C /var/lib/buildkit/bin
+      else
+          echo "[stage2] buildkit.tar.zst not found on the share; docker build will be unavailable (containers are unaffected)" >&2
+      fi
   fi
   ln -sf /var/lib/buildkit/bin/buildkitd            /opt/containerd/bin/buildkitd
   ln -sf /var/lib/buildkit/bin/buildctl             /opt/containerd/bin/buildctl
@@ -1022,7 +1035,7 @@ mkdir -p "$(dirname "$OUT")"
 find . -mindepth 1 -print0 | cpio -o -0 -H newc | zstd -q -19 -T0 > "$OUT"
 
 if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
-    chown "$HOST_UID:$HOST_GID" "$OUT" 2>/dev/null || true
+    chown "$HOST_UID:$HOST_GID" "$OUT" "$BUILDKIT_OUT" 2>/dev/null || true
 fi
 
-echo "created $OUT"
+echo "created $OUT and $BUILDKIT_OUT"

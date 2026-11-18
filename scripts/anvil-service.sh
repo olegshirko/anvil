@@ -245,6 +245,34 @@ cmd_run() {
     exec "$VZRUNNER_BIN" "${DAEMON_ARGS[@]}" >>"$LOG_FILE" 2>&1
 }
 
+# provision_buildkit puts buildkit.tar.zst on the VM's share for the guest's
+# one-time unpack. Same precedence as the kernel/initramfs: in a source tree
+# the fresh build under .download wins, for brew installs the package assets
+# do. Copied only when the source is newer, so a start does not rewrite
+# ~54 MB every time; a missing asset is not an error (an existing VM disk
+# keeps its unpacked buildkit, and the guest reports it if it has none).
+provision_buildkit() {
+    local src dest
+    if [[ -f "$PROJECT_ROOT/Package.swift" ]]; then
+        src="$(find_asset \
+            "$PROJECT_ROOT/.download/ubuntu/buildkit.tar.zst" \
+            "$STATE_DIR/buildkit.tar.zst" \
+            "$BREW_ASSETS_DIR/buildkit.tar.zst" || true)"
+    else
+        src="$(find_asset \
+            "$BREW_ASSETS_DIR/buildkit.tar.zst" \
+            "$STATE_DIR/buildkit.tar.zst" \
+            "$PROJECT_ROOT/.download/ubuntu/buildkit.tar.zst" || true)"
+    fi
+    [[ -n "$src" ]] || return 0
+    dest="$SHARE_ROOT/.anvil-run/buildkit.tar.zst"
+    if [[ ! -f "$dest" || "$src" -nt "$dest" ]]; then
+        mkdir -p "$SHARE_ROOT/.anvil-run"
+        cp -p "$src" "$dest"
+        echo "[anvil-service] provisioning buildkit asset: $src" >&2
+    fi
+}
+
 # prepare_daemon creates or grows the containerd disk, rotates the log and
 # fills DAEMON_ARGS.
 prepare_daemon() {
@@ -270,6 +298,13 @@ prepare_daemon() {
             /bin/dd if=/dev/zero of="$CONTAINERD_DISK" bs=1 count=1 seek=$((DISK_BYTES - 1)) conv=notrunc 2>/dev/null
         fi
     fi
+
+    # Buildkit is a separate asset (its 54 MB tarball used to sit inside the
+    # initramfs and be decompressed by the kernel on every boot). Put it on
+    # the share for the guest's one-time unpack to /var/lib/buildkit; without
+    # it the VM still boots and runs containers, only `docker build` is
+    # unavailable, and the guest says so when a build starts.
+    provision_buildkit
 
     DAEMON_ARGS=(daemon --kernel "$KERNEL_PATH" --initrd "$INITRD_PATH" --share "$SHARE_ROOT"
                  --memory "$MEMORY_GB" --idle "${ANVIL_IDLE:-600}")

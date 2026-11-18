@@ -60,14 +60,13 @@ func ensureBuildkitd() error {
 	// (containerd worker, local FROM resolution) must own /run/buildkit.
 	killallStaleBuildkitd()
 
-	// buildkitd ships as a tarball extracted to /var/lib/buildkit by a
+	// buildkitd is unpacked from buildkit.tar.zst (a host asset on the
+	// share, no longer part of the initramfs) to /var/lib/buildkit by a
 	// background stage2 job on first boot; a build racing that extraction
-	// would see a dangling symlink. Wait (bounded) for it to appear.
-	for i := 0; i < 50; i++ {
-		if _, err := os.Stat(buildkitdBin); err == nil {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
+	// would see a dangling symlink. Wait (bounded) for it to appear, then
+	// report a missing install precisely instead of failing on exec.
+	if !waitForFile(buildkitdBin, 5*time.Second) {
+		return buildkitMissingError(buildkitdBin)
 	}
 
 	if err := os.MkdirAll("/var/lib/buildkit", 0o755); err != nil {
@@ -111,6 +110,32 @@ func ensureBuildkitd() error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("buildkitd did not open %s in time", buildkitSocket)
+}
+
+// waitForFile polls path until it exists or timeout expires. The background
+// stage2 unpack of buildkit.tar.zst may still be running.
+func waitForFile(path string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// buildkitMissingError explains why `docker build` cannot start: buildkit is
+// provisioned as a separate asset (it is not in the initramfs), and a VM
+// whose host never provided it has no builder. Containers are unaffected.
+func buildkitMissingError(binary string) error {
+	return fmt.Errorf("buildkit is not installed in this VM: %s is missing. "+
+		"The host did not provide buildkit.tar.zst on the share "+
+		"(/mnt/anvil/.anvil-run/buildkit.tar.zst) and this VM's /var/lib/buildkit "+
+		"was never unpacked; reinstall or rebuild the anvil assets (or recreate the "+
+		"VM disk). Containers are unaffected; docker build is unavailable", binary)
 }
 
 // killallStaleBuildkitd SIGKILLs every running buildkitd except our own pid
