@@ -55,6 +55,12 @@ final class VMLifecycleManager: NSObject {
     /// from current files on every save made a rebuilt initramfs look
     /// "matching" and restored a stale guest.
     private var bootedWithCurrentArgs = false
+
+    /// Whether the live VM came back from a snapshot (rather than a cold
+    /// boot). NATRecovery uses it to check the guest's egress as soon as the
+    /// VM is ready: a restored virtio-net device can come back without a
+    /// working layer-2 path, and the minute tick would delay the recovery.
+    private(set) var restoredFromSnapshot = false
     /// The config hash of the VM instance in `vm`, taken when it was
     /// configured (see SnapshotManager.configHash).
     private var vmConfigHash = ""
@@ -640,6 +646,7 @@ final class VMLifecycleManager: NSObject {
                     self.coldBoot(vm: vm)
                 } else {
                     print("[anvil] VM restored in \(String(format: "%.3f", restoreDuration))s, resuming...")
+                    self.restoredFromSnapshot = true
                     self.timingsStore.recordRestore(restoreDuration, memoryGiB: self.args.memoryGiB)
                     self.phaseTimer.mark("vm_restore")
                     self.snapshot.invalidateBeforeResume()
@@ -669,6 +676,7 @@ final class VMLifecycleManager: NSObject {
     private func coldBoot(vm: VZVirtualMachine) {
         coldBootStart = Date()
         bootedWithCurrentArgs = true
+        restoredFromSnapshot = false
         vm.start { [weak self] result in
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }

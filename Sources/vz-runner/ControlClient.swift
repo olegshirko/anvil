@@ -48,6 +48,16 @@ enum ControlClient {
         try sendUnix(request: ControlRequest(cmd: cmd, args: nil, internalRequest: true))
     }
 
+    /// Asks the guest to reinitialize its network (NATRecovery). The guest
+    /// spends up to ~20 s bringing the link down and up and waiting for a
+    /// DHCP lease, so the read gets a deadline: a wedged guest must not park
+    /// the daemon's recovery thread forever.
+    static func resetGuestNetwork() throws -> ControlResponse {
+        try sendUnix(
+            request: ControlRequest(cmd: "net_reset", args: nil, internalRequest: true),
+            timeout: 45)
+    }
+
     /// Runs a command in the VM and returns its output (no streaming).
     static func run(_ args: [String]) throws -> ControlResponse {
         try sendUnix(request: ControlRequest(cmd: "exec", args: args))
@@ -55,7 +65,7 @@ enum ControlClient {
 
     // MARK: - Private
 
-    private static func sendUnix(request: ControlRequest) throws -> ControlResponse {
+    private static func sendUnix(request: ControlRequest, timeout: TimeInterval? = nil) throws -> ControlResponse {
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         _ = controlSocketPath.withCString {
@@ -68,6 +78,11 @@ enum ControlClient {
         }
         setSocketNoSigPipe(fd)
         defer { close(fd) }
+
+        if let timeout = timeout {
+            var tv = timeval(tv_sec: Int(timeout), tv_usec: 0)
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        }
 
         let connected = withUnsafePointer(to: &addr) { ptr -> Bool in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {

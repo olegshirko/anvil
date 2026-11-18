@@ -37,9 +37,14 @@ final class NATRecovery {
     /// Periodic guest probe (no change seen on the Mac).
     private let healthInterval: TimeInterval = 60
     private var lastHealthCheck = Date()
-    /// One reattach per incident: set when the NAT was reattached, cleared
-    /// when the guest reaches the internet again or the network changes.
-    private var reattachedSinceHealthy = false
+    /// What this incident has already tried: one reattach, then one guest
+    /// network reset, then quiet until the guest is healthy or the Mac's
+    /// network changes. Main queue.
+    private var ladder = NATRecoveryLadder()
+    /// An action and its follow-up probe are in flight: a periodic check
+    /// that lands meanwhile must not judge the path before the step finished.
+    /// Main queue.
+    private var recovering = false
     private var wakeObserver: NSObjectProtocol?
 
     init(manager: VMLifecycleManager) {
@@ -56,7 +61,7 @@ final class NATRecovery {
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.reattachedSinceHealthy = false
+            self?.ladder.recovered()
             self?.scheduleCheck(reason: "the Mac woke up")
         }
     }
@@ -71,10 +76,15 @@ final class NATRecovery {
         }
     }
 
-    /// The VM is running again: run a check a route change left pending.
+    /// The VM is running again: run a check a route change left pending, or
+    /// look right away when the VM was restored from a snapshot. A restored
+    /// virtio-net device can come back without a working layer-2 path, and
+    /// waiting for the minute tick only delays the recovery.
     func vmBecameReady() {
         if pendingCheck {
             scheduleCheck(reason: "network changed while the VM was paused")
+        } else if manager.restoredFromSnapshot {
+            scheduleCheck(reason: "the VM was restored from its snapshot", quietWhenHealthy: true)
         }
     }
 
@@ -97,14 +107,16 @@ final class NATRecovery {
         }
         print("[nat] Mac primary interface \(lastInterface ?? "none") -> \(current ?? "none")")
         lastInterface = current
-        reattachedSinceHealthy = false
+        ladder.recovered()
         guard current != nil else { return } // offline: nothing to check yet
         scheduleCheck(reason: "primary interface changed")
     }
 
-    private func scheduleCheck(reason: String) {
+    private func scheduleCheck(reason: String, quietWhenHealthy: Bool = false) {
         checkScheduled?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.check(reason: reason) }
+        let work = DispatchWorkItem { [weak self] in
+            self?.check(reason: reason, quietWhenHealthy: quietWhenHealthy)
+        }
         checkScheduled = work
         DispatchQueue.main.asyncAfter(deadline: .now() + settleDelay, execute: work)
     }
@@ -133,34 +145,92 @@ final class NATRecovery {
                 before = again
             }
             if before == "ok" {
-                DispatchQueue.main.async { self.reattachedSinceHealthy = false }
-                if !quietWhenHealthy {
-                    print("[nat] \(reason): the VM still reaches the internet")
+                DispatchQueue.main.async {
+                    // A step in flight confirms health itself when its probe
+                    // lands; resetting the ladder underneath it would only
+                    // let a new incident start mid-step.
+                    guard !self.recovering else { return }
+                    self.ladder.recovered()
+                    if !quietWhenHealthy {
+                        print("[nat] \(reason): the VM still reaches the internet")
+                    }
                 }
                 return
             }
             DispatchQueue.main.async {
-                // Once per incident: a full-tunnel VPN keeps the path dead,
-                // and reattaching every minute would only cut connections.
-                guard !self.reattachedSinceHealthy, self.manager.isVMRunning else { return }
-                guard self.manager.reattachNAT() else { return }
-                self.reattachedSinceHealthy = true
-                print("[nat] \(reason): VM egress \(before); reattached the NAT")
-                DispatchQueue.global().asyncAfter(deadline: .now() + self.settleDelay) {
-                    let after = NATRecovery.guestEgress()
-                    if after == "ok" {
-                        DispatchQueue.main.async { self.reattachedSinceHealthy = false }
-                        print("[nat] VM internet restored")
-                    } else {
-                        let iface = DispatchQueue.main.sync { self.lastInterface ?? "" }
-                        let hint = iface.hasPrefix("utun")
-                            ? " (the Mac's default route is the VPN tunnel \(iface); macOS NAT traffic does not pass it — registry traffic still goes through the Mac)"
-                            : ""
-                        print("[nat] VM egress still \(after) after reattaching the NAT\(hint)")
-                    }
-                }
+                // Everything this incident can try was already tried: a
+                // full-tunnel VPN keeps the path dead, and reattaching or
+                // resetting every minute would only cut connections.
+                guard !self.ladder.isExhausted, !self.recovering else { return }
+                self.recover(reason: reason, failure: before)
             }
         }
+    }
+
+    /// Advances one rung of the incident ladder. Main queue.
+    private func recover(reason: String, failure: String) {
+        guard manager.isVMRunning, !recovering else { return }
+        switch ladder.nextAfterFailure() {
+        case .reattachNAT:
+            guard manager.reattachNAT() else { return }
+            recovering = true
+            print("[nat] \(reason): VM egress \(failure); reattached the NAT")
+            probeAfterAction(reason: reason)
+        case .resetGuestNetwork:
+            // A reattached NAT hands the guest a fresh vmnet attachment, but
+            // a restored virtio-net device keeps stale queue state and the
+            // guest can hold a lease the attachment no longer honours; only a
+            // guest-side driver reset and a fresh DHCP lease clear both. The
+            // old code stopped here and a restart was the only way out.
+            recovering = true
+            print("[nat] VM egress still \(failure) after reattaching the NAT; reinitializing the guest network")
+            DispatchQueue.global().async { [weak self] in
+                guard let self = self else { return }
+                let reset = NATRecovery.guestNetworkReset()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    if let reset = reset {
+                        print("[nat] guest network reset failed: \(reset)")
+                    } else {
+                        print("[nat] guest network reinitialized")
+                    }
+                    guard self.manager.isVMRunning else {
+                        self.recovering = false
+                        return
+                    }
+                    self.probeAfterAction(reason: reason)
+                }
+            }
+        case .giveUp:
+            print("[nat] VM egress still \(failure) after reattaching the NAT and reinitializing the guest network\(vpnHint())")
+        }
+    }
+
+    /// Probes once more after a rung had time to take effect; a still-dead
+    /// path moves on to the next rung. Main queue, probing off it.
+    private func probeAfterAction(reason: String) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + settleDelay) { [weak self] in
+            guard let self = self else { return }
+            let after = NATRecovery.guestEgress()
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.recovering = false
+                guard self.manager.isVMRunning else { return }
+                if after == "ok" {
+                    self.ladder.recovered()
+                    print("[nat] VM internet restored")
+                    return
+                }
+                self.recover(reason: reason, failure: after)
+            }
+        }
+    }
+
+    /// Says why a full-tunnel VPN can keep the VM offline even after both
+    /// rungs (macOS NAT traffic does not pass the Mac's default route).
+    private func vpnHint() -> String {
+        guard let iface = lastInterface, iface.hasPrefix("utun") else { return "" }
+        return " (the Mac's default route is the VPN tunnel \(iface); macOS NAT traffic does not pass it — registry traffic still goes through the Mac)"
     }
 
     /// The guest's direct-egress state: "ok", "via-host", or an error.
@@ -170,6 +240,15 @@ final class NATRecovery {
         if resp.status == "via-host" {
             return resp.error.map { "via-host (\($0))" } ?? "via-host"
         }
+        return resp.error ?? resp.status ?? "unknown"
+    }
+
+    /// Asks the guest to reinitialize eth0 and take a fresh DHCP lease.
+    /// Returns nil when the guest reports success, otherwise a one-line
+    /// explanation.
+    private static func guestNetworkReset() -> String? {
+        guard let resp = try? ControlClient.resetGuestNetwork() else { return "no answer" }
+        if resp.status == "ok" { return nil }
         return resp.error ?? resp.status ?? "unknown"
     }
 }
