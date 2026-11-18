@@ -37,6 +37,16 @@ struct PortMapping: Codable, Hashable {
         let proto = `protocol` ?? "tcp"
         return "\(namespace)/\(containerID)/\(hostPort)/\(proto)"
     }
+
+    /// The mapping with its guest address replaced. An empty address keeps
+    /// the mapping's own, so a push that says nothing changes nothing.
+    func withGuestAddress(_ address: String) -> PortMapping {
+        guard !address.isEmpty, address != guestIP else { return self }
+        return PortMapping(namespace: namespace, containerID: containerID, name: name,
+                           hostPort: hostPort, containerPort: containerPort,
+                           protocol: `protocol`, guestIP: address,
+                           containerIP: containerIP, hostIP: hostIP)
+    }
 }
 
 /// Where a host listener binds. Listeners use one AF_INET6 socket type for
@@ -111,6 +121,36 @@ struct PortMapState: Codable {
     }
 }
 
+/// The listeners a push must rebuild: those whose mapping changed (container
+/// restart, CNI address, host IP) and those created for a different guest
+/// address than the one tracked now. Pure so the decision is unit-tested;
+/// without the address term a listener whose mapping still stamps the old
+/// address would survive a lease move.
+func listenersToRebuild(current: [String: PortMapping],
+                        desired: [String: PortMapping],
+                        address: String) -> Set<String> {
+    let shared = Set(current.keys).intersection(desired.keys)
+    return shared.filter { key in
+        guard let old = current[key], let new = desired[key] else { return false }
+        if old != new { return true }
+        return !address.isEmpty && old.guestIP != address
+    }
+}
+
+/// The guest address to dial from one pushed state. The state-level
+/// `guest_ip` is authoritative (the guest reads it from eth0 every scan);
+/// guests that predate the field only stamp the address on each mapping, and
+/// a push with no address at all (networking still down, or a restored guest
+/// mid-deconfig) keeps the last known one rather than leaving every listener
+/// pointing at nothing.
+func resolvedGuestAddress(pushed state: PortMapState, previous: String) -> String {
+    if let ip = state.guestIP, !ip.isEmpty { return ip }
+    for mapping in state.mappings where !mapping.guestIP.isEmpty {
+        return mapping.guestIP
+    }
+    return previous
+}
+
 /// Callbacks a listener runs around every forwarded TCP connection.
 final class PortConnectionHooks {
     let resume: () -> Void
@@ -145,6 +185,13 @@ final class PortForwarder {
 
     private var listeners: [String: Listener] = [:]
     private let listenersLock = NSLock()
+    /// The guest address every dial uses, updated from every push. The
+    /// listener's own mapping address is only a fallback for guests that never
+    /// send the state field: a restored VM can renew its DHCP lease to a new
+    /// address while the daemon keeps running, and a listener must never
+    /// dial the address it was created with. Guarded by `listenersLock`
+    /// (connection threads read it while pushes replace it).
+    private var guestAddress = ""
     /// The mappings the guest last asked for, and the retry backoff of
     /// listeners whose bind failed (a Mac process held the port, a race
     /// after the port check): those are retried while still desired.
@@ -245,7 +292,10 @@ final class PortForwarder {
                     let state = try decodeLengthPrefixedFD(PortMapState.self, fd: fd)
                     self.updateRunningContainers(state.runningContainers)
                     self.onWatchPathsChange?(state.watchPaths ?? [])
-                    self.onDomainsChange?(state.domains ?? [], state.guestIP ?? "")
+                    // The domain proxy follows the same address the listener
+                    // dials: the state field, or the mappings' for older guests.
+                    self.onDomainsChange?(state.domains ?? [],
+                                          resolvedGuestAddress(pushed: state, previous: self.currentGuestAddress))
                     self.apply(state: state)
                 } catch {
                     print("[port-forwarder] subscription read failed: \(error)")
@@ -306,16 +356,38 @@ final class PortForwarder {
         if !state.mappings.isEmpty && !isRunning {
             return
         }
+        // The guest's address is tracked from every push, not from the
+        // listener's creation: a snapshot restore resumes with the pre-save
+        // lease and renews to a different address, and a listener pinned to
+        // the old one would dial a dead address forever. Each connection
+        // dials the tracked address at connect time (see Listener), and the
+        // desired mappings are normalized to it so a changed address also
+        // rebuilds the listeners (the UDP relay captures its target at
+        // start).
+        let previousAddress = currentGuestAddress
+        let address = resolvedGuestAddress(pushed: state, previous: previousAddress)
+        listenersLock.lock()
+        if !address.isEmpty {
+            guestAddress = address
+        }
+        let current: [String: PortMapping] = listeners.mapValues { $0.mapping }
+        listenersLock.unlock()
+        if !previousAddress.isEmpty && address != previousAddress {
+            let rebinding = current.values.filter { !address.isEmpty && $0.guestIP != address }.count
+            print("[port-forwarder] guest address \(previousAddress) -> \(address), rebinding \(rebinding) listener(s)")
+        }
+
         // Diff on the full mapping, not just the listener key: a container
-        // restart keeps its ID (same key) but usually gets a new CNI address,
-        // and the listener dials the IP captured at creation.
+        // restart keeps its ID (same key) but usually gets a new CNI address.
+        // Every mapping is stamped with the tracked guest address, so a lease
+        // move rebuilds the listeners even when the guest still sent the old
+        // address on the mapping.
         var desiredByKey: [String: PortMapping] = [:]
         for mapping in state.mappings where desiredByKey[mapping.listenerKey] == nil {
-            desiredByKey[mapping.listenerKey] = mapping
+            desiredByKey[mapping.listenerKey] = mapping.withGuestAddress(address)
         }
 
         listenersLock.lock()
-        let current: [String: PortMapping] = listeners.mapValues { $0.mapping }
         desiredMappings = desiredByKey
         retryDelay = retryDelay.filter { desiredByKey[$0.key] != nil }
         lastFailure = lastFailure.filter { desiredByKey[$0.key] != nil }
@@ -324,9 +396,10 @@ final class PortForwarder {
         let desiredKeys = Set(desiredByKey.keys)
         let currentKeys = Set(current.keys)
         let toRemove = currentKeys.subtracting(desiredKeys)
-        // Same key but changed target (new container IP after a restart) —
-        // the listener must be rebuilt, not left dialing the old address.
-        let toRestart = currentKeys.intersection(desiredKeys).filter { current[$0] != desiredByKey[$0] }
+        // Same key but changed target (new container IP after a restart) or a
+        // guest address that no longer matches — the listener must be
+        // rebuilt, not left dialing the old target.
+        let toRestart = listenersToRebuild(current: current, desired: desiredByKey, address: address)
         let toAdd = desiredKeys.subtracting(currentKeys).union(toRestart)
 
         // Removal runs before (re)addition so a same-port replacement never
@@ -353,7 +426,10 @@ final class PortForwarder {
             return
         }
 
-        let listener = Listener(mapping: mapping, hooks: hooks)
+        let listener = Listener(mapping: mapping, hooks: hooks,
+                                guestAddressProvider: { [weak self] in
+                                    self?.currentGuestAddress ?? mapping.guestIP
+                                })
         listenersLock.lock()
         listeners[mapping.listenerKey] = listener
         listenersLock.unlock()
@@ -423,16 +499,24 @@ final class PortForwarder {
     }
 
     /// The container target of a published TCP host port (DomainProxy hands
-    /// it requests that are not for a container domain).
+    /// it requests that are not for a container domain). The guest address is
+    /// the currently tracked one, not the one the listener was created with.
     func tcpTarget(hostPort: Int) -> (guestIP: String, ip: String, port: Int)? {
         listenersLock.lock()
         defer { listenersLock.unlock() }
         for l in listeners.values where l.mapping.hostPort == hostPort && (l.mapping.protocol ?? "tcp") == "tcp" {
             if let ip = l.mapping.containerIP, !ip.isEmpty {
-                return (l.mapping.guestIP, ip, l.mapping.containerPort)
+                return (guestAddress.isEmpty ? l.mapping.guestIP : guestAddress, ip, l.mapping.containerPort)
             }
         }
         return nil
+    }
+
+    /// The guest address every dial uses right now.
+    private var currentGuestAddress: String {
+        listenersLock.lock()
+        defer { listenersLock.unlock() }
+        return guestAddress
     }
 
     /// Whether a host TCP port is currently bound by one of our own listeners.
@@ -460,12 +544,25 @@ final class PortForwarder {
 private final class Listener {
     let mapping: PortMapping
     private let hooks: PortConnectionHooks
+    /// The forwarder's currently tracked guest address. Read on every dial:
+    /// the address can change under a live listener (a restored VM renews its
+    /// DHCP lease), so the one captured at creation must never be trusted.
+    private let guestAddressProvider: () -> String
     private var fd: Int32 = -1
     private let lock = NSLock()
 
-    init(mapping: PortMapping, hooks: PortConnectionHooks) {
+    init(mapping: PortMapping, hooks: PortConnectionHooks,
+         guestAddressProvider: @escaping () -> String) {
         self.mapping = mapping
         self.hooks = hooks
+        self.guestAddressProvider = guestAddressProvider
+    }
+
+    /// The guest address to dial now: the latest pushed one, or the
+    /// mapping's own when no push has ever carried one.
+    private var dialGuestAddress: String {
+        let current = guestAddressProvider()
+        return current.isEmpty ? mapping.guestIP : current
     }
 
     deinit {
@@ -611,7 +708,9 @@ private final class Listener {
         // arms nft DNAT hostPort -> containerPort in the container's netns
         // at attach time. The host side therefore only needs a datagram
         // listener forwarding to guestIP:hostPort, which vzNAT delivers.
-        guard !mapping.guestIP.isEmpty else {
+        // The address is the currently tracked one, not the mapping's.
+        let targetIP = dialGuestAddress
+        guard !targetIP.isEmpty else {
             print("[listener :\(mapping.hostPort)/udp] no guest IP; refusing to start")
             onFailure()
             return
@@ -639,7 +738,6 @@ private final class Listener {
         lock.lock()
         self.fd = fd
         lock.unlock()
-        let targetIP = mapping.guestIP
         let targetPort = mapping.hostPort
         print("[port-forwarder] forwarding localhost:\(mapping.hostPort)/udp -> \(targetIP):\(targetPort) (guest relay)")
         udpRelayLoop(fd, targetIP: targetIP, targetPort: targetPort)
@@ -840,7 +938,11 @@ private final class Listener {
     private func connectToGuest() -> Int32 {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return -1 }
-        bindToGuestInterface(fd, guestIP: mapping.guestIP)
+        // Dial the address the guest reported last, not the one this listener
+        // was created with: a restored VM can renew its DHCP lease to a new
+        // address while the listener stays bound to the same host port.
+        let guestIP = dialGuestAddress
+        bindToGuestInterface(fd, guestIP: guestIP)
 
         // Preferred path: the guest-side port proxy. The forwarder connects
         // to a single well-known port and names the real target
@@ -854,32 +956,23 @@ private final class Listener {
 
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
+        let port = useProxy != nil ? guestPortProxyPort : mapping.hostPort
+        addr.sin_port = in_port_t(port).bigEndian
+        guard !guestIP.isEmpty, guestIP.withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1 else {
+            close(fd)
+            print("[listener :\(mapping.hostPort)] dial guest \(guestIP.isEmpty ? "<no address>" : guestIP):\(port) failed: no valid guest address (is the guest's DHCP lease up?)")
+            return -1
+        }
+        if let error = connectWithTimeout(fd, addr, timeout: 5.0) {
+            close(fd)
+            print("[listener :\(mapping.hostPort)] dial guest \(guestIP):\(port) failed: \(error)")
+            return -1
+        }
         if let proxy = useProxy {
-            addr.sin_port = in_port_t(guestPortProxyPort).bigEndian
-            guard mapping.guestIP.withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1 else {
-                close(fd)
-                return -1
-            }
-            guard connectWithTimeout(fd, addr, timeout: 5.0) else {
-                close(fd)
-                return -1
-            }
             guard sendPortProxyHeader(fd, target: proxy) else {
                 close(fd)
                 return -1
             }
-            return fd
-        }
-
-        addr.sin_port = in_port_t(mapping.hostPort).bigEndian
-        guard mapping.guestIP.withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1 else {
-            close(fd)
-            return -1
-        }
-
-        guard connectWithTimeout(fd, addr, timeout: 5.0) else {
-            close(fd)
-            return -1
         }
         return fd
     }
@@ -900,10 +993,6 @@ private final class Listener {
 
 // MARK: - FD write helper
 
-/// connect(2) with a timeout, via non-blocking mode + poll. A blocking
-/// connect to an unreachable guest address stalls for the full TCP SYN
-/// timeout (~75 s), and since it runs inline in the listener's accept loop
-/// it takes the whole published port down with it.
 /// Sends the guest port-proxy handshake: 4-byte big-endian body length +
 /// JSON naming the target inside the VM.
 func sendGuestPortProxyHeader(_ fd: Int32, ip: String, port: Int) -> Bool {
@@ -917,9 +1006,14 @@ func sendGuestPortProxyHeader(_ fd: Int32, ip: String, port: Int) -> Bool {
     return (try? writeExactlyFD(fd, data: frame)) != nil
 }
 
-func connectWithTimeout(_ fd: Int32, _ addr: sockaddr_in, timeout: TimeInterval) -> Bool {
+/// connect(2) with a timeout, via non-blocking mode + poll. A blocking
+/// connect to an unreachable guest address stalls for the full TCP SYN
+/// timeout (~75 s), and since it runs inline in the connection's thread it
+/// takes the whole published port down with it. Returns nil on success, or a
+/// short reason (the errno text, "timed out") for the dial-failure log.
+func connectWithTimeout(_ fd: Int32, _ addr: sockaddr_in, timeout: TimeInterval) -> String? {
     let flags = fcntl(fd, F_GETFL, 0)
-    guard flags >= 0 else { return false }
+    guard flags >= 0 else { return String(cString: strerror(errno)) }
     _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 
     let rc = withUnsafePointer(to: addr) { ptr -> Int32 in
@@ -929,18 +1023,25 @@ func connectWithTimeout(_ fd: Int32, _ addr: sockaddr_in, timeout: TimeInterval)
     }
     if rc == 0 {
         _ = fcntl(fd, F_SETFL, flags)
-        return true
+        return nil
     }
-    guard errno == EINPROGRESS else { return false }
+    guard errno == EINPROGRESS else {
+        let reason = String(cString: strerror(errno))
+        _ = fcntl(fd, F_SETFL, flags)
+        return reason
+    }
 
     var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
-    guard poll(&pfd, 1, Int32(timeout * 1000)) == 1 else { return false }
+    guard poll(&pfd, 1, Int32(timeout * 1000)) == 1 else {
+        _ = fcntl(fd, F_SETFL, flags)
+        return errno == EINTR ? "interrupted" : "timed out"
+    }
     var soError: Int32 = 0
     var len = socklen_t(MemoryLayout<Int32>.size)
     getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &len)
     // Restore blocking mode: the relay pumps rely on blocking recv/send.
     _ = fcntl(fd, F_SETFL, flags)
-    return soError == 0
+    return soError == 0 ? nil : String(cString: strerror(soError))
 }
 
 private func writeAllFD(_ fd: Int32, data: Data) -> Bool {
