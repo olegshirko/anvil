@@ -1,3 +1,28 @@
+## v1.11.0 (2026-11-18)
+
+### Docs
+- d61131c docs(changelog): v1.10.4
+
+### Internal
+- 470a73f build: overwrite the buildkit asset on a rebuild
+- 653adfc chore: drop an unmeasured boot-time figure and a stray blank line
+- 7b8b7ff ci: ship and verify buildkit.tar.zst with the release
+- 812236d build: ship buildkit as a separate asset, not in the initramfs
+- f64fa33 build: assemble the initramfs on the instance's own VM
+
+### Other
+- a7b42f5 agent: match mirror releases by the familiar image ref
+- 1c96c43 nat: start a fresh recovery ladder when the VM becomes ready
+- ad82257 agent: treat an exhausted pull timeout as final
+- 9e1f60d agent: give the DHCP renewal time to land after the link bounce
+- 0c1a0a2 daemon: publish the pull timeout settings to the guest
+- b587059 agent: bound every registry pull attempt and fall back to the mirror
+- fc3b21a nat: reset the guest network when a reattach does not restore egress
+- 1f7b96c agent: reinitialize the guest network on the host's request
+- b41ea82 dev: bootstrap a fresh checkout before the dev rebuild
+- ceef4a2 agent: report a missing buildkit install instead of failing on exec
+- f6548be host: put buildkit.tar.zst on the VM share at start
+- 368f06a forwarder: hold a published-port client while the guest warms up
 ## v1.10.4 (2026-11-18)
 
 ### Internal
