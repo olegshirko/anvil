@@ -175,10 +175,18 @@ func isPullTimeout(err error) bool {
 }
 
 // isStallTimeout reports a transport read/write that hit the idle deadline
-// (as opposed to a dial timeout or an HTTP status answer).
+// (as opposed to a dial timeout or an HTTP status answer). The string check
+// covers fetcher errors that crossed a %v boundary inside containerd and no
+// longer expose the net.Error.
 func isStallTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "dial tcp") {
+		return false
+	}
 	var ne net.Error
-	return errors.As(err, &ne) && ne.Timeout() && !errors.Is(err, context.DeadlineExceeded)
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return strings.Contains(err.Error(), "i/o timeout")
 }
 
 // retryablePullError decides between one more registry attempt and the
@@ -197,6 +205,12 @@ func retryablePullError(err error) bool {
 	if isPullTimeout(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
+	// Any other timeout (a dial that ran out, a transport read deadline)
+	// already spent its budget; retrying only doubles the wait.
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return false
+	}
 	return true
 }
 
@@ -207,7 +221,9 @@ func describePullError(err error) string {
 		return ""
 	}
 	msg := stripANSI(explainEgressFailure(err).Error())
-	if errors.Is(err, errPullStall) {
+	// A raw transport timeout that containerd did not classify still needs
+	// to say what it means; errPullStall already names the silence.
+	if isStallTimeout(err) && !errors.Is(err, errPullStall) {
 		return fmt.Sprintf("%s (no data for %s)", msg, pullStallTimeout())
 	}
 	return msg

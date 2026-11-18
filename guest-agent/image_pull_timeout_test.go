@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,6 +139,87 @@ func TestStallWrappedDial(t *testing.T) {
 	}
 }
 
+// stallTestClient is an HTTP client whose connections go through the same
+// stall wrapper the registry transport uses, with a short idle timeout.
+func stallTestClient(idle time.Duration) *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = stallWrappedDial((&net.Dialer{Timeout: time.Second}).DialContext, idle)
+	return &http.Client{Transport: tr}
+}
+
+// A response whose headers arrive and whose body goes silent must fail on
+// the stall bound: this is the "connected, but no bytes" case that used to
+// hang the pull forever.
+func TestStallTransportFailsSilentBody(t *testing.T) {
+	bodyDone := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte{1})
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-bodyDone:
+		}
+	}))
+	defer srv.Close()
+	defer close(bodyDone)
+
+	client := stallTestClient(100 * time.Millisecond)
+	start := time.Now()
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("headers did not arrive: %v", err)
+	}
+	defer resp.Body.Close()
+	_, err = io.ReadAll(resp.Body)
+	if err == nil {
+		t.Fatal("reading a silent body returned no error")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("stalled body took %v, want about 100ms", elapsed)
+	}
+}
+
+// A server that accepts and never sends headers must also fail on the stall
+// bound (the resolve/manifest phase case).
+func TestStallTransportFailsSilentHeaders(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var held net.Conn
+	accepted := make(chan struct{})
+	go func() {
+		c, aerr := ln.Accept()
+		if aerr == nil {
+			held = c
+		}
+		close(accepted)
+	}()
+	t.Cleanup(func() {
+		if held != nil {
+			held.Close()
+		}
+	})
+
+	client := stallTestClient(100 * time.Millisecond)
+	start := time.Now()
+	_, err = client.Get("http://" + ln.Addr().String() + "/v2/")
+	<-accepted
+	if err == nil {
+		t.Fatal("a server that never answers returned no error")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("silent server took %v, want about 100ms", elapsed)
+	}
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("error = %v, want a timeout", err)
+	}
+}
+
 func TestStopOnFirstLayer(t *testing.T) {
 	stopped := 0
 	h := stopOnFirstLayer(func() { stopped++ })
@@ -160,6 +243,7 @@ func TestStopOnFirstLayer(t *testing.T) {
 }
 
 func TestRetryablePullError(t *testing.T) {
+	dialTimeout := &net.DNSError{Err: "i/o timeout", IsTimeout: true}
 	cases := []struct {
 		name string
 		err  error
@@ -169,12 +253,26 @@ func TestRetryablePullError(t *testing.T) {
 		{"phase timeout", errPullPhaseTimeout, false},
 		{"stall", errPullStall, false},
 		{"context deadline", context.DeadlineExceeded, false},
+		{"dial timeout", dialTimeout, false},
 		{"generic transient", errors.New("read: connection reset by peer"), true},
 	}
 	for _, tc := range cases {
 		if got := retryablePullError(tc.err); got != tc.want {
 			t.Errorf("%s: retryablePullError(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
 		}
+	}
+}
+
+func TestIsStallTimeout(t *testing.T) {
+	dialTimeout := errors.New("dial tcp 192.0.2.1:443: i/o timeout")
+	if isStallTimeout(dialTimeout) {
+		t.Error("a dial timeout must not be classified as a stream stall")
+	}
+	if isStallTimeout(context.DeadlineExceeded) {
+		t.Error("the client's own deadline must not be classified as a stall")
+	}
+	if !isStallTimeout(errors.New("failed to copy: read tcp 10.0.0.2:1->1.2.3.4:443: i/o timeout")) {
+		t.Error("a stalled read must be classified as a stall")
 	}
 }
 
