@@ -186,3 +186,91 @@ final class GuestInterfaceTests: XCTestCase {
         XCTAssertNil(interfaceIndex(containing: "203.0.113.7"), "TEST-NET-3 is on no interface")
     }
 }
+
+/// The published-port warm-up: a listener is bound as soon as the guest
+/// pushes a mapping, which can be before the guest can serve it. A client
+/// arriving then must wait (bounded) rather than get an empty reply.
+final class GuestDialRetryTests: XCTestCase {
+    private func failure(_ code: Int32) -> GuestDialOutcome {
+        GuestDialOutcome(fd: -1, retryable: retryableGuestDialError(code),
+                         reason: String(cString: strerror(code)), target: "192.0.2.1:39131")
+    }
+
+    func testWarmupErrorsAreRetried() {
+        for code in [ECONNREFUSED, ECONNRESET, EHOSTUNREACH, ENETUNREACH,
+                     EADDRNOTAVAIL, ETIMEDOUT] {
+            XCTAssertTrue(retryableGuestDialError(code), "errno \(code) should retry")
+        }
+        for code in [EACCES, EPERM, EINVAL, EAFNOSUPPORT] {
+            XCTAssertFalse(retryableGuestDialError(code), "errno \(code) should not retry")
+        }
+    }
+
+    // A real refused connect (the guest's proxy is not listening yet) must
+    // land in the retryable set, not just the synthetic errno list.
+    func testRefusedConnectIsRetryable() throws {
+        // Reserve a loopback port, then release it: nothing listens there.
+        let probe = socket(AF_INET, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(probe, 0)
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(probe, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        XCTAssertEqual(bound, 0, String(cString: strerror(errno)))
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(probe, $0, &len) }
+        }
+        close(probe)
+
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { close(fd) }
+        let error = try XCTUnwrap(connectWithTimeoutError(fd, addr, timeout: 1.0))
+        XCTAssertEqual(error.code, ECONNREFUSED, error.reason)
+        XCTAssertTrue(retryableGuestDialError(error.code))
+    }
+
+    func testRetriesUntilTheGuestServes() {
+        var attempts = 0
+        let started = Date()
+        let outcome = dialGuestWithRetry(grace: 1.0, retryDelay: 0.02) { _ in
+            attempts += 1
+            if attempts < 4 { return self.failure(ECONNREFUSED) }
+            return GuestDialOutcome(fd: 42, retryable: false, reason: nil, target: "x")
+        }
+        XCTAssertEqual(outcome.fd, 42)
+        XCTAssertEqual(attempts, 4)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1.0)
+    }
+
+    func testPermanentErrorIsNotRetried() {
+        var attempts = 0
+        let outcome = dialGuestWithRetry(grace: 1.0, retryDelay: 0.02) { _ in
+            attempts += 1
+            return self.failure(EACCES)
+        }
+        XCTAssertEqual(outcome.fd, -1)
+        XCTAssertEqual(attempts, 1)
+    }
+
+    func testGivesUpAfterTheGrace() {
+        var attempts = 0
+        let started = Date()
+        let outcome = dialGuestWithRetry(grace: 0.25, retryDelay: 0.05) { _ in
+            attempts += 1
+            return self.failure(EHOSTUNREACH)
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertEqual(outcome.fd, -1)
+        XCTAssertGreaterThanOrEqual(elapsed, 0.25, "the client must be refused only after the grace")
+        XCTAssertLessThan(elapsed, 1.0, "the wait stays bounded")
+        XCTAssertGreaterThan(attempts, 2)
+        XCTAssertEqual(outcome.reason, String(cString: strerror(EHOSTUNREACH)))
+    }
+}

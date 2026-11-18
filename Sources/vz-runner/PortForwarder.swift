@@ -7,6 +7,61 @@ import Darwin
 /// JSON header describing the real target (containerIP:containerPort).
 let guestPortProxyPort: Int = 39131
 
+/// How long a forwarded connection keeps retrying a warm-up dial to the
+/// guest. The host binds a published port as soon as the guest's first
+/// mapping push arrives, which can be before the guest is actually
+/// reachable (its port proxy still starting, the DHCP lease or the Mac's ARP
+/// entry not ready yet after a start/resume). A client that connects in that
+/// window waits for the guest instead of getting an empty reply. The wait is
+/// bounded: a guest that is genuinely down refuses the client after this.
+let guestDialGrace: TimeInterval = 2.0
+
+/// Pause between warm-up dial attempts. Short enough that a recovered guest
+/// is used immediately, long enough not to spin while it boots.
+let guestDialRetryDelay: TimeInterval = 0.1
+
+/// One attempt to reach the guest (the port proxy, or the direct fallback
+/// for guests that predate it). `fd` is a connected socket or -1; a failure
+/// is worth retrying when the guest may simply not be serving yet.
+struct GuestDialOutcome {
+    let fd: Int32
+    let retryable: Bool
+    let reason: String?
+    let target: String
+}
+
+/// Whether a failed connect to the guest can clear on its own during the
+/// warm-up window: the proxy is not listening yet (RST), the guest address
+/// is not resolvable yet (ARP/DHCP), or the route is not up. A permission
+/// or argument error will not, and its client should be refused at once.
+func retryableGuestDialError(_ code: Int32) -> Bool {
+    switch code {
+    case ECONNREFUSED, ECONNRESET, EHOSTUNREACH, ENETUNREACH, EADDRNOTAVAIL,
+         ETIMEDOUT, EINTR:
+        return true
+    default:
+        return false
+    }
+}
+
+/// Retry a guest dial while it fails for a warm-up reason, until `grace`
+/// elapses or the failure is permanent. Returns the successful outcome, or
+/// the last failure. The caller supplies the attempt (and its own deadline
+/// so a single blocking connect cannot overshoot the grace).
+func dialGuestWithRetry(grace: TimeInterval = guestDialGrace,
+                        retryDelay: TimeInterval = guestDialRetryDelay,
+                        _ dial: (Date) -> GuestDialOutcome) -> GuestDialOutcome {
+    let deadline = Date().addingTimeInterval(grace)
+    while true {
+        let outcome = dial(deadline)
+        if outcome.fd >= 0 || !outcome.retryable || Date() >= deadline {
+            return outcome
+        }
+        Thread.sleep(forTimeInterval: retryDelay)
+    }
+}
+
+
 struct PortMapping: Codable, Hashable {
     let namespace: String
     let containerID: String
@@ -936,8 +991,38 @@ private final class Listener {
     }
 
     private func connectToGuest() -> Int32 {
+        var failures = 0
+        var firstFailure: String?
+        let started = Date()
+        let outcome = dialGuestWithRetry { [self] deadline in
+            let attempt = connectToGuestOnce(deadline: deadline)
+            if attempt.fd < 0 {
+                failures += 1
+                if firstFailure == nil {
+                    firstFailure = attempt.reason
+                }
+            }
+            return attempt
+        }
+        if outcome.fd >= 0 {
+            if failures > 0 {
+                // The client connected while the guest was still warming up;
+                // it was held (not refused) and is now being served.
+                print("[listener :\(mapping.hostPort)] guest was not ready (\(firstFailure ?? "retrying")); connection forwarded after \(String(format: "%.1f", Date().timeIntervalSince(started)))s")
+            }
+            return outcome.fd
+        }
+        print("[listener :\(mapping.hostPort)] dial guest \(outcome.target) failed: \(outcome.reason ?? "unknown error")")
+        return -1
+    }
+
+    /// One dial attempt. `deadline` bounds the single connect so a warm-up
+    /// retry loop never waits more than the grace in total.
+    private func connectToGuestOnce(deadline: Date) -> GuestDialOutcome {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { return -1 }
+        guard fd >= 0 else {
+            return GuestDialOutcome(fd: -1, retryable: false, reason: "socket failed", target: "")
+        }
         // Dial the address the guest reported last, not the one this listener
         // was created with: a restored VM can renew its DHCP lease to a new
         // address while the listener stays bound to the same host port.
@@ -958,23 +1043,32 @@ private final class Listener {
         addr.sin_family = sa_family_t(AF_INET)
         let port = useProxy != nil ? guestPortProxyPort : mapping.hostPort
         addr.sin_port = in_port_t(port).bigEndian
+        let target = "\(guestIP.isEmpty ? "<no address>" : guestIP):\(port)"
         guard !guestIP.isEmpty, guestIP.withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1 else {
             close(fd)
-            print("[listener :\(mapping.hostPort)] dial guest \(guestIP.isEmpty ? "<no address>" : guestIP):\(port) failed: no valid guest address (is the guest's DHCP lease up?)")
-            return -1
+            // No address yet is a warm-up state too: the guest's DHCP lease
+            // lands during boot and the next push carries it.
+            return GuestDialOutcome(fd: -1, retryable: true,
+                                    reason: "no valid guest address (is the guest's DHCP lease up?)",
+                                    target: target)
         }
-        if let error = connectWithTimeout(fd, addr, timeout: 5.0) {
+        let timeout = max(0.2, min(5.0, deadline.timeIntervalSinceNow))
+        if let error = connectWithTimeoutError(fd, addr, timeout: timeout) {
             close(fd)
-            print("[listener :\(mapping.hostPort)] dial guest \(guestIP):\(port) failed: \(error)")
-            return -1
+            return GuestDialOutcome(fd: -1, retryable: retryableGuestDialError(error.code),
+                                    reason: error.reason, target: target)
         }
         if let proxy = useProxy {
             guard sendPortProxyHeader(fd, target: proxy) else {
                 close(fd)
-                return -1
+                // The socket opened but the guest stopped serving it: still
+                // warming up (a restarting proxy), or closing a dead target.
+                return GuestDialOutcome(fd: -1, retryable: true,
+                                        reason: "guest port proxy closed the connection",
+                                        target: target)
             }
         }
-        return fd
+        return GuestDialOutcome(fd: fd, retryable: false, reason: nil, target: target)
     }
 
     /// The proxy target when the mapping carries a container IP (the CNI
@@ -1012,8 +1106,15 @@ func sendGuestPortProxyHeader(_ fd: Int32, ip: String, port: Int) -> Bool {
 /// takes the whole published port down with it. Returns nil on success, or a
 /// short reason (the errno text, "timed out") for the dial-failure log.
 func connectWithTimeout(_ fd: Int32, _ addr: sockaddr_in, timeout: TimeInterval) -> String? {
+    connectWithTimeoutError(fd, addr, timeout: timeout)?.reason
+}
+
+/// connectWithTimeout keeping the errno: the published-port forwarder
+/// decides from it whether a failed dial can clear during warm-up.
+func connectWithTimeoutError(_ fd: Int32, _ addr: sockaddr_in,
+                             timeout: TimeInterval) -> (reason: String, code: Int32)? {
     let flags = fcntl(fd, F_GETFL, 0)
-    guard flags >= 0 else { return String(cString: strerror(errno)) }
+    guard flags >= 0 else { return (String(cString: strerror(errno)), errno) }
     _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 
     let rc = withUnsafePointer(to: addr) { ptr -> Int32 in
@@ -1026,22 +1127,22 @@ func connectWithTimeout(_ fd: Int32, _ addr: sockaddr_in, timeout: TimeInterval)
         return nil
     }
     guard errno == EINPROGRESS else {
-        let reason = String(cString: strerror(errno))
+        let code = errno
         _ = fcntl(fd, F_SETFL, flags)
-        return reason
+        return (String(cString: strerror(code)), code)
     }
 
     var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
     guard poll(&pfd, 1, Int32(timeout * 1000)) == 1 else {
         _ = fcntl(fd, F_SETFL, flags)
-        return errno == EINTR ? "interrupted" : "timed out"
+        return errno == EINTR ? ("interrupted", EINTR) : ("timed out", ETIMEDOUT)
     }
     var soError: Int32 = 0
     var len = socklen_t(MemoryLayout<Int32>.size)
     getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &len)
     // Restore blocking mode: the relay pumps rely on blocking recv/send.
     _ = fcntl(fd, F_SETFL, flags)
-    return soError == 0 ? nil : String(cString: strerror(soError))
+    return soError == 0 ? nil : (String(cString: strerror(soError)), soError)
 }
 
 private func writeAllFD(_ fd: Int32, data: Data) -> Bool {
