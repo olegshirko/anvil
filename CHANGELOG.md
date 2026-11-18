@@ -1,3 +1,16 @@
+## v1.10.4 (2026-11-18)
+
+### Internal
+- 653adfc chore: drop an unmeasured boot-time figure and a stray blank line
+- 7b8b7ff ci: ship and verify buildkit.tar.zst with the release
+- 812236d build: ship buildkit as a separate asset, not in the initramfs
+- f64fa33 build: assemble the initramfs on the instance's own VM
+
+### Other
+- b41ea82 dev: bootstrap a fresh checkout before the dev rebuild
+- ceef4a2 agent: report a missing buildkit install instead of failing on exec
+- f6548be host: put buildkit.tar.zst on the VM share at start
+- 368f06a forwarder: hold a published-port client while the guest warms up
 ## v1.10.3 (2026-11-18)
 
 ### Other
