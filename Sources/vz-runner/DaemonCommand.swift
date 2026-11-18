@@ -724,6 +724,9 @@ func raiseOpenFileLimit() {
 /// Hands settings the guest reads lazily to it through the share:
 /// <share>/.anvil-run/build-cache-gb caps the buildkit cache (default 20,
 /// Docker Desktop's builder default; 0 leaves buildkit's own policy).
+/// pull-timeout and pull-stall-timeout carry ANVIL_PULL_TIMEOUT and
+/// ANVIL_PULL_STALL_TIMEOUT (durations; the guest-agent keeps its own
+/// defaults when the file is empty or invalid).
 func publishGuestSettings(sharePath: String?) {
     guard let share = sharePath else { return }
     let dir = URL(fileURLWithPath: share).appendingPathComponent(".anvil-run", isDirectory: true)
@@ -731,4 +734,10 @@ func publishGuestSettings(sharePath: String?) {
     let raw = anvilSetting("ANVIL_BUILD_CACHE_GB")?.trimmingCharacters(in: .whitespaces) ?? ""
     let gb = UInt(raw) ?? 20
     try? "\(gb)\n".write(to: dir.appendingPathComponent("build-cache-gb"), atomically: true, encoding: .utf8)
+    let pullSettings = [("ANVIL_PULL_TIMEOUT", "pull-timeout"),
+                        ("ANVIL_PULL_STALL_TIMEOUT", "pull-stall-timeout")]
+    for (key, file) in pullSettings {
+        let value = anvilSetting(key)?.trimmingCharacters(in: .whitespaces) ?? ""
+        try? "\(value)\n".write(to: dir.appendingPathComponent(file), atomically: true, encoding: .utf8)
+    }
 }

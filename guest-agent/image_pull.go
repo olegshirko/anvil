@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/containerd/containerd/v2/client"
@@ -33,18 +34,13 @@ const dockerMirrorRepo = "olegshirko/docker-mirror"
 // instead of reporting a noisy download failure.
 var errMirrorNotFound = errors.New("image not found in docker-mirror")
 
-// mirrorHTTPClient adds a header timeout to the mirror download: the body
-// streams for as long as the transfer takes (archives are large), but an
-// endpoint that accepts the connection and then goes silent must not hang
-// the pull before a byte of body arrives. It clones http.DefaultTransport —
-// a bare &http.Transport{} would silently drop ProxyFromEnvironment and the
-// pull would stop honoring HTTP(S)_PROXY.
+// mirrorHTTPClient adds a header timeout and stall-bounded connections to
+// the mirror download: the body streams for as long as the transfer takes
+// (archives are large), but an endpoint that accepts the connection and then
+// goes silent must not hang the pull. mirrorTransport clones
+// http.DefaultTransport, so ProxyFromEnvironment survives.
 var mirrorHTTPClient = &http.Client{
-	Transport: func() http.RoundTripper {
-		t := http.DefaultTransport.(*http.Transport).Clone()
-		t.ResponseHeaderTimeout = 30 * time.Second
-		return t
-	}(),
+	Transport: mirrorTransport(),
 }
 
 // splitImageTag splits a user image ref into name and tag. Digest refs
@@ -69,19 +65,16 @@ func splitImageTag(ref string) (name, tag string, ok bool) {
 	return ref[:colon], tag, true
 }
 
-// loadFromMirror downloads an image archive from the docker-mirror GitHub
-// release and imports it into containerd. The release tag is derived from the
-// ref (<safe-name>-<tag>-arm64, where safe-name replaces "/" with "-"), so no
-// GitHub API call is made and the unauthenticated release-asset download never
-// hits API rate limits. Returns errMirrorNotFound when the image has not been
-// mirrored, so callers can distinguish "mirror it first" from a real failure.
-func loadFromMirror(ctx context.Context, ref, ns string) error {
-	return loadFromMirrorPlatform(ctx, ref, ns, "")
-}
-
-// loadFromMirrorPlatform is loadFromMirror with an explicit platform:
-// "" / linux/arm64 uses the native -arm64 release, linux/amd64 the -amd64
-// one (naming per mirrorReleaseAsset).
+// loadFromMirrorPlatform downloads an image archive from the docker-mirror
+// GitHub release and imports it into containerd. The release tag is derived
+// from the ref (<safe-name>-<tag>-<platform>, where safe-name replaces "/"
+// with "-"), so no GitHub API call is made and the unauthenticated
+// release-asset download never hits API rate limits. Returns
+// errMirrorNotFound when the image has not been mirrored, so callers can
+// distinguish "mirror it first" from a real failure.
+//
+// platform: "" / linux/arm64 uses the native -arm64 release, linux/amd64 the
+// -amd64 one (naming per mirrorReleaseAsset).
 func loadFromMirrorPlatform(ctx context.Context, ref, ns, platform string) error {
 	release, asset, err := mirrorReleaseAsset(ref, platform)
 	if err != nil {
@@ -296,35 +289,20 @@ func ensureImageInNamespace(ctx context.Context, ref, targetNs, platform string,
 		imageMemo.forgetImage(img.Target().Digest)
 	}
 	log.Printf("[images] pulling %q (canonical %q) into namespace %s", ref, canonicalRef, targetNs)
-	var perr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
-		}
-		perr = pullImageIntoNamespace(ctx, canonicalRef, targetNs, platform, auth)
-		if perr == nil {
-			break
-		}
-		debugLog("pull attempt %d for %s failed: %v", attempt+1, canonicalRef, perr)
+	mirrorUsed, pullErr, mirrorErr := pullWithMirrorFallback(ctx, ref, canonicalRef, targetNs, platform, auth)
+	if pullErr != nil && mirrorErr != nil {
+		return &pullFallbackError{ref: ref, registry: pullErr, mirror: mirrorErr}
 	}
-	if perr != nil {
-		pullErr := fmt.Errorf("pull failed: %w", explainEgressFailure(perr))
-		// Fallback: docker-mirror GitHub release (used when the registry is
-		// unreachable or rate-limited but a mirror exists). Only silent on a
-		// clean 404 ("not mirrored yet"); other download errors are logged.
-		if platform != "" {
-			return pullErr // the mirror only carries the native platform
+	if mirrorUsed {
+		// The load imports under the canonical name; verify it landed before
+		// reporting success (a partial import must not look like a pull).
+		if img, err := cl.GetImage(targetCtx, canonicalRef); err == nil {
+			imageMemo.forgetRef(targetNs, canonicalRef)
+			imageMemo.forgetImage(img.Target().Digest)
+			log.Printf("[images] %q loaded from docker-mirror after the registry failed: %v", ref, pullErr)
+			return nil
 		}
-		if mErr := loadFromMirror(ctx, ref, targetNs); mErr == nil {
-			if img, err := cl.GetImage(targetCtx, canonicalRef); err == nil {
-				imageMemo.forgetRef(targetNs, canonicalRef)
-				imageMemo.forgetImage(img.Target().Digest)
-				return nil
-			}
-		} else if !errors.Is(mErr, errMirrorNotFound) {
-			log.Printf("[images] mirror fallback for %q: %v", ref, mErr)
-		}
-		return pullErr
+		return fmt.Errorf("mirror load of %s reported success but the image is not in namespace %s", ref, targetNs)
 	}
 	log.Printf("[images] pulled %q into namespace %s", ref, targetNs)
 	return nil
@@ -357,14 +335,12 @@ func pullImageIntoNamespace(ctx context.Context, canonicalRef, ns, platform stri
 	// the next attempt that pass has finished. NOTE: no outer lease here —
 	// wrapping Pull in our own lease makes the committed image record
 	// lease-scoped, and releasing it deletes the record outright.
-	opts := append([]client.RemoteOpt{client.WithPullUnpack}, authResolverOpts(auth)...)
+	baseOpts := append([]client.RemoteOpt{client.WithPullUnpack}, authResolverOpts(auth)...)
 	if platform != "" {
-		opts = append(opts, client.WithPlatformMatcher(platformMatcher(platform)))
+		baseOpts = append(baseOpts, client.WithPlatformMatcher(platformMatcher(platform)))
 	}
 	prog := pullProgressFrom(ctx)
-	if prog != nil {
-		opts = append(opts, client.WithImageHandler(prog.handler()))
-	}
+	phaseTimeout := pullPhaseTimeout()
 	for attempt := 1; ; attempt++ {
 		var stopPoll func()
 		if prog != nil {
@@ -372,11 +348,36 @@ func pullImageIntoNamespace(ctx context.Context, canonicalRef, ns, platform stri
 			go func() { defer close(done); prog.poll(nsCtx, cl.ContentStore(), stop) }()
 			stopPoll = func() { close(stop); <-done }
 		}
-		img, perr := cl.Pull(nsCtx, canonicalRef, opts...)
+		// Each attempt is bounded: the resolve/manifest phase by a timer that
+		// is stopped as soon as the first layer descriptor arrives, and every
+		// registry read after that by the connection's stall timeout. A
+		// registry that accepts the connection and then goes quiet therefore
+		// fails the attempt instead of keeping the pull alive indefinitely.
+		attemptCtx, cancelAttempt := context.WithCancel(nsCtx)
+		var phaseExpired atomic.Bool
+		phaseTimer := time.AfterFunc(phaseTimeout, func() {
+			phaseExpired.Store(true)
+			cancelAttempt()
+		})
+		handlers := []images.Handler{stopOnFirstLayer(func() { phaseTimer.Stop() })}
+		if prog != nil {
+			handlers = append(handlers, prog.handler())
+		}
+		opts := append([]client.RemoteOpt(nil), baseOpts...)
+		opts = append(opts, client.WithImageHandler(images.Handlers(handlers...)))
+		img, perr := cl.Pull(attemptCtx, canonicalRef, opts...)
+		phaseTimer.Stop()
+		cancelAttempt()
 		if stopPoll != nil {
 			stopPoll() // nothing may write to the response after we return
 		}
 		if perr != nil {
+			switch {
+			case phaseExpired.Load():
+				return fmt.Errorf("%w: no image content within %s", errPullPhaseTimeout, phaseTimeout)
+			case isStallTimeout(perr):
+				return fmt.Errorf("%w: no data for %s", errPullStall, pullStallTimeout())
+			}
 			return perr
 		}
 		// Pin the tree explicitly: the fetch path does not reliably set the
@@ -441,27 +442,27 @@ func pushDockerImage(ctx context.Context, name string, auth *registryAuth, w io.
 }
 
 // pullDockerImage pulls an image natively into the default namespace. When
-// the registry pull fails it falls back to the docker-mirror GitHub release
-// and returns a status line describing which path produced the image.
+// the registry pull fails (including after its bounded deadline) it falls
+// back to the docker-mirror GitHub release and returns a status line
+// describing which path produced the image.
 func pullDockerImage(ctx context.Context, image, platform string, auth *registryAuth) (string, error) {
 	ns := "default"
 	before := localImageDigest(ctx, ns, image)
-	if err := pullImageIntoNamespace(ctx, canonicalizeImageRef(image), ns, platform, auth); err == nil {
-		if before != "" && before == localImageDigest(ctx, ns, image) {
-			return fmt.Sprintf("Image is up to date for %s", image), nil
-		}
-		return fmt.Sprintf("Downloaded newer image for %s", image), nil
-	} else {
-		pullErr := err
-		if mErr := loadFromMirror(ctx, image, ns); mErr == nil {
-			// The wording clients check for success (docker-java).
-			log.Printf("[images] %s loaded from docker-mirror", image)
-			return fmt.Sprintf("Downloaded newer image for %s", image), nil
-		} else if !errors.Is(mErr, errMirrorNotFound) {
-			log.Printf("[images] mirror fallback for %q: %v", image, mErr)
-		}
-		return "", fmt.Errorf("pull failed: %w", explainEgressFailure(pullErr))
+	mirrorUsed, pullErr, mirrorErr := pullWithMirrorFallback(ctx, image, canonicalizeImageRef(image), ns, platform, auth)
+	if pullErr != nil && mirrorErr != nil {
+		return "", &pullFallbackError{ref: image, registry: pullErr, mirror: mirrorErr}
 	}
+	if mirrorUsed {
+		// The wording clients check for success (docker-java) stays the
+		// prefix; the parenthesis says where the image actually came from.
+		log.Printf("[images] %s loaded from docker-mirror after the registry failed: %v", image, pullErr)
+		return fmt.Sprintf("Downloaded newer image for %s (%s; loaded from docker-mirror)",
+			image, registryFailureSummary(pullErr)), nil
+	}
+	if before != "" && before == localImageDigest(ctx, ns, image) {
+		return fmt.Sprintf("Image is up to date for %s", image), nil
+	}
+	return fmt.Sprintf("Downloaded newer image for %s", image), nil
 }
 
 // pushableTarget is what `docker push` sends: the image's index when every

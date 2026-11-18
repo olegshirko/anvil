@@ -109,11 +109,13 @@ func (a *registryAuth) credentials(host string) (string, string, error) {
 // authHTTPClient bounds registry interactions so a hung or unreachable
 // registry cannot wedge docker login / docker pull forever. Response-header
 // (not total) timeout: blob downloads may legitimately stream for minutes,
-// but a server that never answers headers is dead.
+// but a server that never answers headers is dead. Connections are also
+// stall-bounded (see registryTransportWithStall): a registry that answers
+// headers and then goes quiet must fail the pull, not hang it.
 // Connections go through dialOut, which falls back to the host when the
 // VM has no direct internet access (egressproxy.go).
 var authHTTPClient = &http.Client{
-	Transport: registryTransport(),
+	Transport: registryTransportWithStall(),
 }
 
 // authResolverOpts returns pull/push remote options: a resolver whose

@@ -275,7 +275,7 @@ fi
 # /var/lib/buildkit once, from the share.
 mkdir -p "$(dirname "$BUILDKIT_OUT")"
 tar -C "$BUILDKIT_STAGE" -cf - buildkitd buildctl buildkit-qemu-x86_64 buildkit-qemu-arm \
-    | zstd -q -o "$BUILDKIT_OUT"
+    | zstd -q -f -o "$BUILDKIT_OUT"
 rm -rf "$BUILDKIT_STAGE"
 ln -sf /opt/containerd/bin/ctr bin/ctr
 ln -sf /opt/containerd/bin/buildctl bin/buildctl

@@ -41,6 +41,11 @@ func TestMirrorReleaseAsset(t *testing.T) {
 		{"postgres:15.5", "", "postgres-15.5-arm64", "image-arm64.tar.zst", ""},
 		{"postgres:15.5", "linux/arm64", "postgres-15.5-arm64", "image-arm64.tar.zst", ""},
 		{"apache/kafka:4.1.1", "linux/amd64", "apache-kafka-4.1.1-amd64", "image-amd64.tar.zst", ""},
+		// Pulls hand the fallback a canonical ref; the mirror is named by
+		// the familiar one.
+		{"docker.io/library/alpine:3.20", "", "alpine-3.20-arm64", "image-arm64.tar.zst", ""},
+		{"docker.io/library/postgres:15.5", "linux/amd64", "postgres-15.5-amd64", "image-amd64.tar.zst", ""},
+		{"docker.io/apache/kafka:4.1.1", "", "apache-kafka-4.1.1-arm64", "image-arm64.tar.zst", ""},
 		{"alpine:3.20", "linux/riscv64", "", "", "not mirrored"},
 		{"postgres@sha256:abc", "", "", "", "not found in docker-mirror"},
 	}
