@@ -84,7 +84,12 @@ func splitMirrorForcedRef(ref string) (string, bool) {
 // separate `-amd64` release carrying image-amd64.tar.zst. Other platforms
 // are not mirrored.
 func mirrorReleaseAsset(ref, platform string) (release, asset string, err error) {
-	name, tag, ok := splitImageTag(ref)
+	// The mirror names releases by the familiar Docker Hub ref
+	// (alpine-3.20-arm64), while pulls and create requests arrive
+	// canonicalized (docker.io/library/alpine:3.20). Without this, the
+	// automatic fallback looked for docker.io-library-alpine-3.20-arm64 and
+	// reported a mirrored image as missing.
+	name, tag, ok := splitImageTag(familiarRef(ref))
 	if !ok {
 		return "", "", errMirrorNotFound
 	}
