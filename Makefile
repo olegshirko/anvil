@@ -633,6 +633,10 @@ update-brew:
 		sed -i '' 's|version ".*"|version "$(VERSION)"|' "$(HOMEBREW_TAP_DIR)/anvil.rb"; \
 		sed -i '' 's|url ".*anvil-darwin-arm64.tar.gz"|url "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz"|' "$(HOMEBREW_TAP_DIR)/anvil.rb"; \
 		sed -i '' 's|sha256 ".*"|sha256 "'$$SHA_TAR'"|' "$(HOMEBREW_TAP_DIR)/anvil.rb"; \
+		if ! grep -q 'buildkit.tar.zst' "$(HOMEBREW_TAP_DIR)/anvil.rb"; then \
+			echo "[update-brew] adding the buildkit asset install to the formula"; \
+			perl -0pi -e 's|(\(share/"anvil/assets"\)\.install "initramfs-containerd"\n)|$$1    (share/"anvil/assets").install "buildkit.tar.zst" if File.exist?("buildkit.tar.zst")\n|' "$(HOMEBREW_TAP_DIR)/anvil.rb"; \
+		fi; \
 		cd "$(HOMEBREW_TAP_DIR)" && git add anvil.rb && git commit -m "v$(VERSION)" && git push; \
 		echo "[update-brew] done. Run 'make bottle VERSION=$(VERSION)' to build and publish a bottle."
 
