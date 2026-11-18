@@ -198,7 +198,7 @@ final class DomainProxy {
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = in_port_t(guestPortProxyPort).bigEndian
         guard vmIP.withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1,
-              connectWithTimeout(upstream, addr, timeout: 5),
+              connectWithTimeout(upstream, addr, timeout: 5) == nil,
               sendGuestPortProxyHeader(upstream, ip: ip, port: targetPort),
               (try? writeExactlyFD(upstream, data: head)) != nil else {
             respond(client, status: "502 Bad Gateway", body: "anvil: cannot reach \(ip):\(targetPort) in the VM\n")

@@ -108,6 +108,75 @@ final class PortForwarderTests: XCTestCase {
     }
 }
 
+final class GuestAddressTrackingTests: XCTestCase {
+    private func mapping(guestIP: String, containerIP: String = "10.89.0.5") -> PortMapping {
+        PortMapping(namespace: "ns", containerID: "c1", name: "web",
+                    hostPort: 8080, containerPort: 80, protocol: "tcp",
+                    guestIP: guestIP, containerIP: containerIP)
+    }
+
+    func testStateAddressWins() {
+        // The state-level field is what the guest reads from eth0 every scan.
+        let state = PortMapState(mappings: [mapping(guestIP: "192.168.64.2")],
+                                 guestIP: "192.168.64.9")
+        XCTAssertEqual(resolvedGuestAddress(pushed: state, previous: "192.168.64.2"), "192.168.64.9")
+    }
+
+    func testFallsBackToMappingForOlderGuests() {
+        let state = PortMapState(mappings: [mapping(guestIP: "192.168.64.4")])
+        XCTAssertEqual(resolvedGuestAddress(pushed: state, previous: "192.168.64.2"), "192.168.64.4")
+    }
+
+    func testEmptyPushKeepsLastKnownAddress() {
+        // A guest mid-deconfig (or one that never reported an address) must
+        // not blank every listener: keep dialing the last known address.
+        XCTAssertEqual(resolvedGuestAddress(pushed: PortMapState(mappings: []), previous: "192.168.64.3"),
+                       "192.168.64.3")
+    }
+
+    func testEmptyMappingAddressIsIgnored() {
+        let state = PortMapState(mappings: [mapping(guestIP: "")], guestIP: "")
+        XCTAssertEqual(resolvedGuestAddress(pushed: state, previous: "192.168.64.3"), "192.168.64.3")
+    }
+
+    func testMappingWithGuestAddress() {
+        let original = mapping(guestIP: "192.168.64.2")
+        XCTAssertEqual(original.withGuestAddress("192.168.64.9").guestIP, "192.168.64.9")
+        XCTAssertEqual(original.withGuestAddress("192.168.64.9").containerIP, original.containerIP)
+        XCTAssertEqual(original.withGuestAddress(""), original, "an empty push changes nothing")
+        XCTAssertEqual(original.withGuestAddress("192.168.64.2"), original)
+    }
+
+    func testAddressChangeRebuildsListenersWhoseMappingIsStale() {
+        // The restored guest renewed its lease; the push still stamps the old
+        // address on the mapping (or the listener predates the change).
+        let current = ["ns/c1/8080/tcp": mapping(guestIP: "192.168.64.2")]
+        let desired = ["ns/c1/8080/tcp": mapping(guestIP: "192.168.64.2")]
+        XCTAssertEqual(listenersToRebuild(current: current, desired: desired, address: "192.168.64.9"),
+                       ["ns/c1/8080/tcp"])
+    }
+
+    func testAddressChangeDoesNotRebuildUnrelatedKeys() {
+        let current = ["ns/c1/8080/tcp": mapping(guestIP: "192.168.64.9")]
+        let desired = ["ns/c1/8080/tcp": mapping(guestIP: "192.168.64.9")]
+        XCTAssertTrue(listenersToRebuild(current: current, desired: desired, address: "192.168.64.9").isEmpty)
+    }
+
+    func testChangedContainerTargetStillRebuilds() {
+        let current = ["ns/c1/8080/tcp": mapping(guestIP: "192.168.64.2", containerIP: "10.89.0.5")]
+        let desired = ["ns/c1/8080/tcp": mapping(guestIP: "192.168.64.2", containerIP: "10.89.0.6")]
+        XCTAssertEqual(listenersToRebuild(current: current, desired: desired, address: "192.168.64.2"),
+                       ["ns/c1/8080/tcp"])
+    }
+
+    func testNoTrackedAddressKeepsMappingOnlyDecision() {
+        // An empty address must not force a rebuild of every listener.
+        let current = ["ns/c1/8080/tcp": mapping(guestIP: "192.168.64.2")]
+        let desired = ["ns/c1/8080/tcp": mapping(guestIP: "192.168.64.2")]
+        XCTAssertTrue(listenersToRebuild(current: current, desired: desired, address: "").isEmpty)
+    }
+}
+
 final class GuestInterfaceTests: XCTestCase {
     // The forwarder pins guest connections to the interface owning the
     // guest's subnet; loopback is always present to check the lookup.

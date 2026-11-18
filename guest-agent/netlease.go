@@ -9,8 +9,11 @@ package main
 // same address (the vmnet DHCP server does this once a lease is not renewed),
 // and both guests then answer ARP for it.
 //
-// Detection only: the host's port forwarder and the CNI bridge keep using the
-// address they learned, so re-addressing mid-run would break them.
+// Detection only: the agent never reconfigures the interface itself. The
+// udhcpc event script applies whatever lease the vmnet DHCP server hands out
+// (a renewal can move the address; the host's port forwarder follows it from
+// every pushed state instead of caching it), and the CNI bridges keep their
+// own 10.10.x subnets, which no lease move touches.
 //
 // The frame code here is pure Go and unit-tested on the host; the AF_PACKET
 // socket and /dev/console mirroring live in netlease_linux.go.
