@@ -357,6 +357,10 @@ func dispatch(req *Request) Response {
 		return runExec(req.Args)
 	case "egress":
 		return egressStatus()
+	case "net_reset":
+		// The host's NAT recovery asks for this when a NAT reattach did not
+		// restore the guest's layer-2 path (see netreset.go).
+		return resetGuestNetwork()
 	case "df":
 		return diskUsage("/var/lib")
 	default:
