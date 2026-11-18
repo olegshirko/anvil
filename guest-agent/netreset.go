@@ -28,8 +28,11 @@ import (
 const (
 	netResetIface = "eth0"
 	// netResetRenewWait bounds a forced renewal before a full discover is
-	// attempted.
-	netResetRenewWait = 6 * time.Second
+	// attempted. The client retries a renewal every -T seconds (2) and the
+	// link needs a moment for carrier after the up, so the first attempt
+	// after the bounce often fails; six seconds cut a renewal that landed
+	// just after the window short and always forced a full discover.
+	netResetRenewWait = 12 * time.Second
 	// netResetDiscoverWait bounds the one-shot discover.
 	netResetDiscoverWait = 10 * time.Second
 	// netResetStepTimeout bounds one ip/killall/ifconfig call.
