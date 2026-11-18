@@ -1,3 +1,14 @@
+## v1.10.3 (2026-11-18)
+
+### Other
+- 64a6eda host: dial the guest's current address for published ports
+- a93a65d agent: the port forwarder follows a lease move now
+- 7263ab0 daemon: bound the pre-save guest work on shutdown
+- e91eed1 guest: tune virtio-blk from the agent, not during boot
+- 2e6a95f guest: tune the virtio-blk queue off the boot critical path
+- ef48542 daemon: keep a skipped-save stop fast and bounded
+- db40050 guest-agent: mark boot phases on the console
+- 37b2513 daemon: adapt snapshot use to measured restore vs boot time
 ## v1.10.2 (2026-11-17)
 
 ### Docs
