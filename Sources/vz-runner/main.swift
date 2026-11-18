@@ -528,6 +528,48 @@ func bootAssetCandidates(stateDir: String, stateBinDir: String, brewAssets: Stri
     return (brewK + stateK, brewI + stateI)
 }
 
+/// Where buildkit.tar.zst can come from, with the same precedence as the
+/// boot assets: a source tree's fresh build, then the installed package,
+/// then state-dir copies. It is a separate asset (not part of the initramfs):
+/// 54 MB of tarball in the image was unpacked by the kernel on every boot.
+func buildkitAssetCandidates() -> [String] {
+    var out: [String] = []
+    if let root = findProjectRoot() {
+        out.append("\(root)/.download/ubuntu/buildkit.tar.zst")
+    }
+    if let brew = brewAssetsDir() {
+        out.append("\(brew)/buildkit.tar.zst")
+    }
+    out.append("\(stateDir.path)/buildkit.tar.zst")
+    out.append("\(stateDir.path)/bin/buildkit.tar.zst")
+    return out
+}
+
+/// Put buildkit.tar.zst on the VM share for the guest's one-time unpack to
+/// /var/lib/buildkit (stage2 reads <share>/.anvil-run/buildkit.tar.zst).
+/// Copied only when the packaged asset is newer, so repeated starts do not
+/// rewrite 54 MB. A missing asset is not fatal: the VM boots and containers
+/// run, and guest-agent reports the missing builder when a build starts.
+func provisionBuildkitAsset(share: String) {
+    guard let source = buildkitAssetCandidates().first(where: {
+        FileManager.default.isReadableFile(atPath: $0)
+    }) else { return }
+    let dir = "\(share)/.anvil-run"
+    let dest = "\(dir)/buildkit.tar.zst"
+    if let srcDate = modificationDate(source), let destDate = modificationDate(dest),
+       destDate >= srcDate {
+        return
+    }
+    do {
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(atPath: dest)
+        try FileManager.default.copyItem(atPath: source, toPath: dest)
+        print("[anvil] provisioning buildkit asset \(source)")
+    } catch {
+        print("[anvil] buildkit asset: \(error)")
+    }
+}
+
 /// Releases ship the kernel gzipped; unpack it into the state dir when the
 /// packaged copy is newer than the unpacked one (first start, or an upgrade
 /// — the old unpacked kernel would otherwise boot with the new initramfs).
