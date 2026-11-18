@@ -81,6 +81,11 @@ final class NATRecovery {
     /// virtio-net device can come back without a working layer-2 path, and
     /// waiting for the minute tick only delays the recovery.
     func vmBecameReady() {
+        // A VM that just started or was restored is a new incident: a ladder
+        // exhausted against the previous VM (or a step it died during) must
+        // not silence the recovery of this one.
+        ladder.recovered()
+        recovering = false
         if pendingCheck {
             scheduleCheck(reason: "network changed while the VM was paused")
         } else if manager.restoredFromSnapshot {
