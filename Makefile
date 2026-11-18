@@ -19,6 +19,12 @@ BINARY := .build/release/vz-runner
 # docker context anvil-dev) next to the usual service — see `make dev-*`.
 ANVIL_INSTANCE ?=
 export ANVIL_INSTANCE
+# The initramfs is assembled in a Linux container. Recipes build it on the
+# instance's own VM (anvil-dev for a dev rebuild): a development build must
+# not run a container, pull an image or write to the disk of the user's usual
+# instance. ANVIL_BUILD_CONTEXT still overrides the context explicitly.
+ANVIL_BUILD_CONTEXT ?=
+ANVIL_BUILD_CONTEXT_EFFECTIVE := $(or $(ANVIL_BUILD_CONTEXT),anvil$(if $(ANVIL_INSTANCE),-$(ANVIL_INSTANCE)))
 ANVIL_STATE_DIR := $(HOME)/.anvil-vz$(if $(ANVIL_INSTANCE),-$(ANVIL_INSTANCE))
 ENTITLEMENTS := entitlements.plist
 # Release targets require an explicit VERSION=x.y.z; plain builds are "dev".
@@ -103,6 +109,10 @@ dev-start:
 dev-stop:
 	@$(MAKE) service-stop ANVIL_INSTANCE=dev
 dev-rebuild:
+	@# The initramfs build container runs in this instance's VM, so the
+	@# daemon must be up while everything is built; the final step stops it,
+	@# drops the snapshot and cold boots the freshly built initramfs.
+	@$(MAKE) dev-start
 	@$(MAKE) service-debug-rebuild ANVIL_INSTANCE=dev
 dev-integration:
 	@$(MAKE) integration ANVIL_INSTANCE=dev
@@ -314,7 +324,7 @@ NATIVE_HELPER_SRC := $(CURDIR)/guest-agent/guest-shim/native/anvil-init.c
 NATIVE_BUILD_IMAGE := anvil-init-cc:3.20
 
 anvil-init-native:
-	@ANVIL_BUILD_CONTEXT=$${ANVIL_BUILD_CONTEXT:-anvil}; \
+	@ANVIL_BUILD_CONTEXT="$(ANVIL_BUILD_CONTEXT_EFFECTIVE)"; \
 	if ! docker --context "$$ANVIL_BUILD_CONTEXT" info >/dev/null 2>&1; then \
 	    echo "docker context '$$ANVIL_BUILD_CONTEXT' is not reachable - the native init helper is compiled in a Linux container (start the anvil service or pass ANVIL_BUILD_CONTEXT=<ctx>)."; \
 	    exit 1; \
@@ -464,9 +474,9 @@ download-upx:
 	fi
 
 initramfs-containerd: download-alpine extract-alpine-kernel alpine-virt-modules guest-agent guest-shim anvil-init container-tools alpine-iptables download-upx
-	@ANVIL_BUILD_CONTEXT=$${ANVIL_BUILD_CONTEXT:-anvil}; \
+	@ANVIL_BUILD_CONTEXT="$(ANVIL_BUILD_CONTEXT_EFFECTIVE)"; \
 	if ! docker --context "$$ANVIL_BUILD_CONTEXT" info >/dev/null 2>&1; then \
-	    echo "docker context '$$ANVIL_BUILD_CONTEXT' is not reachable - initramfs builds run on the anvil service; start it first (make service-start) or pass ANVIL_BUILD_CONTEXT=<ctx>."; \
+	    echo "docker context '$$ANVIL_BUILD_CONTEXT' is not reachable - initramfs builds run in an anvil VM; start it first (make dev-start / make service-start) or pass ANVIL_BUILD_CONTEXT=<ctx>."; \
 	    exit 1; \
 	fi; \
 	echo "Building initramfs in docker context '$$ANVIL_BUILD_CONTEXT'..."; \
