@@ -108,7 +108,33 @@ dev-start:
 	@$(MAKE) service-start ANVIL_INSTANCE=dev
 dev-stop:
 	@$(MAKE) service-stop ANVIL_INSTANCE=dev
-dev-rebuild:
+# A fresh checkout has no .download assets, and the dev VM must boot before
+# it can host the build container. Seed a bootable kernel/initramfs from the
+# installed package (read-only; the rebuild overwrites them). Never touches
+# the usual instance: the files are only copied into this checkout.
+dev-bootstrap:
+	@mkdir -p .download/alpine .download/ubuntu
+	@if [ ! -f .download/alpine/vmlinuz-raw ] && [ ! -f $(HOME)/.anvil-vz-dev/vmlinuz-raw ]; then \
+		for d in /opt/homebrew/opt/anvil/share/anvil/assets /usr/local/opt/anvil/share/anvil/assets; do \
+			if [ -f "$$d/vmlinuz-raw.gz" ]; then \
+				echo "[dev-bootstrap] seeding kernel from $$d"; \
+				gunzip -c "$$d/vmlinuz-raw.gz" > .download/alpine/vmlinuz-raw; break; \
+			elif [ -f "$$d/vmlinuz-raw" ]; then \
+				echo "[dev-bootstrap] seeding kernel from $$d"; \
+				cp "$$d/vmlinuz-raw" .download/alpine/vmlinuz-raw; break; \
+			fi; \
+		done; \
+	fi
+	@if [ ! -f .download/ubuntu/initramfs-containerd ] && [ ! -f $(HOME)/.anvil-vz-dev/initramfs-containerd ]; then \
+		for d in /opt/homebrew/opt/anvil/share/anvil/assets /usr/local/opt/anvil/share/anvil/assets; do \
+			if [ -f "$$d/initramfs-containerd" ]; then \
+				echo "[dev-bootstrap] seeding initramfs from $$d"; \
+				cp "$$d/initramfs-containerd" .download/ubuntu/initramfs-containerd; break; \
+			fi; \
+		done; \
+	fi
+
+dev-rebuild: dev-bootstrap
 	@# The initramfs build container runs in this instance's VM, so the
 	@# daemon must be up while everything is built; the final step stops it,
 	@# drops the snapshot and cold boots the freshly built initramfs.
